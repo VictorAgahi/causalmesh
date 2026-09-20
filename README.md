@@ -98,7 +98,7 @@ The following unstyled diagrams illustrate the internal subsystem data flow and 
 graph TD
     Client["AI Agent / IDE Client"] -->|JSON-RPC 2.0 over Stdio| StdioActor["Stdio Framing Actor"]
     StdioActor -->|Extract W3C traceparent| Router["Protocol Router & Validator"]
-    Router -->|ValidatedScope Jail (Unicode NFC + Mount Aliases)| Security["Security & Path Canonicalization"]
+    Router -->|ValidatedScope Jail - Unicode NFC and Mount Aliases| Security["Security & Path Canonicalization"]
     Security -->|Scope Approved| Dispatcher["MCP Tool Registry"]
     
     Dispatcher --> Tools{"Tool Selection"}
@@ -109,20 +109,20 @@ graph TD
     Tools -->|search_docs| EngineDocs["Sanitized Architecture Docs"]
     
     EngineSearch --> Parsers["Tree-sitter AST Guard"]
-    EngineGraph --> State["Lock-Free AppState CoW (ArcSwap)"]
+    EngineGraph --> State["Lock-Free AppState CoW - ArcSwap"]
     EngineGrpc --> State
     EngineImpact --> State
     EngineDocs --> State
     
-    Parsers --> Decap["AST Body Decapitator (incl. Arrow Functions)"]
+    Parsers --> Decap["AST Body Decapitator - Arrow Functions Support"]
     Decap --> Formatter["Markdown Formatter 48KB Cap"]
     
     Formatter --> Audit["SQLite WAL Cryptographically Chained Audit Logger"]
     Audit --> StdioActor
     StdioActor -->|JSON-RPC Output via BufWriter| Client
 
-    Watcher["In-Kernel File Watcher (notify 150ms debounce)"] -->|Event: Code / .git/HEAD| Rescan["Rayon Background Rescan"]
-    Rescan -.->|Atomic ArcSwap Store (QoS Background)| State
+    Watcher["In-Kernel File Watcher - notify 150ms debounce"] -->|Event: Code or Git HEAD| Rescan["Rayon Background Rescan"]
+    Rescan -.->|Atomic ArcSwap Store - QoS Background| State
 ```
 
 #### Governance & Refusal (RSAH) Flow

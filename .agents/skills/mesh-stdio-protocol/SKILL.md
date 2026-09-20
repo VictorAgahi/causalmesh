@@ -13,17 +13,17 @@ This skill guides you through maintaining and extending the JSON-RPC 2.0 stdio t
 
 ## 1. Quick Navigation & Codebase References
 
-- **Stdio Framing Actor**: [`crates/mesh-server/src/framing.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/framing.rs)
+- **Stdio Framing Actor**: [`crates/mesh-server/src/framing.rs`](../../../crates/mesh-server/src/framing.rs)
   - `StdioFramingActor::spawn()`: Background task with exclusive write ownership of `BufWriter<Stdout>`
   - Bounded MPSC channels (capacity 64)
   - Non-blocking Stdin EOF shutdown
-- **Protocol & W3C Tracing**: [`crates/mesh-server/src/protocol.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/protocol.rs)
+- **Protocol & W3C Tracing**: [`crates/mesh-server/src/protocol.rs`](../../../crates/mesh-server/src/protocol.rs)
   - `JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcError`
   - `RequestMeta`: Extracts `_meta.traceparent` for distributed APM tracing
-- **Markdown Formatter & Truncation**: [`crates/mesh-parsers/src/markdown.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/markdown.rs)
+- **Markdown Formatter & Truncation**: [`crates/mesh-parsers/src/markdown.rs`](../../../crates/mesh-parsers/src/markdown.rs)
   - `MAX_OUTPUT_BYTES = 48 * 1024` (48 KB cap)
   - `build_truncated_search_output()`: Injects sub-scope counts and navigational tips
-- **Tool Registry & Dispatch**: [`crates/mesh-server/src/tools/mod.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/tools/mod.rs)
+- **Tool Registry & Dispatch**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
   - `ToolRegistry::handle_call()`: Tool execution and framing dispatch
 
 ---

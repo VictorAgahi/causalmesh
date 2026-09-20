@@ -13,22 +13,22 @@ This skill guides you through extending and maintaining the syntax parsing and A
 
 ## 1. Quick Navigation & Codebase References
 
-- **AST Safety Guard**: [`crates/mesh-parsers/src/guard.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/guard.rs)
+- **AST Safety Guard**: [`crates/mesh-parsers/src/guard.rs`](../../../crates/mesh-parsers/src/guard.rs)
   - `AstGuard::verify_all_parsers()`: Grammar healthcheck
   - `AstGuard::check_file()`: 384 KB size check, 4 KB null sniffing, max line 1,024 bytes
   - `AstGuard::check_nesting_depth()`: Fast lexical scanner (max depth 64)
   - `BoundedMatch`: ReDoS cursor step limiter (10,000 steps)
-- **Polyglot AST Decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/decapitate.rs)
+- **Polyglot AST Decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](../../../crates/mesh-parsers/src/decapitate.rs)
   - `AstDecapitator::decapitate()`: Byte-offset replacement engine
   - `AstDecapitator::collect_body_replacements()`: Grammar rules per language
-- **Language Extractors**: [`crates/mesh-parsers/src/languages/`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/)
-  - [`proto.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/proto.rs): Protobuf service and RPC method extractor
-  - [`java.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/java.rs): Spring Boot `@GrpcService` and `@RestController`
-  - [`go.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/go.rs): Go `pb.Register*Server` and handler methods
-  - [`python.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/python.rs): FastAPI and gRPC servicer classes
-  - [`typescript.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/typescript.rs): NestJS and Node.js gRPC client invocations
-  - [`rust_lang.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/rust_lang.rs): Tonic gRPC services and public functions
-  - [`mod.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/languages/mod.rs): AsyncAPI channels & OpenAPI paths from YAML
+- **Language Extractors**: [`crates/mesh-parsers/src/languages/`](../../../crates/mesh-parsers/src/languages/)
+  - [`proto.rs`](../../../crates/mesh-parsers/src/languages/proto.rs): Protobuf service and RPC method extractor
+  - [`java.rs`](../../../crates/mesh-parsers/src/languages/java.rs): Spring Boot `@GrpcService` and `@RestController`
+  - [`go.rs`](../../../crates/mesh-parsers/src/languages/go.rs): Go `pb.Register*Server` and handler methods
+  - [`python.rs`](../../../crates/mesh-parsers/src/languages/python.rs): FastAPI and gRPC servicer classes
+  - [`typescript.rs`](../../../crates/mesh-parsers/src/languages/typescript.rs): NestJS and Node.js gRPC client invocations
+  - [`rust_lang.rs`](../../../crates/mesh-parsers/src/languages/rust_lang.rs): Tonic gRPC services and public functions
+  - [`mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs): AsyncAPI channels & OpenAPI paths from YAML
 
 ---
 

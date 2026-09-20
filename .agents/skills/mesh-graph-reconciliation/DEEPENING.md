@@ -12,7 +12,7 @@ In conventional architectures, in-memory graphs are protected by `tokio::sync::R
 - Latency spikes can exceed 100ms.
 
 ### MeshMCP Lock-Free Design:
-In [`AppState`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/state.rs#L20-L55):
+In [`AppState`](../../../crates/mesh-core/src/state.rs):
 ```rust
 pub struct AppState {
     pub contract_graph: ArcSwap<ContractGraph>,
@@ -56,7 +56,7 @@ Different languages declare package hierarchies differently:
 - **TypeScript**: `import { BillingServiceClient } from '@corp/proto/billing/v1'` $\to$ `billing.v1.BillingService`
 
 ### Canonicalization Algorithm:
-In [`ContractGraph`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/contracts.rs#L60-L110):
+In [`ContractGraph`](../../../crates/mesh-core/src/contracts.rs):
 1. **Strip Language Suffixes**: Remove `Client`, `Server`, `Handler`, `Impl`, `Controller`, `Servicer`.
 2. **Reverse Domain Matching**: Match `.proto` package segments (`billing.v1`) against Java reverse domains (`com.corp.billing.v1`).
 3. **Symbol Index**: Index by both fully qualified canonical name (`com.corp.billing.v1.BillingService`) and short name (`BillingService`) to allow fuzzy lookups while maintaining exact reverse dependency mapping.

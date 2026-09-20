@@ -14,7 +14,7 @@ On case-insensitive filesystems (macOS APFS default, Windows NTFS):
 If `allowed_roots` contains `/Users/dev/project`, an agent passing `/Users/dev/PROJECT/../../etc/passwd` could bypass naive prefix checks if canonicalization or comparison fails to account for case folding.
 
 ### The Defense:
-In [`ValidatedScope`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/security.rs#L30-L70):
+In [`ValidatedScope`](../../../crates/mesh-core/src/security.rs):
 ```rust
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 let canonical_check = PathBuf::from(canonical.to_string_lossy().to_lowercase());

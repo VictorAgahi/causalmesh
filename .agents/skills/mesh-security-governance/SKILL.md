@@ -13,20 +13,20 @@ This skill guides you through maintaining and enforcing the security boundaries,
 
 ## 1. Quick Navigation & Codebase References
 
-- **Security Boundary & Jail**: [`crates/mesh-core/src/security.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/security.rs)
+- **Security Boundary & Jail**: [`crates/mesh-core/src/security.rs`](../../../crates/mesh-core/src/security.rs)
   - `ValidatedScope::resolve()`: Normalization, Dunce canonicalization, and boundary check
   - `SecurityError`: Sandbox breakout, symlink traversal, not found
-- **Secret Redaction Engine**: [`crates/mesh-core/src/properties.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/properties.rs)
+- **Secret Redaction Engine**: [`crates/mesh-core/src/properties.rs`](../../../crates/mesh-core/src/properties.rs)
   - `PropertyRegistry::load_file()`: Properties & YAML flattening
   - `PropertyRegistry::redact_secrets()`: Regex masking of AWS keys, JWTs, private keys, API secrets
   - `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`: Testing fallback guidance
-- **Governance & RSAH**: [`crates/mesh-core/src/governance.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/governance.rs)
+- **Governance & RSAH**: [`crates/mesh-core/src/governance.rs`](../../../crates/mesh-core/src/governance.rs)
   - `GovernanceEngine::check_scope()`: Checks path against `[engines.policy.stop_rules]`
   - `GovernanceEngine::generate_rsah_refusal()`: Returns structured handoff envelope
-- **Cryptographic Audit**: [`crates/mesh-core/src/audit.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/audit.rs)
+- **Cryptographic Audit**: [`crates/mesh-core/src/audit.rs`](../../../crates/mesh-core/src/audit.rs)
   - `AuditLogger::log()`: SHA-256 hash chaining
   - Mode `0600` POSIX permission verification
-- **Physical Git Pre-Commit Hook**: [`crates/mesh-server/src/cli/hooks.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/cli/hooks.rs)
+- **Physical Git Pre-Commit Hook**: [`crates/mesh-server/src/cli/hooks.rs`](../../../crates/mesh-server/src/cli/hooks.rs)
   - Installs `.git/hooks/pre-commit` (mode `0755`) to prevent unauthorized cross-service commits
 
 ---

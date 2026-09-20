@@ -18,7 +18,7 @@ while let Some(m) = matches.next() {
 ```
 
 ### The Solution: `BoundedMatch<'tree>`
-MeshMCP introduces [`BoundedMatch<'tree>`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/guard.rs#L85-L125):
+MeshMCP introduces [`BoundedMatch<'tree>`](../../../crates/mesh-parsers/src/guard.rs):
 ```rust
 pub struct BoundedMatch<'tree> {
     pub pattern_index: usize,
@@ -31,7 +31,7 @@ pub struct BoundedMatch<'tree> {
 
 ## 2. Zero-Copy AST Body Replacement Algorithm
 
-In [`AstDecapitator`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/decapitate.rs#L30-L75), we replace function bodies without constructing intermediate string buffers or regex passes:
+In [`AstDecapitator`](../../../crates/mesh-parsers/src/decapitate.rs), we replace function bodies without constructing intermediate string buffers or regex passes:
 
 ```mermaid
 graph TD
@@ -68,7 +68,7 @@ graph TD
 
 Tree-sitter's C parser allocates stack frames proportional to grammar recursion depth. Malicious or generated files with 1,000+ nested parentheses can cause native C stack overflow, terminating the Rust process instantly (`SIGSEGV`).
 
-MeshMCP avoids this with a 0-allocation linear pre-scan in [`AstGuard::check_nesting_depth`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/guard.rs#L50-L80):
+MeshMCP avoids this with a 0-allocation linear pre-scan in [`AstGuard::check_nesting_depth`](../../../crates/mesh-parsers/src/guard.rs):
 ```rust
 pub fn check_nesting_depth(source: &str, max_depth: usize) -> bool {
     let mut current_depth: usize = 0;
@@ -97,7 +97,7 @@ This check runs in $< 50\mu\text{s}$ over a 384 KB file, rejecting dangerous pay
 
 Tree-sitter queries with recursive wildcards (e.g., `(class_declaration (_)*)`) can induce exponential backtracking.
 
-In [`AstGuard::execute_query_bounded`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/guard.rs#L95-L125):
+In [`AstGuard::execute_query_bounded`](../../../crates/mesh-parsers/src/guard.rs):
 ```rust
 let mut steps = 0;
 while let Some(m) = matches.next() {

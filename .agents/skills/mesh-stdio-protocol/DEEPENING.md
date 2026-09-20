@@ -8,7 +8,7 @@ This document provides deep technical reference material for the `mesh-stdio-pro
 
 Standard synchronous `std::io::stdin().read_line()` blocks the thread. If the client terminates, the thread hangs indefinitely unless an interrupt is delivered.
 
-In [`StdioFramingActor`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/framing.rs#L40-L95):
+In [`StdioFramingActor`](../../../crates/mesh-server/src/framing.rs):
 ```rust
 let (tx_out, mut rx_out) = mpsc::channel::<String>(64);
 let (tx_in, rx_in) = mpsc::channel::<String>(64);
@@ -36,7 +36,7 @@ let (tx_in, rx_in) = mpsc::channel::<String>(64);
 
 To correlate agent queries with APM traces (Datadog, OpenTelemetry, Jaeger), MeshMCP extracts and propagates the W3C Trace Context over JSON-RPC.
 
-In [`crates/mesh-server/src/protocol.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-server/src/protocol.rs#L30-L75):
+In [`crates/mesh-server/src/protocol.rs`](../../../crates/mesh-server/src/protocol.rs):
 ```rust
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RequestMeta {
@@ -62,7 +62,7 @@ When present:
 
 When a query yields more results than can fit in the 48 KB buffer, cutting off abruptly leaves the agent blind to remaining matches.
 
-In [`MarkdownFormatter::build_truncated_search_output`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-parsers/src/markdown.rs#L85-L135):
+In [`MarkdownFormatter::build_truncated_search_output`](../../../crates/mesh-parsers/src/markdown.rs):
 
 ```mermaid
 graph TD

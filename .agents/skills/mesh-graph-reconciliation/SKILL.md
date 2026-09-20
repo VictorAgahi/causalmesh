@@ -13,18 +13,18 @@ This skill guides you through maintaining, querying, and updating the cross-serv
 
 ## 1. Quick Navigation & Codebase References
 
-- **Core Data Types**: [`crates/mesh-core/src/types.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/types.rs)
+- **Core Data Types**: [`crates/mesh-core/src/types.rs`](../../../crates/mesh-core/src/types.rs)
   - `CompactStr`: 24-byte stack inline string
   - `RepoId = u8`: Interned repository index (up to 256 repos)
   - `NodeId`: Monotonically increasing 32-bit node index
   - `ContractNode`: Node representing a Service, RPC, Schema, Topic, or RestEndpoint
   - `ContractEdge`: Typed relationship (`Implements`, `CallsRpc`, `PublishesTo`, `SubscribesFrom`)
-- **Contract Graph Engine**: [`crates/mesh-core/src/contracts.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/contracts.rs)
+- **Contract Graph Engine**: [`crates/mesh-core/src/contracts.rs`](../../../crates/mesh-core/src/contracts.rs)
   - `ContractGraph::new()`: Graph builder and adjacency index
   - `ContractGraph::find_reverse_dependencies()`: $O(1)$ caller lookup
   - `ContractGraph::trace_grpc_service()`: Protobuf $\to$ Server $\to$ Client matrix
   - `ContractGraph::compute_blast_radius()`: Causal impact analysis
-- **Lock-Free State**: [`crates/mesh-core/src/state.rs`](file:///Users/victoragahi/Developer/causalmesh/crates/mesh-core/src/state.rs)
+- **Lock-Free State**: [`crates/mesh-core/src/state.rs`](../../../crates/mesh-core/src/state.rs)
   - `AppState`: Map-level Copy-on-Write using `ArcSwap`
   - Atomic snapshot swap: `state.contract_graph.store(Arc::new(new_graph))`
 

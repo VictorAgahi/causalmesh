@@ -214,4 +214,77 @@ export class AuthController {
         );
         assert!(!decapitated.contains("jwt.sign"));
     }
+
+    #[test]
+    fn test_java_decapitation() {
+        let code = r#"
+@RestController
+public class AuthController {
+    @PostMapping("/login")
+    public ResponseEntity<TokenResponse> login(@RequestBody LoginRequest req) {
+        String token = authService.generate(req);
+        return ResponseEntity.ok(new TokenResponse(token));
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Java, &mut parser, false);
+        assert!(decapitated.contains("@RestController"));
+        assert!(decapitated.contains("@PostMapping(\"/login\")"));
+        assert!(decapitated.contains("public ResponseEntity<TokenResponse> login(@RequestBody LoginRequest req) { /* stripped */ }"));
+        assert!(!decapitated.contains("authService.generate"));
+    }
+
+    #[test]
+    fn test_go_decapitation() {
+        let code = r#"
+package auth
+
+func (s *AuthServer) Authenticate(ctx context.Context, req *AuthRequest) (*AuthResponse, error) {
+    token, err := s.jwt.Sign(req.UserId)
+    if err != nil {
+        return nil, err
+    }
+    return &AuthResponse{Token: token}, nil
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_go::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Go, &mut parser, false);
+        assert!(decapitated.contains("func (s *AuthServer) Authenticate(ctx context.Context, req *AuthRequest) (*AuthResponse, error) { /* stripped */ }"));
+        assert!(!decapitated.contains("s.jwt.Sign"));
+    }
+
+    #[test]
+    fn test_python_decapitation() {
+        let code = r#"
+class AuthService:
+    @tracer.trace("login")
+    def login(self, username: str, secret: str) -> dict:
+        token = generate_jwt(username)
+        return {"token": token}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_python::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let decapitated =
+            AstDecapitator::decapitate(code, LanguageKind::Python, &mut parser, false);
+        assert!(decapitated.contains("@tracer.trace(\"login\")"));
+        assert!(decapitated.contains("def login(self, username: str, secret: str) -> dict:"));
+        assert!(decapitated.contains("..."));
+        assert!(!decapitated.contains("generate_jwt"));
+    }
+
+    #[test]
+    fn test_decapitate_auto_preserves_on_include_body() {
+        let code = "fn compute() -> i32 { let x = 42; x * 2 }";
+        let out = AstDecapitator::decapitate_auto(code, LanguageKind::Rust, true);
+        assert_eq!(out, code);
+    }
 }

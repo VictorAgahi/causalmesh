@@ -84,12 +84,12 @@ Identifiers, repository names, method signatures, and file sub-paths never use R
 - **Small String Optimization (SSO)**: Strings up to 24 bytes (on 64-bit systems) are stored completely on the stack with zero heap indirection.
 - **Cache Locality**: Vectors of `CompactString` retain sequential CPU cache line locality during iterations.
 
-### 3.3 Interned Repository Identifiers: `RepoId = u8`
-In a 50-repository workspace, mapping strings in graph nodes consumes significant memory and induces pointer chasing. MeshMCP interns repository names into a single byte:
+### 3.3 Interned Repository Identifiers: `RepoId = u16`
+In a 50-repository to 65,000-repository workspace, mapping strings in graph nodes consumes significant memory and induces pointer chasing. MeshMCP interns repository names into a compact 16-bit integer:
 ```rust
-pub type RepoId = u8;
+pub type RepoId = u16;
 ```
-All graph lookups index into flat arrays or contiguous maps indexed by `RepoId`.
+All graph lookups index into flat arrays or contiguous maps indexed by `RepoId`, scaling seamlessly to 65,535 microservices and libraries.
 
 ### 3.4 Lock-Free State Management via `ArcSwap`
 State updates never acquire mutexes or read-write locks in the query path:

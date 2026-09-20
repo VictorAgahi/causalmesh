@@ -4,7 +4,7 @@ use std::path::PathBuf;
 /// Re-export CompactString as CompactStr for zero-allocation hot loops per RFC-001 Commandment 1
 pub type CompactStr = compact_str::CompactString;
 
-pub type RepoId = u8;
+pub type RepoId = u16;
 
 pub type SymbolName = CompactStr;
 pub type PathStr = CompactStr;

@@ -141,7 +141,7 @@ sequenceDiagram
 
 Every line of Rust in MeshMCP adheres strictly to the 7 Code Commandments:
 
-1. **Zero Dynamic Allocation in Hot Loops**: Global `mimalloc`, string interning via `CompactString` (24 bytes inline stack allocation), `RepoId = u8` indices, and reusable scratch buffers.
+1. **Zero Dynamic Allocation in Hot Loops**: Global `mimalloc`, string interning via `CompactString` (24 bytes inline stack allocation), `RepoId = u16` indices (up to 65,535 repos), and reusable scratch buffers.
 2. **Bounded Tree-sitter & IOPS Guards**: Files exceeding 384 KB or lines exceeding 1,024 bytes are rejected. Null-byte sniffing over 4,096 bytes prevents binary ingestion. AST nesting depth capped at 64; C-FFI timeout set to 15,000 microseconds; queries bounded to 10,000 steps (anti-ReDoS).
 3. **Stdio Isolation & Affordance Truncation**: Standard output is exclusively owned by a dedicated Tokio task with `BufWriter<Stdout>`. Standard error is strictly reserved for diagnostic tracing. Responses exceeding 48 KB are truncated with actionable sub-scope navigational hints.
 4. **Security Boundary via `ValidatedScope` Jail**: Absolute prohibition of raw `PathBuf` or string paths. Dual-check resolution via `dunce::canonicalize` and case-folding normalization (APFS/NTFS). Symlink traversal outside declared roots triggers immediate rejection (JSON-RPC error `-32602`).

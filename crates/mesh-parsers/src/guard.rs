@@ -26,7 +26,8 @@ pub struct BoundedMatch<'tree> {
 pub struct AstGuard;
 
 impl AstGuard {
-    pub const MAX_FILE_SIZE_BYTES: u64 = 384 * 1024; // 384 KB
+    pub const MAX_FILE_SIZE_BYTES: u64 = 384 * 1024; // 384 KB for standard source code
+    pub const MAX_SCHEMA_FILE_SIZE_BYTES: u64 = 1536 * 1024; // 1.5 MB for generated schemas & contracts
     pub const BINARY_SNIFF_LEN: usize = 4096;
     pub const MAX_LINE_LEN_BYTES: usize = 1024;
     pub const MAX_NESTING_DEPTH: usize = 64;
@@ -34,10 +35,56 @@ impl AstGuard {
     pub const QUERY_MATCH_LIMIT: u32 = 500;
     pub const MAX_QUERY_STEPS: usize = 10_000; // Anti-ReDoS step limit
 
-    /// Lexical pre-check rejecting oversized, binary, long-line, or deeply nested files in < 1us
+    /// Identifies whether a file is a contract definition or generated serialization stub
+    pub fn is_contract_or_schema(path: &std::path::Path) -> bool {
+        let filename = match path.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f.to_ascii_lowercase(),
+            None => return false,
+        };
+        filename.ends_with(".proto")
+            || filename.ends_with(".pb.go")
+            || filename.ends_with("outerclass.java")
+            || filename.ends_with(".pb.ts")
+            || filename.ends_with("_pb2.py")
+            || filename.ends_with(".pb.rs")
+            || filename == "openapi.yaml"
+            || filename == "openapi.json"
+            || filename == "asyncapi.yaml"
+            || filename == "asyncapi.json"
+    }
+
+    /// Lexical pre-check with path-aware sizing (1.5 MB budget for schemas/stubs, 384 KB for source files)
+    pub fn should_parse_path(
+        path: &std::path::Path,
+        metadata: &fs::Metadata,
+        content: &[u8],
+    ) -> bool {
+        let budget = if Self::is_contract_or_schema(path) {
+            Self::MAX_SCHEMA_FILE_SIZE_BYTES
+        } else {
+            Self::MAX_FILE_SIZE_BYTES
+        };
+        Self::should_parse_with_budget(metadata, content, budget)
+    }
+
+    /// Default lexical pre-check rejecting oversized, binary, long-line, or deeply nested files
     pub fn should_parse(metadata: &fs::Metadata, content: &[u8]) -> bool {
-        if metadata.len() > Self::MAX_FILE_SIZE_BYTES {
-            tracing::debug!(target: "mesh::parser", "Rejected file exceeding 384 KB (size: {} bytes)", metadata.len());
+        Self::should_parse_with_budget(metadata, content, Self::MAX_FILE_SIZE_BYTES)
+    }
+
+    /// Lexical pre-check with custom byte size budget
+    pub fn should_parse_with_budget(
+        metadata: &fs::Metadata,
+        content: &[u8],
+        max_bytes: u64,
+    ) -> bool {
+        if metadata.len() > max_bytes {
+            tracing::debug!(
+                target: "mesh::parser",
+                "Rejected file exceeding budget (size: {} bytes, budget: {} bytes)",
+                metadata.len(),
+                max_bytes
+            );
             return false;
         }
 
@@ -63,12 +110,95 @@ impl AstGuard {
         true
     }
 
+    /// Fast, context-aware lexical depth scanner ignoring brackets inside comments and string literals
     #[inline]
     pub fn max_nesting_depth(content: &[u8]) -> usize {
         let mut depth = 0usize;
         let mut max_depth = 0usize;
-        for &byte in content {
-            match byte {
+        let mut i = 0;
+        let len = content.len();
+
+        while i < len {
+            let b = content[i];
+
+            // 1. Single-line comment //
+            if b == b'/' && i + 1 < len && content[i + 1] == b'/' {
+                i += 2;
+                while i < len && content[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // 2. Multi-line comment /* ... */
+            if b == b'/' && i + 1 < len && content[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < len && !(content[i] == b'*' && content[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(len);
+                continue;
+            }
+
+            // 3. Single-line comment # (Python, YAML, Shell)
+            if b == b'#' {
+                i += 1;
+                while i < len && content[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // 4. Double quoted string "..."
+            if b == b'"' {
+                i += 1;
+                while i < len {
+                    if content[i] == b'\\' {
+                        i = (i + 2).min(len);
+                    } else if content[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // 5. Single quoted char or string '...'
+            if b == b'\'' {
+                i += 1;
+                while i < len {
+                    if content[i] == b'\\' {
+                        i = (i + 2).min(len);
+                    } else if content[i] == b'\'' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // 6. Backtick template / raw string `...`
+            if b == b'`' {
+                i += 1;
+                while i < len {
+                    if content[i] == b'\\' {
+                        i = (i + 2).min(len);
+                    } else if content[i] == b'`' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Syntactic brackets and braces outside literals and comments
+            match b {
                 b'{' | b'(' | b'[' => {
                     depth += 1;
                     if depth > max_depth {
@@ -80,7 +210,9 @@ impl AstGuard {
                 }
                 _ => {}
             }
+            i += 1;
         }
+
         max_depth
     }
 
@@ -144,5 +276,95 @@ mod tests {
         let mut deep_code = vec![b'('; 70];
         deep_code.extend(vec![b')'; 70]);
         assert!(AstGuard::max_nesting_depth(&deep_code) > 64);
+    }
+
+    #[test]
+    fn test_nesting_depth_ignores_strings_and_comments() {
+        // String literal with 80 brackets should NOT trip the nesting guard
+        let code_with_string = br#"
+        fn log() {
+            let pattern = "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[";
+        }
+        "#;
+        assert_eq!(AstGuard::max_nesting_depth(code_with_string), 1);
+
+        // Single-line and multi-line comments with deep braces should NOT trip the nesting guard
+        let code_with_comments = br#"
+        // {{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{
+        /* (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((( */
+        # [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[
+        fn clean() {
+            return;
+        }
+        "#;
+        assert_eq!(AstGuard::max_nesting_depth(code_with_comments), 1);
+    }
+
+    #[test]
+    fn test_is_contract_or_schema() {
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "services/auth.proto"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "client.pb.go"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "AuthOuterClass.java"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "api.pb.ts"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "user_pb2.py"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "contract.pb.rs"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "openapi.yaml"
+        )));
+        assert!(AstGuard::is_contract_or_schema(std::path::Path::new(
+            "asyncapi.json"
+        )));
+
+        assert!(!AstGuard::is_contract_or_schema(std::path::Path::new(
+            "main.rs"
+        )));
+        assert!(!AstGuard::is_contract_or_schema(std::path::Path::new(
+            "UserController.java"
+        )));
+        assert!(!AstGuard::is_contract_or_schema(std::path::Path::new(
+            "app.ts"
+        )));
+    }
+
+    #[test]
+    fn test_schema_large_budget() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let proto_file = temp.path().join("large.proto");
+        let rust_file = temp.path().join("large.rs");
+
+        // Write 500 KB file with normal line lengths (exceeds 384 KB MAX_FILE_SIZE, within 1.5 MB MAX_SCHEMA_FILE_SIZE)
+        let large_content =
+            b"syntax = \"proto3\";\nmessage LargeStub { string id = 1; }\n".repeat(10_000);
+        std::fs::write(&proto_file, &large_content).expect("write proto");
+        std::fs::write(&rust_file, &large_content).expect("write rust");
+
+        let proto_meta = std::fs::metadata(&proto_file).expect("meta proto");
+        let rust_meta = std::fs::metadata(&rust_file).expect("meta rust");
+
+        // Proto file passes under 1.5 MB schema budget
+        assert!(AstGuard::should_parse_path(
+            &proto_file,
+            &proto_meta,
+            &large_content
+        ));
+
+        // Regular Rust file is rejected by 384 KB budget
+        assert!(!AstGuard::should_parse_path(
+            &rust_file,
+            &rust_meta,
+            &large_content
+        ));
     }
 }

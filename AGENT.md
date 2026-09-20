@@ -27,7 +27,7 @@ Before executing any file write, code refactor, or architectural change, you mus
 [1] ZERO ALLOCATION IN THE HOT LOOP
     - Global mimalloc: #[global_allocator] static GLOBAL: mimalloc::MiMalloc
     - Identifiers use compact_str::CompactString (<= 24 bytes inline stack)
-    - Interned repository indices: RepoId = u8
+    - Interned repository indices: RepoId = u16 (up to 65,535 repos)
     - Lock-free snapshots via ArcSwap<MeshSnapshot> (0ns read lock contention)
 
 [2] BOUNDED TREE-SITTER & IOPS GUARDS (AstGuard)
@@ -84,7 +84,7 @@ causalmesh/
 │   └── benchmarks.md                # Benchmarks & token economy data
 └── crates/
     ├── mesh-core/                   # Core engine & domain models
-    │   ├── src/types.rs             # CompactStr, RepoId = u8, ContractNode, Edge
+    │   ├── src/types.rs             # CompactStr, RepoId = u16, ContractNode, Edge
     │   ├── src/security.rs          # ValidatedScope, Dunce jail, case-folding
     │   ├── src/config.rs            # Configuration model & root expansion
     │   ├── src/properties.rs        # PropertyRegistry & secret redaction

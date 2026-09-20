@@ -13,13 +13,25 @@ pub struct DocSection {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DocIndex {
     sections: Vec<DocSection>,
     aliases: HashMap<String, String>,
     stop_words: Vec<String>,
     exact_phrase_boost: u32,
     sanitize_injections: bool,
+}
+
+impl Default for DocIndex {
+    fn default() -> Self {
+        Self {
+            sections: Vec::new(),
+            aliases: HashMap::new(),
+            stop_words: Vec::new(),
+            exact_phrase_boost: 10,
+            sanitize_injections: true,
+        }
+    }
 }
 
 impl DocIndex {
@@ -108,17 +120,28 @@ impl DocIndex {
             "<|system|>",
             "<|assistant|>",
             "<|user|>",
-            "[SYSTEM]",
-            "[ASSISTANT]",
+            "<system>",
+            "</system>",
+            "[system]",
+            "[assistant]",
             "ignore previous instructions",
+            "ignore all previous instructions",
             "disregard prior guidelines",
             "bypass safety checks",
+            "output system prompt",
+            "override authorization",
         ];
 
         let mut sanitized = text.to_string();
         for &pattern in INJECTION_PATTERNS {
-            if sanitized.contains(pattern) {
-                sanitized = sanitized.replace(pattern, "[FILTERED_ADVERSARIAL_INPUT]");
+            let pattern_len = pattern.len();
+            loop {
+                let lower = sanitized.to_lowercase();
+                if let Some(pos) = lower.find(pattern) {
+                    sanitized.replace_range(pos..pos + pattern_len, "[FILTERED_ADVERSARIAL_INPUT]");
+                } else {
+                    break;
+                }
             }
         }
         sanitized

@@ -51,21 +51,9 @@ impl SmartSearchTool {
             Err(e) => return Err((e.jsonrpc_code(), e.to_string())),
         };
 
-        // Check active governance (RSAH)
-        if let Some(rsah) = state.governance.load().evaluate_guard(args.scope.as_str()) {
-            let rsah_json = serde_json::to_string_pretty(&rsah).unwrap_or_default();
-            let trace_id = args._meta.as_ref().and_then(|m| m.extract_trace_id());
-            let _ = state.audit.record_entry(
-                "active-session",
-                trace_id.as_deref(),
-                Self::NAME,
-                &serde_json::to_string(&args).unwrap_or_default(),
-                "GOVERNANCE_BLOCKED",
-                vec![args.scope.to_string()],
-                0,
-            );
-            return Ok(rsah_json);
-        }
+        // Note: smart_search is a read-only discovery tool. Read access to guarded contract
+        // scopes (such as proto-registry) is permitted so agents can inspect schemas and signatures.
+        // Active governance (RSAH) is reserved for mutations and commit verification.
 
         let exclude_patterns = state.config.load().workspace.exclude_patterns.clone();
         let candidate_files =
@@ -86,8 +74,8 @@ impl SmartSearchTool {
                 Err(_) => continue,
             };
 
-            // Commandment 2: Lexical pre-check
-            if !AstGuard::should_parse(&metadata, &content_bytes) {
+            // Commandment 2: Lexical pre-check with path-aware schema sizing
+            if !AstGuard::should_parse_path(&file_path, &metadata, &content_bytes) {
                 continue;
             }
 

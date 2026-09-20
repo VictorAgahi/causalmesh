@@ -11,6 +11,10 @@ default-run = "mesh-mcp"
 name = "mesh-mcp"
 path = "src/main.rs"
 
+[[bench]]
+name = "real_benchmarks"
+harness = false
+
 [dependencies]
 mesh-core.workspace = true
 mesh-parsers.workspace = true
@@ -29,6 +33,7 @@ toml.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 dunce.workspace = true
+num_cpus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

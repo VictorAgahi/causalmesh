@@ -108,6 +108,21 @@ impl ContractGraph {
     }
 
     pub fn add_edge(&mut self, edge: ContractEdge) {
+        match edge.kind {
+            EdgeKind::Produces => {
+                if let Some(to_node) = self.nodes.get(&edge.to) {
+                    let key = CompactStr::new(to_node.name.to_lowercase());
+                    self.topic_producers.entry(key).or_default().push(edge.from);
+                }
+            }
+            EdgeKind::Consumes => {
+                if let Some(to_node) = self.nodes.get(&edge.to) {
+                    let key = CompactStr::new(to_node.name.to_lowercase());
+                    self.topic_consumers.entry(key).or_default().push(edge.from);
+                }
+            }
+            _ => {}
+        }
         self.edges.push(edge);
     }
 
@@ -201,6 +216,25 @@ impl ContractGraph {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // If a formal proto definition is identified, resolve implementors and callers via graph edges
+        if let Some(ref proto) = proto_definition {
+            for edge in &self.edges {
+                if edge.to == proto.id && edge.kind == EdgeKind::Implements {
+                    if let Some(handler) = self.nodes.get(&edge.from) {
+                        if !server_handlers.iter().any(|h| h.id == handler.id) {
+                            server_handlers.push(handler.clone());
+                        }
+                    }
+                } else if edge.to == proto.id && edge.kind == EdgeKind::CallsRpc {
+                    if let Some(client) = self.nodes.get(&edge.from) {
+                        if !client_stubs.iter().any(|c| c.id == client.id) {
+                            client_stubs.push(client.clone());
+                        }
+                    }
                 }
             }
         }
@@ -343,5 +377,40 @@ mod tests {
             trace.proto_definition.unwrap().name.as_str(),
             "AuthenticateUser"
         );
+    }
+
+    #[test]
+    fn test_large_scale_repo_indexing() {
+        let mut graph = ContractGraph::new();
+
+        // Register 500 microservices (exceeding 255 u8 limit)
+        for repo_idx in 0..500u16 {
+            let node = ContractNode {
+                id: 0,
+                name: CompactStr::new(format!("ServiceHandler{repo_idx}")),
+                kind: NodeKind::ServiceClass,
+                file_path: PathBuf::from(format!("services/service_{repo_idx}/Handler.go")),
+                line_start: 1,
+                line_end: 100,
+                package: CompactStr::new(format!("service.{repo_idx}")),
+                repo_id: repo_idx,
+                signature: None,
+                docstring: None,
+            };
+            let nid = graph.add_node(node);
+            if repo_idx % 2 == 0 {
+                graph.add_dependency(nid, "SharedEnterpriseContract");
+            }
+        }
+
+        assert_eq!(graph.node_count(), 500);
+
+        let dependents = graph.find_dependents("SharedEnterpriseContract");
+        assert_eq!(dependents.len(), 250);
+
+        // Verify high repo_id (e.g. repo 498) is accurately preserved without overflow
+        let high_repo_node = dependents.iter().find(|n| n.repo_id == 498);
+        assert!(high_repo_node.is_some());
+        assert_eq!(high_repo_node.unwrap().name.as_str(), "ServiceHandler498");
     }
 }

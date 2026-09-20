@@ -17,7 +17,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 echo "✔ Clippy check passed with 0 warnings."
 
 # Step 3: Run all workspace tests
-echo "👉 [3/6] Running complete test suite (33 unit & integration tests)..."
+echo "👉 [3/6] Running complete test suite (48 unit & integration tests)..."
 cargo test --workspace --verbose
 echo "✔ All tests passed."
 

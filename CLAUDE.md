@@ -48,7 +48,7 @@ Claude Code must strictly enforce these invariants on every edit:
 1. **Zero Dynamic Allocation in Hot Loop**:
    - `mimalloc` is the global allocator.
    - Use `compact_str::CompactString` for symbols, paths, and IDs (<= 24 bytes inline stack).
-   - Use `RepoId = u8` for repository indexing.
+   - Use `RepoId = u16` for repository indexing (up to 65,535 repos).
    - Use `ArcSwap<MeshSnapshot>` for lock-free state reads (0ns contention).
 2. **Bounded Tree-Sitter & IOPS (`AstGuard`)**:
    - Files > 384 KB or lines > 1,024 bytes must be rejected.

@@ -33,10 +33,46 @@ pub struct AuditEntry {
     pub entry_hash: String,
 }
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+struct AdvisoryFileLockGuard {
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+}
+
+impl AdvisoryFileLockGuard {
+    fn lock(file: &File) -> Self {
+        #[cfg(unix)]
+        {
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::flock(fd, libc::LOCK_EX);
+            }
+            Self { fd }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Self {}
+        }
+    }
+}
+
+impl Drop for AdvisoryFileLockGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
 pub struct AuditLogger {
     file: Mutex<File>,
     last_hash: Mutex<String>,
     seq_counter: Mutex<u64>,
+    log_path: PathBuf,
 }
 
 impl AuditLogger {
@@ -96,7 +132,13 @@ impl AuditLogger {
             file: Mutex::new(file),
             last_hash: Mutex::new(last_hash),
             seq_counter: Mutex::new(seq_counter),
+            log_path,
         })
+    }
+
+    #[inline]
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 
     pub fn compute_sha256(data: &[u8]) -> String {
@@ -154,6 +196,9 @@ impl AuditLogger {
             .file
             .lock()
             .map_err(|_| std::io::Error::other("AuditLogger file mutex poisoned"))?;
+
+        // Commandment 7: Acquire advisory OS file lock for multi-instance process safety
+        let _advisory_lock = AdvisoryFileLockGuard::lock(&file_guard);
 
         writeln!(file_guard, "{serialized}")?;
         file_guard.flush()?;
@@ -273,5 +318,44 @@ mod tests {
 
         let is_valid = AuditLogger::verify_log_file(&log_file).expect("verify chain");
         assert!(is_valid);
+    }
+
+    #[test]
+    fn test_audit_concurrent_appends() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let log_file = temp_dir.path().join("concurrent_audit.log");
+
+        let logger = Arc::new(AuditLogger::new(Some(log_file.clone())).expect("init logger"));
+        let mut handles = Vec::new();
+
+        // Spawn 8 concurrent threads appending entries simultaneously
+        for t_idx in 0..8 {
+            let log_clone = Arc::clone(&logger);
+            let handle = thread::spawn(move || {
+                for entry_idx in 0..15 {
+                    let _ = log_clone.record_entry(
+                        &format!("session-{t_idx}"),
+                        Some("trace-concurrent"),
+                        "smart_search",
+                        &format!("{{\"thread\":{t_idx},\"seq\":{entry_idx}}}"),
+                        "SUCCESS",
+                        vec!["src/lib.rs".to_string()],
+                        0,
+                    );
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("thread failed");
+        }
+
+        // Entire concurrent log (120 entries) must have unbroken SHA-256 hash chain
+        let valid = AuditLogger::verify_log_file(&log_file).expect("verify log");
+        assert!(valid, "Concurrent audit log hash chain was broken!");
     }
 }

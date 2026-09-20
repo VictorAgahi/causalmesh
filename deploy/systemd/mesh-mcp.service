@@ -1,0 +1,26 @@
+[Unit]
+Description=MeshMCP — Universal Polyglot Architecture Mesh & Contract Governance Server
+Documentation=https://github.com/causalmesh/mesh-mcp
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mesh-mcp run
+Restart=on-failure
+RestartSec=5s
+
+# Sandboxing & Resource Boundaries (cgroups v2 per RFC-001 Rev. 2.9.0 Section 5.6)
+MemoryHigh=128M
+MemoryMax=256M
+CPUWeight=20
+IOWeight=20
+Nice=10
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/mesh-mcp
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,29 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod audit;
+pub mod config;
+pub mod contracts;
+pub mod crawler;
+pub mod docs;
+pub mod governance;
+pub mod properties;
+pub mod rescan;
+pub mod security;
+pub mod state;
+pub mod types;
+
+// Re-export common types
+pub use audit::{AuditEntry, AuditError, AuditLogger};
+pub use config::{expand_roots, Config, ConfigError, WorkspaceConfig};
+pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
+pub use crawler::FilesystemCrawler;
+pub use docs::{DocIndex, DocSection};
+pub use governance::{GovernanceEngine, RsahResponse};
+pub use properties::PropertyRegistry;
+pub use rescan::BackgroundRescanEngine;
+pub use security::{SecurityError, ValidatedScope};
+pub use state::AppState;
+pub use types::{
+    to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge, ContractNode, EdgeKind, NodeId,
+    NodeKind, PathStr, RepoId, RepoState, SymbolName,
+};

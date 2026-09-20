@@ -1,0 +1,94 @@
+# mesh-mcp.toml — Enterprise Production Configuration (RFC-001 Rev. 2.9.0 Section 9)
+
+[workspace]
+name = "enterprise-polyglot-mesh"
+version = "2.9.0"
+
+workspace_root = "${WORKSPACE_ROOT:-.}"
+roots = [
+  "${workspace_root}/proto-registry",
+  "${workspace_root}/api-gateway",          # TypeScript / NestJS
+  "${workspace_root}/services/*",           # Globs for microservices
+  "${workspace_root}/k8s-infrastructure",    # YAML / Kubernetes Manifests
+  "${workspace_root}/docs"                  # Markdown / C4 Architecture
+]
+
+exclude_patterns = [
+  "**/.env*",
+  "**/secrets/**",
+  "**/*.pem",
+  "**/*.key",
+  "**/id_rsa*",
+  "**/id_ed25519*",
+  "**/id_ecdsa*",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.dockercfg",
+  "**/.docker/**",
+  "**/.kube/**",
+  "**/*.jks",
+  "**/*.p12",
+  "**/*.pfx",
+  "**/*.keystore",
+  "**/node_modules/**",
+  "**/target/**",
+  "**/build/**",
+  "**/.venv/**",
+  "**/.git/**"
+]
+
+# ==============================================================================
+# Engine 1: Documentation Engine (C4, ADRs, RFCs)
+# ==============================================================================
+[engines.docs]
+enabled = true
+paths = ["${workspace_root}/docs", "${workspace_root}/architecture"]
+aliases = { "ws" = "websocket", "k8s" = "kubernetes", "dlq" = "dead-letter-queue", "auth" = "authentication" }
+stop_words = ["comment", "pourquoi", "dans", "avec", "how", "what", "which", "the"]
+exact_phrase_boost = 60
+fuzzy_fallback = true
+sanitize_prompt_injections = true
+
+# ==============================================================================
+# Engine 2: Formal Schema & Properties Engine (Protobuf / OpenAPI / AsyncAPI / Spring)
+# ==============================================================================
+[engines.contracts]
+enabled = true
+
+[engines.contracts.grpc]
+proto_dirs = ["${workspace_root}/proto-registry/proto"]
+controller_annotations = ["@GrpcMethod", "@GrpcService"]
+canonical_fqcn_projection = true
+
+[engines.contracts.spring]
+enabled = true
+property_files = [
+  "**/src/main/resources/application*.yml",
+  "**/src/main/resources/application*.properties"
+]
+resolve_placeholders = true
+auto_redact_secrets = true
+
+[engines.contracts.openapi]
+enabled = true
+spec_files = ["${workspace_root}/api-gateway/docs/openapi.yaml"]
+
+[engines.contracts.asyncapi]
+enabled = true
+spec_files = ["${workspace_root}/docs/asyncapi.yaml"]
+infer_string_topics = true
+
+# ==============================================================================
+# Engine 3: Policy Steering, Audit & Git Enforcement (Active Defense)
+# ==============================================================================
+[engines.policy]
+enabled = true
+enforce_git_hooks = true
+cryptographic_audit_trail = true
+
+[engines.policy.stop_rules]
+"proto-registry" = "🛑 STOP CASCADE CI : proto-registry génère les stubs TS/Go/Java. Ne touche pas aux microservices !"
+"k8s-infrastructure" = "🛑 STOP INFRASTRUCTURE : Modification des manifests K8s sous revue DevOps obligatoire !"
+
+[engines.policy.skills]
+"engines.contracts.grpc" = ".agents/skills/proto-contract-evolution.md"

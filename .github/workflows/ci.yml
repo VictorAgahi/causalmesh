@@ -1,0 +1,131 @@
+name: MeshMCP Enterprise CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ============================================================================
+  # 1. Code Quality & Linter Invariants
+  # ============================================================================
+  code-quality:
+    name: Code Quality & Strict Lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Invariant Check: Rustfmt (Code Formatting)
+        run: cargo fmt --all -- --check
+
+      - name: Invariant Check: Strict Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ============================================================================
+  # 2. Cross-Platform Multi-OS Test Suite (33 Tests)
+  # ============================================================================
+  test-suite:
+    name: Test Suite (${{ matrix.os }})
+    needs: code-quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Workspace Tests (Core, Parsers, Server, Integration)
+        run: cargo test --workspace --verbose
+
+  # ============================================================================
+  # 3. Production Release Build & Smoke Test
+  # ============================================================================
+  release-smoke-test:
+    name: Release Build & Doctor Verification (${{ matrix.os }})
+    needs: test-suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile Release Binary with Thin LTO & mimalloc
+        run: cargo build --workspace --release
+
+      - name: Smoke Test: Version Check
+        run: ./target/release/mesh-mcp --version
+
+      - name: Smoke Test: Diagnostic Doctor
+        run: ./target/release/mesh-mcp doctor
+
+      - name: Smoke Test: JSON-RPC Stdio Handshake Loopback
+        shell: bash
+        run: |
+          PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke-test","version":"1.0.0"}}}'
+          RESPONSE=$(echo "$PAYLOAD" | ./target/release/mesh-mcp run)
+          echo "Server Response: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"jsonrpc":"2.0"'
+          echo "$RESPONSE" | grep -q '"name":"mesh-mcp"'
+          echo "✔ Stdio JSON-RPC protocol loopback verified successfully."
+
+  # ============================================================================
+  # 4. Packaging & Enterprise Tooling Syntax Validation
+  # ============================================================================
+  tooling-validation:
+    name: Tooling & Daemon Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate NPM Runner Syntax (bin/mesh-mcp.js)
+        run: node -c bin/mesh-mcp.js
+
+      - name: Validate Systemd Service Unit Syntax
+        run: |
+          test -f deploy/systemd/mesh-mcp.service
+          grep -q "MemoryMax=256M" deploy/systemd/mesh-mcp.service
+          grep -q "IOWeight=20" deploy/systemd/mesh-mcp.service
+          echo "✔ Systemd cgroups v2 unit validated."
+
+      - name: Validate macOS Launchd Plist Syntax
+        run: |
+          test -f deploy/launchd/com.causalmesh.mcp.plist
+          grep -q "QOS_CLASS_BACKGROUND" deploy/launchd/com.causalmesh.mcp.plist
+          echo "✔ macOS launchd plist validated."

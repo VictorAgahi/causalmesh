@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mesh-core",
+    "crates/mesh-parsers",
+    "crates/mesh-server"
+]
+
+[workspace.package]
+version = "2.9.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+authors = ["CausalMesh Enterprise Contributors"]
+repository = "https://github.com/causalmesh/mesh-mcp"
+
+[workspace.dependencies]
+mesh-core = { path = "crates/mesh-core" }
+mesh-parsers = { path = "crates/mesh-parsers" }
+
+arc-swap = "1.7"
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = "0.7"
+rayon = "1.10"
+num_cpus = "1.16"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+dunce = "1.0"
+same-file = "1.0"
+path-clean = "1.0"
+glob = "0.3"
+shellexpand = "3.1"
+ignore = "0.4"
+
+compact_str = { version = "0.8", features = ["serde"] }
+mimalloc = { version = "0.1", default-features = false }
+
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+
+clap = { version = "4.5", features = ["derive", "env"] }
+ring = "0.17"
+libc = "0.2"
+thiserror = "2.0"
+streaming-iterator = "0.1"
+tempfile = "3"
+
+tree-sitter = "0.24"
+tree-sitter-language = "0.1"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"

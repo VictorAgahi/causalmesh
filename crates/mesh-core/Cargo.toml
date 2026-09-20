@@ -1,0 +1,34 @@
+[package]
+name = "mesh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+compact_str.workspace = true
+mimalloc.workspace = true
+arc-swap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rayon.workspace = true
+num_cpus.workspace = true
+tracing.workspace = true
+dunce.workspace = true
+same-file.workspace = true
+path-clean.workspace = true
+glob.workspace = true
+shellexpand.workspace = true
+ignore.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+ring.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

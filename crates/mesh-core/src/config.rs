@@ -51,6 +51,8 @@ pub struct WorkspaceConfig {
     pub roots: Vec<String>,
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
+    #[serde(default)]
+    pub mount_aliases: HashMap<String, String>,
 }
 
 fn default_version() -> String {

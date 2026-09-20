@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SecurityError {
@@ -27,6 +29,14 @@ impl SecurityError {
     }
 }
 
+/// Helper normalizing any Path to Unicode Normalization Form C (NFC)
+#[inline]
+pub fn to_nfc_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let nfc: String = s.nfc().collect();
+    PathBuf::from(nfc)
+}
+
 /// A validated, canonicalized, and sandboxed path jail per RFC-001 Commandment 4.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValidatedScope(PathBuf);
@@ -34,24 +44,53 @@ pub struct ValidatedScope(PathBuf);
 impl ValidatedScope {
     /// Resolves and canonicalizes a raw scope path, asserting it is jailed within one of `allowed_roots`.
     pub fn resolve(raw_scope: &str, allowed_roots: &[PathBuf]) -> Result<Self, SecurityError> {
-        let clean = path_clean::clean(raw_scope);
+        Self::resolve_with_aliases(raw_scope, allowed_roots, &HashMap::new())
+    }
+
+    /// Resolves and canonicalizes a raw scope path with Docker bind-mount alias translation and Unicode NFC normalization.
+    pub fn resolve_with_aliases(
+        raw_scope: &str,
+        allowed_roots: &[PathBuf],
+        mount_aliases: &HashMap<String, String>,
+    ) -> Result<Self, SecurityError> {
+        // Step 1: Normalize input string to Unicode NFC form
+        let nfc_input: String = raw_scope.nfc().collect();
+
+        // Step 2: Resolve Docker bind-mount aliases if applicable
+        let mut translated_scope = nfc_input.clone();
+        for (alias, target) in mount_aliases {
+            let alias_nfc: String = alias.nfc().collect();
+            let target_nfc: String = target.nfc().collect();
+            if nfc_input == alias_nfc {
+                translated_scope = target_nfc;
+                break;
+            } else if nfc_input.starts_with(&format!("{alias_nfc}/")) {
+                translated_scope = format!("{}{}", target_nfc, &nfc_input[alias_nfc.len()..]);
+                break;
+            }
+        }
+
+        let clean = path_clean::clean(&translated_scope);
         let canonical =
             dunce::canonicalize(&clean).map_err(|_| SecurityError::PathNotFound(clean.clone()))?;
 
+        let canonical_nfc = to_nfc_path(&canonical);
+
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let canonical_check = PathBuf::from(canonical.to_string_lossy().to_lowercase());
+        let canonical_check = PathBuf::from(canonical_nfc.to_string_lossy().to_lowercase());
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let canonical_check = &canonical;
+        let canonical_check = &canonical_nfc;
 
         let is_jailed = allowed_roots.iter().any(|root| {
+            let root_nfc = to_nfc_path(root);
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
-                let root_check = PathBuf::from(root.to_string_lossy().to_lowercase());
+                let root_check = PathBuf::from(root_nfc.to_string_lossy().to_lowercase());
                 canonical_check.starts_with(&root_check)
             }
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
-                canonical_check.starts_with(root)
+                canonical_check.starts_with(&root_nfc)
             }
         });
 
@@ -173,5 +212,68 @@ mod tests {
                 res
             );
         }
+    }
+
+    #[test]
+    fn test_unicode_nfc_nfd_normalization() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        // Folder name with French accent: "crédit-service"
+        // In NFC: \u{00e9} (single code point)
+        // In NFD: e + \u{0301} (two code points)
+        let nfc_name = "cr\u{00e9}dit-service";
+        let nfd_name = "cre\u{0301}dit-service";
+
+        assert_ne!(nfc_name.as_bytes(), nfd_name.as_bytes());
+
+        let service_dir = temp_dir.path().join(nfc_name);
+        fs::create_dir_all(&service_dir).expect("create accented dir");
+
+        let canonical_root = dunce::canonicalize(temp_dir.path()).expect("canonical root");
+
+        // Resolve using NFD decomposed string
+        let nfd_input = format!("{}/{}", temp_dir.path().display(), nfd_name);
+        let scope_res = ValidatedScope::resolve(&nfd_input, std::slice::from_ref(&canonical_root));
+        assert!(
+            scope_res.is_ok(),
+            "NFD input must resolve cleanly against NFC canonical path: {:?}",
+            scope_res
+        );
+
+        // Resolve using NFC composed string
+        let nfc_input = format!("{}/{}", temp_dir.path().display(), nfc_name);
+        let scope_res2 = ValidatedScope::resolve(&nfc_input, std::slice::from_ref(&canonical_root));
+        assert!(
+            scope_res2.is_ok(),
+            "NFC input must resolve cleanly: {:?}",
+            scope_res2
+        );
+    }
+
+    #[test]
+    fn test_docker_mount_alias_resolution() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let sub_service = temp_dir.path().join("services").join("billing");
+        fs::create_dir_all(&sub_service).expect("create billing service");
+
+        let canonical_root = dunce::canonicalize(temp_dir.path()).expect("canonical root");
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "/workspace".to_string(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        );
+
+        let result = ValidatedScope::resolve_with_aliases(
+            "/workspace/services/billing",
+            &[canonical_root],
+            &aliases,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Docker bind mount alias /workspace must be resolved to temp dir"
+        );
+        let scope = result.expect("resolved scope");
+        assert!(scope.as_path().ends_with("billing"));
     }
 }

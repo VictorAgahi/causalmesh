@@ -68,8 +68,7 @@ impl StdioFramingActor {
                     read_res = reader.read_line(&mut line) => {
                         match read_res {
                             Ok(0) => {
-                                tracing::info!(target: "mesh::framing", "Stdin EOF detected. Initiating shutdown.");
-                                cancel_reader.cancel();
+                                tracing::info!(target: "mesh::framing", "Stdin EOF detected. Closing reader channel.");
                                 break;
                             }
                             Ok(_) => {

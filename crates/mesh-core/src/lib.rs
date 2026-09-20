@@ -11,6 +11,7 @@ pub mod rescan;
 pub mod security;
 pub mod state;
 pub mod types;
+pub mod watcher;
 
 // Re-export common types
 pub use audit::{AuditEntry, AuditError, AuditLogger};
@@ -27,3 +28,4 @@ pub use types::{
     to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge, ContractNode, EdgeKind, NodeId,
     NodeKind, PathStr, RepoId, RepoState, SymbolName,
 };
+pub use watcher::FileWatcherService;

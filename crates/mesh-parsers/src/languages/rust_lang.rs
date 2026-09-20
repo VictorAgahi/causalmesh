@@ -97,6 +97,36 @@ impl RustExtractor {
                     docstring: None,
                 });
             }
+            "macro_invocation" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    if text.contains("include_proto!") {
+                        if let Some(open) = text.find('(') {
+                            if let Some(close) = text[open..].find(')') {
+                                let arg = text[open + 1..open + close]
+                                    .trim()
+                                    .trim_matches('"')
+                                    .trim_matches('\'');
+                                if !arg.is_empty() {
+                                    nodes.push(ContractNode {
+                                        id: 0,
+                                        name: CompactStr::new(arg),
+                                        kind: NodeKind::ServiceClass,
+                                        file_path: file_path.to_path_buf(),
+                                        line_start: node.start_position().row + 1,
+                                        line_end: node.end_position().row + 1,
+                                        package: package_name.clone(),
+                                        repo_id,
+                                        signature: Some(CompactStr::new(format!(
+                                            "tonic::include_proto!(\"{arg}\")"
+                                        ))),
+                                        docstring: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -131,5 +161,23 @@ impl AuthServer {
         let nodes = RustExtractor::extract(Path::new("src/auth.rs"), code, 5, &mut parser);
         assert!(nodes.iter().any(|n| n.name == "AuthServer"));
         assert!(nodes.iter().any(|n| n.name == "authenticate"));
+    }
+
+    #[test]
+    fn test_rust_tonic_macro_extractor() {
+        let code = r#"
+pub mod proto {
+    tonic::include_proto!("fintech.orders");
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let nodes = RustExtractor::extract(Path::new("src/trading.rs"), code, 2, &mut parser);
+        assert!(
+            nodes.iter().any(|n| n.name == "fintech.orders"),
+            "Expected fintech.orders contract node from tonic macro"
+        );
     }
 }

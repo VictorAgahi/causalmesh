@@ -4,6 +4,9 @@ pub mod cli;
 pub mod framing;
 pub mod protocol;
 pub mod tools;
+pub mod watcher;
+
+pub use watcher::FileWatcherService;
 
 use framing::StdioFramingActor;
 use mesh_core::AppState;

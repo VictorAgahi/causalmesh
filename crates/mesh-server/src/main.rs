@@ -168,6 +168,13 @@ roots = ["."]
                 cancel_sig.cancel();
             });
 
+            // [P0-1] Spawn in-kernel FileWatcherService for hot debounced reloading and git checkout detection
+            if let Err(e) =
+                mesh_server::FileWatcherService::spawn(state.clone(), cancel_token.clone())
+            {
+                tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
+            }
+
             run_server(state, cancel_token).await?;
         }
     }

@@ -41,6 +41,10 @@ impl LanguageKind {
 pub struct AstDecapitator;
 
 impl AstDecapitator {
+    /// Compact bounded stub (122 bytes <= 256 bytes) protecting LLM context on parser timeout or resource exhaustion
+    pub const BOUNDED_ERROR_STUB: &'static str =
+        "// [MeshMCP Warning: AST decapitation bounded or parser timeout (>15ms). Body stripped to protect context window.]\n";
+
     /// Decapitates imperative method bodies using the appropriate language parser automatically
     pub fn decapitate_auto(content: &str, lang_kind: LanguageKind, include_body: bool) -> String {
         if include_body {
@@ -63,13 +67,20 @@ impl AstDecapitator {
             LanguageKind::Rust => {
                 crate::guard::AstGuard::create_bounded_parser(&tree_sitter_rust::LANGUAGE.into())
             }
-            _ => return content.to_string(),
+            LanguageKind::Protobuf | LanguageKind::Yaml => return content.to_string(),
+            _ => {
+                if content.len() > 1024 {
+                    return Self::BOUNDED_ERROR_STUB.to_string();
+                } else {
+                    return content.to_string();
+                }
+            }
         };
 
         if let Ok(mut parser) = parser_res {
             Self::decapitate(content, lang_kind, &mut parser, false)
         } else {
-            content.to_string()
+            Self::BOUNDED_ERROR_STUB.to_string()
         }
     }
 
@@ -86,7 +97,15 @@ impl AstDecapitator {
 
         let tree = match parser.parse(content, None) {
             Some(t) => t,
-            None => return content.to_string(),
+            None => {
+                // Commandment 2 & RFC-001: NEVER return the raw gigantic file on timeout or failure.
+                // Return bounded error stub <= 256 bytes protecting LLM context window.
+                tracing::warn!(
+                    target: "mesh::parser",
+                    "Parser timeout (>15ms) or C-FFI failure; returning bounded stub (<= 256 bytes)"
+                );
+                return Self::BOUNDED_ERROR_STUB.to_string();
+            }
         };
 
         let mut replacements = Vec::new();
@@ -134,11 +153,21 @@ impl AstDecapitator {
             LanguageKind::TypeScript
                 if kind == "method_definition"
                     || kind == "function_declaration"
-                    || kind == "function_item" =>
+                    || kind == "function_item"
+                    || kind == "arrow_function" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((body.start_byte(), body.end_byte(), "{ /* stripped */ }"));
-                    return;
+                    if body.kind() == "statement_block" {
+                        replacements.push((
+                            body.start_byte(),
+                            body.end_byte(),
+                            "{ /* stripped */ }",
+                        ));
+                        return;
+                    } else if kind == "arrow_function" {
+                        replacements.push((body.start_byte(), body.end_byte(), "/* stripped */"));
+                        return;
+                    }
                 }
             }
             LanguageKind::Rust if kind == "function_item" => {
@@ -286,5 +315,62 @@ class AuthService:
         let code = "fn compute() -> i32 { let x = 42; x * 2 }";
         let out = AstDecapitator::decapitate_auto(code, LanguageKind::Rust, true);
         assert_eq!(out, code);
+    }
+
+    #[test]
+    fn test_typescript_arrow_functions_decapitation() {
+        let code = r#"
+export const processRefund = async (req: Request): Promise<Response> => {
+    const amount = req.body.amount;
+    for (let i = 0; i < 100; i++) {
+        total += i;
+    }
+    return { status: "ok" };
+};
+
+export const computeDiscount = (rate: number) => rate * 0.15;
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+
+        let decapitated =
+            AstDecapitator::decapitate(code, LanguageKind::TypeScript, &mut parser, false);
+
+        assert!(
+            decapitated.contains("export const processRefund = async (req: Request): Promise<Response> => { /* stripped */ };"),
+            "Arrow function with statement block body must be decapitated to stripped block"
+        );
+        assert!(
+            !decapitated.contains("req.body.amount"),
+            "Arrow function imperative body must not leak"
+        );
+        assert!(
+            decapitated
+                .contains("export const computeDiscount = (rate: number) => /* stripped */;"),
+            "Concise arrow function must be decapitated"
+        );
+        assert!(!decapitated.contains("rate * 0.15"));
+    }
+
+    #[test]
+    fn test_parser_timeout_bounded_stub() {
+        // Verify bounded error stub invariant: must be <= 256 bytes protecting LLM context
+        assert!(AstDecapitator::BOUNDED_ERROR_STUB.len() <= 256);
+
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        // Set an immediate 1 microsecond timeout to guarantee timeout trigger
+        parser.set_timeout_micros(1);
+
+        // Huge simulated unparsable or timeout payload
+        let huge_code =
+            "fn heavy_computation() { ".to_string() + &"let x = 1; ".repeat(10_000) + "}";
+        let result = AstDecapitator::decapitate(&huge_code, LanguageKind::Rust, &mut parser, false);
+
+        // On timeout, result MUST be the compact bounded stub, NEVER the huge raw file
+        assert_eq!(result, AstDecapitator::BOUNDED_ERROR_STUB);
+        assert!(result.len() <= 256);
     }
 }

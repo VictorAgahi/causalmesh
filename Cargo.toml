@@ -47,6 +47,11 @@ ring = "0.17"
 libc = "0.2"
 thiserror = "2.0"
 streaming-iterator = "0.1"
+notify = "6.1"
+notify-debouncer-mini = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+unicode-normalization = "0.1"
+
 tempfile = "3"
 
 tree-sitter = "0.24"

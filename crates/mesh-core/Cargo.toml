@@ -29,6 +29,10 @@ toml.workspace = true
 ring.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+rusqlite.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

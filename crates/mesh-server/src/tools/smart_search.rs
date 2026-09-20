@@ -74,15 +74,30 @@ impl SmartSearchTool {
                 Err(_) => continue,
             };
 
-            // Commandment 2: Lexical pre-check with path-aware schema sizing
-            if !AstGuard::should_parse_path(&file_path, &metadata, &content_bytes) {
-                continue;
-            }
-
             let content_str = match std::str::from_utf8(&content_bytes) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+
+            // Commandment 2: Lexical pre-check with path-aware schema sizing
+            if !AstGuard::should_parse_path(&file_path, &metadata, &content_bytes) {
+                // If file failed guard due to minified/long lines (>1024b) or size, but contains query:
+                // Return a compact bounded stub (<= 256 bytes) informing the agent without dumping raw file
+                if content_str.contains(query_str) {
+                    files_accessed.push(file_path.to_string_lossy().into_owned());
+                    let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
+                    matches.push(SearchResult {
+                        file_path: file_path.to_string_lossy().into_owned(),
+                        line_start: 1,
+                        line_end: 1,
+                        language: format!("{:?}", lang_kind).to_lowercase(),
+                        snippet: format!(
+                            "// [MeshMCP Note: Matched symbol '{query_str}' in minified/oversized file (>1024b/line). Raw content bounded.]"
+                        ),
+                    });
+                }
+                continue;
+            }
 
             if content_str.contains(query_str) {
                 files_accessed.push(file_path.to_string_lossy().into_owned());
@@ -99,12 +114,24 @@ impl SmartSearchTool {
                             decapitated.lines().skip(line_start - 1).take(15).collect();
                         let line_end = line_start + snippet_lines.len() - 1;
 
+                        let safe_snippet = snippet_lines
+                            .iter()
+                            .map(|l| {
+                                if l.len() > 256 {
+                                    format!("{}...", &l[..253])
+                                } else {
+                                    l.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
                         matches.push(SearchResult {
                             file_path: file_path.to_string_lossy().into_owned(),
                             line_start,
                             line_end,
                             language: format!("{:?}", lang_kind).to_lowercase(),
-                            snippet: snippet_lines.join("\n"),
+                            snippet: safe_snippet,
                         });
                         break;
                     }

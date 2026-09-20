@@ -586,6 +586,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "num_cpus",
+ "once_cell",
  "path-clean",
  "rayon",
  "ring",

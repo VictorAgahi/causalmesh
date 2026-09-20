@@ -108,20 +108,21 @@ impl AstDecapitator {
             }
         };
 
-        let mut replacements = Vec::new();
-        Self::collect_body_replacements(tree.root_node(), lang_kind, &mut replacements);
+        let mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)> = Vec::new();
+        Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements);
 
         if replacements.is_empty() {
             return content.to_string();
         }
 
-        // Sort replacements in reverse order of start byte to apply bottom-up
-        replacements.sort_by_key(|a| std::cmp::Reverse(a.0));
+        // Sort replacements in reverse order of start byte to apply bottom-up.
+        // For identical start bytes (e.g. insertion at start of body), sort by end byte descending.
+        replacements.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         let mut result = content.to_string();
         for (start_byte, end_byte, replacement) in replacements {
             if start_byte < result.len() && end_byte <= result.len() && start_byte <= end_byte {
-                result.replace_range(start_byte..end_byte, replacement);
+                result.replace_range(start_byte..end_byte, &replacement);
             }
         }
 
@@ -129,9 +130,10 @@ impl AstDecapitator {
     }
 
     fn collect_body_replacements(
+        source: &str,
         node: Node,
         lang_kind: LanguageKind,
-        replacements: &mut Vec<(usize, usize, &'static str)>,
+        replacements: &mut Vec<(usize, usize, std::borrow::Cow<'static, str>)>,
     ) {
         let kind = node.kind();
 
@@ -140,13 +142,21 @@ impl AstDecapitator {
                 if kind == "method_declaration" || kind == "constructor_declaration" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((body.start_byte(), body.end_byte(), "{ /* stripped */ }"));
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
                     return;
                 }
             }
             LanguageKind::Go if kind == "function_declaration" || kind == "method_declaration" => {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((body.start_byte(), body.end_byte(), "{ /* stripped */ }"));
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
                     return;
                 }
             }
@@ -157,28 +167,61 @@ impl AstDecapitator {
                     || kind == "arrow_function" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {
+                    // Check if explicit return type is absent; if so, attempt synthetic inference
+                    if node.child_by_field_name("return_type").is_none() {
+                        let keys = Self::extract_returned_object_keys(source, body);
+                        if !keys.is_empty() {
+                            let insert_pos = node
+                                .child_by_field_name("parameters")
+                                .or_else(|| node.child_by_field_name("parameter"))
+                                .map(|p| p.end_byte());
+
+                            if let Some(pos) = insert_pos {
+                                let fields = keys
+                                    .iter()
+                                    .map(|k| format!("{}: any", k))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let synthetic_type = format!(": {{ {} }}", fields);
+                                replacements.push((pos, pos, std::borrow::Cow::Owned(synthetic_type)));
+                            }
+                        }
+                    }
+
                     if body.kind() == "statement_block" {
                         replacements.push((
                             body.start_byte(),
                             body.end_byte(),
-                            "{ /* stripped */ }",
+                            std::borrow::Cow::Borrowed("{ /* stripped */ }"),
                         ));
                         return;
                     } else if kind == "arrow_function" {
-                        replacements.push((body.start_byte(), body.end_byte(), "/* stripped */"));
+                        replacements.push((
+                            body.start_byte(),
+                            body.end_byte(),
+                            std::borrow::Cow::Borrowed("/* stripped */"),
+                        ));
                         return;
                     }
                 }
             }
             LanguageKind::Rust if kind == "function_item" => {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((body.start_byte(), body.end_byte(), "{ /* stripped */ }"));
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
                     return;
                 }
             }
             LanguageKind::Python if kind == "function_definition" => {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((body.start_byte(), body.end_byte(), " ..."));
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed(" ..."),
+                    ));
                     return;
                 }
             }
@@ -188,7 +231,74 @@ impl AstDecapitator {
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_body_replacements(child, lang_kind, replacements);
+            Self::collect_body_replacements(source, child, lang_kind, replacements);
+        }
+    }
+
+    /// Recursively collects key names from returned object literals to synthesize inferred return types
+    fn extract_returned_object_keys(source: &str, node: Node) -> Vec<String> {
+        let mut keys = Vec::new();
+        Self::collect_keys_recursive(source, node, &mut keys, 0);
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn collect_keys_recursive(source: &str, node: Node, keys: &mut Vec<String>, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        let kind = node.kind();
+        match kind {
+            "object" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "pair" {
+                        if let Some(key) = child.child_by_field_name("key") {
+                            if key.start_byte() < source.len() && key.end_byte() <= source.len() {
+                                let key_text = source[key.start_byte()..key.end_byte()].trim();
+                                if !key_text.is_empty()
+                                    && key_text
+                                        .chars()
+                                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                                {
+                                    keys.push(key_text.to_string());
+                                }
+                            }
+                        }
+                    } else if (child.kind() == "shorthand_property_identifier"
+                        || child.kind() == "shorthand_property_identifier_pattern")
+                        && child.start_byte() < source.len()
+                        && child.end_byte() <= source.len()
+                    {
+                        let key_text = source[child.start_byte()..child.end_byte()].trim();
+                        if !key_text.is_empty()
+                            && key_text
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                        {
+                            keys.push(key_text.to_string());
+                        }
+                    }
+                }
+            }
+            "parenthesized_expression" | "as_expression" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    Self::collect_keys_recursive(source, child, keys, depth + 1);
+                }
+            }
+            "statement_block" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "return_statement" {
+                        if let Some(val) = child.named_child(0) {
+                            Self::collect_keys_recursive(source, val, keys, depth + 1);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -372,5 +482,44 @@ export const computeDiscount = (rate: number) => rate * 0.15;
         // On timeout, result MUST be the compact bounded stub, NEVER the huge raw file
         assert_eq!(result, AstDecapitator::BOUNDED_ERROR_STUB);
         assert!(result.len() <= 256);
+    }
+
+    #[test]
+    fn test_typescript_inferred_return_type_synthesis() {
+        let code = r#"
+export const fetchBillingRecord = (tenantId: string) => {
+    return { id: "rec_123", status: "PAID", balance: 0.00 };
+};
+
+export const getUserAccount = (id: string) => ({
+    id,
+    email: "user@corp.com",
+    tier: "ENTERPRISE",
+});
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+
+        let decapitated =
+            AstDecapitator::decapitate(code, LanguageKind::TypeScript, &mut parser, false);
+
+        // Verify statement block return type synthesis
+        assert!(
+            decapitated.contains("export const fetchBillingRecord = (tenantId: string): { balance: any, id: any, status: any } => { /* stripped */ };"),
+            "Should synthesize inferred return type for statement block arrow function: got: {}",
+            decapitated
+        );
+
+        // Verify concise arrow function return type synthesis
+        assert!(
+            decapitated.contains("export const getUserAccount = (id: string): { email: any, id: any, tier: any } => /* stripped */;"),
+            "Should synthesize inferred return type for concise arrow function: got: {}",
+            decapitated
+        );
+
+        // Imperative literal values must not leak
+        assert!(!decapitated.contains("rec_123"));
+        assert!(!decapitated.contains("user@corp.com"));
     }
 }

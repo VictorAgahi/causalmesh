@@ -1,7 +1,5 @@
 use crate::contracts::ContractGraph;
 use crate::crawler::FilesystemCrawler;
-use crate::docs::DocIndex;
-use crate::properties::PropertyRegistry;
 use crate::security::ValidatedScope;
 use crate::state::AppState;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
@@ -122,7 +120,8 @@ impl FileWatcherService {
             || path_str.ends_with(".md")
     }
 
-    /// Reloads the polyglot contract graph, doc index, and property registry on the background Rayon pool
+    /// Reloads the polyglot contract graph, doc index, and property registry on the background Rayon pool.
+    /// Uses DifferentialVfs to avoid re-parsing files whose content hasn't changed.
     pub fn schedule_reload<F>(state: Arc<AppState>, indexer: Arc<F>)
     where
         F: Fn(&Path, &str, &mut ContractGraph) + Send + Sync + 'static,
@@ -133,7 +132,10 @@ impl FileWatcherService {
         }));
     }
 
-    /// Synchronous rescan logic executed on the QoS-throttled thread pool
+    /// Synchronous rescan logic executed on the QoS-throttled thread pool.
+    /// Performs a differential reload: only files with changed content hashes are re-indexed.
+    /// For massive filesystem mutations (>200 files changed, e.g. `git checkout`),
+    /// processes files in throttled batches to prevent I/O thrashing and IDE stuttering.
     pub fn execute_reload_sync<F>(state: &AppState, indexer: &F)
     where
         F: Fn(&Path, &str, &mut ContractGraph),
@@ -141,32 +143,78 @@ impl FileWatcherService {
         let allowed_roots = state.allowed_roots.load().clone();
         let exclude_patterns = state.config.load().workspace.exclude_patterns.clone();
 
-        let mut new_graph = ContractGraph::new();
-        let mut new_doc_index = DocIndex::default();
-        let mut new_prop_reg = PropertyRegistry::default();
-
+        // Collect all files across all roots
+        let mut all_files = Vec::new();
         for root in allowed_roots.iter() {
             if let Ok(validated_scope) =
                 ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
             {
                 let files =
                     FilesystemCrawler::crawl_scope(&validated_scope, &exclude_patterns, Some(10));
+                all_files.extend(files);
+            }
+        }
 
-                for file in files {
-                    if let Ok(content) = std::fs::read_to_string(&file) {
-                        let path_str = file.to_string_lossy();
-                        if path_str.ends_with(".md") {
-                            new_doc_index.index_markdown_file(&file, &content);
-                        } else if path_str.ends_with(".properties") {
-                            new_prop_reg.ingest_properties_str(&content);
-                        } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
-                            let _ = new_prop_reg.ingest_yaml_str(&content);
-                            indexer(&file, &content, &mut new_graph);
-                        } else {
-                            indexer(&file, &content, &mut new_graph);
-                        }
-                    }
+        // Use a thread-local VFS cache to avoid re-parsing unchanged files.
+        // For the first run, all files are considered changed.
+        use std::sync::Mutex;
+        use once_cell::sync::Lazy;
+        static VFS_CACHE: Lazy<Mutex<crate::vfs::DifferentialVfs>> =
+            Lazy::new(|| Mutex::new(crate::vfs::DifferentialVfs::new()));
+
+        let mut vfs = VFS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut changed_files: Vec<(std::path::PathBuf, String)> = Vec::new();
+        for file in &all_files {
+            if let Ok(content) = std::fs::read_to_string(file) {
+                if vfs.check_and_update(file, &content) {
+                    changed_files.push((file.clone(), content));
                 }
+            }
+        }
+
+        if changed_files.is_empty() {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "VFS differential: 0 files changed, skipping reload."
+            );
+            return;
+        }
+
+        let is_mass_checkout = changed_files.len() > 200;
+        if is_mass_checkout {
+            tracing::info!(
+                target: "mesh::watcher",
+                "Mass filesystem mutation detected ({} files). Running throttled full rebuild.",
+                changed_files.len()
+            );
+        }
+
+        // Clone the current graph and apply incremental patches
+        let current_graph = state.contract_graph.load();
+        let mut new_graph = (**current_graph).clone();
+        let mut new_doc_index = (**state.doc_index.load()).clone();
+        let mut new_prop_reg = (**state.property_registry.load()).clone();
+
+        for (batch_idx, (file, content)) in changed_files.iter().enumerate() {
+            // Throttle I/O on massive checkouts to preserve IDE responsiveness
+            if is_mass_checkout && batch_idx % 50 == 49 {
+                std::thread::yield_now();
+            }
+
+            // Purge stale nodes for this file path before re-indexing
+            new_graph.patch_file(file);
+
+            let path_str = file.to_string_lossy();
+            if path_str.ends_with(".md") {
+                new_doc_index.index_markdown_file(file, content);
+            } else if path_str.ends_with(".properties") {
+                new_prop_reg.ingest_properties_str(content);
+            } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
+                let _ = new_prop_reg.ingest_yaml_str(content);
+                indexer(file, content, &mut new_graph);
+            } else {
+                indexer(file, content, &mut new_graph);
             }
         }
 
@@ -176,7 +224,9 @@ impl FileWatcherService {
 
         tracing::info!(
             target: "mesh::watcher",
-            "Atomic reload completed: {} contract nodes indexed.",
+            "Incremental reload completed: {}/{} files re-indexed, {} total contract nodes.",
+            changed_files.len(),
+            all_files.len(),
             state.contract_graph.load().node_count()
         );
     }

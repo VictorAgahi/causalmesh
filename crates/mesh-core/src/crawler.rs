@@ -21,16 +21,54 @@ impl FilesystemCrawler {
         builder.hidden(false); // Scan hidden folders like .github, .agents, but exclude .git
 
         let mut files = Vec::new();
+        let mut visited_symlink_targets = std::collections::HashSet::new();
         let walker = builder.build();
 
         for result in walker {
             match result {
                 Ok(entry) => {
                     let path = entry.path();
-                    if entry.file_type().is_some_and(|ft| ft.is_file())
-                        && !Self::is_excluded(path, exclude_patterns)
-                    {
-                        files.push(path.to_path_buf());
+                    let is_symlink = entry.path_is_symlink();
+                    if !is_symlink {
+                        if entry.file_type().is_some_and(|ft| ft.is_file())
+                            && !Self::is_excluded(path, exclude_patterns)
+                        {
+                            files.push(path.to_path_buf());
+                        }
+                    } else {
+                        // Monorepo support (pnpm / Turborepo / Nx):
+                        // If symlink target is strictly inside the validated scope root, follow it safely.
+                        // External symlinks escaping the scope are strictly discarded.
+                        if let Ok(canonical) = dunce::canonicalize(path) {
+                            let root_nfc = crate::security::to_nfc_path(root);
+                            let canonical_nfc = crate::security::to_nfc_path(&canonical);
+                            if canonical_nfc.starts_with(&root_nfc) {
+                                if canonical.is_file() {
+                                    if !Self::is_excluded(&canonical, exclude_patterns) {
+                                        files.push(canonical);
+                                    }
+                                } else if canonical.is_dir()
+                                    && visited_symlink_targets.insert(canonical.clone())
+                                {
+                                    let sub_scope = match ValidatedScope::resolve(
+                                        &canonical.to_string_lossy(),
+                                        std::slice::from_ref(&root.to_path_buf()),
+                                    ) {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                    let sub_files =
+                                        Self::crawl_scope(&sub_scope, exclude_patterns, Some(5));
+                                    files.extend(sub_files);
+                                }
+                            } else {
+                                tracing::debug!(
+                                    target: "mesh::crawler",
+                                    "Skipping external symlink target outside workspace: {}",
+                                    canonical.display()
+                                );
+                            }
+                        }
                     }
                 }
                 Err(err) => {
@@ -39,6 +77,8 @@ impl FilesystemCrawler {
             }
         }
 
+        files.sort();
+        files.dedup();
         files
     }
 
@@ -88,5 +128,47 @@ mod tests {
         let files = FilesystemCrawler::crawl_scope(&scope, &[".env".to_string()], Some(2));
         assert!(files.iter().any(|p| p.ends_with("test.txt")));
         assert!(!files.iter().any(|p| p.ends_with(".env")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_crawler_intra_workspace_symlinks() {
+        let temp_dir = std::env::temp_dir().join("crawler_symlinks_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let pkg_dir = temp_dir.join("packages").join("common-models");
+        let _ = std::fs::create_dir_all(&pkg_dir);
+        let model_file = pkg_dir.join("user.ts");
+        std::fs::write(&model_file, "export interface User { id: string; }").unwrap();
+
+        // Simulate pnpm monorepo symlink: node_modules/@company/common-models -> ../../packages/common-models
+        let nm_dir = temp_dir.join("node_modules").join("@company");
+        let _ = std::fs::create_dir_all(&nm_dir);
+        let internal_symlink = nm_dir.join("common-models");
+        std::os::unix::fs::symlink(&pkg_dir, &internal_symlink).unwrap();
+
+        // Simulate external rogue symlink escaping to /etc
+        let external_symlink = temp_dir.join("external_escape");
+        let _ = std::os::unix::fs::symlink(std::path::Path::new("/etc"), &external_symlink);
+
+        let allowed = dunce::canonicalize(&temp_dir).unwrap();
+        let scope =
+            ValidatedScope::resolve(&temp_dir.to_string_lossy(), std::slice::from_ref(&allowed))
+                .unwrap();
+
+        let files = FilesystemCrawler::crawl_scope(&scope, &[], Some(5));
+
+        // The internal symlinked target file must be crawled
+        assert!(
+            files.iter().any(|p| p.ends_with("user.ts")),
+            "Internal monorepo symlink target must be included in crawl results"
+        );
+
+        // The external escape must NEVER be traversed
+        assert!(
+            !files.iter().any(|p| p.to_string_lossy().contains("/etc/")),
+            "External symlink escaping workspace must be discarded"
+        );
     }
 }

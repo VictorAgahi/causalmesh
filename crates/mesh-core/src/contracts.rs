@@ -157,6 +157,57 @@ impl ContractGraph {
             .push(consumer_node_id);
     }
 
+    pub fn patch_file(&mut self, file_path: &Path) {
+        let stale_ids: Vec<NodeId> = self
+            .file_to_nodes
+            .remove(file_path)
+            .unwrap_or_default();
+
+        if stale_ids.is_empty() {
+            return;
+        }
+
+        let stale_set: std::collections::HashSet<NodeId> = stale_ids.iter().copied().collect();
+
+        // Remove nodes from primary store
+        for &id in &stale_ids {
+            self.nodes.remove(&id);
+        }
+
+        // Purge from secondary indices
+        self.name_to_nodes
+            .retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        self.package_to_nodes
+            .retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        self.fqcn_to_node
+            .retain(|_, id| !stale_set.contains(id));
+        self.reverse_deps
+            .retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        self.topic_producers
+            .retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        self.topic_consumers
+            .retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+
+        // Remove edges referencing stale nodes
+        self.edges
+            .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
+    }
+
     /// O(1) in-memory reverse dependency resolution
     pub fn find_dependents(&self, target: &str) -> Vec<&ContractNode> {
         let mut result = Vec::new();

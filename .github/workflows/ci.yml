@@ -127,5 +127,6 @@ jobs:
       - name: "Validate macOS Launchd Plist Syntax"
         run: |
           test -f deploy/launchd/com.causalmesh.mcp.plist
-          grep -q "QOS_CLASS_BACKGROUND" deploy/launchd/com.causalmesh.mcp.plist
+          grep -q "<string>Background</string>" deploy/launchd/com.causalmesh.mcp.plist
+          grep -q "LowPriorityIO" deploy/launchd/com.causalmesh.mcp.plist
           echo "✔ macOS launchd plist validated."

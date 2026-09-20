@@ -39,17 +39,25 @@ impl ValidatedScope {
             dunce::canonicalize(&clean).map_err(|_| SecurityError::PathNotFound(clean.clone()))?;
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let canonical_cmp = canonical.to_string_lossy().to_lowercase();
+        let canonical_lower = canonical.to_string_lossy().to_lowercase();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let canonical_cmp: &str = &canonical_lower;
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let canonical_cmp = canonical.to_string_lossy();
+        let canonical_lossy = canonical.to_string_lossy();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let canonical_cmp: &str = &canonical_lossy;
 
         let is_jailed = allowed_roots.iter().any(|root| {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            let root_cmp = root.to_string_lossy().to_lowercase();
+            let root_lower = root.to_string_lossy().to_lowercase();
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            let root_cmp: &str = &root_lower;
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            let root_cmp = root.to_string_lossy();
+            let root_lossy = root.to_string_lossy();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let root_cmp: &str = &root_lossy;
 
-            canonical_cmp.starts_with(root_cmp.as_str())
+            canonical_cmp.starts_with(root_cmp)
         });
 
         if is_jailed {

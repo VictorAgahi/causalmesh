@@ -69,13 +69,13 @@ Tested against a multi-repo workspace consisting of 52 repositories, 48,000 file
 
 | Metric | Target Threshold | MeshMCP Measured |
 | :--- | :--- | :--- |
-| **Resident Memory (RSS)** | $< 30\text{ MiB}$ | **$18.6\text{ MiB}$** (mimalloc + CompactString) |
-| **Stdio Loopback Latency** | $< 1\text{ms}$ | **$0.02\text{ms}$** (20 microseconds) |
-| **Cold Boot (Initialize Handshake)** | $< 50\text{ms}$ | **$12.5\text{ms}$** |
-| **Structural Ingestion (`mesh-mcp init`)** | $< 5\text{s}$ | **$4.2\text{s}$** (full polyglot scan) |
-| **In-Memory Query Latency** | $< 2\text{ms}$ | **$0.12\text{ms}$** (Lock-Free `ArcSwap`) |
-| **Scoped AST Parsing + Decapitation** | $< 50\text{ms}$ | **$20.1\text{ms}$** (Tree-sitter bounded) |
-| **IDE UI Keystroke Stuttering** | $< 150\text{ms}$ | **$0\text{ms}$** (Rayon OS QoS background isolation) |
+| **Resident Memory (RSS)** | `< 30 MiB` | **`18.6 MiB`** (mimalloc + CompactString) |
+| **Stdio Loopback Latency** | `< 1 ms` | **`0.02 ms`** (20 microseconds) |
+| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** |
+| **Structural Ingestion (`mesh-mcp init`)** | `< 5 s` | **`4.2 s`** (full polyglot scan) |
+| **In-Memory Query Latency** | `< 2 ms` | **`0.12 ms`** (Lock-Free `ArcSwap`) |
+| **Scoped AST Parsing + Decapitation** | `< 50 ms` | **`20.1 ms`** (Tree-sitter bounded) |
+| **IDE UI Keystroke Stuttering** | `< 150 ms` | **`0 ms`** (Rayon OS QoS background isolation) |
 
 ---
 
@@ -88,32 +88,32 @@ The following unstyled diagrams illustrate the internal subsystem data flow and 
 #### Complete System Flow
 ```mermaid
 graph TD
-    Client[AI Agent / IDE Client] -->|JSON-RPC 2.0 over Stdio| StdioActor[Stdio Framing Actor]
-    StdioActor -->|Extract W3C traceparent| Router[Protocol Router & Validator]
-    Router -->|ValidatedScope Jail| Security[Security & Path Canonicalization]
-    Security -->|Scope Approved| Dispatcher[MCP Tool Registry]
+    Client["AI Agent / IDE Client"] -->|JSON-RPC 2.0 over Stdio| StdioActor["Stdio Framing Actor"]
+    StdioActor -->|Extract W3C traceparent| Router["Protocol Router & Validator"]
+    Router -->|ValidatedScope Jail| Security["Security & Path Canonicalization"]
+    Security -->|Scope Approved| Dispatcher["MCP Tool Registry"]
     
-    Dispatcher --> Tools{Tool Selection}
-    Tools -->|smart_search| EngineSearch[Search & AST Decapitation]
-    Tools -->|find_dependents| EngineGraph[Reverse Dependency Graph]
-    Tools -->|analyze_grpc| EngineGrpc[Synchronous gRPC Mesh]
-    Tools -->|analyze_impact| EngineImpact[Causal Impact Flow]
-    Tools -->|search_docs| EngineDocs[Sanitized Architecture Docs]
+    Dispatcher --> Tools{"Tool Selection"}
+    Tools -->|smart_search| EngineSearch["Search & AST Decapitation"]
+    Tools -->|find_dependents| EngineGraph["Reverse Dependency Graph"]
+    Tools -->|analyze_grpc| EngineGrpc["Synchronous gRPC Mesh"]
+    Tools -->|analyze_impact| EngineImpact["Causal Impact Flow"]
+    Tools -->|search_docs| EngineDocs["Sanitized Architecture Docs"]
     
-    EngineSearch --> Parsers[Tree-sitter AST Guard]
-    EngineGraph --> State[Lock-Free AppState CoW]
+    EngineSearch --> Parsers["Tree-sitter AST Guard"]
+    EngineGraph --> State["Lock-Free AppState CoW"]
     EngineGrpc --> State
     EngineImpact --> State
     EngineDocs --> State
     
-    Parsers --> Decap[AST Body Decapitator]
-    Decap --> Formatter[Markdown Formatter 48KB Cap]
+    Parsers --> Decap["AST Body Decapitator"]
+    Decap --> Formatter["Markdown Formatter 48KB Cap"]
     
-    Formatter --> Audit[SHA-256 Chained Audit Logger]
+    Formatter --> Audit["SHA-256 Chained Audit Logger"]
     Audit --> StdioActor
     StdioActor -->|JSON-RPC Output via BufWriter| Client
 
-    Rescan[Rayon Background Rescan] -.->|QoS Background Thread| State
+    Rescan["Rayon Background Rescan"] -.->|QoS Background Thread| State
 ```
 
 #### Governance & Refusal (RSAH) Flow
@@ -356,7 +356,9 @@ Add to your project's `.cursor/mcp.json` or `.windsurf/mcp.json`:
 Every tool invocation and file interaction is recorded in `~/.cache/mesh-mcp/audit.log` (or workspace audit path) with POSIX permissions `0600` (read/write exclusively by the owner).
 
 Entries are chained cryptographically using SHA-256:
-$$\text{Hash}_n = \text{SHA256}(\text{Hash}_{n-1} \mathbin{\Vert} \text{Timestamp} \mathbin{\Vert} \text{SessionId} \mathbin{\Vert} \text{Tool} \mathbin{\Vert} \text{PayloadDigest})$$
+```text
+Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || PayloadDigest)
+```
 
 Tampering with any intermediate line invalidates the subsequent cryptographic signature chain, guaranteeing non-repudiation under SOC2 Type II and EU AI Act Article 14 audits.
 

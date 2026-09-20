@@ -53,7 +53,9 @@ A common vector for agent sandbox escape is symlinks inside dependency directori
 
 The append-only audit trail in `~/.cache/mesh-mcp/audit.log` guarantees non-repudiation:
 
-$$\text{Hash}_n = \text{SHA256}(\text{Hash}_{n-1} \mathbin{\Vert} \text{Timestamp} \mathbin{\Vert} \text{SessionId} \mathbin{\Vert} \text{Tool} \mathbin{\Vert} \text{PayloadDigest})$$
+```text
+Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || PayloadDigest)
+```
 
 ### Log Format:
 ```

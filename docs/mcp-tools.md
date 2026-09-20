@@ -265,5 +265,5 @@ MeshMCP maps all internal failure modes into standard JSON-RPC 2.0 error respons
 | :--- | :--- | :--- | :--- |
 | **`-32602`** | `InvalidParams` | Scope path escaped sandbox jail (`ValidatedScope`), or unknown parameters sent | Verify path exists within declared `roots` in `mesh-mcp.toml`. |
 | **`-32601`** | `MethodNotFound`| Unrecognized tool requested | Use one of the 5 registered tools (`smart_search`, etc.). |
-| **`-32603`** | `InternalError` | Tree-sitter timeout (15ms exceeded) or file $> 384\text{ KB}$ | Reduce query scope or check file size. |
+| **`-32603`** | `InternalError` | Tree-sitter timeout (15ms exceeded) or file > 384 KB | Reduce query scope or check file size. |
 | **`200 OK`** | `RSAH Governance Block` | Attempted write to guarded repo (e.g. `proto-registry`) | Follow structured action handoff to human engineer. |

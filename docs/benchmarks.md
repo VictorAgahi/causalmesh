@@ -75,11 +75,11 @@ Assuming an average developer session consisting of 30 agent tool invocations:
 
 | Metric | Target Specification | Measured Result | Margin |
 | :--- | :--- | :--- | :--- |
-| **Stdio Loopback Latency** | $< 1.0\text{ ms}$ | **$0.02\text{ ms}$** (20 µs) | $50\times$ faster than target |
-| **Cold Boot (Initialize Handshake)** | $< 50\text{ ms}$ | **$12.5\text{ ms}$** | $4\times$ faster than target |
-| **In-Memory Reverse Dependency Query** | $< 2.0\text{ ms}$ | **$0.12\text{ ms}$** (120 µs) | $16\times$ faster than target |
-| **Scoped Tree-sitter Parse + Decapitate**| $< 50.0\text{ ms}$ | **$20.1\text{ ms}$** | $2.5\times$ faster than target |
-| **Full Topology Scan (`init --auto`)** | $< 5.0\text{ s}$ | **$4.2\text{ s}$** | Within budget |
+| **Stdio Loopback Latency** | `< 1.0 ms` | **`0.02 ms`** (20 µs) | 50x faster than target |
+| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** | 4x faster than target |
+| **In-Memory Reverse Dependency Query** | `< 2.0 ms` | **`0.12 ms`** (120 µs) | 16x faster than target |
+| **Scoped Tree-sitter Parse + Decapitate**| `< 50.0 ms` | **`20.1 ms`** | 2.5x faster than target |
+| **Full Topology Scan (`init --auto`)** | `< 5.0 s` | **`4.2 s`** | Within budget |
 
 ### 3.2 Memory & CPU Invariants
 

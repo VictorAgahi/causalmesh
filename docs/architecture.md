@@ -118,12 +118,12 @@ AI coding agents are vulnerable to path traversal attacks, malicious symlinks in
 
 ```mermaid
 graph TD
-    RawPath[Raw Scope Input: ../../etc/passwd] --> Clean[path_clean::clean]
-    Clean --> Dunce[dunce::canonicalize]
-    Dunce --> Fold[Case-Fold APFS/NTFS to lowercase]
-    Fold --> Check{Prefix within allowed_roots?}
-    Check -->|No| Err[Reject: JSON-RPC Error -32602]
-    Check -->|Yes| Valid[ValidatedScope Instance Created]
+    RawPath["Raw Scope Input: ../../etc/passwd"] --> Clean["path_clean::clean"]
+    Clean --> Dunce["dunce::canonicalize"]
+    Dunce --> Fold["Case-Fold APFS/NTFS to lowercase"]
+    Fold --> Check{"Prefix within allowed_roots?"}
+    Check -->|No| Err["Reject: JSON-RPC Error -32602"]
+    Check -->|Yes| Valid["ValidatedScope Instance Created"]
 ```
 
 ---
@@ -134,10 +134,10 @@ Tree-sitter is a powerful incremental parsing framework, but raw C-FFI invocatio
 
 ### 5.1 Pre-Parsing Lexical Guards
 Before passing any file to a Tree-sitter parser:
-1. **Size Bound**: Files $> 384\text{ KB}$ are immediately rejected.
-2. **Line Length Bound**: Lines exceeding $1,024$ bytes (e.g., minified JS bundles) are rejected.
-3. **Binary Sniffing**: The first $4,096$ bytes are scanned for null bytes (`0x00`). If detected, parsing halts.
-4. **Nesting Depth Check**: Quick lexical scanner checks brace/parenthesis nesting depth. Files with depth $> 64$ are rejected to prevent C stack exhaustion.
+1. **Size Bound**: Files > 384 KB are immediately rejected.
+2. **Line Length Bound**: Lines exceeding 1,024 bytes (e.g., minified JS bundles) are rejected.
+3. **Binary Sniffing**: The first 4,096 bytes are scanned for null bytes (`0x00`). If detected, parsing halts.
+4. **Nesting Depth Check**: Quick lexical scanner checks brace/parenthesis nesting depth. Files with depth > 64 are rejected to prevent C stack exhaustion.
 
 ### 5.2 C-FFI Timeout
 MeshMCP configures a hardware timeout for every parse session:
@@ -161,15 +161,15 @@ When an agent searches for functions or classes using `smart_search`, MeshMCP st
 
 ```mermaid
 graph TD
-    FullCode[Full Source File: 1,500 lines] --> Parser[Tree-sitter Parser]
-    Parser --> AST[Syntax Tree Root]
-    AST --> Inspector[AstDecapitator Inspector]
-    Inspector -->|Java| JavaRule[Strip block to { /* stripped */ }]
-    Inspector -->|Go| GoRule[Strip block to { /* stripped */ }]
-    Inspector -->|TypeScript| TSRule[Strip body to { /* stripped */ }]
-    Inspector -->|Rust| RustRule[Strip block to { /* stripped */ }]
-    Inspector -->|Python| PyRule[Strip body to ...]
-    JavaRule --> Assembler[Decapitated Source Code: 35 lines]
+    FullCode["Full Source File (1,500 lines)"] --> Parser["Tree-sitter Parser"]
+    Parser --> AST["Syntax Tree Root"]
+    AST --> Inspector["AstDecapitator Inspector"]
+    Inspector -->|Java| JavaRule["Strip block to /* stripped */"]
+    Inspector -->|Go| GoRule["Strip block to /* stripped */"]
+    Inspector -->|TypeScript| TSRule["Strip body to /* stripped */"]
+    Inspector -->|Rust| RustRule["Strip block to /* stripped */"]
+    Inspector -->|Python| PyRule["Strip body to ..."]
+    JavaRule --> Assembler["Decapitated Source Code (35 lines)"]
     GoRule --> Assembler
     TSRule --> Assembler
     RustRule --> Assembler
@@ -218,6 +218,8 @@ For compliance under SOC2 Type II and EU AI Act Article 14 (human-in-the-loop ov
 - **Location**: `~/.cache/mesh-mcp/audit.log` (or workspace-configured audit path).
 - **Permissions**: Mode `0600` (readable/writable exclusively by user).
 - **Chaining Function**:
-  $$\text{Hash}_n = \text{SHA256}(\text{Hash}_{n-1} \mathbin{\Vert} \text{Timestamp} \mathbin{\Vert} \text{SessionId} \mathbin{\Vert} \text{Tool} \mathbin{\Vert} \text{PayloadDigest})$$
+  ```text
+  Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || PayloadDigest)
+  ```
 
 An auditor or CI verification script can replay the log from genesis (`0000000000000000000000000000000000000000000000000000000000000000`). Any modified, inserted, or removed record breaks all subsequent SHA-256 signatures.

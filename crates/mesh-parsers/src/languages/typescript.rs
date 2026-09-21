@@ -54,9 +54,7 @@ impl TypeScriptExtractor {
                             .trim_matches('\'')
                             .trim_matches('"');
 
-
                         imports.push((String::new(), from_str.to_string()));
-
 
                         for named in Self::collect_named_import_specifiers(node, source) {
                             imports.push((String::new(), named));

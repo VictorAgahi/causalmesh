@@ -229,7 +229,7 @@ impl ContractGraph {
             if edge.kind == EdgeKind::Imports && edge.to == 0 {
                 if let Some(ref target) = edge.metadata {
                     let target_str = target.as_str();
-                   
+
                     let target_stem = Path::new(target_str)
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -237,7 +237,7 @@ impl ContractGraph {
 
                     let is_relative_or_absolute_path =
                         target_str.starts_with('.') || target_str.starts_with('/');
-                    
+
                     let is_qualified = target_str.contains('/') || target_str.contains('.');
 
                     let importer_repo_id = self.nodes.get(&edge.from).map(|n| n.repo_id);

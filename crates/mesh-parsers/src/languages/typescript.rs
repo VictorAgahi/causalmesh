@@ -275,7 +275,9 @@ export class AuthController {
         // One module-path-level entry plus one entry per named specifier
         // (here just `UserAuthRequest`).
         assert_eq!(imports.len(), 2);
-        assert!(imports.iter().any(|(_, t)| t == "@volontariapp/domain-user"));
+        assert!(imports
+            .iter()
+            .any(|(_, t)| t == "@volontariapp/domain-user"));
         assert!(imports.iter().any(|(_, t)| t == "UserAuthRequest"));
         assert!(nodes.iter().any(|n| n.name == "AuthController"));
         assert!(nodes

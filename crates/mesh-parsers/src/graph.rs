@@ -248,7 +248,30 @@ impl GraphRenderer {
     .controls {{
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
+    }}
+    .filter-btn-group {{
+      display: inline-flex;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--surface-border);
+      border-radius: 6px;
+      padding: 2px;
+    }}
+    .filter-btn {{
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }}
+    .filter-btn.active {{
+      background: var(--accent);
+      color: #0b0c10;
     }}
     .search-input {{
       background: var(--surface);
@@ -259,7 +282,7 @@ impl GraphRenderer {
       padding: 6px 12px;
       border-radius: 6px;
       outline: none;
-      width: 220px;
+      width: 200px;
       transition: border-color 0.2s;
     }}
     .search-input:focus {{
@@ -423,7 +446,7 @@ impl GraphRenderer {
     <div class="stats-bar">
       <div class="stat-badge">
         <span class="dot" style="background: var(--accent);"></span>
-        <span>Nodes: <strong id="stat-nodes">0</strong></span>
+        <span>Visible Nodes: <strong id="stat-nodes">0</strong></span>
       </div>
       <div class="stat-badge">
         <span class="dot" style="background: var(--accent-purple);"></span>
@@ -431,8 +454,12 @@ impl GraphRenderer {
       </div>
     </div>
     <div class="controls">
-      <input type="text" id="search-input" class="search-input" placeholder="Search contracts..." />
-      <button class="btn" id="btn-reset">Reset View</button>
+      <div class="filter-btn-group">
+        <button class="filter-btn active" id="filter-contracts">Contracts & Flows</button>
+        <button class="filter-btn" id="filter-all">All Symbols</button>
+      </div>
+      <input type="text" id="search-input" class="search-input" placeholder="Search symbol or service..." />
+      <button class="btn" id="btn-reset">Reset</button>
       <button class="btn" id="btn-copy-mermaid">Copy Mermaid</button>
     </div>
   </header>
@@ -468,7 +495,7 @@ impl GraphRenderer {
       <div class="legend-item"><div class="legend-color" style="background: #fbbf24;"></div>Kafka / Queue Topic</div>
       <div class="legend-item"><div class="legend-color" style="background: #34d399;"></div>Protobuf Message</div>
       <div class="legend-item"><div class="legend-color" style="background: #a855f7;"></div>HTTP Endpoint</div>
-      <div class="legend-item"><div class="legend-color" style="background: #fb7185;"></div>Saga / Transaction</div>
+      <div class="legend-item"><div class="legend-color" style="background: #fb7185;"></div>Saga / Outbox</div>
     </div>
 
     <div id="toast" class="toast">Mermaid Copied to Clipboard!</div>
@@ -480,8 +507,6 @@ impl GraphRenderer {
 
   <script>
     const rawData = JSON.parse(document.getElementById('graph-data').textContent);
-    document.getElementById('stat-nodes').textContent = rawData.total_nodes;
-    document.getElementById('stat-edges').textContent = rawData.total_edges;
 
     const canvas = document.getElementById('viewport');
     const ctx = canvas.getContext('2d');
@@ -494,7 +519,6 @@ impl GraphRenderer {
     }}
     window.addEventListener('resize', resizeCanvas);
 
-    // Color palette per node kind
     function getNodeColor(kind) {{
       switch (kind) {{
         case 'GrpcService':
@@ -506,37 +530,100 @@ impl GraphRenderer {
         case 'HttpEndpoint': return '#a855f7';
         case 'Saga':
         case 'PostProcessor': return '#fb7185';
-        default: return '#94a3b8';
+        default: return '#64748b';
       }}
     }}
 
-    // Layout nodes into a radial / layered layout by package
-    const nodes = rawData.nodes.map((n, i) => {{
-      const angle = (i / Math.max(1, rawData.nodes.length)) * Math.PI * 2;
-      const radius = 220 + (i % 3) * 140;
-      return {{
-        ...n,
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-        radius: 16,
-        color: getNodeColor(n.kind)
-      }};
-    }});
+    function isContractNode(n) {{
+      return n.kind !== 'ServiceClass' &&
+             n.kind !== 'Interface' &&
+             n.kind !== 'Other' ||
+             rawData.edges.some(e => e.from === n.id || e.to === n.id);
+    }}
 
-    const nodeMap = new Map();
-    nodes.forEach(n => nodeMap.set(n.id, n));
+    let showOnlyContracts = true;
+    let nodes = [];
+    let edges = [];
+    let clusters = new Map();
+    let nodeMap = new Map();
 
-    const edges = rawData.edges.filter(e => nodeMap.has(e.from) && nodeMap.has(e.to)).map(e => ({{
-      ...e,
-      source: nodeMap.get(e.from),
-      target: nodeMap.get(e.to)
-    }}));
+    function buildLayout() {{
+      const candidateNodes = showOnlyContracts
+        ? rawData.nodes.filter(isContractNode)
+        : rawData.nodes;
+
+      const activeIds = new Set(candidateNodes.map(n => n.id));
+      const activeEdges = rawData.edges.filter(e => activeIds.has(e.from) && activeIds.has(e.to));
+
+      // Group candidate nodes by package
+      const pkgMap = new Map();
+      candidateNodes.forEach(n => {{
+        const pkg = n.package || 'shared';
+        if (!pkgMap.has(pkg)) pkgMap.set(pkg, []);
+        pkgMap.get(pkg).push(n);
+      }});
+
+      clusters.clear();
+      nodeMap.clear();
+      nodes = [];
+
+      const pkgCount = pkgMap.size;
+      const cols = Math.ceil(Math.sqrt(pkgCount));
+      const clusterSpacingX = 360;
+      const clusterSpacingY = 320;
+
+      let pkgIdx = 0;
+      pkgMap.forEach((pkgNodes, pkgName) => {{
+        const row = Math.floor(pkgIdx / cols);
+        const col = pkgIdx % cols;
+        const cx = (col - (cols - 1) / 2) * clusterSpacingX;
+        const cy = (row - Math.floor(pkgCount / cols) / 2) * clusterSpacingY;
+
+        const clusterRadius = Math.max(90, Math.min(180, Math.sqrt(pkgNodes.length) * 35));
+        clusters.set(pkgName, {{
+          name: pkgName,
+          x: cx,
+          y: cy,
+          radius: clusterRadius,
+          count: pkgNodes.length
+        }});
+
+        pkgNodes.forEach((n, i) => {{
+          const subAngle = (i / pkgNodes.length) * Math.PI * 2;
+          const dist = pkgNodes.length === 1 ? 0 : Math.min(clusterRadius - 25, 30 + (i % 3) * 30);
+          const nodeObj = {{
+            ...n,
+            x: cx + Math.cos(subAngle) * dist,
+            y: cy + Math.sin(subAngle) * dist,
+            vx: 0,
+            vy: 0,
+            radius: n.kind === 'GrpcService' || n.kind === 'KafkaTopic' ? 14 : 10,
+            color: getNodeColor(n.kind)
+          }};
+          nodes.push(nodeObj);
+          nodeMap.set(nodeObj.id, nodeObj);
+        }});
+
+        pkgIdx++;
+      }});
+
+      edges = activeEdges.filter(e => nodeMap.has(e.from) && nodeMap.has(e.to)).map(e => ({{
+        ...e,
+        source: nodeMap.get(e.from),
+        target: nodeMap.get(e.to)
+      }}));
+
+      document.getElementById('stat-nodes').textContent = nodes.length;
+      document.getElementById('stat-edges').textContent = edges.length;
+      render();
+    }}
 
     // View transform
-    let scale = 1;
+    let scale = 0.9;
     let panX = 0;
     let panY = 0;
     let isDragging = false;
+    let draggedNode = null;
     let lastMouseX = 0;
     let lastMouseY = 0;
     let hoveredNode = null;
@@ -544,16 +631,16 @@ impl GraphRenderer {
     let searchQuery = '';
 
     function resetView() {{
-      scale = 1;
-      panX = (canvas.width / window.devicePixelRatio) / 2;
-      panY = (canvas.height / window.devicePixelRatio) / 2;
+      scale = 0.9;
+      panX = (canvas.width / (window.devicePixelRatio || 1)) / 2;
+      panY = (canvas.height / (window.devicePixelRatio || 1)) / 2;
       render();
     }}
 
     canvas.addEventListener('wheel', e => {{
       e.preventDefault();
-      const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-      scale = Math.min(Math.max(0.2, scale * zoomFactor), 4);
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.88;
+      scale = Math.min(Math.max(0.15, scale * zoomFactor), 4);
       render();
     }});
 
@@ -564,6 +651,7 @@ impl GraphRenderer {
 
       const hit = nodes.find(n => Math.hypot(n.x - mouseX, n.y - mouseY) <= n.radius * 1.5);
       if (hit) {{
+        draggedNode = hit;
         selectedNode = hit;
         openSidebar(hit);
         render();
@@ -576,6 +664,17 @@ impl GraphRenderer {
     }});
 
     window.addEventListener('mousemove', e => {{
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = (e.clientX - rect.left - panX) / scale;
+      const mouseY = (e.clientY - rect.top - panY) / scale;
+
+      if (draggedNode) {{
+        draggedNode.x = mouseX;
+        draggedNode.y = mouseY;
+        render();
+        return;
+      }}
+
       if (isDragging) {{
         panX += e.clientX - lastMouseX;
         panY += e.clientY - lastMouseY;
@@ -584,10 +683,6 @@ impl GraphRenderer {
         render();
         return;
       }}
-
-      const rect = canvas.getBoundingClientRect();
-      const mouseX = (e.clientX - rect.left - panX) / scale;
-      const mouseY = (e.clientY - rect.top - panY) / scale;
 
       const hit = nodes.find(n => Math.hypot(n.x - mouseX, n.y - mouseY) <= n.radius * 1.5);
       if (hit !== hoveredNode) {{
@@ -599,6 +694,7 @@ impl GraphRenderer {
 
     window.addEventListener('mouseup', () => {{
       isDragging = false;
+      draggedNode = null;
     }});
 
     function openSidebar(node) {{
@@ -628,6 +724,22 @@ impl GraphRenderer {
 
     document.getElementById('btn-reset').addEventListener('click', resetView);
 
+    document.getElementById('filter-contracts').addEventListener('click', () => {{
+      showOnlyContracts = true;
+      document.getElementById('filter-contracts').classList.add('active');
+      document.getElementById('filter-all').classList.remove('active');
+      buildLayout();
+      resetView();
+    }});
+
+    document.getElementById('filter-all').addEventListener('click', () => {{
+      showOnlyContracts = false;
+      document.getElementById('filter-all').classList.add('active');
+      document.getElementById('filter-contracts').classList.remove('active');
+      buildLayout();
+      resetView();
+    }});
+
     document.getElementById('search-input').addEventListener('input', e => {{
       searchQuery = e.target.value.toLowerCase().trim();
       render();
@@ -641,37 +753,107 @@ impl GraphRenderer {
       ctx.translate(panX, panY);
       ctx.scale(scale, scale);
 
-      // Draw edges
-      edges.forEach(e => {{
+      // 1. Draw Cluster Background Cards
+      clusters.forEach(c => {{
         ctx.beginPath();
+        ctx.arc(c.x, c.y, c.radius + 18, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(20, 22, 31, 0.45)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Cluster Title Pill
+        ctx.font = '600 12px "JetBrains Mono", monospace';
+        const titleText = `📦 ${{c.name}} (${{c.count}})`;
+        const textWidth = ctx.measureText(titleText).width;
+
+        ctx.fillStyle = 'rgba(11, 12, 16, 0.85)';
+        ctx.beginPath();
+        ctx.roundRect(c.x - textWidth / 2 - 8, c.y - c.radius - 32, textWidth + 16, 22, 4);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.stroke();
+
+        ctx.fillStyle = '#cbd5e1';
+        ctx.textAlign = 'center';
+        ctx.fillText(titleText, c.x, c.y - c.radius - 17);
+      }});
+
+      // 2. Draw Curved Edges
+      edges.forEach(e => {{
+        const isConnected = selectedNode && (selectedNode.id === e.from || selectedNode.id === e.to);
+        const isDimmed = selectedNode && !isConnected;
+
+        ctx.beginPath();
+        const midX = (e.source.x + e.target.x) / 2;
+        const midY = (e.source.y + e.target.y) / 2;
+        const dx = e.target.x - e.source.x;
+        const dy = e.target.y - e.source.y;
+        const normalX = -dy * 0.15;
+        const normalY = dx * 0.15;
+
         ctx.moveTo(e.source.x, e.source.y);
-        ctx.lineTo(e.target.x, e.target.y);
-        ctx.strokeStyle = (selectedNode && (selectedNode.id === e.from || selectedNode.id === e.to))
+        ctx.quadraticCurveTo(midX + normalX, midY + normalY, e.target.x, e.target.y);
+
+        ctx.strokeStyle = isConnected
           ? '#38bdf8'
-          : 'rgba(255, 255, 255, 0.12)';
-        ctx.lineWidth = (selectedNode && (selectedNode.id === e.from || selectedNode.id === e.to)) ? 2.5 : 1;
+          : isDimmed
+            ? 'rgba(255, 255, 255, 0.03)'
+            : 'rgba(56, 189, 248, 0.25)';
+        ctx.lineWidth = isConnected ? 2.5 : 1.2;
         ctx.stroke();
       }});
 
-      // Draw nodes
+      // 3. Draw Nodes with Smart Level of Detail
       nodes.forEach(n => {{
         const isMatched = !searchQuery || n.name.toLowerCase().includes(searchQuery) || n.package.toLowerCase().includes(searchQuery);
         const isSelected = selectedNode && selectedNode.id === n.id;
         const isHovered = hoveredNode && hoveredNode.id === n.id;
+        const isDimmed = selectedNode && !isSelected && !edges.some(e => (e.from === selectedNode.id && e.to === n.id) || (e.to === selectedNode.id && e.from === n.id));
 
+        // Node Glow & Circle
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.radius * (isSelected || isHovered ? 1.3 : 1), 0, Math.PI * 2);
-        ctx.fillStyle = isMatched ? n.color : '#334155';
-        ctx.shadowColor = isMatched ? n.color : 'transparent';
-        ctx.shadowBlur = (isSelected || isHovered) ? 20 : 6;
-        ctx.fill();
-        ctx.shadowBlur = 0;
+        ctx.arc(n.x, n.y, n.radius * (isSelected || isHovered ? 1.35 : 1), 0, Math.PI * 2);
 
-        // Label
-        ctx.font = '11px "JetBrains Mono", monospace';
-        ctx.fillStyle = isMatched ? '#f1f5f9' : '#64748b';
-        ctx.textAlign = 'center';
-        ctx.fillText(n.name, n.x, n.y + n.radius + 14);
+        if (isDimmed) {{
+          ctx.fillStyle = 'rgba(51, 65, 85, 0.25)';
+          ctx.fill();
+        }} else {{
+          ctx.fillStyle = isMatched ? n.color : '#334155';
+          if (isSelected || isHovered || isMatched && searchQuery) {{
+            ctx.shadowColor = n.color;
+            ctx.shadowBlur = 16;
+          }}
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }}
+
+        // Level of Detail for labels:
+        // Only draw labels if:
+        // a) Zoomed in (scale > 1.1)
+        // b) Node is hovered or selected
+        // c) Search matches
+        // d) Contracts-only mode with low density
+        const shouldShowLabel = (scale >= 1.0) || isSelected || isHovered || (searchQuery && isMatched) || (nodes.length <= 40);
+
+        if (shouldShowLabel && !isDimmed) {{
+          ctx.font = '500 11px "JetBrains Mono", monospace';
+          const labelWidth = ctx.measureText(n.name).width;
+
+          // Draw pill background to prevent text collision
+          ctx.fillStyle = 'rgba(11, 12, 16, 0.9)';
+          ctx.beginPath();
+          ctx.roundRect(n.x - labelWidth / 2 - 4, n.y + n.radius + 4, labelWidth + 8, 16, 3);
+          ctx.fill();
+          ctx.strokeStyle = isSelected || isHovered ? n.color : 'rgba(255, 255, 255, 0.1)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+
+          ctx.fillStyle = isSelected || isHovered ? '#38bdf8' : '#f1f5f9';
+          ctx.textAlign = 'center';
+          ctx.fillText(n.name, n.x, n.y + n.radius + 16);
+        }}
       }});
 
       ctx.restore();
@@ -695,6 +877,7 @@ impl GraphRenderer {
 
     // Initialize layout
     resizeCanvas();
+    buildLayout();
     resetView();
   </script>
 </body>

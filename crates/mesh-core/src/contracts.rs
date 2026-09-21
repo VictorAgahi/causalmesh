@@ -58,6 +58,16 @@ impl ContractGraph {
         self.nodes.get(&id)
     }
 
+    #[inline]
+    pub fn all_nodes(&self) -> impl Iterator<Item = &ContractNode> {
+        self.nodes.values()
+    }
+
+    #[inline]
+    pub fn all_edges(&self) -> &[ContractEdge] {
+        &self.edges
+    }
+
     pub fn get_nodes_for_file(&self, path: &Path) -> &[NodeId] {
         self.file_to_nodes
             .get(path)

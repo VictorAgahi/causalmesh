@@ -24,7 +24,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long, help = "Path to custom configuration file")]
+    #[arg(short, long, global = true, help = "Path to custom configuration file")]
     config: Option<PathBuf>,
 }
 
@@ -59,6 +59,21 @@ enum Commands {
 
     /// Install OS-level Git pre-commit hooks for active governance
     InstallHooks,
+
+    /// Generate and view an interactive architecture graph of services, contracts, and topics
+    Graph {
+        /// Format of the output: html, mermaid, or json
+        #[arg(short, long, default_value = "html")]
+        format: String,
+
+        /// Optional file path to write the output to
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Open the resulting visualization directly in your default browser
+        #[arg(long, default_value = "false")]
+        open: bool,
+    },
 }
 
 #[tokio::main]
@@ -84,6 +99,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::InstallHooks => {
             HooksCommand::run()?;
+        }
+        Commands::Graph {
+            format,
+            output,
+            open,
+        } => {
+            mesh_server::cli::GraphCommand::run(
+                cli.config.as_deref(),
+                &format,
+                output.as_deref(),
+                open,
+            )?;
         }
         Commands::Run { standalone } => {
             #[cfg(unix)]

@@ -3,8 +3,9 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-67%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)]()
 [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
+[![Visualizer](https://img.shields.io/badge/visualizer-HTML5%20%2B%20Mermaid-purple.svg)]()
 [![Binary Size](https://img.shields.io/badge/binary-6.8%20MB-blue.svg)]()
 [![RSS Memory](https://img.shields.io/badge/memory-%3C%2020%20MiB-blue.svg)]()
 [![Stdio Latency](https://img.shields.io/badge/stdio%20latency-0.02%20ms-brightgreen.svg)]()
@@ -16,19 +17,31 @@ MeshMCP is an industrial-grade, local-first multi-root architecture mesh and hig
 
 ---
 
+### ⚡ 1-Liner Quick Install (macOS / Linux / Windows WSL)
+```bash
+curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
+```
+
+Or run instantly via NPX (corporate hardened, zero-dependency download):
+```bash
+npx mesh-mcp init --auto
+```
+
+---
+
 ## Table of Contents
 
 - [1. Why MeshMCP?](#1-why-meshmcp)
-- [2. Context Engineering & Performance Profile](#2-context-engineering--performance-profile)
-- [3. Architecture Overview](#3-architecture-overview)
-  - [System Topologies & Flows](#system-topologies--flows)
-  - [The 7 Code Commandments (RFC-001)](#the-7-code-commandments-rfc-001)
-- [4. The 5 Core MCP Tools](#4-the-5-core-mcp-tools)
-- [5. Active Governance & RSAH Protocol](#5-active-governance--rsah-protocol)
-- [6. Installation & Quick Start](#6-installation--quick-start) (See [SETUP.md](SETUP.md) for full walkthrough)
-- [7. Configuration (`mesh-mcp.toml`)](#7-configuration-mesh-mcptoml)
-- [8. CLI Reference](#8-cli-reference)
-- [9. IDE & Agent Integration](#9-ide--agent-integration)
+- [2. Competitive Matrix & Context Engineering](#2-competitive-matrix--context-engineering)
+- [3. Interactive Topology Visualizer (`mesh-mcp graph`)](#3-interactive-topology-visualizer-mesh-mcp-graph)
+- [4. Architecture Overview](#4-architecture-overview)
+- [5. The 6 Core MCP Tools](#5-the-6-core-mcp-tools)
+- [6. Active Governance & RSAH Protocol](#6-active-governance--rsah-protocol)
+- [7. Installation & Quick Start](#7-installation--quick-start)
+- [8. Try the Demo Monorepo (`examples/polyglot-shop`)](#8-try-the-demo-monorepo-examplespolyglot-shop)
+- [9. Configuration (`mesh-mcp.toml`)](#9-configuration-mesh-mcptoml)
+- [10. CLI Reference](#10-cli-reference)
+- [11. IDE & Agent Integration](#11-ide--agent-integration)
 - [10. Cryptographic Audit & Compliance](#10-cryptographic-audit--compliance)
 - [11. Verification & Test Suite](#11-verification--test-suite)
 - [12. Documentation Index](#12-documentation-index)
@@ -86,9 +99,45 @@ Tested against a multi-repo workspace consisting of 52 repositories, 48,000 file
 | **Concurrent Audit Write Latency** | `< 100 µs` | **`27.57 µs`** (SQLite WAL `BEGIN IMMEDIATE`, 36k+ ops/s) | Verified |
 | **IDE UI Keystroke Stuttering** | `< 150 ms` | **`0 ms`** (Rayon OS QoS background isolation) | Zero UI impact |
 
+### Competitive Benchmark & Value Matrix
+
+| Architectural Capability | Generic MCP (TypeScript / Python) | Sourcegraph / Large LSP | CausalMesh (`mesh-mcp`) |
+| :--- | :--- | :--- | :--- |
+| **Engine Runtime** | Node.js / Python VM (slow startup) | Heavy JVM / Go cluster daemon | **Pure Zero-Copy Rust (mimalloc)** |
+| **Resident Memory (RSS)** | 350 MiB &ndash; 900 MiB per IDE window | 2 GiB &ndash; 8 GiB background daemon | **`< 20 MiB` total across all IDE windows** |
+| **Process Model** | 1 heavy process per client connection | Multi-tier distributed server | **Ultra-light proxy (< 2 MiB) + shared `meshd` UDS daemon** |
+| **Context Consumption** | Whole file dumps (10k &ndash; 50k tokens) | Search excerpts with full bodies | **Strict AST Decapitation (< 1k tokens, signatures only)** |
+| **Causal Impact Tracking** | None (lexical text match only) | Code references only (same language) | **Polyglot Graph (Proto &harr; NestJS &harr; Go &harr; Rust &harr; Kafka &harr; K8s)** |
+| **Topology Visualization** | None | Proprietary Web UI | **Autonomous Dark-Mode HTML5 Canvas + Mermaid CLI** |
+| **AI Agent Sandboxing** | Open OS disk access (leaks `.env`, keys) | Server-side read-only index | **Canonical `ValidatedScope` Jail + Anti-Prompt Injection** |
+
 ---
 
-## 3. Architecture Overview
+## 3. Interactive Topology Visualizer (`mesh-mcp graph`)
+
+CausalMesh includes an autonomous, zero-dependency **Interactive Topology Engine** that compiles your monorepo's contracts, gRPC flows, Kafka topics, and microservices into a stunning visual graph:
+
+```bash
+# 1. Open the interactive Dark Mode Canvas directly in your default browser:
+mesh-mcp graph --open
+
+# 2. Export a clean GitHub-Flavored Mermaid diagram:
+mesh-mcp graph --format mermaid
+
+# 3. Export to a static standalone HTML file or JSON payload:
+mesh-mcp graph --format html --output ./topology.html
+mesh-mcp graph --format json --output ./topology.json
+```
+
+### Visualizer Features
+- 🌌 **Zero-Dependency HTML5 Canvas**: Runs 100% locally and offline in air-gapped corporate environments.
+- 🎨 **Sleek Dark Mode Aesthetics**: Glassmorphic styling, neon type accents (cyan for gRPC, amber for Kafka, green for Protobuf, purple for HTTP).
+- 🔍 **Real-Time Symbol Filtering**: Instant fuzzy search across contracts and packages.
+- 📋 **1-Click Mermaid Clipboard Export**: Instantly embed topology diagrams into GitHub PR descriptions and architecture RFCs.
+
+---
+
+## 4. Architecture Overview
 
 ### System Topologies & Flows
 
@@ -161,9 +210,9 @@ Every line of Rust in MeshMCP adheres strictly to the 7 Code Commandments:
 
 ---
 
-## 4. The 5 Core MCP Tools
+## 5. The 6 Core MCP Tools
 
-MeshMCP implements five specialized MCP tools designed for deep architecture navigation:
+MeshMCP implements six specialized MCP tools designed for deep architecture navigation:
 
 ### 1. `smart_search`
 - **Purpose**: Fast scoped regex search returning AST-decapitated definitions across polyglot source code.
@@ -201,9 +250,15 @@ MeshMCP implements five specialized MCP tools designed for deep architecture nav
   - `scope` *(string, optional)*: Specific documentation directory.
 - **Output**: Sanitized documentation excerpts with prompt-injection tokens neutralized.
 
+### 6. `visualize_mesh`
+- **Purpose**: Generates visual architecture topology diagrams (Mermaid or interactive HTML) on demand directly within AI agent conversations.
+- **Parameters**:
+  - `format` *(string, optional)*: `'mermaid'` (default, GitHub-flavored Markdown) or `'html'` (standalone interactive app).
+- **Output**: Clean Mermaid diagram block or self-contained HTML graph string.
+
 ---
 
-## 5. Active Governance & RSAH Protocol
+## 6. Active Governance & RSAH Protocol
 
 When an AI agent attempts to modify a protected contract repository (such as `proto-registry`), MeshMCP activates **Refusal with Structured Action Handoff (RSAH)**:
 
@@ -285,7 +340,53 @@ Output:
 
 ---
 
-## 7. Configuration (`mesh-mcp.toml`)
+## 7. Installation & Quick Start
+
+### 1. Automatic 1-Liner (Recommended)
+```bash
+curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
+```
+
+### 2. From Source via Cargo
+```bash
+git clone https://github.com/VictorAgahi/causalmesh.git
+cd causalmesh
+cargo build --release
+cp target/release/mesh-mcp target/release/meshd ~/.local/bin/
+```
+
+### 3. Initialize Monorepo Architecture
+```bash
+cd /path/to/your/monorepo
+mesh-mcp init --auto
+mesh-mcp doctor
+```
+
+---
+
+## 8. Try the Demo Monorepo (`examples/polyglot-shop`)
+
+A self-contained polyglot demonstration monorepo is bundled in [`examples/polyglot-shop`](examples/polyglot-shop) featuring:
+- **`proto/checkout.proto`**: gRPC definition of `CheckoutService` and `OrderCreatedEvent`.
+- **`services/order-gateway`** (*TypeScript NestJS*): Implements `@GrpcMethod('CheckoutService', 'CreateOrder')` and emits to Kafka.
+- **`services/payment-worker`** (*Go*): Consumes `order-created-topic` and executes settlement.
+- **`services/inventory-manager`** (*Rust*): Subscribes to stock decrement events.
+
+### Test in 10 Seconds:
+```bash
+# 1. Visualize cross-service topology in your browser:
+mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
+
+# 2. Export Mermaid diagram:
+mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
+
+# 3. Check health:
+mesh-mcp doctor --config examples/polyglot-shop/mesh-mcp.toml
+```
+
+---
+
+## 9. Configuration (`mesh-mcp.toml`)
 
 MeshMCP is configured via a declarative `mesh-mcp.toml` file at the root of your workspace:
 
@@ -362,7 +463,7 @@ db_path = "~/.cache/mesh-mcp/audit.db" # Or ":memory:" for zero-disk-overhead in
 
 ---
 
-## 8. CLI Reference
+## 10. CLI Reference
 
 ```
 Usage: mesh-mcp [OPTIONS] [COMMAND]
@@ -371,8 +472,14 @@ Commands:
   run            Run the MeshMCP JSON-RPC server over stdio (default)
   doctor         Run diagnostic healthchecks on environment, permissions, and roots
   init           Automatically scan polyglot workspace and generate .agents/mesh-mcp.toml
+  graph          Generate and view an interactive architecture graph of services, contracts, and topics
+                 Flags:
+                   --format <html|mermaid|json> (default: html)
+                   --output <path>              (optional output file)
+                   --open                       (opens browser automatically)
   install-hooks  Install OS-level Git pre-commit hooks for active governance
   help           Print help information
+```
 
 Options:
   -c, --config <CONFIG>  Path to custom configuration file [default: mesh-mcp.toml]

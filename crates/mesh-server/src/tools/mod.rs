@@ -3,6 +3,7 @@ pub mod analyze_impact;
 pub mod find_dependents;
 pub mod search_docs;
 pub mod smart_search;
+pub mod visualize_mesh;
 
 use analyze_grpc::{AnalyzeGrpcArgs, AnalyzeGrpcTool};
 use analyze_impact::{AnalyzeImpactArgs, AnalyzeImpactTool};
@@ -13,17 +14,19 @@ use search_docs::{SearchDocsArgs, SearchDocsTool};
 use serde_json::{json, Value};
 use smart_search::{SmartSearchArgs, SmartSearchTool};
 use std::sync::Arc;
+use visualize_mesh::{VisualizeMeshArgs, VisualizeMeshTool};
 
 pub struct ToolRegistry;
 
 impl ToolRegistry {
-    /// Returns the schema definition for all 5 enterprise MCP tools
+    /// Returns the schema definition for all enterprise MCP tools
     pub fn list_tools() -> Value {
         let smart_search_schema = schema_for!(SmartSearchArgs);
         let find_dependents_schema = schema_for!(FindDependentsArgs);
         let analyze_grpc_schema = schema_for!(AnalyzeGrpcArgs);
         let analyze_impact_schema = schema_for!(AnalyzeImpactArgs);
         let search_docs_schema = schema_for!(SearchDocsArgs);
+        let visualize_mesh_schema = schema_for!(VisualizeMeshArgs);
 
         json!([
             {
@@ -50,6 +53,11 @@ impl ToolRegistry {
                 "name": SearchDocsTool::NAME,
                 "description": SearchDocsTool::DESCRIPTION,
                 "inputSchema": search_docs_schema,
+            },
+            {
+                "name": VisualizeMeshTool::NAME,
+                "description": VisualizeMeshTool::DESCRIPTION,
+                "inputSchema": visualize_mesh_schema,
             }
         ])
     }
@@ -106,6 +114,15 @@ impl ToolRegistry {
                 })?;
                 SearchDocsTool::execute(args, state).await?
             }
+            VisualizeMeshTool::NAME => {
+                let args: VisualizeMeshArgs = serde_json::from_value(arguments).map_err(|e| {
+                    (
+                        -32602,
+                        format!("Invalid arguments for {}: {e}", VisualizeMeshTool::NAME),
+                    )
+                })?;
+                VisualizeMeshTool::execute(args, state).await?
+            }
             unknown => return Err((-32601, format!("Unknown tool: {unknown}"))),
         };
 
@@ -125,15 +142,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_list_tools_contains_all_5() {
+    fn test_list_tools_contains_all_tools() {
         let tools = ToolRegistry::list_tools();
         let arr = tools.as_array().expect("tools array");
-        assert_eq!(arr.len(), 5);
+        assert_eq!(arr.len(), 6);
         let names: Vec<_> = arr.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"smart_search"));
         assert!(names.contains(&"find_dependents"));
         assert!(names.contains(&"analyze_grpc"));
         assert!(names.contains(&"analyze_impact"));
         assert!(names.contains(&"search_docs"));
+        assert!(names.contains(&"visualize_mesh"));
     }
 }

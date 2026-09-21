@@ -1,0 +1,24 @@
+# Configuration for polyglot-shop demo monorepo
+[workspace]
+name = "polyglot-shop"
+version = "1.0.0"
+roots = [
+  "proto",
+  "services/order-gateway",
+  "services/payment-worker",
+  "services/inventory-manager"
+]
+exclude_patterns = [
+  "**/target/**",
+  "**/node_modules/**"
+]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
+
+[engines.contracts.grpc]
+proto_dirs = ["proto"]
+controller_annotations = ["@GrpcMethod"]

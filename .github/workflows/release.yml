@@ -1,0 +1,91 @@
+name: Release Automation & Multi-Platform Matrix
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: mesh-mcp-x86_64-unknown-linux-gnu.tar.gz
+            bin_suffix: ""
+            cmd_compress: "tar -czf"
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_name: mesh-mcp-aarch64-apple-darwin.tar.gz
+            bin_suffix: ""
+            cmd_compress: "tar -czf"
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_name: mesh-mcp-x86_64-apple-darwin.tar.gz
+            bin_suffix: ""
+            cmd_compress: "tar -czf"
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: mesh-mcp-x86_64-pc-windows-msvc.zip
+            bin_suffix: ".exe"
+            cmd_compress: "zip"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Release Binaries
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Package Unix Archive (tar.gz)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mesh-mcp dist/
+          cp target/${{ matrix.target }}/release/meshd dist/
+          cd dist
+          tar -czf "../${{ matrix.archive_name }}" mesh-mcp meshd
+          cd ..
+          shasum -a 256 "${{ matrix.archive_name }}" > "${{ matrix.archive_name }}.sha256"
+
+      - name: Package Windows Archive (zip)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mesh-mcp.exe dist/
+          cp target/${{ matrix.target }}/release/meshd.exe dist/
+          cd dist
+          7z a "../${{ matrix.archive_name }}" mesh-mcp.exe meshd.exe
+          cd ..
+          certutil -hashfile "${{ matrix.archive_name }}" SHA256 | grep -v "hash" | tr -d ' \r\n' > "${{ matrix.archive_name }}.sha256"
+
+      - name: Upload Artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.archive_name }}
+            ${{ matrix.archive_name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

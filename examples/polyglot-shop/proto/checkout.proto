@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package shop.checkout.v1;
+
+service CheckoutService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc GetOrderStatus(OrderStatusRequest) returns (OrderStatusResponse);
+}
+
+message CreateOrderRequest {
+  string order_id = 1;
+  string customer_id = 2;
+  double amount = 3;
+}
+
+message CreateOrderResponse {
+  string order_id = 1;
+  string status = 2;
+}
+
+message OrderStatusRequest {
+  string order_id = 1;
+}
+
+message OrderStatusResponse {
+  string order_id = 1;
+  string status = 2;
+}
+
+message OrderCreatedEvent {
+  string order_id = 1;
+  string customer_id = 2;
+  double amount = 3;
+  int64 timestamp = 4;
+}

@@ -16,7 +16,9 @@ pub mod watcher;
 
 // Re-export common types
 pub use audit::{AuditEntry, AuditError, AuditLogger};
-pub use config::{expand_roots, Config, ConfigError, WorkspaceConfig};
+pub use config::{
+    expand_roots, Config, ConfigError, CustomPatternConfig, PatternKind, WorkspaceConfig,
+};
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::FilesystemCrawler;
 pub use docs::{DocIndex, DocSection};

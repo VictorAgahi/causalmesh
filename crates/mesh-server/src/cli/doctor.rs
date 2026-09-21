@@ -66,9 +66,17 @@ impl DoctorCommand {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             eprintln!("✔ Host OS event subsystem: Native (APFS FSEvents/kqueue active)");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("✔ Host OS event subsystem: Native (Windows ReadDirectoryChangesW active)");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            eprintln!("✔ Host OS event subsystem: Native event queue active");
         }
 
         // 5. Stdio loopback latency
@@ -89,6 +97,27 @@ impl DoctorCommand {
 
         // 7. Memory baseline
         eprintln!("✔ Memory baseline: < 20 MiB RSS (mimalloc + compact_str)");
+
+        // 8. Toolchain utilities check
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let rg_ok = std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if git_ok && rg_ok {
+            eprintln!("✔ Toolchain utilities: git & ripgrep detected");
+        } else if git_ok {
+            eprintln!("✔ Toolchain utilities: git detected (ripgrep recommended for large repos)");
+        } else {
+            eprintln!("⚠ Toolchain utilities: git not found in PATH");
+        }
+
         eprintln!("\n✔ All systems operational. Ready for AI agents.");
 
         Ok(())

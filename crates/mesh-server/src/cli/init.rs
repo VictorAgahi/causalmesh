@@ -26,6 +26,32 @@ impl InitCommand {
             roots.push("./services/*".to_string());
         }
 
+        if cur_dir.join("crates").exists() {
+            eprintln!("  Found: Rust multi-crate workspace (./crates/*)");
+            roots.push("./crates/*".to_string());
+        } else if cur_dir.join("Cargo.toml").exists() {
+            eprintln!("  Found: Rust project (Cargo.toml)");
+        }
+
+        if cur_dir.join("packages").exists() {
+            eprintln!("  Found: Monorepo packages (./packages/*)");
+            roots.push("./packages/*".to_string());
+        } else if cur_dir.join("package.json").exists() {
+            eprintln!("  Found: Node / TypeScript project (package.json)");
+        }
+
+        if cur_dir.join("go.mod").exists() {
+            eprintln!("  Found: Go module (go.mod)");
+        }
+
+        if cur_dir.join("pom.xml").exists() || cur_dir.join("build.gradle").exists() {
+            eprintln!("  Found: Java / Gradle / Maven project");
+        }
+
+        if cur_dir.join("pyproject.toml").exists() || cur_dir.join("requirements.txt").exists() {
+            eprintln!("  Found: Python project");
+        }
+
         if cur_dir.join("k8s-infrastructure").exists() || cur_dir.join("deploy").exists() {
             eprintln!("  Found: Kubernetes manifests");
             roots.push("./k8s*".to_string());

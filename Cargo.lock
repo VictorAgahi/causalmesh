@@ -589,6 +589,7 @@ dependencies = [
  "once_cell",
  "path-clean",
  "rayon",
+ "regex",
  "ring",
  "rusqlite",
  "same-file",
@@ -636,6 +637,7 @@ version = "2.9.0"
 dependencies = [
  "compact_str",
  "mesh-core",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

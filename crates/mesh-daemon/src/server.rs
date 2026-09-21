@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +66,7 @@ impl RpcResponse {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Binds to `socket_path` and accepts connections until `cancel_token` fires.
+#[cfg(unix)]
 pub async fn run_uds_server(
     socket_path: &std::path::Path,
     state: Arc<AppState>,
@@ -106,8 +108,19 @@ pub async fn run_uds_server(
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub async fn run_uds_server(
+    _socket_path: &std::path::Path,
+    _state: Arc<AppState>,
+    _cancel_token: CancellationToken,
+    _counter: ClientCounter,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err("meshd background UDS daemon is only supported on Unix targets. On Windows, run `mesh-mcp run --standalone`.".into())
+}
+
 // ── Per-client handler ────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 async fn handle_client(
     stream: UnixStream,
     state: Arc<AppState>,
@@ -203,7 +216,7 @@ async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::idle::ClientCounter;

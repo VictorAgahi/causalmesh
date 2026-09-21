@@ -135,6 +135,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
                     }
+
+                    if let Some(ref contracts_cfg) = state.config.load().engines.contracts {
+                        PolyglotIndexer::apply_custom_patterns(
+                            &file,
+                            &content,
+                            0,
+                            &contracts_cfg.patterns,
+                            &mut graph,
+                        );
+                    }
                 }
             }
 

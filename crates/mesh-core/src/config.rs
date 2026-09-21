@@ -140,6 +140,35 @@ pub struct ContractsConfig {
     pub openapi: Option<OpenApiConfig>,
     #[serde(default)]
     pub asyncapi: Option<AsyncApiConfig>,
+    #[serde(default)]
+    pub patterns: Vec<CustomPatternConfig>,
+}
+
+fn default_group_1() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomPatternConfig {
+    pub name: String,
+    pub kind: PatternKind,
+    #[serde(default)]
+    pub file_pattern: Option<String>,
+    pub regex: String,
+    #[serde(default = "default_group_1")]
+    pub target_group: usize,
+    #[serde(default)]
+    pub consumer_group: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternKind {
+    TopicProducer,
+    TopicConsumer,
+    Saga,
+    Rpc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

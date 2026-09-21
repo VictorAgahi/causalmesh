@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HooksCommand::run()?;
         }
         Commands::Run { standalone } => {
+            #[cfg(unix)]
             if !standalone {
                 // ── UDS Proxy Mode ────────────────────────────────────────────
                 let sock_path = resolve_socket_path();
@@ -108,6 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            #[cfg(not(unix))]
+            let _ = standalone;
+
             // ── Standalone Mode (in-process fallback) ─────────────────────────
             run_standalone(cli.config.as_deref()).await?;
         }
@@ -119,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
 /// Resolves the socket path — mirrors meshd/src/socket.rs logic.
+#[cfg(unix)]
 fn resolve_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("MESH_SOCKET_PATH") {
         return PathBuf::from(p);
@@ -126,7 +131,7 @@ fn resolve_socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("mesh").join("meshd.sock");
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         return PathBuf::from(home)
             .join(".cache")
             .join("mesh")
@@ -137,6 +142,7 @@ fn resolve_socket_path() -> PathBuf {
 }
 
 /// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
+#[cfg(unix)]
 async fn ensure_daemon_running(
     sock_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -175,6 +181,7 @@ async fn ensure_daemon_running(
 }
 
 /// Ultra-lightweight proxy: bridges stdin/stdout ↔ UDS (zero-copy, < 2 MiB footprint).
+#[cfg(unix)]
 async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::AsyncWriteExt;
 
@@ -267,6 +274,16 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
                         PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
                     } else {
                         PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                    }
+
+                    if let Some(ref contracts_cfg) = state.config.load().engines.contracts {
+                        PolyglotIndexer::apply_custom_patterns(
+                            &file,
+                            &content,
+                            0,
+                            &contracts_cfg.patterns,
+                            &mut graph,
+                        );
                     }
                 }
             }

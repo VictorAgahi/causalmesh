@@ -14,8 +14,20 @@ impl FileWatcherService {
         state: Arc<AppState>,
         cancel_token: CancellationToken,
     ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
-        mesh_core::FileWatcherService::spawn(state, cancel_token, |file, content, graph| {
+        let patterns = state
+            .config
+            .load()
+            .engines
+            .contracts
+            .as_ref()
+            .map(|c| c.patterns.clone())
+            .unwrap_or_default();
+
+        mesh_core::FileWatcherService::spawn(state, cancel_token, move |file, content, graph| {
             mesh_parsers::PolyglotIndexer::index_file(file, content, 0, graph);
+            mesh_parsers::PolyglotIndexer::apply_custom_patterns(
+                file, content, 0, &patterns, graph,
+            );
         })
     }
 
@@ -25,8 +37,20 @@ impl FileWatcherService {
     }
 
     pub fn execute_reload_sync(state: &AppState) {
+        let patterns = state
+            .config
+            .load()
+            .engines
+            .contracts
+            .as_ref()
+            .map(|c| c.patterns.clone())
+            .unwrap_or_default();
+
         mesh_core::FileWatcherService::execute_reload_sync(state, &|file, content, graph| {
             mesh_parsers::PolyglotIndexer::index_file(file, content, 0, graph);
+            mesh_parsers::PolyglotIndexer::apply_custom_patterns(
+                file, content, 0, &patterns, graph,
+            );
         });
     }
 }

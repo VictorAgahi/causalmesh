@@ -48,30 +48,42 @@ impl AuditLogger {
         "0000000000000000000000000000000000000000000000000000000000000000";
 
     pub fn default_db_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join(".cache")
-            .join("mesh-mcp")
-            .join("audit.db")
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("mesh-mcp")
+                .join("audit.db")
+        } else {
+            std::env::temp_dir().join("mesh-mcp").join("audit.db")
+        }
     }
 
     pub fn default_log_path() -> PathBuf {
         Self::default_db_path()
     }
 
+    pub fn new_in_memory() -> Result<Self, AuditError> {
+        Self::new(Some(PathBuf::from(":memory:")))
+    }
+
     pub fn new(path: Option<PathBuf>) -> Result<Self, AuditError> {
         let db_path = path.unwrap_or_else(Self::default_db_path);
 
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let conn = if db_path.to_string_lossy() == ":memory:" {
+            Connection::open_in_memory()?
+        } else {
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
             }
-        }
+            Connection::open(&db_path)?
+        };
 
-        let conn = Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let current_mode: String = conn

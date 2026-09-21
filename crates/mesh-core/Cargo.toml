@@ -34,6 +34,7 @@ notify-debouncer-mini.workspace = true
 rusqlite.workspace = true
 unicode-normalization.workspace = true
 once_cell.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

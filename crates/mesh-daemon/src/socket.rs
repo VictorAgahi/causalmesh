@@ -30,27 +30,43 @@ pub fn socket_path() -> PathBuf {
         return p;
     }
 
+    #[cfg(unix)]
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/mesh-{uid}.sock"))
+    #[cfg(not(unix))]
+    let uid = unsafe { libc::getpid() as u32 };
+
+    #[cfg(unix)]
+    return PathBuf::from(format!("/tmp/mesh-{uid}.sock"));
+    #[cfg(not(unix))]
+    return std::env::temp_dir().join(format!("mesh-{uid}.sock"));
 }
 
 pub fn cleanup_stale_socket(path: &std::path::Path) {
     if !path.exists() {
         return;
     }
-    use std::os::unix::net::UnixStream;
-    if UnixStream::connect(path).is_err() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        if UnixStream::connect(path).is_err() {
+            let _ = std::fs::remove_file(path);
+            tracing::info!(
+                target: "meshd::socket",
+                "Removed stale socket at {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
         let _ = std::fs::remove_file(path);
-        tracing::info!(
-            target: "meshd::socket",
-            "Removed stale socket at {}",
-            path.display()
-        );
     }
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]

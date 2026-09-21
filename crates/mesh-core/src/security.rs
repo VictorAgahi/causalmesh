@@ -185,6 +185,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_symlink_escape_attempt() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -200,18 +201,15 @@ mod tests {
         let canonical_allowed = dunce::canonicalize(&allowed_dir).expect("canonical allowed");
         let scope = ValidatedScope(canonical_allowed.clone());
 
-        #[cfg(unix)]
-        {
-            let symlink_path = allowed_dir.join("symlink_to_secret.txt");
-            let _ = std::os::unix::fs::symlink(&secret_file, &symlink_path);
+        let symlink_path = allowed_dir.join("symlink_to_secret.txt");
+        let _ = std::os::unix::fs::symlink(&secret_file, &symlink_path);
 
-            let res = scope.validate_file_access(&symlink_path, &[canonical_allowed]);
-            assert!(
-                matches!(res, Err(SecurityError::SandboxEscapeAttempt(_))),
-                "Symlink pointing outside allowed root must be rejected, got: {:?}",
-                res
-            );
-        }
+        let res = scope.validate_file_access(&symlink_path, &[canonical_allowed]);
+        assert!(
+            matches!(res, Err(SecurityError::SandboxEscapeAttempt(_))),
+            "Symlink pointing outside allowed root must be rejected, got: {:?}",
+            res
+        );
     }
 
     #[test]

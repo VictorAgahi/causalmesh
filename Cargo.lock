@@ -607,6 +607,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-daemon"
+version = "2.9.0"
+dependencies = [
+ "arc-swap",
+ "clap",
+ "dunce",
+ "libc",
+ "mesh-core",
+ "mesh-parsers",
+ "mesh-server",
+ "mimalloc",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mesh-parsers"
 version = "2.9.0"
 dependencies = [
@@ -636,6 +660,7 @@ dependencies = [
  "clap",
  "compact_str",
  "dunce",
+ "libc",
  "mesh-core",
  "mesh-parsers",
  "mimalloc",

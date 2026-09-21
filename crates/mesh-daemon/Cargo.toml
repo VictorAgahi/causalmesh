@@ -1,42 +1,35 @@
 [package]
-name = "mesh-server"
+name = "mesh-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-default-run = "mesh-mcp"
 
 [[bin]]
-name = "mesh-mcp"
+name = "meshd"
 path = "src/main.rs"
-
-[[bench]]
-name = "real_benchmarks"
-harness = false
 
 [dependencies]
 mesh-core.workspace = true
 mesh-parsers.workspace = true
+mesh-server.workspace = true
 
-compact_str.workspace = true
-mimalloc.workspace = true
+arc-swap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 toml.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 dunce.workspace = true
-num_cpus.workspace = true
-notify.workspace = true
-notify-debouncer-mini.workspace = true
+once_cell.workspace = true
+mimalloc.workspace = true
 libc.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "crates/mesh-core",
     "crates/mesh-parsers",
-    "crates/mesh-server"
+    "crates/mesh-server",
+    "crates/mesh-daemon"
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ repository = "https://github.com/causalmesh/mesh-mcp"
 [workspace.dependencies]
 mesh-core = { path = "crates/mesh-core" }
 mesh-parsers = { path = "crates/mesh-parsers" }
+mesh-server = { path = "crates/mesh-server" }
 
 arc-swap = "1.7"
 tokio = { version = "1.43", features = ["full"] }

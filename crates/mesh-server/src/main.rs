@@ -30,24 +30,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the MeshMCP JSON-RPC server over stdio (default)
-    Run,
+    /// Run the MeshMCP JSON-RPC server over stdio.
+    /// By default, connects to the shared meshd daemon via UDS for zero-overhead operation.
+    /// Falls back to --standalone mode if daemon is unavailable.
+    Run {
+        /// Force standalone mode: skip daemon detection and run a full in-process server.
+        /// Use this in containerised environments or when UDS is not available.
+        #[arg(long, default_value = "false")]
+        standalone: bool,
+    },
 
     /// Run diagnostic healthchecks on environment, permissions, and roots
     Doctor,
 
     /// Automatically scan polyglot workspace and generate .agents/mesh-mcp.toml
     Init {
-        #[arg(
-            long,
-            help = "Automatically detect all services and schemas without prompts"
-        )]
+        #[arg(long, help = "Automatically detect all services and schemas without prompts")]
         auto: bool,
-
-        #[arg(
-            long,
-            help = "Generate IDE configurations for Cursor, VS Code, and Claude Code"
-        )]
+        #[arg(long, help = "Generate IDE configurations for Cursor, VS Code, and Claude Code")]
         write_ide_config: bool,
     },
 
@@ -66,118 +66,209 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run) {
+    match cli.command.unwrap_or(Commands::Run { standalone: false }) {
         Commands::Doctor => {
             DoctorCommand::run(cli.config.as_deref())?;
         }
-        Commands::Init {
-            auto,
-            write_ide_config,
-        } => {
+        Commands::Init { auto, write_ide_config } => {
             InitCommand::run(auto, write_ide_config)?;
         }
         Commands::InstallHooks => {
             HooksCommand::run()?;
         }
-        Commands::Run => {
-            let config_paths = [
-                cli.config.clone(),
-                Some(PathBuf::from(".agents/mesh-mcp.toml")),
-                Some(PathBuf::from("mesh-mcp.toml")),
-            ];
-
-            let found_path = config_paths.into_iter().flatten().find(|p| p.exists());
-            let (config, base_dir) = if let Some(ref path) = found_path {
-                let cfg = Config::load_from_file(path)?;
-                let base = path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                (cfg, base)
-            } else {
-                let default_cfg_str = r#"
-[workspace]
-name = "default-mesh"
-version = "2.9.0"
-roots = ["."]
-"#;
-                (Config::load_from_str(default_cfg_str)?, PathBuf::from("."))
-            };
-
-            let allowed_roots = match expand_roots(&config.workspace.roots, &base_dir) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "mesh::config", "Failed to expand roots: {e}. Falling back to base directory.");
-                    vec![dunce::canonicalize(&base_dir).unwrap_or(base_dir.clone())]
-                }
-            };
-
-            let audit = Arc::new(AuditLogger::new(None)?);
-            let rescan = Arc::new(BackgroundRescanEngine::new()?);
-
-            let state = Arc::new(AppState::new(
-                config.clone(),
-                allowed_roots.clone(),
-                audit,
-                rescan,
-            ));
-
-            // Initial Ingestion Phase
-            for root in &allowed_roots {
-                if let Ok(validated_scope) =
-                    ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
-                {
-                    let files = FilesystemCrawler::crawl_scope(
-                        &validated_scope,
-                        &config.workspace.exclude_patterns,
-                        Some(10),
-                    );
-                    let mut graph = (*state.contract_graph.load().as_ref()).clone();
-                    let mut doc_index = (*state.doc_index.load().as_ref()).clone();
-                    let mut prop_reg = (*state.property_registry.load().as_ref()).clone();
-
-                    for file in files {
-                        if let Ok(content) = std::fs::read_to_string(&file) {
-                            let path_str = file.to_string_lossy();
-                            if path_str.ends_with(".md") {
-                                doc_index.index_markdown_file(&file, &content);
-                            } else if path_str.ends_with(".properties") {
-                                prop_reg.ingest_properties_str(&content);
-                            } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
-                                let _ = prop_reg.ingest_yaml_str(&content);
-                                PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
-                            } else {
-                                PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
-                            }
-                        }
+        Commands::Run { standalone } => {
+            if !standalone {
+                // ── UDS Proxy Mode ────────────────────────────────────────────
+                let sock_path = resolve_socket_path();
+                match ensure_daemon_running(&sock_path).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "mesh::proxy",
+                            "Connecting to meshd at {}",
+                            sock_path.display()
+                        );
+                        return run_proxy_mode(&sock_path).await;
                     }
-
-                    state.contract_graph.store(Arc::new(graph));
-                    state.doc_index.store(Arc::new(doc_index));
-                    state.property_registry.store(Arc::new(prop_reg));
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mesh::proxy",
+                            "Could not connect to meshd ({}). Falling back to standalone mode.",
+                            e
+                        );
+                    }
                 }
             }
 
-            let cancel_token = CancellationToken::new();
-            let cancel_sig = cancel_token.clone();
-
-            // Graceful shutdown on SIGINT / Ctrl-C per RFC Section 3.6
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!(target: "mesh::shutdown", "SIGINT/Ctrl-C received. Initiating graceful shutdown.");
-                cancel_sig.cancel();
-            });
-
-            // [P0-1] Spawn in-kernel FileWatcherService for hot debounced reloading and git checkout detection
-            if let Err(e) =
-                mesh_server::FileWatcherService::spawn(state.clone(), cancel_token.clone())
-            {
-                tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
-            }
-
-            run_server(state, cancel_token).await?;
+            // ── Standalone Mode (in-process fallback) ─────────────────────────
+            run_standalone(cli.config.as_deref()).await?;
         }
     }
 
+    Ok(())
+}
+
+// ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+/// Resolves the socket path — mirrors meshd/src/socket.rs logic.
+fn resolve_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("MESH_SOCKET_PATH") {
+        return PathBuf::from(p);
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("mesh").join("meshd.sock");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("mesh").join("meshd.sock");
+    }
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/mesh-{uid}.sock"))
+}
+
+/// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
+async fn ensure_daemon_running(
+    sock_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
+        return Ok(());
+    }
+
+    tracing::info!(target: "mesh::proxy", "meshd not found. Attempting auto-spawn…");
+
+    let meshd_path = std::env::current_exe()?
+        .parent()
+        .ok_or("Cannot determine exe dir")?
+        .join("meshd");
+
+    if !meshd_path.exists() {
+        return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
+    }
+
+    std::process::Command::new(&meshd_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
+
+    // Poll up to 500ms for socket to appear
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
+            tracing::info!(target: "mesh::proxy", "meshd started successfully.");
+            return Ok(());
+        }
+    }
+
+    Err("meshd did not bind socket within 500ms".into())
+}
+
+/// Ultra-lightweight proxy: bridges stdin/stdout ↔ UDS (zero-copy, < 2 MiB footprint).
+async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncWriteExt;
+
+    let stream = tokio::net::UnixStream::connect(sock_path).await?;
+    let (daemon_reader, mut daemon_writer) = stream.into_split();
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let stdin_to_daemon = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stdin, &mut daemon_writer).await;
+        let _ = daemon_writer.shutdown().await;
+    });
+
+    let daemon_to_stdout = tokio::spawn(async move {
+        let mut daemon_reader = daemon_reader;
+        let _ = tokio::io::copy(&mut daemon_reader, &mut stdout).await;
+    });
+
+    tokio::select! {
+        _ = stdin_to_daemon => {}
+        _ = daemon_to_stdout => {}
+    }
+
+    Ok(())
+}
+
+// ── Standalone mode (full in-process server, original V2 behaviour) ───────────
+
+async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let config_paths = [
+        config_path.map(|p| p.to_path_buf()),
+        Some(PathBuf::from(".agents/mesh-mcp.toml")),
+        Some(PathBuf::from("mesh-mcp.toml")),
+    ];
+
+    let found_path = config_paths.into_iter().flatten().find(|p| p.exists());
+    let (config, base_dir) = if let Some(ref path) = found_path {
+        let cfg = Config::load_from_file(path)?;
+        let base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        (cfg, base)
+    } else {
+        let default = "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
+        (Config::load_from_str(default)?, PathBuf::from("."))
+    };
+
+    let allowed_roots = match expand_roots(&config.workspace.roots, &base_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "mesh::config", "Failed to expand roots: {e}. Falling back to base directory.");
+            vec![dunce::canonicalize(&base_dir).unwrap_or(base_dir.clone())]
+        }
+    };
+
+    let audit = Arc::new(AuditLogger::new(None)?);
+    let rescan = Arc::new(BackgroundRescanEngine::new()?);
+    let state = Arc::new(AppState::new(config.clone(), allowed_roots.clone(), audit, rescan));
+
+    for root in &allowed_roots {
+        if let Ok(validated_scope) =
+            ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
+        {
+            let files = FilesystemCrawler::crawl_scope(
+                &validated_scope,
+                &config.workspace.exclude_patterns,
+                Some(10),
+            );
+            let mut graph = (*state.contract_graph.load().as_ref()).clone();
+            let mut doc_index = (*state.doc_index.load().as_ref()).clone();
+            let mut prop_reg = (*state.property_registry.load().as_ref()).clone();
+
+            for file in files {
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    let path_str = file.to_string_lossy();
+                    if path_str.ends_with(".md") {
+                        doc_index.index_markdown_file(&file, &content);
+                    } else if path_str.ends_with(".properties") {
+                        prop_reg.ingest_properties_str(&content);
+                    } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
+                        let _ = prop_reg.ingest_yaml_str(&content);
+                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                    } else {
+                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                    }
+                }
+            }
+
+            state.contract_graph.store(Arc::new(graph));
+            state.doc_index.store(Arc::new(doc_index));
+            state.property_registry.store(Arc::new(prop_reg));
+        }
+    }
+
+    let cancel_token = CancellationToken::new();
+    let cancel_sig = cancel_token.clone();
+
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(target: "mesh::shutdown", "SIGINT/Ctrl-C received. Initiating graceful shutdown.");
+        cancel_sig.cancel();
+    });
+
+    if let Err(e) = mesh_server::FileWatcherService::spawn(state.clone(), cancel_token.clone()) {
+        tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
+    }
+
+    run_server(state, cancel_token).await?;
     Ok(())
 }

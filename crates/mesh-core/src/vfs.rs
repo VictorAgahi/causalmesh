@@ -130,7 +130,10 @@ mod tests {
 
         // Fourth check after modification with same content: unchanged
         let is_changed_fourth = vfs.check_and_update(&path, "content v2");
-        assert!(!is_changed_fourth, "Same content after update must return false");
+        assert!(
+            !is_changed_fourth,
+            "Same content after update must return false"
+        );
 
         // Remove
         assert!(vfs.remove(&path));

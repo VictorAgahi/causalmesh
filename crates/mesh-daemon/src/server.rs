@@ -41,7 +41,12 @@ struct RpcError {
 
 impl RpcResponse {
     fn success(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     fn error(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
@@ -49,7 +54,10 @@ impl RpcResponse {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -175,7 +183,10 @@ async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
         "tools/call" => {
             if let Some(params) = req.params {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 match ToolRegistry::call_tool(tool_name, arguments, state.clone()).await {
                     Ok(result) => RpcResponse::success(id, result),
                     Err((code, msg)) => RpcResponse::error(id, code.into(), msg),
@@ -235,7 +246,10 @@ mod tests {
         // Wait for socket to appear
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert!(sock_path.exists(), "Socket file must exist after daemon binds");
+        assert!(
+            sock_path.exists(),
+            "Socket file must exist after daemon binds"
+        );
 
         token.cancel();
     }
@@ -273,7 +287,10 @@ mod tests {
                 let mut buf = vec![0u8; 256];
                 let n = stream.read(&mut buf).await.unwrap();
                 let resp = std::str::from_utf8(&buf[..n]).unwrap().to_string();
-                assert!(resp.contains("\"result\""), "Expected result in response: {resp}");
+                assert!(
+                    resp.contains("\"result\""),
+                    "Expected result in response: {resp}"
+                );
             }));
         }
 
@@ -312,8 +329,7 @@ mod tests {
 
         let mut buf = vec![0u8; 512];
         let n = stream.read(&mut buf).await.unwrap();
-        let resp: serde_json::Value =
-            serde_json::from_slice(&buf[..n]).unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
 
         assert_eq!(resp["id"], 42);
         assert!(resp["result"].is_object());

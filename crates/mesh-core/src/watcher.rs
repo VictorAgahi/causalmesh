@@ -157,8 +157,8 @@ impl FileWatcherService {
 
         // Use a thread-local VFS cache to avoid re-parsing unchanged files.
         // For the first run, all files are considered changed.
-        use std::sync::Mutex;
         use once_cell::sync::Lazy;
+        use std::sync::Mutex;
         static VFS_CACHE: Lazy<Mutex<crate::vfs::DifferentialVfs>> =
             Lazy::new(|| Mutex::new(crate::vfs::DifferentialVfs::new()));
 

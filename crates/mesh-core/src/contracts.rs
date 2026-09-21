@@ -158,10 +158,7 @@ impl ContractGraph {
     }
 
     pub fn patch_file(&mut self, file_path: &Path) {
-        let stale_ids: Vec<NodeId> = self
-            .file_to_nodes
-            .remove(file_path)
-            .unwrap_or_default();
+        let stale_ids: Vec<NodeId> = self.file_to_nodes.remove(file_path).unwrap_or_default();
 
         if stale_ids.is_empty() {
             return;
@@ -175,33 +172,27 @@ impl ContractGraph {
         }
 
         // Purge from secondary indices
-        self.name_to_nodes
-            .retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
-        self.package_to_nodes
-            .retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
-        self.fqcn_to_node
-            .retain(|_, id| !stale_set.contains(id));
-        self.reverse_deps
-            .retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
-        self.topic_producers
-            .retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
-        self.topic_consumers
-            .retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
+        self.name_to_nodes.retain(|_, ids| {
+            ids.retain(|id| !stale_set.contains(id));
+            !ids.is_empty()
+        });
+        self.package_to_nodes.retain(|_, ids| {
+            ids.retain(|id| !stale_set.contains(id));
+            !ids.is_empty()
+        });
+        self.fqcn_to_node.retain(|_, id| !stale_set.contains(id));
+        self.reverse_deps.retain(|_, ids| {
+            ids.retain(|id| !stale_set.contains(id));
+            !ids.is_empty()
+        });
+        self.topic_producers.retain(|_, ids| {
+            ids.retain(|id| !stale_set.contains(id));
+            !ids.is_empty()
+        });
+        self.topic_consumers.retain(|_, ids| {
+            ids.retain(|id| !stale_set.contains(id));
+            !ids.is_empty()
+        });
 
         // Remove edges referencing stale nodes
         self.edges

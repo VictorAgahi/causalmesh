@@ -183,7 +183,11 @@ impl AstDecapitator {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 let synthetic_type = format!(": {{ {} }}", fields);
-                                replacements.push((pos, pos, std::borrow::Cow::Owned(synthetic_type)));
+                                replacements.push((
+                                    pos,
+                                    pos,
+                                    std::borrow::Cow::Owned(synthetic_type),
+                                ));
                             }
                         }
                     }

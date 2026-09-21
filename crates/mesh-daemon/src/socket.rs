@@ -34,7 +34,6 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/mesh-{uid}.sock"))
 }
 
-
 pub fn cleanup_stale_socket(path: &std::path::Path) {
     if !path.exists() {
         return;

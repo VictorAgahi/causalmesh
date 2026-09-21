@@ -86,7 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_path_buf();
         (cfg, base)
     } else {
-        let default = "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
+        let default =
+            "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
         (Config::load_from_str(default)?, PathBuf::from("."))
     };
 
@@ -112,7 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
     for root in &allowed_roots {
         if let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots) {
-            let files = FilesystemCrawler::crawl_scope(&scope, &config.workspace.exclude_patterns, Some(10));
+            let files = FilesystemCrawler::crawl_scope(
+                &scope,
+                &config.workspace.exclude_patterns,
+                Some(10),
+            );
             let mut graph = (*state.contract_graph.load().as_ref()).clone();
             let mut doc_index = (*state.doc_index.load().as_ref()).clone();
             let mut prop_reg = (*state.property_registry.load().as_ref()).clone();

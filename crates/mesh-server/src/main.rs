@@ -45,9 +45,15 @@ enum Commands {
 
     /// Automatically scan polyglot workspace and generate .agents/mesh-mcp.toml
     Init {
-        #[arg(long, help = "Automatically detect all services and schemas without prompts")]
+        #[arg(
+            long,
+            help = "Automatically detect all services and schemas without prompts"
+        )]
         auto: bool,
-        #[arg(long, help = "Generate IDE configurations for Cursor, VS Code, and Claude Code")]
+        #[arg(
+            long,
+            help = "Generate IDE configurations for Cursor, VS Code, and Claude Code"
+        )]
         write_ide_config: bool,
     },
 
@@ -70,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Doctor => {
             DoctorCommand::run(cli.config.as_deref())?;
         }
-        Commands::Init { auto, write_ide_config } => {
+        Commands::Init {
+            auto,
+            write_ide_config,
+        } => {
             InitCommand::run(auto, write_ide_config)?;
         }
         Commands::InstallHooks => {
@@ -118,7 +127,10 @@ fn resolve_socket_path() -> PathBuf {
         return PathBuf::from(dir).join("mesh").join("meshd.sock");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("mesh").join("meshd.sock");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("mesh")
+            .join("meshd.sock");
     }
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/tmp/mesh-{uid}.sock"))
@@ -202,10 +214,14 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
     let found_path = config_paths.into_iter().flatten().find(|p| p.exists());
     let (config, base_dir) = if let Some(ref path) = found_path {
         let cfg = Config::load_from_file(path)?;
-        let base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let base = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         (cfg, base)
     } else {
-        let default = "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
+        let default =
+            "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
         (Config::load_from_str(default)?, PathBuf::from("."))
     };
 
@@ -219,7 +235,12 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
 
     let audit = Arc::new(AuditLogger::new(None)?);
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
-    let state = Arc::new(AppState::new(config.clone(), allowed_roots.clone(), audit, rescan));
+    let state = Arc::new(AppState::new(
+        config.clone(),
+        allowed_roots.clone(),
+        audit,
+        rescan,
+    ));
 
     for root in &allowed_roots {
         if let Ok(validated_scope) =

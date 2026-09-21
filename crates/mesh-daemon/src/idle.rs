@@ -108,8 +108,8 @@ mod tests {
         spawn_idle_watchdog(
             counter.clone(),
             token.clone(),
-            Duration::from_millis(80),  // idle timeout
-            Duration::from_millis(20),  // poll interval
+            Duration::from_millis(80), // idle timeout
+            Duration::from_millis(20), // poll interval
         );
 
         // Give watchdog at least one poll cycle to observe the active client
@@ -120,7 +120,10 @@ mod tests {
 
         // Wait for idle timeout + several poll cycles
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(token.is_cancelled(), "Watchdog should have cancelled the token");
+        assert!(
+            token.is_cancelled(),
+            "Watchdog should have cancelled the token"
+        );
     }
 
     #[tokio::test]
@@ -137,6 +140,9 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!token.is_cancelled(), "Watchdog must not fire without ever having a client");
+        assert!(
+            !token.is_cancelled(),
+            "Watchdog must not fire without ever having a client"
+        );
     }
 }

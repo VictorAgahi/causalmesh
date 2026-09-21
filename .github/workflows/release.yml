@@ -18,7 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            archive_name: mesh-mcp-x86_64-unknown-linux-musl.tar.gz
+            bin_suffix: ""
+            cmd_compress: "tar -czf"
+
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_name: mesh-mcp-x86_64-unknown-linux-gnu.tar.gz
             bin_suffix: ""
@@ -45,6 +51,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install musl-tools (for static Linux target)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

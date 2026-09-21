@@ -42,7 +42,7 @@ esac
 
 case "$OS" in
   linux)
-    TARGET_OS="unknown-linux-gnu"
+    TARGET_OS="unknown-linux-musl"
     EXT="tar.gz"
     ;;
   darwin)
@@ -79,17 +79,25 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 echo -e "⬇ Downloading CausalMesh from ${CYAN}${DOWNLOAD_URL}${RESET}..."
 
 DOWNLOAD_SUCCESS=0
-if command -v curl >/dev/null 2>&1; then
-  if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/archive.${EXT}" 2>/dev/null; then
+try_download() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$TMP_DIR/archive.${EXT}" 2>/dev/null && return 0
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$TMP_DIR/archive.${EXT}" "$url" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+if try_download "$DOWNLOAD_URL"; then
+  DOWNLOAD_SUCCESS=1
+elif [ "$TARGET_OS" = "unknown-linux-musl" ]; then
+  # Fallback to gnu if musl is not found
+  GNU_URL="${DOWNLOAD_URL/unknown-linux-musl/unknown-linux-gnu}"
+  echo -e "ℹ Trying fallback GNU target: ${CYAN}${GNU_URL}${RESET}..."
+  if try_download "$GNU_URL"; then
     DOWNLOAD_SUCCESS=1
   fi
-elif command -v wget >/dev/null 2>&1; then
-  if wget -qO "$TMP_DIR/archive.${EXT}" "$DOWNLOAD_URL" 2>/dev/null; then
-    DOWNLOAD_SUCCESS=1
-  fi
-else
-  echo -e "${RED}✖ Neither curl nor wget found. Please install one to proceed.${RESET}"
-  exit 1
 fi
 
 if [ "$DOWNLOAD_SUCCESS" -eq 1 ]; then

@@ -229,31 +229,38 @@ impl ContractGraph {
             if edge.kind == EdgeKind::Imports && edge.to == 0 {
                 if let Some(ref target) = edge.metadata {
                     let target_str = target.as_str();
+                    // Path::file_stem() strips everything after the LAST '.', so it
+                    // treats a scoped package ("@volontariapp/contracts" -> "contracts")
+                    // exactly the same as a dotted relative filename
+                    // ("./post.endpoints" -> "post", discarding ".endpoints" as if it
+                    // were an extension). Both are intentional here — see below — but
+                    // this is why the two cases must never share a matching branch.
                     let target_stem = Path::new(target_str)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(target_str);
 
-                    // A bare, unqualified specifier (no '/' or '.') is ambiguous: it
-                    // could be a workspace package's directory name, but it's just as
-                    // likely a language builtin module that happens to share that name
-                    // (e.g. `import { randomUUID } from 'crypto'` — Node's builtin —
-                    // colliding with an `@volontariapp/crypto` workspace package). Only
-                    // match on bare `package` equality for qualified specifiers, where
-                    // that ambiguity doesn't exist.
-                    let is_qualified = target_str.contains('/') || target_str.contains('.');
-
-                    // `target_stem` (the last path segment, extension stripped) is only
-                    // a meaningful symbol hint for an actual file path, e.g. `./auth`
-                    // stemming to "auth" for a same-named default export. For a bare or
-                    // scoped PACKAGE specifier (no leading '.' or '/'), the stem is just
-                    // the package's short name and matching it against ANY node's bare
-                    // name anywhere in the whole graph is unsound: `@volontariapp/auth`
-                    // stems to "auth" too, and would collide with any unrelated symbol
-                    // named "auth" in the entire codebase (e.g. a `get auth()` getter),
-                    // pulling every one of that package's dozens of importers onto it.
                     let is_relative_or_absolute_path =
                         target_str.starts_with('.') || target_str.starts_with('/');
+                    // NOTE: matching a scoped package specifier ("@volontariapp/contracts")
+                    // against `n.package` was tried and reverted — the extractor only ever
+                    // records the raw "from '...'" module string, never which SPECIFIC
+                    // named symbol was imported (`import { A, B, C } from 'x'` collapses to
+                    // just "x"). Any package-name match therefore has to `.find()` an
+                    // arbitrary node that merely shares that package, in HashMap iteration
+                    // order — observed live picking an unrelated symbol out of dozens of
+                    // real candidates. A silently wrong specific edge is worse than no
+                    // edge; fixing this for real needs the extractor to capture and resolve
+                    // each named import individually, not a matching-branch tweak here.
+                    let is_qualified = target_str.contains('/') || target_str.contains('.');
+
+                    // Relative imports can only ever resolve to a file inside the SAME
+                    // repo as the importer — never across a repo boundary. Without this,
+                    // a generic stem like "post" (from "../endpoints/post.endpoints")
+                    // matches any same-named symbol anywhere in the whole multi-repo
+                    // graph (e.g. an unrelated `post()` HTTP helper method in a
+                    // completely different repo's e2e test helpers).
+                    let importer_repo_id = self.nodes.get(&edge.from).map(|n| n.repo_id);
 
                     let matched_id = self
                         .nodes
@@ -261,8 +268,11 @@ impl ContractGraph {
                         .find(|n| {
                             n.name.as_str() == target_str
                                 || (is_relative_or_absolute_path
-                                    && n.name.as_str() == target_stem)
-                                || (is_qualified && n.package.as_str() == target_str)
+                                    && n.name.as_str() == target_stem
+                                    && importer_repo_id == Some(n.repo_id))
+                                || (is_qualified
+                                    && !is_relative_or_absolute_path
+                                    && n.package.as_str() == target_str)
                                 || format!("{}.{}", n.package, n.name) == target_str
                         })
                         .map(|n| n.id);

@@ -199,11 +199,18 @@ async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Erro
     let daemon_to_stdout = tokio::spawn(async move {
         let mut daemon_reader = daemon_reader;
         let _ = tokio::io::copy(&mut daemon_reader, &mut stdout).await;
+        let _ = stdout.flush().await;
     });
 
+    tokio::pin!(daemon_to_stdout);
+
+    // If daemon disconnects, terminate immediately.
+    // If stdin closes (e.g. echo pipe in CI), wait for daemon to drain response.
     tokio::select! {
-        _ = stdin_to_daemon => {}
-        _ = daemon_to_stdout => {}
+        _ = stdin_to_daemon => {
+            let _ = (&mut daemon_to_stdout).await;
+        }
+        _ = &mut daemon_to_stdout => {}
     }
 
     Ok(())

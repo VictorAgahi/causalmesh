@@ -176,7 +176,7 @@ mod unix_impl {
                 json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "meshd", "version": "2.9.0" }
+                    "serverInfo": { "name": "mesh-mcp", "version": "2.9.0" }
                 }),
             ),
             "notifications/initialized" => return None,

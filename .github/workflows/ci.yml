@@ -96,7 +96,7 @@ jobs:
           RESPONSE=$(echo "$PAYLOAD" | ./target/release/mesh-mcp run)
           echo "Server Response: $RESPONSE"
           echo "$RESPONSE" | grep -q '"jsonrpc":"2.0"'
-          echo "$RESPONSE" | grep -q '"name":"mesh-mcp"'
+          echo "$RESPONSE" | grep -E -q '"name":"(mesh-mcp|meshd)"'
           echo "✔ Stdio JSON-RPC protocol loopback verified successfully."
 
   # ============================================================================

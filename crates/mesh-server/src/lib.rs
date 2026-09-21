@@ -21,7 +21,7 @@ pub async fn run_server(
     state: Arc<AppState>,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (tx_out, mut rx_in) = StdioFramingActor::spawn(cancel_token.clone());
+    let (tx_out, mut rx_in, writer_done) = StdioFramingActor::spawn(cancel_token.clone());
 
     tracing::info!(target: "mesh::server", "MeshMCP server initialized on stdio");
 
@@ -91,5 +91,11 @@ pub async fn run_server(
         }
     }
 
+    // Drop tx_out so the writer task sees channel closure and flushes, then
+    // wait for it to complete before returning — this is the key drain barrier.
+    drop(tx_out);
+    let _ = writer_done.await;
+
     Ok(())
 }
+

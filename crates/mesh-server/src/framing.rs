@@ -1,6 +1,7 @@
 use std::io::ErrorKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub const MPSC_BUFFER_CAPACITY: usize = 64;
@@ -10,16 +11,25 @@ pub struct StdioFramingActor;
 
 impl StdioFramingActor {
     /// Spawns the dedicated reader and writer actors.
-    /// Returns the sender to write frames and the receiver of incoming lines.
+    ///
+    /// Returns:
+    /// - `tx_out`: sender used to enqueue outgoing JSON-RPC frames
+    /// - `rx_in`:  receiver that delivers incoming JSON-RPC frames from stdin
+    /// - `writer_done`: a `JoinHandle` that resolves once the writer task has
+    ///   flushed all pending output and exited.  The caller **must** await this
+    ///   handle after the event-loop drains so the process does not exit before
+    ///   the response has been written to stdout (fixes the CI EOF race).
     pub fn spawn(
         cancel_token: CancellationToken,
-    ) -> (mpsc::Sender<String>, mpsc::Receiver<String>) {
+    ) -> (mpsc::Sender<String>, mpsc::Receiver<String>, JoinHandle<()>) {
         let (tx_in, rx_in) = mpsc::channel::<String>(MPSC_BUFFER_CAPACITY);
         let (tx_out, mut rx_out) = mpsc::channel::<String>(MPSC_BUFFER_CAPACITY);
 
-        // Dedicated Tokio writer task wrapping stdout in BufWriter
+        // Dedicated Tokio writer task wrapping stdout in BufWriter.
+        // The JoinHandle is returned to the caller so it can be awaited after
+        // the event-loop ends, guaranteeing all pending frames are flushed.
         let cancel_writer = cancel_token.clone();
-        tokio::spawn(async move {
+        let writer_done: JoinHandle<()> = tokio::spawn(async move {
             let stdout = tokio::io::stdout();
             let mut writer = BufWriter::new(stdout);
 
@@ -45,6 +55,7 @@ impl StdioFramingActor {
                                 }
                             }
                             None => {
+                                // All senders dropped – flush and exit cleanly.
                                 let _ = writer.flush().await;
                                 break;
                             }
@@ -54,7 +65,7 @@ impl StdioFramingActor {
             }
         });
 
-        // Dedicated Tokio reader task reading stdin line-by-line
+        // Dedicated Tokio reader task reading stdin line-by-line.
         let cancel_reader = cancel_token.clone();
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
@@ -88,6 +99,6 @@ impl StdioFramingActor {
             }
         });
 
-        (tx_out, rx_in)
+        (tx_out, rx_in, writer_done)
     }
 }

@@ -78,35 +78,54 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo -e "⬇ Downloading CausalMesh from ${CYAN}${DOWNLOAD_URL}${RESET}..."
 
+DOWNLOAD_SUCCESS=0
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/archive.${EXT}"
+  if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/archive.${EXT}" 2>/dev/null; then
+    DOWNLOAD_SUCCESS=1
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$TMP_DIR/archive.${EXT}" "$DOWNLOAD_URL"
+  if wget -qO "$TMP_DIR/archive.${EXT}" "$DOWNLOAD_URL" 2>/dev/null; then
+    DOWNLOAD_SUCCESS=1
+  fi
 else
   echo -e "${RED}✖ Neither curl nor wget found. Please install one to proceed.${RESET}"
   exit 1
 fi
 
-echo -e "📦 Unpacking binaries into ${INSTALL_DIR}..."
-if [ "$EXT" = "tar.gz" ]; then
-  tar -xzf "$TMP_DIR/archive.${EXT}" -C "$TMP_DIR"
-elif [ "$EXT" = "zip" ]; then
-  unzip -q "$TMP_DIR/archive.${EXT}" -d "$TMP_DIR"
-fi
+if [ "$DOWNLOAD_SUCCESS" -eq 1 ]; then
+  echo -e "📦 Unpacking binaries into ${INSTALL_DIR}..."
+  if [ "$EXT" = "tar.gz" ]; then
+    tar -xzf "$TMP_DIR/archive.${EXT}" -C "$TMP_DIR"
+  elif [ "$EXT" = "zip" ]; then
+    unzip -q "$TMP_DIR/archive.${EXT}" -d "$TMP_DIR"
+  fi
 
-# Move binaries
-if [ -f "$TMP_DIR/mesh-mcp" ]; then
-  mv "$TMP_DIR/mesh-mcp" "$INSTALL_DIR/mesh-mcp"
-  chmod +x "$INSTALL_DIR/mesh-mcp"
-elif [ -f "$TMP_DIR/mesh-mcp.exe" ]; then
-  mv "$TMP_DIR/mesh-mcp.exe" "$INSTALL_DIR/mesh-mcp.exe"
-fi
+  # Move binaries
+  if [ -f "$TMP_DIR/mesh-mcp" ]; then
+    mv "$TMP_DIR/mesh-mcp" "$INSTALL_DIR/mesh-mcp"
+    chmod +x "$INSTALL_DIR/mesh-mcp"
+  elif [ -f "$TMP_DIR/mesh-mcp.exe" ]; then
+    mv "$TMP_DIR/mesh-mcp.exe" "$INSTALL_DIR/mesh-mcp.exe"
+  fi
 
-if [ -f "$TMP_DIR/meshd" ]; then
-  mv "$TMP_DIR/meshd" "$INSTALL_DIR/meshd"
-  chmod +x "$INSTALL_DIR/meshd"
-elif [ -f "$TMP_DIR/meshd.exe" ]; then
-  mv "$TMP_DIR/meshd.exe" "$INSTALL_DIR/meshd.exe"
+  if [ -f "$TMP_DIR/meshd" ]; then
+    mv "$TMP_DIR/meshd" "$INSTALL_DIR/meshd"
+    chmod +x "$INSTALL_DIR/meshd"
+  elif [ -f "$TMP_DIR/meshd.exe" ]; then
+    mv "$TMP_DIR/meshd.exe" "$INSTALL_DIR/meshd.exe"
+  fi
+else
+  echo -e "${YELLOW}ℹ Precompiled binary release not yet published on GitHub Releases.${RESET}"
+  if command -v cargo >/dev/null 2>&1; then
+    echo -e "⚙ Building and installing locally via Cargo..."
+    cargo install --git "https://github.com/${REPO}.git" mesh-server --bin mesh-mcp --root "$HOME/.local"
+    cargo install --git "https://github.com/${REPO}.git" mesh-daemon --bin meshd --root "$HOME/.local"
+  else
+    echo -e "${RED}✖ Failed to download release archive from GitHub and Cargo is not installed.${RESET}"
+    echo -e "  Please ensure the repository has published release binaries at:"
+    echo -e "  https://github.com/${REPO}/releases"
+    exit 1
+  fi
 fi
 
 echo -e "\n${GREEN}${BOLD}✔ CausalMesh installed successfully!${RESET}"

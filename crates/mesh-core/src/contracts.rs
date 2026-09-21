@@ -1,5 +1,5 @@
 use crate::types::CompactStr;
-use crate::types::{ContractEdge, ContractNode, EdgeKind, NodeId, NodeKind};
+use crate::types::{ContractEdge, ContractNode, EdgeKind, NodeId, NodeKind, RepoId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -234,13 +234,22 @@ impl ContractGraph {
                         .and_then(|s| s.to_str())
                         .unwrap_or(target_str);
 
+                    // A bare, unqualified specifier (no '/' or '.') is ambiguous: it
+                    // could be a workspace package's directory name, but it's just as
+                    // likely a language builtin module that happens to share that name
+                    // (e.g. `import { randomUUID } from 'crypto'` — Node's builtin —
+                    // colliding with an `@volontariapp/crypto` workspace package). Only
+                    // match on bare `package` equality for qualified specifiers, where
+                    // that ambiguity doesn't exist.
+                    let is_qualified = target_str.contains('/') || target_str.contains('.');
+
                     let matched_id = self
                         .nodes
                         .values()
                         .find(|n| {
                             n.name.as_str() == target_str
                                 || n.name.as_str() == target_stem
-                                || n.package.as_str() == target_str
+                                || (is_qualified && n.package.as_str() == target_str)
                                 || format!("{}.{}", n.package, n.name) == target_str
                         })
                         .map(|n| n.id);
@@ -272,7 +281,7 @@ impl ContractGraph {
                 .values()
                 .find(|n| {
                     n.package == "event-bus"
-                        && n.kind == NodeKind::KafkaTopic
+                        && n.kind == NodeKind::EventStream
                         && n.name.eq_ignore_ascii_case(topic_key.as_str())
                 })
                 .map(|n| n.id);
@@ -280,15 +289,25 @@ impl ContractGraph {
             let topic_id = match existing_topic_id {
                 Some(id) => id,
                 None => {
+                    // Declarative `[[engines.contracts.patterns]]` hits are transport-agnostic
+                    // (Kafka, Redis Streams, BullMQ, SQS, ...) — label them EventStream, not
+                    // KafkaTopic. Real Kafka usage is still tagged NodeKind::KafkaTopic by the
+                    // language-specific extractors that actually detect it (e.g. Spring @KafkaListener).
                     let node = ContractNode {
                         id: 0,
                         name: topic_key.clone(),
-                        kind: NodeKind::KafkaTopic,
+                        kind: NodeKind::EventStream,
                         file_path: PathBuf::from("event-bus"),
                         line_start: 1,
                         line_end: 1,
                         package: CompactStr::new("event-bus"),
-                        repo_id: 0,
+                        // This node is a synthetic cross-repo hub, not something
+                        // scanned from any configured root — `repo_id: 0` would
+                        // silently alias it to whichever repo happens to be
+                        // first in `[workspace] roots`, misattributing every
+                        // event/topic in the mesh to that one repo. `RepoId::MAX`
+                        // is a sentinel no real root index can ever reach.
+                        repo_id: RepoId::MAX,
                         signature: Some(CompactStr::new(format!("topic://{topic_key}"))),
                         docstring: None,
                     };
@@ -380,7 +399,11 @@ impl ContractGraph {
                     if n.file_path.to_string_lossy().ends_with(".proto") {
                         return false;
                     }
-                    if n.kind == NodeKind::Interface || n.kind == NodeKind::ProtoMessage {
+                    // Only nodes the language extractors actually tagged as a gRPC
+                    // handler (e.g. TS `@GrpcMethod`/`@GrpcService`) may implement an
+                    // RPC. Without this, any same-named REST handler, factory method,
+                    // or unrelated function matches by bare name alone.
+                    if n.kind != NodeKind::GrpcMethod && n.kind != NodeKind::GrpcService {
                         return false;
                     }
                     if n.name.starts_with("rpc:")

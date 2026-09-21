@@ -12,6 +12,10 @@ pub struct WebNode {
     pub line_start: usize,
     pub line_end: usize,
     pub package: String,
+    /// Name of the configured workspace root (repo) this node was scanned from,
+    /// e.g. "ms-user" — distinct from `package`, which is only the local
+    /// sub-directory/module name and says nothing about which repo owns it.
+    pub repo: String,
     pub signature: Option<String>,
 }
 
@@ -39,7 +43,21 @@ pub struct GraphRenderer;
 
 impl GraphRenderer {
     /// Extracts a serializable web payload from a ContractGraph.
-    pub fn to_payload(graph: &ContractGraph, workspace_name: &str) -> WebGraphPayload {
+    ///
+    /// `repo_names` maps each node's `repo_id` (its index into the configured
+    /// `[workspace] roots`) to a human-readable repo name, e.g. `["ms-user",
+    /// "npm-packages", ...]`. A node whose `repo_id` doesn't resolve to a real
+    /// root (e.g. a synthetic cross-repo hub like the canonical event/topic
+    /// nodes, tagged with `RepoId::MAX`) isn't scanned from any one repo, so
+    /// it falls back to displaying its own `package` as the repo label
+    /// instead of silently aliasing to whatever root happens to sit at
+    /// index 0 — that aliasing previously misattributed every event/topic
+    /// in the mesh to the first configured root.
+    pub fn to_payload(
+        graph: &ContractGraph,
+        workspace_name: &str,
+        repo_names: &[String],
+    ) -> WebGraphPayload {
         let nodes: Vec<WebNode> = graph
             .all_nodes()
             .map(|n| WebNode {
@@ -50,6 +68,10 @@ impl GraphRenderer {
                 line_start: n.line_start,
                 line_end: n.line_end,
                 package: n.package.to_string(),
+                repo: repo_names
+                    .get(n.repo_id as usize)
+                    .cloned()
+                    .unwrap_or_else(|| n.package.to_string()),
                 signature: n.signature.as_ref().map(|s| s.to_string()),
             })
             .collect();
@@ -75,49 +97,71 @@ impl GraphRenderer {
     }
 
     /// Exports the graph to standard JSON format.
-    pub fn to_json(graph: &ContractGraph, workspace_name: &str) -> String {
-        let payload = Self::to_payload(graph, workspace_name);
+    pub fn to_json(graph: &ContractGraph, workspace_name: &str, repo_names: &[String]) -> String {
+        let payload = Self::to_payload(graph, workspace_name, repo_names);
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Exports the graph to GitHub-flavored Mermaid syntax.
-    pub fn to_mermaid(graph: &ContractGraph, workspace_name: &str) -> String {
+    /// Exports the graph to GitHub-flavored Mermaid syntax, nesting nodes two
+    /// levels deep — outer subgraph per repo, inner subgraph per package — so
+    /// e.g. a `database` package renders visibly inside its owning `ms-user`
+    /// repo instead of floating as an ambiguous top-level group.
+    pub fn to_mermaid(graph: &ContractGraph, workspace_name: &str, repo_names: &[String]) -> String {
         let mut out = String::with_capacity(4096);
         out.push_str(&format!("%% CausalMesh Topology: {workspace_name}\n"));
         out.push_str("graph TD\n");
 
-        // Group nodes by package/service
-        let mut packages: HashMap<String, Vec<&mesh_core::ContractNode>> = HashMap::new();
+        // Group nodes by repo, then by package/service within each repo
+        let mut repos: HashMap<String, HashMap<String, Vec<&mesh_core::ContractNode>>> =
+            HashMap::new();
         for node in graph.all_nodes() {
+            let repo = repo_names
+                .get(node.repo_id as usize)
+                .cloned()
+                .unwrap_or_else(|| node.package.to_string());
             let pkg = if node.package.is_empty() {
                 "shared".to_string()
             } else {
                 node.package.to_string()
             };
-            packages.entry(pkg).or_default().push(node);
+            repos.entry(repo).or_default().entry(pkg).or_default().push(node);
         }
 
-        let mut sorted_packages: Vec<_> = packages.into_iter().collect();
-        sorted_packages.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sorted_repos: Vec<_> = repos.into_iter().collect();
+        sorted_repos.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (pkg_name, nodes) in sorted_packages {
-            let clean_subgraph_id = pkg_name.replace(['-', '.', '/', '@'], "_");
-            out.push_str(&format!(
-                "  subgraph sg_{clean_subgraph_id}[\"{pkg_name}\"]\n"
-            ));
+        for (repo_name, packages) in sorted_repos {
+            let clean_repo_id = repo_name.replace(['-', '.', '/', '@'], "_");
+            out.push_str(&format!("  subgraph repo_{clean_repo_id}[\"{repo_name}\"]\n"));
 
-            for node in nodes {
-                let node_id = format!("n_{}", node.id);
-                let label = Self::sanitize_mermaid_label(node.name.as_str());
-                let (shape_start, shape_end) = match node.kind {
-                    NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => ("([", "])"),
-                    NodeKind::GrpcService | NodeKind::HttpEndpoint => ("[[", "]]"),
-                    NodeKind::ProtoMessage => ("{", "}"),
-                    _ => ("[", "]"),
-                };
+            let mut sorted_packages: Vec<_> = packages.into_iter().collect();
+            sorted_packages.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (pkg_name, nodes) in sorted_packages {
+                let clean_subgraph_id = format!("{clean_repo_id}_{pkg_name}").replace(
+                    ['-', '.', '/', '@'],
+                    "_",
+                );
                 out.push_str(&format!(
-                    "    {node_id}{shape_start}\"{label}\"{shape_end}\n"
+                    "    subgraph sg_{clean_subgraph_id}[\"{pkg_name}\"]\n"
                 ));
+
+                for node in nodes {
+                    let node_id = format!("n_{}", node.id);
+                    let label = Self::sanitize_mermaid_label(node.name.as_str());
+                    let (shape_start, shape_end) = match node.kind {
+                        NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => {
+                            ("([", "])")
+                        }
+                        NodeKind::GrpcService | NodeKind::HttpEndpoint => ("[[", "]]"),
+                        NodeKind::ProtoMessage => ("{", "}"),
+                        _ => ("[", "]"),
+                    };
+                    out.push_str(&format!(
+                        "      {node_id}{shape_start}\"{label}\"{shape_end}\n"
+                    ));
+                }
+                out.push_str("    end\n");
             }
             out.push_str("  end\n");
         }
@@ -147,8 +191,8 @@ impl GraphRenderer {
     }
 
     /// Exports the graph to an autonomous, standalone interactive Dark Mode HTML5 application.
-    pub fn to_html(graph: &ContractGraph, workspace_name: &str) -> String {
-        let payload = Self::to_payload(graph, workspace_name);
+    pub fn to_html(graph: &ContractGraph, workspace_name: &str, repo_names: &[String]) -> String {
+        let payload = Self::to_payload(graph, workspace_name, repo_names);
         let json_data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
         format!(
@@ -475,6 +519,11 @@ impl GraphRenderer {
       <div id="node-title" class="node-title"></div>
 
       <div class="property-group">
+        <div class="property-label">Repo</div>
+        <div id="node-repo" class="property-value" style="color: var(--accent-green);"></div>
+      </div>
+
+      <div class="property-group">
         <div class="property-label">Package / Service</div>
         <div id="node-package" class="property-value"></div>
       </div>
@@ -551,8 +600,75 @@ impl GraphRenderer {
     let showOnlyContracts = true;
     let nodes = [];
     let edges = [];
+    // Package-level sub-clusters (small halos, drawn on top) and repo-level
+    // super-clusters (big halos, drawn behind) — a node's repo/package pair
+    // fully answers "which workspace root does this belong to?" visually,
+    // instead of only in the sidebar's PACKAGE / SERVICE text field.
     let clusters = new Map();
+    let repoClusters = new Map();
     let nodeMap = new Map();
+
+    // Shelf-packs circles of varying radii into rows instead of a uniform
+    // grid sized off the single largest circle — a uniform grid wastes huge
+    // amounts of space (and forces excessive zooming) whenever cluster sizes
+    // vary a lot, since every cell has to be as big as the biggest one.
+    // `items` must each have a `radius` field; returns [{{ item, x, y }}] with
+    // (x, y) centered around the origin.
+    function packCircles(items, cols, margin) {{
+      if (items.length === 0) return [];
+      const rows = [];
+      for (let i = 0; i < items.length; i += cols) {{
+        rows.push(items.slice(i, i + cols));
+      }}
+
+      const placed = [];
+      let curY = 0;
+      const rowSpans = [];
+      rows.forEach(row => {{
+        const rowMaxRadius = row.reduce((m, it) => Math.max(m, it.radius), 0);
+        let curX = row[0].radius;
+        const rowPositions = [{{ item: row[0], x: curX }}];
+        for (let i = 1; i < row.length; i++) {{
+          curX += row[i - 1].radius + margin + row[i].radius;
+          rowPositions.push({{ item: row[i], x: curX }});
+        }}
+        const rowWidth = curX + row[row.length - 1].radius;
+        const xOffset = rowWidth / 2;
+        const rowY = curY + rowMaxRadius;
+        rowPositions.forEach(p => placed.push({{ item: p.item, x: p.x - xOffset, y: rowY }}));
+        rowSpans.push(rowMaxRadius);
+        curY += rowMaxRadius * 2 + margin;
+      }});
+
+      const totalHeight = curY - margin;
+      placed.forEach(p => {{ p.y -= totalHeight / 2; }});
+      return placed;
+    }}
+
+    // Places `count` items around concentric rings instead of a single ring,
+    // so dense clusters don't crush every item onto one crowded circle.
+    // Returns x/y offsets relative to the cluster center for item `i`.
+    function ringPosition(i, count, maxRadius, itemSpan) {{
+      if (count <= 1) return {{ x: 0, y: 0 }};
+      let ring = 0;
+      let placed = 0;
+      // Each successive ring has more circumference, so it holds more items;
+      // items only ever get closer than `itemSpan` apart at the outermost
+      // ring once we clamp to maxRadius, which is an intentional last resort
+      // for extremely dense clusters rather than the common case.
+      while (true) {{
+        const ringRadius = itemSpan * (ring + 1) * 0.9;
+        const ringCapacity = Math.max(1, Math.floor((2 * Math.PI * ringRadius) / itemSpan));
+        if (i < placed + ringCapacity || ringRadius >= maxRadius) {{
+          const idxInRing = i - placed;
+          const angle = (idxInRing / Math.max(1, ringCapacity)) * Math.PI * 2;
+          const r = Math.min(ringRadius, maxRadius);
+          return {{ x: Math.cos(angle) * r, y: Math.sin(angle) * r }};
+        }}
+        placed += ringCapacity;
+        ring++;
+      }}
+    }}
 
     function buildLayout() {{
       const candidateNodes = showOnlyContracts
@@ -562,56 +678,110 @@ impl GraphRenderer {
       const activeIds = new Set(candidateNodes.map(n => n.id));
       const activeEdges = rawData.edges.filter(e => activeIds.has(e.from) && activeIds.has(e.to));
 
-      // Group candidate nodes by package
-      const pkgMap = new Map();
+      // Group candidate nodes by repo, then by package within each repo
+      const repoMap = new Map();
       candidateNodes.forEach(n => {{
+        const repo = n.repo || 'shared';
         const pkg = n.package || 'shared';
+        if (!repoMap.has(repo)) repoMap.set(repo, new Map());
+        const pkgMap = repoMap.get(repo);
         if (!pkgMap.has(pkg)) pkgMap.set(pkg, []);
         pkgMap.get(pkg).push(n);
       }});
 
       clusters.clear();
+      repoClusters.clear();
       nodeMap.clear();
       nodes = [];
 
-      const pkgCount = pkgMap.size;
-      const cols = Math.ceil(Math.sqrt(pkgCount));
-      const clusterSpacingX = 360;
-      const clusterSpacingY = 320;
+      // Pass 1: pack each repo's packages FIRST (in its own local coordinate
+      // space, centered on origin), then derive the repo's halo radius as the
+      // tight bounding circle of that actual packed content — not a formula
+      // guessing at size from node counts. A guessed radius is what left
+      // repos as mostly-empty circles: the guess was consistently bigger
+      // than what the packed packages really occupied.
+      const repoLayout = [];
+      repoMap.forEach((pkgMap, repoName) => {{
+        const pkgCount = pkgMap.size;
+        const pkgCols = Math.ceil(Math.sqrt(pkgCount));
 
-      let pkgIdx = 0;
-      pkgMap.forEach((pkgNodes, pkgName) => {{
-        const row = Math.floor(pkgIdx / cols);
-        const col = pkgIdx % cols;
-        const cx = (col - (cols - 1) / 2) * clusterSpacingX;
-        const cy = (row - Math.floor(pkgCount / cols) / 2) * clusterSpacingY;
-
-        const clusterRadius = Math.max(90, Math.min(180, Math.sqrt(pkgNodes.length) * 35));
-        clusters.set(pkgName, {{
-          name: pkgName,
-          x: cx,
-          y: cy,
-          radius: clusterRadius,
-          count: pkgNodes.length
+        let totalNodesInRepo = 0;
+        const pkgItems = [];
+        pkgMap.forEach((pkgNodes, pkgName) => {{
+          totalNodesInRepo += pkgNodes.length;
+          const clusterRadius = Math.max(55, Math.min(140, Math.sqrt(pkgNodes.length) * 24));
+          pkgItems.push({{ pkgName, pkgNodes, radius: clusterRadius }});
         }});
 
-        pkgNodes.forEach((n, i) => {{
-          const subAngle = (i / pkgNodes.length) * Math.PI * 2;
-          const dist = pkgNodes.length === 1 ? 0 : Math.min(clusterRadius - 25, 30 + (i % 3) * 30);
-          const nodeObj = {{
-            ...n,
-            x: cx + Math.cos(subAngle) * dist,
-            y: cy + Math.sin(subAngle) * dist,
-            vx: 0,
-            vy: 0,
-            radius: n.kind === 'GrpcService' || n.kind === 'KafkaTopic' ? 14 : 10,
-            color: getNodeColor(n.kind)
-          }};
-          nodes.push(nodeObj);
-          nodeMap.set(nodeObj.id, nodeObj);
+        const pkgPositions = packCircles(
+          pkgItems.map(p => ({{ radius: p.radius, p }})),
+          pkgCols,
+          40
+        );
+
+        const repoRadius = Math.max(
+          150,
+          pkgPositions.reduce(
+            (m, pos) => Math.max(m, Math.hypot(pos.x, pos.y) + pos.item.radius),
+            0
+          ) + 50
+        );
+
+        repoLayout.push({{ repoName, pkgPositions, totalNodesInRepo, repoRadius }});
+      }});
+
+      // Pass 2: shelf-pack repos by their actual radius (see packCircles) —
+      // this keeps small repos close together instead of stretching the
+      // whole canvas to the size of the single largest one.
+      const repoCount = repoLayout.length;
+      const repoCols = Math.ceil(Math.sqrt(repoCount));
+      const repoPositions = packCircles(
+        repoLayout.map(r => ({{ radius: r.repoRadius, r }})),
+        repoCols,
+        90
+      );
+
+      repoPositions.forEach(({{ item, x: repoCx, y: repoCy }}) => {{
+        const r = item.r;
+        repoClusters.set(r.repoName, {{
+          name: r.repoName,
+          x: repoCx,
+          y: repoCy,
+          radius: r.repoRadius,
+          count: r.totalNodesInRepo
         }});
 
-        pkgIdx++;
+        // Package positions were already packed in pass 1 (that's what gave
+        // us this repo's tight radius) — just translate them into place.
+        r.pkgPositions.forEach(({{ item: pItem, x: cxOffset, y: cyOffset }}) => {{
+          const p = pItem.p;
+          const cx = repoCx + cxOffset;
+          const cy = repoCy + cyOffset;
+
+          clusters.set(`${{r.repoName}}::${{p.pkgName}}`, {{
+            name: p.pkgName,
+            x: cx,
+            y: cy,
+            radius: p.radius,
+            count: p.pkgNodes.length
+          }});
+
+          p.pkgNodes.forEach((n, i) => {{
+            const nodeRadius = n.kind === 'GrpcService' || n.kind === 'KafkaTopic' ? 14 : 10;
+            const offset = ringPosition(i, p.pkgNodes.length, p.radius - nodeRadius - 6, nodeRadius * 2 + 10);
+            const nodeObj = {{
+              ...n,
+              x: cx + offset.x,
+              y: cy + offset.y,
+              vx: 0,
+              vy: 0,
+              radius: nodeRadius,
+              color: getNodeColor(n.kind)
+            }};
+            nodes.push(nodeObj);
+            nodeMap.set(nodeObj.id, nodeObj);
+          }});
+        }});
       }});
 
       edges = activeEdges.filter(e => nodeMap.has(e.from) && nodeMap.has(e.to)).map(e => ({{
@@ -637,17 +807,44 @@ impl GraphRenderer {
     let selectedNode = null;
     let searchQuery = '';
 
+    // Fits the whole current layout (all repo halos, or all nodes if there
+    // are no clusters) into view instead of a fixed scale — a fixed 0.9 zoom
+    // only worked by luck for one particular graph size; any other node
+    // count either overflowed the canvas or left it mostly empty.
     function resetView() {{
-      scale = 0.9;
-      panX = (canvas.width / (window.devicePixelRatio || 1)) / 2;
-      panY = (canvas.height / (window.devicePixelRatio || 1)) / 2;
+      const dpr = window.devicePixelRatio || 1;
+      const viewW = canvas.width / dpr;
+      const viewH = canvas.height / dpr;
+
+      const bounds = repoClusters.size > 0
+        ? Array.from(repoClusters.values()).map(c => ({{ x: c.x, y: c.y, r: c.radius + 40 }}))
+        : nodes.map(n => ({{ x: n.x, y: n.y, r: n.radius + 20 }}));
+
+      if (bounds.length === 0) {{
+        scale = 0.9;
+        panX = viewW / 2;
+        panY = viewH / 2;
+        render();
+        return;
+      }}
+
+      const minX = Math.min(...bounds.map(b => b.x - b.r));
+      const maxX = Math.max(...bounds.map(b => b.x + b.r));
+      const minY = Math.min(...bounds.map(b => b.y - b.r));
+      const maxY = Math.max(...bounds.map(b => b.y + b.r));
+      const contentW = Math.max(1, maxX - minX);
+      const contentH = Math.max(1, maxY - minY);
+
+      scale = Math.min(Math.max(0.05, Math.min(viewW / contentW, viewH / contentH) * 0.92), 6);
+      panX = viewW / 2 - ((minX + maxX) / 2) * scale;
+      panY = viewH / 2 - ((minY + maxY) / 2) * scale;
       render();
     }}
 
     canvas.addEventListener('wheel', e => {{
       e.preventDefault();
       const zoomFactor = e.deltaY < 0 ? 1.12 : 0.88;
-      scale = Math.min(Math.max(0.15, scale * zoomFactor), 4);
+      scale = Math.min(Math.max(0.03, scale * zoomFactor), 8);
       render();
     }});
 
@@ -711,6 +908,7 @@ impl GraphRenderer {
       tag.style.background = node.color + '22';
       tag.style.color = node.color;
       document.getElementById('node-title').textContent = node.name;
+      document.getElementById('node-repo').textContent = node.repo || 'shared';
       document.getElementById('node-package').textContent = node.package || 'shared';
       document.getElementById('node-location').textContent = `${{node.file_path}}:${{node.line_start}}-${{node.line_end}}`;
 
@@ -789,7 +987,37 @@ impl GraphRenderer {
       ctx.translate(panX, panY);
       ctx.scale(scale, scale);
 
-      // 1. Draw Cluster Background Cards
+      // 1a. Draw Repo Super-Cluster Halos (bigger, behind everything — this is
+      // the "which workspace root am I in?" grouping the graph is organized by)
+      repoClusters.forEach(r => {{
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.radius + 30, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.05)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.font = '700 14px "JetBrains Mono", monospace';
+        const titleText = `🗂 ${{r.name}} (${{r.count}})`;
+        const textWidth = ctx.measureText(titleText).width;
+
+        ctx.fillStyle = 'rgba(11, 12, 16, 0.92)';
+        ctx.beginPath();
+        ctx.roundRect(r.x - textWidth / 2 - 10, r.y - r.radius - 54, textWidth + 20, 26, 5);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        ctx.fillStyle = '#38bdf8';
+        ctx.textAlign = 'center';
+        ctx.fillText(titleText, r.x, r.y - r.radius - 37);
+      }});
+
+      // 1b. Draw Package Sub-Cluster Cards (smaller, nested inside their repo halo)
       clusters.forEach(c => {{
         ctx.beginPath();
         ctx.arc(c.x, c.y, c.radius + 18, 0, Math.PI * 2);
@@ -882,7 +1110,7 @@ impl GraphRenderer {
 
       // 3. Draw Nodes with Smart Level of Detail
       nodes.forEach(n => {{
-        const isMatched = !searchQuery || n.name.toLowerCase().includes(searchQuery) || n.package.toLowerCase().includes(searchQuery);
+        const isMatched = !searchQuery || n.name.toLowerCase().includes(searchQuery) || n.package.toLowerCase().includes(searchQuery) || (n.repo || '').toLowerCase().includes(searchQuery);
         const isSelected = selectedNode && selectedNode.id === n.id;
         const isHovered = hoveredNode && hoveredNode.id === n.id;
         const isDimmed = selectedNode && !isSelected && !edges.some(e => (e.from === selectedNode.id && e.to === n.id) || (e.to === selectedNode.id && e.from === n.id));
@@ -1009,12 +1237,16 @@ mod tests {
             metadata: Some("orders.created".into()),
         });
 
-        let mermaid = GraphRenderer::to_mermaid(&graph, "test-workspace");
+        // Node repo_ids in this test are 1, so index 0 is an unused placeholder.
+        let repo_names = vec!["shared".to_string(), "ms-payment".to_string()];
+
+        let mermaid = GraphRenderer::to_mermaid(&graph, "test-workspace", &repo_names);
         assert!(mermaid.contains("OrderCreatedEvent"));
         assert!(mermaid.contains("PaymentProcessor"));
         assert!(mermaid.contains("Produces"));
+        assert!(mermaid.contains("ms-payment"));
 
-        let html = GraphRenderer::to_html(&graph, "test-workspace");
+        let html = GraphRenderer::to_html(&graph, "test-workspace", &repo_names);
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("CausalMesh Interactive Topology"));
         assert!(html.contains("OrderCreatedEvent"));

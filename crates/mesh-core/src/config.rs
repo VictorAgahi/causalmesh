@@ -272,15 +272,36 @@ fn validate_not_prohibited(path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Expands environment variables and globs in root configurations.
-pub fn expand_roots(raw_roots: &[String], base_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+///
+/// `workspace_root` is the raw `[workspace] workspace_root` value (itself possibly
+/// containing an OS env var reference, e.g. `${WORKSPACE_ROOT:-.}`). It is resolved
+/// once up front so that `${workspace_root}` placeholders inside each root string
+/// resolve to it, in addition to real OS environment variables.
+pub fn expand_roots(
+    raw_roots: &[String],
+    base_dir: &Path,
+    workspace_root: &str,
+) -> Result<Vec<PathBuf>, ConfigError> {
     let mut resolved = Vec::new();
 
+    let resolved_workspace_root = shellexpand::env_with_context(workspace_root, |var| {
+        Ok(std::env::var(var).ok().map(Cow::Owned))
+    })
+    .map_err(|e: shellexpand::LookupError<std::convert::Infallible>| {
+        ConfigError::EnvExpansionFailed(e.to_string())
+    })?
+    .into_owned();
+
     for raw in raw_roots {
-        let expanded =
-            shellexpand::env_with_context(raw, |var| Ok(std::env::var(var).ok().map(Cow::Owned)))
-                .map_err(|e: shellexpand::LookupError<std::convert::Infallible>| {
-                ConfigError::EnvExpansionFailed(e.to_string())
-            })?;
+        let expanded = shellexpand::env_with_context(raw, |var| {
+            if var == "workspace_root" {
+                return Ok(Some(Cow::Borrowed(resolved_workspace_root.as_str())));
+            }
+            Ok(std::env::var(var).ok().map(Cow::Owned))
+        })
+        .map_err(|e: shellexpand::LookupError<std::convert::Infallible>| {
+            ConfigError::EnvExpansionFailed(e.to_string())
+        })?;
 
         let path_pattern = if Path::new(expanded.as_ref()).is_absolute() {
             expanded.into_owned()
@@ -346,6 +367,6 @@ impl Config {
     }
 
     pub fn resolve_allowed_roots(&self, base_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
-        expand_roots(&self.workspace.roots, base_dir)
+        expand_roots(&self.workspace.roots, base_dir, &self.workspace.workspace_root)
     }
 }

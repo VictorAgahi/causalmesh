@@ -26,7 +26,9 @@ impl DoctorCommand {
                 Ok(cfg) => {
                     eprintln!("✔ Config syntax: Valid ({})", p.display());
                     let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
-                    if let Ok(roots) = expand_roots(&cfg.workspace.roots, base_dir) {
+                    if let Ok(roots) =
+                        expand_roots(&cfg.workspace.roots, base_dir, &cfg.workspace.workspace_root)
+                    {
                         let roots_count = roots.len();
                         eprintln!("✔ Jailed roots verified ({roots_count}/{roots_count} allowed roots, 0 escapes detected)");
                     } else {

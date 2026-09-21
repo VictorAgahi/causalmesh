@@ -266,7 +266,11 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
         (Config::load_from_str(default)?, PathBuf::from("."))
     };
 
-    let allowed_roots = match expand_roots(&config.workspace.roots, &base_dir) {
+    let allowed_roots = match expand_roots(
+        &config.workspace.roots,
+        &base_dir,
+        &config.workspace.workspace_root,
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "mesh::config", "Failed to expand roots: {e}. Falling back to base directory.");
@@ -283,7 +287,8 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
         rescan,
     ));
 
-    for root in &allowed_roots {
+    for (repo_idx, root) in allowed_roots.iter().enumerate() {
+        let repo_id = repo_idx as mesh_core::RepoId;
         if let Ok(validated_scope) =
             ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
         {
@@ -305,16 +310,16 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
                         prop_reg.ingest_properties_str(&content);
                     } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
                         let _ = prop_reg.ingest_yaml_str(&content);
-                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
                     } else {
-                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
                     }
 
                     if let Some(ref contracts_cfg) = state.config.load().engines.contracts {
                         PolyglotIndexer::apply_custom_patterns(
                             &file,
                             &content,
-                            0,
+                            repo_id,
                             &contracts_cfg.patterns,
                             &mut graph,
                         );

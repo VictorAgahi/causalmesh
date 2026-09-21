@@ -8,6 +8,11 @@ impl ProtoExtractor {
         let mut nodes = Vec::new();
         let mut current_package = CompactStr::default();
         let mut in_service = None::<CompactStr>;
+        // Brace depth at the point `in_service` was set — a closing "}" only clears
+        // `in_service` when it returns to this depth, not on any nested block's own
+        // closing brace (e.g. a one-liner `rpc Foo (...) returns (...) {}` body).
+        let mut service_depth: Option<usize> = None;
+        let mut depth: usize = 0;
 
         // Normalize statements across newlines, semicolons, and braces to handle all formatting
         let normalized = content
@@ -20,6 +25,17 @@ impl ProtoExtractor {
             let trimmed = line.trim();
 
             if trimmed.starts_with("//") || trimmed.is_empty() {
+                continue;
+            }
+
+            // Closing brace of some block. Pop depth first; only clear `in_service`
+            // once depth falls back to the level it was at when the service opened.
+            if trimmed == "}" {
+                depth = depth.saturating_sub(1);
+                if service_depth == Some(depth) {
+                    in_service = None;
+                    service_depth = None;
+                }
                 continue;
             }
 
@@ -40,6 +56,8 @@ impl ProtoExtractor {
                     let s_name = parts[1].trim_end_matches('{').trim();
                     let s_name_compact = CompactStr::new(s_name);
                     in_service = Some(s_name_compact.clone());
+                    service_depth = Some(depth);
+                    depth += 1; // this line's own trailing "{" opens the service block
 
                     nodes.push(ContractNode {
                         id: 0,
@@ -80,6 +98,11 @@ impl ProtoExtractor {
                         signature: Some(CompactStr::new(trimmed)),
                         docstring: None,
                     });
+                    // Handles both `rpc Foo (...) returns (...);` and the one-liner
+                    // body form `rpc Foo (...) returns (...) {}` (valid proto3).
+                    if trimmed.ends_with('{') {
+                        depth += 1;
+                    }
                 }
                 continue;
             }
@@ -101,12 +124,15 @@ impl ProtoExtractor {
                         signature: Some(CompactStr::new(trimmed)),
                         docstring: None,
                     });
+                    depth += 1;
                 }
                 continue;
             }
 
-            if trimmed == "}" {
-                in_service = None;
+            // Any other block-opening line we don't specially parse (oneof, enum,
+            // option {...}, etc.) — still track depth so closing braces stay balanced.
+            if trimmed.ends_with('{') {
+                depth += 1;
             }
         }
 

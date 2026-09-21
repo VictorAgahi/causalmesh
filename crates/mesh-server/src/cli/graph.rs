@@ -33,7 +33,11 @@ impl GraphCommand {
             (Config::load_from_str(default)?, PathBuf::from("."))
         };
 
-        let allowed_roots = match expand_roots(&config.workspace.roots, &base_dir) {
+        let allowed_roots = match expand_roots(
+            &config.workspace.roots,
+            &base_dir,
+            &config.workspace.workspace_root,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(target: "mesh::graph", "Failed to expand roots: {e}");
@@ -44,7 +48,8 @@ impl GraphCommand {
         let mut graph = ContractGraph::new();
         let mut file_count = 0usize;
 
-        for root in &allowed_roots {
+        for (repo_idx, root) in allowed_roots.iter().enumerate() {
+            let repo_id = repo_idx as mesh_core::RepoId;
             if let Ok(validated_scope) =
                 ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
             {
@@ -59,12 +64,12 @@ impl GraphCommand {
                         file_count += 1;
                         let path_str = file.to_string_lossy();
                         if !path_str.ends_with(".md") && !path_str.ends_with(".properties") {
-                            PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                            PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
                             if let Some(ref contracts_cfg) = config.engines.contracts {
                                 PolyglotIndexer::apply_custom_patterns(
                                     &file,
                                     &content,
-                                    0,
+                                    repo_id,
                                     &contracts_cfg.patterns,
                                     &mut graph,
                                 );
@@ -85,10 +90,18 @@ impl GraphCommand {
         );
 
         let workspace_name = &config.workspace.name;
+        let repo_names: Vec<String> = allowed_roots
+            .iter()
+            .map(|r| {
+                r.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| r.display().to_string())
+            })
+            .collect();
         let rendered = match format.to_lowercase().as_str() {
-            "mermaid" => GraphRenderer::to_mermaid(&graph, workspace_name),
-            "json" => GraphRenderer::to_json(&graph, workspace_name),
-            _ => GraphRenderer::to_html(&graph, workspace_name),
+            "mermaid" => GraphRenderer::to_mermaid(&graph, workspace_name, &repo_names),
+            "json" => GraphRenderer::to_json(&graph, workspace_name, &repo_names),
+            _ => GraphRenderer::to_html(&graph, workspace_name, &repo_names),
         };
 
         let final_path = if let Some(out) = output_path {

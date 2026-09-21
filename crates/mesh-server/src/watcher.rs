@@ -22,13 +22,25 @@ impl FileWatcherService {
             .as_ref()
             .map(|c| c.patterns.clone())
             .unwrap_or_default();
+        let roots = state.allowed_roots.load_full();
 
         mesh_core::FileWatcherService::spawn(state, cancel_token, move |file, content, graph| {
-            mesh_parsers::PolyglotIndexer::index_file(file, content, 0, graph);
+            let repo_id = Self::repo_id_for_file(file, &roots);
+            mesh_parsers::PolyglotIndexer::index_file(file, content, repo_id, graph);
             mesh_parsers::PolyglotIndexer::apply_custom_patterns(
-                file, content, 0, &patterns, graph,
+                file, content, repo_id, &patterns, graph,
             );
         })
+    }
+
+    /// Finds which configured root a changed file belongs to, so hot-reloaded
+    /// nodes keep the same `repo_id` (and therefore repo identity) they'd get
+    /// from the initial full workspace scan.
+    fn repo_id_for_file(file: &std::path::Path, roots: &[std::path::PathBuf]) -> mesh_core::RepoId {
+        roots
+            .iter()
+            .position(|root| file.starts_with(root))
+            .unwrap_or(0) as mesh_core::RepoId
     }
 
     #[inline]
@@ -45,11 +57,13 @@ impl FileWatcherService {
             .as_ref()
             .map(|c| c.patterns.clone())
             .unwrap_or_default();
+        let roots = state.allowed_roots.load_full();
 
         mesh_core::FileWatcherService::execute_reload_sync(state, &|file, content, graph| {
-            mesh_parsers::PolyglotIndexer::index_file(file, content, 0, graph);
+            let repo_id = Self::repo_id_for_file(file, &roots);
+            mesh_parsers::PolyglotIndexer::index_file(file, content, repo_id, graph);
             mesh_parsers::PolyglotIndexer::apply_custom_patterns(
-                file, content, 0, &patterns, graph,
+                file, content, repo_id, &patterns, graph,
             );
         });
     }

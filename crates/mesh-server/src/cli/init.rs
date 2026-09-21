@@ -72,6 +72,22 @@ impl InitCommand {
         fs::create_dir_all(&config_dir)?;
         let config_file = config_dir.join("mesh-mcp.toml");
 
+        // Every root above is relative to `cur_dir` (where `init --auto` was run),
+        // but the config file itself is written one level below it, in `.agents/`.
+        // All consumers (doctor/run/graph) resolve `roots` relative to the config
+        // file's own parent directory, so a bare "./x" here would silently resolve
+        // to ".agents/x" and never match — climb back up to `cur_dir` first.
+        let roots: Vec<String> = roots
+            .iter()
+            .map(|r| {
+                if r == "." {
+                    "..".to_string()
+                } else {
+                    r.replacen("./", "../", 1)
+                }
+            })
+            .collect();
+
         let roots_toml = roots
             .iter()
             .map(|r| format!("\"{}\"", r))
@@ -83,7 +99,7 @@ impl InitCommand {
 [workspace]
 name = "enterprise-polyglot-mesh"
 version = "2.9.0"
-workspace_root = "${{WORKSPACE_ROOT:-.}}"
+workspace_root = "${{WORKSPACE_ROOT:-..}}"
 roots = [{roots_toml}]
 
 [engines.docs]

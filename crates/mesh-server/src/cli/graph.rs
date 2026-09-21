@@ -60,6 +60,15 @@ impl GraphCommand {
                         let path_str = file.to_string_lossy();
                         if !path_str.ends_with(".md") && !path_str.ends_with(".properties") {
                             PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                            if let Some(ref contracts_cfg) = config.engines.contracts {
+                                PolyglotIndexer::apply_custom_patterns(
+                                    &file,
+                                    &content,
+                                    0,
+                                    &contracts_cfg.patterns,
+                                    &mut graph,
+                                );
+                            }
                         }
                     }
                 }

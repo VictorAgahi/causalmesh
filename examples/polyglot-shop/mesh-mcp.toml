@@ -22,3 +22,17 @@ enabled = true
 [engines.contracts.grpc]
 proto_dirs = ["proto"]
 controller_annotations = ["@GrpcMethod"]
+
+[[engines.contracts.patterns]]
+name = "kafka-producer-ts"
+kind = "topic_producer"
+file_pattern = "*.ts"
+regex = "topic:\\s*['\"]([^'\"]+)['\"]"
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "kafka-consumer-go"
+kind = "topic_consumer"
+file_pattern = "*.go"
+regex = "topic:\\s*['\"]([^'\"]+)['\"]"
+target_group = 1

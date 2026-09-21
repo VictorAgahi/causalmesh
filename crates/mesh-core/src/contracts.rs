@@ -243,12 +243,25 @@ impl ContractGraph {
                     // that ambiguity doesn't exist.
                     let is_qualified = target_str.contains('/') || target_str.contains('.');
 
+                    // `target_stem` (the last path segment, extension stripped) is only
+                    // a meaningful symbol hint for an actual file path, e.g. `./auth`
+                    // stemming to "auth" for a same-named default export. For a bare or
+                    // scoped PACKAGE specifier (no leading '.' or '/'), the stem is just
+                    // the package's short name and matching it against ANY node's bare
+                    // name anywhere in the whole graph is unsound: `@volontariapp/auth`
+                    // stems to "auth" too, and would collide with any unrelated symbol
+                    // named "auth" in the entire codebase (e.g. a `get auth()` getter),
+                    // pulling every one of that package's dozens of importers onto it.
+                    let is_relative_or_absolute_path =
+                        target_str.starts_with('.') || target_str.starts_with('/');
+
                     let matched_id = self
                         .nodes
                         .values()
                         .find(|n| {
                             n.name.as_str() == target_str
-                                || n.name.as_str() == target_stem
+                                || (is_relative_or_absolute_path
+                                    && n.name.as_str() == target_stem)
                                 || (is_qualified && n.package.as_str() == target_str)
                                 || format!("{}.{}", n.package, n.name) == target_str
                         })

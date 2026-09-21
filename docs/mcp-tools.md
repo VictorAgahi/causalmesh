@@ -13,7 +13,7 @@ All argument structures derive from `schemars::JsonSchema` with `#[serde(deny_un
 Tool descriptions explicitly declare what the tool **does not do** and instruct the agent when **not to use it**. This prevents cognitive loops and tool misuse.
 
 ### 1.3 High-Density Markdown Payloads
-Outputs are serialized in compact GitHub Flavored Markdown rather than raw JSON strings. This achieves a **-37.2% reduction in BPE tokens**, accelerating LLM response generation and preserving context window capacity.
+Outputs are serialized in compact GitHub Flavored Markdown rather than raw JSON strings. This eliminates redundant JSON escaping, quote noise, and schema envelope overhead, providing clean, readable context directly consumable by LLMs.
 
 ### 1.4 Affordance-Driven Truncation (48 KB Cap)
 When search or analysis outputs exceed 48 KB (approximately 12,000 tokens), MeshMCP automatically truncates the response and injects structured navigation metadata:
@@ -60,7 +60,7 @@ Fast scoped regular expression search over polyglot source code. Definitions are
     },
     "include_body": {
       "type": "boolean",
-      "description": "If false (default), strips function/method bodies into '{ /* stripped */ }' or '...' saving 98% tokens. If true, returns full body."
+      "description": "If false (default), strips function/method bodies into '{ /* stripped */ }' or '...' preserving only signatures, types, and contract docstrings. If true, returns full implementation body."
     }
   },
   "additionalProperties": false

@@ -34,7 +34,11 @@ codegen-units = 1
 panic = "abort"
 strip = true
 ```
-This produces a single, self-contained binary in `target/release/mesh-mcp` with an approximate footprint of **6.8 MB**.
+This produces self-contained binaries in `target/release/`:
+- `mesh-mcp`: Stdio MCP server and transparent UDS client proxy (~6.8 MB)
+- `meshd`: Background architecture daemon with UDS multiplexing (~6.5 MB)
+
+For comprehensive build and configuration walkthroughs, see [SETUP.md](../SETUP.md).
 
 ---
 
@@ -48,17 +52,23 @@ cargo test --workspace
 ```
 Expected output:
 ```
-test result: ok. 14 passed (mesh-core)
-test result: ok. 13 passed (mesh-parsers)
-test result: ok. 2 passed (mesh-server unit)
-test result: ok. 4 passed (mesh-server integration)
-Total: 33 passed; 0 failed
+test result: ok. 22 passed (mesh-core)
+test result: ok. 8 passed (mesh-daemon)
+test result: ok. 24 passed (mesh-parsers)
+test result: ok. 4 passed (mesh-server unit)
+test result: ok. 9 passed (mesh-server integration)
+Total: 67 passed; 0 failed
 ```
 
 ### Run Strict Clippy
 Every pull request must pass Clippy with `-D warnings`:
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+### Check Code Formatting
+```bash
+cargo fmt --all -- --check
 ```
 
 ---

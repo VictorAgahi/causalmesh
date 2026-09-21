@@ -3,29 +3,29 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-56%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-67%20passed-brightgreen.svg)]()
 [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
 [![Binary Size](https://img.shields.io/badge/binary-6.8%20MB-blue.svg)]()
 [![RSS Memory](https://img.shields.io/badge/memory-%3C%2020%20MiB-blue.svg)]()
 [![Stdio Latency](https://img.shields.io/badge/stdio%20latency-0.02%20ms-brightgreen.svg)]()
-[![Token Economy](https://img.shields.io/badge/tokens-%2D98.1%25%20AST%20decap-purple.svg)]()
-[![File Watcher](https://img.shields.io/badge/watcher-notify%20(150ms%20debounce)-brightgreen.svg)]()
+[![Context Efficiency](https://img.shields.io/badge/context-AST%20Decapitation-purple.svg)]()
+[![File Watcher](https://img.shields.io/badge/watcher-Differential%20VFS-brightgreen.svg)]()
 [![Audit Engine](https://img.shields.io/badge/audit-SQLite%20WAL%20%2B%20SHA--256-blue.svg)]()
 
-MeshMCP is an industrial-grade, local-first multi-root architecture mesh and high-performance Model Context Protocol (MCP) server written in pure, zero-copy Rust. Designed for multi-repository codebases and enterprise architectures spanning 50+ local repositories and millions of lines of code across **Java, Go, Python, TypeScript, Rust, Protobuf, and AsyncAPI/OpenAPI YAML**, MeshMCP eliminates the context bottleneck and security risks of modern AI coding agents (Claude Code, Cursor, Windsurf, Antigravity, Copilot).
+MeshMCP is an industrial-grade, local-first multi-root architecture mesh and high-performance Model Context Protocol (MCP) server written in pure, zero-copy Rust. Designed for multi-repository codebases and enterprise architectures spanning 50+ local repositories and millions of lines of code across **Java, Go, Python, TypeScript, Rust, Protobuf, and AsyncAPI/OpenAPI YAML**, MeshMCP eliminates the context bottleneck, cognitive overload, and security risks of modern AI coding agents (Claude Code, Cursor, Windsurf, Antigravity, Copilot).
 
 ---
 
 ## Table of Contents
 
 - [1. Why MeshMCP?](#1-why-meshmcp)
-- [2. Context Reduction & Performance Benchmarks](#2-context-reduction--performance-benchmarks)
+- [2. Context Engineering & Performance Profile](#2-context-engineering--performance-profile)
 - [3. Architecture Overview](#3-architecture-overview)
   - [System Topologies & Flows](#system-topologies--flows)
   - [The 7 Code Commandments (RFC-001)](#the-7-code-commandments-rfc-001)
 - [4. The 5 Core MCP Tools](#4-the-5-core-mcp-tools)
 - [5. Active Governance & RSAH Protocol](#5-active-governance--rsah-protocol)
-- [6. Installation & Quick Start](#6-installation--quick-start)
+- [6. Installation & Quick Start](#6-installation--quick-start) (See [SETUP.md](SETUP.md) for full walkthrough)
 - [7. Configuration (`mesh-mcp.toml`)](#7-configuration-mesh-mcptoml)
 - [8. CLI Reference](#8-cli-reference)
 - [9. IDE & Agent Integration](#9-ide--agent-integration)
@@ -39,51 +39,52 @@ MeshMCP is an industrial-grade, local-first multi-root architecture mesh and hig
 
 Modern AI coding agents face three critical challenges when interacting with large polyglot microservices:
 
-1. **Context Window Exhaustion & Cognitive Overload**: Standard tools (like raw `grep`, `find`, or whole-file readers) flood the LLM context window with hundreds of thousands of tokens of business logic and function bodies. This degrades reasoning accuracy ("lost in the middle"), increases hallucination rates, and triggers prohibitive API costs.
+1. **Context Window Exhaustion & Cognitive Overload**: Standard tools (like raw `grep`, `find`, or whole-file readers) flood the LLM context window with hundreds of thousands of tokens of business logic and function bodies. This degrades reasoning accuracy ("lost in the middle"), increases hallucination rates, and wastes prompt budget on routine implementation boilerplate.
 2. **Reverse Dependency Blindness & Distributed Breakages**: When an engineer or agent modifies a Protobuf schema, an API Gateway route, or an internal library, standard agents cannot detect that 14 downstream microservices across three different languages depend on that contract. Breaking changes escape into staging and production.
 3. **Security Invariants & Boundary Escapes**: Unsandboxed agents run commands across root filesystems, leak local credentials (`.env`, `.npmrc`, AWS keys), traverse malicious symlinks, and mutate critical contract repositories without human delegation or CI synchronization.
 
 ### What MeshMCP Delivers:
-- **Instant AST Decapitation & Bounded Stubs**: Strips method and function bodies (including TypeScript arrow functions `const fn = () => { ... }`) into `{ /* stripped */ }` or `...`. Parser timeouts (>15ms) and minified lines (>1024b) yield a compact 122-byte safe stub, guaranteeing zero raw code blowup.
-- **In-Kernel File Watching & Atomic Hot-Reload**: Watches workspace roots and `.git/HEAD` via OS-native events (`notify` / `notify-debouncer-mini` with 150ms debounce), automatically reloading the in-memory architecture graph via lock-free `ArcSwap` without server restart.
+- **Instant AST Decapitation & Bounded Stubs**: Strips method and function bodies (including TypeScript arrow functions `const fn = () => { ... }`) into `{ /* stripped */ }` or `...`. Returns clear signatures, parameter types, and docstrings. Parser timeouts (>15ms) and minified lines (>1024b) yield a compact 122-byte safe stub, preventing prompt blowup on minified assets.
+- **Background Architecture Daemon (`meshd`) & Differential VFS**: A single background daemon multiplexes multiple agent sessions over a local Unix Domain Socket (`.sock`). A single OS watcher (`notify-debouncer-mini` with 150ms debounce) and differential hashing (Blake3/SHA-256 + mtime) eliminate redundant parsing across hot reloads.
 - **Polyglot Graph Reconciliation & Macro Support**: Cross-references Protobuf RPCs, Tonic Rust macros (`include_proto!`), Spring `@GrpcService`, Go `pb.Register*Server`, TypeScript gRPC clients, and Kafka/AsyncAPI channels into an in-memory reverse dependency graph.
-- **Zero-Copy, Lock-Free Performance**: 0.02ms stdio dispatch, `< 20 MiB` RAM baseline, 4.12 µs reverse dependency queries, and zero editor keystroke interference via OS-level background QoS scheduling.
+- **Zero-Copy, Lock-Free Performance**: 0.02ms stdio dispatch, `< 20 MiB` RAM baseline, 3.97 µs reverse dependency queries, and zero editor keystroke interference via OS-level background QoS scheduling.
 - **Hardened Security & Container Mounts**: Strict `ValidatedScope` jail with Unicode NFC normalization (preventing macOS APFS NFD canonicalization false positives on accented paths) and Docker container path translation (`mount_aliases`).
 - **Double-Barrier Governance (RSAH)**: Refusal with Structured Action Handoff prevents autonomous edits to guarded repos, accompanied by OS-level Git pre-commit hooks.
 - **Multi-Process Concurrent SQLite WAL Audit**: Multi-agent concurrent audit logging via SQLite in WAL mode (`audit.db`, `BEGIN IMMEDIATE`, >36,000 writes/s) with tamper-evident SHA-256 hash chaining and JSONL export.
 
 ---
 
-## 2. Context Reduction & Performance Benchmarks
+## 2. Context Engineering & Performance Profile
 
-MeshMCP drastically compresses the token footprint required for architecture comprehension and cross-service navigation:
+MeshMCP focuses the agent's context window exclusively on architectural contracts and interface boundaries:
 
-### Context Reduction Statistics
+### Context Optimization Strategies
 
-| Technique | Conventional Agent Behavior | MeshMCP Engine | Savings |
+| Technique | Conventional Agent Behavior | MeshMCP Engine | Impact |
 | :--- | :--- | :--- | :--- |
-| **Interface Inspection** | Ingests full implementation files (`500 - 3,000` lines/file) | **AST Decapitation**: Preserves only signature & contract docstrings (incl. TS arrow functions) | **-98.1% tokens** (~80,000 tokens saved per session) |
-| **Parser Guard / Timeout** | Dumps raw 500 KB minified file or unparsed source | **Bounded Error Stub**: Strictly capped 122-byte navigational notice | **Zero token blowup** on minified/complex files |
-| **Payload Formatting** | Verbose raw JSON strings with escaped characters | **Dense High-Density Markdown**: Compact code blocks & navigation metadata | **-37.2% tokens** (BPE token decoding efficiency) |
-| **Output Bounding** | Unbounded outputs leading to context thrashing | **Affordance-Driven Truncation**: Hard 48 KB cap with structured sub-scope guidance | **100% immune** to context overflow crash |
-| **Property Dumps** | Ingests full YAML/properties with raw dev secrets | **Secret Masking**: Redacted tokens with `${key:fallback}` hints | **Zero token leakage** of credentials |
+| **Interface Inspection** | Ingests entire implementation files (`500 - 3,000` lines/file) | **AST Decapitation**: Strips bodies into `{ /* stripped */ }` / `...`; preserves signatures, types, and annotations | Eliminates routine internal loops and private variables; leaves full context for cross-service reasoning |
+| **Parser Guard / Timeout** | Dumps raw 500 KB minified files or unparsed source | **Bounded Error Stub**: Strictly capped 122-byte navigational notice | Prevents massive minified bundle dumps from polluting context |
+| **Payload Formatting** | Verbose raw JSON strings with escaped quotes and newlines | **Dense High-Density Markdown**: Compact code blocks & navigation metadata | Clean formatting directly consumable by LLMs without JSON escaping overhead |
+| **Output Bounding** | Unbounded outputs leading to context thrashing | **Affordance-Driven Truncation**: Hard 48 KB cap with structured sub-scope guidance | Eliminates context buffer overflow; guides agent to narrower queries |
+| **Cross-Repo Navigation** | Crawls dozens of files via raw grep/find | **Reverse Dependency Index**: Instant O(1) in-memory contract graph lookups | Pinpoints callers and impact without mass file reads |
+| **Property Dumps** | Ingests full YAML/properties with raw dev secrets | **Secret Masking**: Redacted tokens with `${key:fallback}` hints | Prevents credentials from leaking into LLM prompt contexts |
 
 ### Execution Performance Profile
 
 Tested against a multi-repo workspace consisting of 52 repositories, 48,000 files, and 2.1M lines of code:
 
-| Metric | Target Threshold | MeshMCP Measured |
-| :--- | :--- | :--- |
-| **Resident Memory (RSS)** | `< 30 MiB` | **`18.6 MiB`** (mimalloc + CompactString) |
-| **Stdio Loopback Latency** | `< 1 ms` | **`0.02 ms`** (20 microseconds) |
-| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** |
-| **Structural Ingestion (`mesh-mcp init`)** | `< 5 s` | **`4.2 s`** (full polyglot scan) |
-| **In-Memory Query Latency** | `< 2 ms` | **`0.12 ms`** (Lock-Free `ArcSwap`) |
-| **Reverse Dependency Index Query** | `< 1 ms` | **`4.12 µs`** (Empirical Criterion) |
-| **Scoped AST Parsing + Decapitation** | `< 50 ms` | **`20.1 ms`** (Tree-sitter bounded) |
-| **Live File Watching Debounce** | `< 250 ms` | **`150 ms`** (`notify-debouncer-mini` OS event queue) |
-| **Concurrent Audit Write Latency** | `< 100 µs` | **`27.57 µs`** (SQLite WAL `BEGIN IMMEDIATE`, 36k+ ops/s) |
-| **IDE UI Keystroke Stuttering** | `< 150 ms` | **`0 ms`** (Rayon OS QoS background isolation) |
+| Metric | Target Threshold | MeshMCP Measured | Margin |
+| :--- | :--- | :--- | :--- |
+| **Resident Memory (RSS)** | `< 30 MiB` | **`18.6 MiB`** (mimalloc + CompactString) | Verified |
+| **Stdio Loopback Latency** | `< 1 ms` | **`0.02 ms`** (20 microseconds) | 50x faster |
+| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** | 4x faster |
+| **Structural Ingestion (`mesh-mcp init`)** | `< 5 s` | **`4.2 s`** (full polyglot scan) | Within budget |
+| **In-Memory Query Latency** | `< 2 ms` | **`0.12 ms`** (Lock-Free `ArcSwap`) | 16x faster |
+| **Reverse Dependency Index Query** | `< 1 ms` | **`3.97 µs`** (Empirical Criterion) | Instantaneous |
+| **Scoped AST Parsing + Decapitation** | `< 50 ms` | **`0.11 ms`** (Tree-sitter bounded) | Sub-millisecond |
+| **Live File Watching Debounce** | `< 250 ms` | **`150 ms`** (`notify-debouncer-mini` OS event queue) | Within budget |
+| **Concurrent Audit Write Latency** | `< 100 µs` | **`27.57 µs`** (SQLite WAL `BEGIN IMMEDIATE`, 36k+ ops/s) | Verified |
+| **IDE UI Keystroke Stuttering** | `< 150 ms` | **`0 ms`** (Rayon OS QoS background isolation) | Zero UI impact |
 
 ---
 
@@ -231,23 +232,35 @@ installs an executable pre-commit hook into `.git/hooks/pre-commit` that physica
 
 ## 6. Installation & Quick Start
 
+> **Full Walkthrough**: For an exhaustive setup, configuration, and agent testing guide, see [**SETUP.md**](SETUP.md).
+
 ### Build from Source (Recommended)
 Requirements: Rust 1.80+ and Cargo.
 
 ```bash
 # Clone the repository
-git clone https://github.com/causalmesh/mesh-mcp.git
-cd mesh-mcp
+git clone https://github.com/VictorAgahi/causalmesh.git
+cd causalmesh
 
-# Build optimized release binary with Thin LTO and mimalloc
-cargo build --release
+# Build optimized release binaries (mesh-mcp and meshd)
+cargo build --workspace --release
 
 # Verify binary
 ./target/release/mesh-mcp --version
 ./target/release/mesh-mcp doctor
 ```
 
+### Running MeshMCP
+- **Daemon Mode (Default)**: Runs `mesh-mcp run` as a lightweight UDS proxy (< 2 MiB RAM) connecting to the background `meshd` daemon (auto-spawned if not running).
+- **Standalone Mode**: Runs in a single process without background daemon:
+  ```bash
+  ./target/release/mesh-mcp run --standalone --config mesh-mcp.toml
+  ```
+
 ### Run Healthcheck Doctor
+```bash
+./target/release/mesh-mcp doctor
+```
 ```bash
 ./target/release/mesh-mcp doctor
 ```
@@ -410,21 +423,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Result:
 ```
-test result: ok. 20 passed (mesh-core)
-test result: ok. 23 passed (mesh-parsers)
+test result: ok. 22 passed (mesh-core)
+test result: ok. 8 passed (mesh-daemon)
+test result: ok. 24 passed (mesh-parsers)
 test result: ok. 4 passed (mesh-server unit)
 test result: ok. 9 passed (mesh-server integration)
-Total: 56 passed, 0 failed, 0 warnings
+Total: 67 passed, 0 failed, 0 warnings
 ```
 
 ---
 
 ## 12. Documentation Index
 
-For deep architectural and technical references, consult the `docs/` directory:
-
-- [**docs/architecture.md**](docs/architecture.md): Systems architecture, memory layout, AST guards, and Rayon QoS.
+- [**SETUP.md**](SETUP.md): Comprehensive setup, build, test, and MCP agent integration guide.
+- [**docs/architecture.md**](docs/architecture.md): Systems architecture, memory layout, AST guards, daemon UDS multiplexing, and Rayon QoS.
 - [**docs/mcp-tools.md**](docs/mcp-tools.md): In-depth specification of the 5 MCP tools, JSON schemas, and affordances.
 - [**docs/development.md**](docs/development.md): Developer guide, building, debugging, and adding new language parsers.
 - [**docs/governance-rsah.md**](docs/governance-rsah.md): Double-barrier governance, RSAH patterns, and Git hook mechanics.
-- [**docs/benchmarks.md**](docs/benchmarks.md): Comprehensive benchmark data, token savings analysis, and memory profiles.
+- [**docs/benchmarks.md**](docs/benchmarks.md): Comprehensive benchmark data, context efficiency analysis, and memory profiles.

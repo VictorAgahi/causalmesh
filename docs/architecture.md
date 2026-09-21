@@ -44,26 +44,31 @@ graph TD
 
 ## 2. Workspace Crate Topology
 
-MeshMCP is structured into three specialized crates to enforce strict separation of concerns, rapid incremental compilation, and modular security auditing:
+MeshMCP is structured into four specialized crates to enforce strict separation of concerns, rapid incremental compilation, and modular security auditing:
 
 ```
 crates/
-├── mesh-core/       # Pure domain logic, memory models, security jail, audit & state
+├── mesh-core/       # Pure domain logic, memory models, security jail, VFS, audit & state
 ├── mesh-parsers/    # Tree-sitter C-FFI bindings, AST decapitators, and Markdown engine
-└── mesh-server/     # Tokio JSON-RPC stdio actor, MCP protocol framing, and CLI binaries
+├── mesh-server/     # Tokio JSON-RPC stdio actor, MCP protocol framing, and UDS client proxy
+└── mesh-daemon/     # meshd background daemon, UDS server, multiplexer, single file watcher & idle watchdog
 ```
 
 ### Dependency Hierarchy
 ```mermaid
 graph TD
-    Server[mesh-server] --> Core[mesh-core]
-    Server --> Parsers[mesh-parsers]
+    Daemon[mesh-daemon] --> Server[mesh-server]
+    Daemon --> Core[mesh-core]
+    Daemon --> Parsers[mesh-parsers]
+    Server --> Core
+    Server --> Parsers
     Parsers --> Core
 ```
 
 - **`mesh-core`** depends only on core runtime utilities (`tokio`, `compact_str`, `arc-swap`, `dunce`, `ring`, `rayon`). It has zero Tree-sitter dependencies.
 - **`mesh-parsers`** handles all grammar evaluation, C-FFI bindings, and AST body stripping.
-- **`mesh-server`** implements the JSON-RPC actor model, CLI subcommands (`doctor`, `init`, `install-hooks`), and exposes the MCP interface.
+- **`mesh-server`** implements the JSON-RPC actor model, CLI subcommands (`doctor`, `init`, `install-hooks`), and the transparent UDS client proxy.
+- **`mesh-daemon`** (`meshd`) maintains the long-lived in-memory architecture graph, differential VFS, single OS watcher, and serves multiple agent sessions concurrently over Unix Domain Sockets.
 
 ---
 
@@ -176,15 +181,16 @@ graph TD
     PyRule --> Assembler
 ```
 
-### Token Compression By Language
+### Representative AST Decapitation By Language
+In typical service codebases, function bodies comprise 50% to 80% of lines. Decapitation strips internal loops, temporary variables, and private business logic while preserving public contracts:
 
-| Language | Original Representation | Decapitated AST Representation | Reduction |
+| Language | Original Source Snippet | Decapitated AST Representation | Preserved Contract Elements |
 | :--- | :--- | :--- | :--- |
-| **Java** | `public UserResponse getUser(UserId id) { ... 120 lines ... }` | `public UserResponse getUser(UserId id) { /* stripped */ }` | **-97.4%** |
-| **Go** | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { ... 85 lines ... }` | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { /* stripped */ }` | **-96.8%** |
-| **TypeScript**| `async getUser(id: string): Promise<User> { ... 90 lines ... }` | `async getUser(id: string): Promise<User> { /* stripped */ }` | **-97.1%** |
-| **Python** | `def get_user(self, user_id: str) -> UserResponse: ... 60 lines ...` | `def get_user(self, user_id: str) -> UserResponse: ...` | **-98.2%** |
-| **Rust** | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { ... 140 lines ... }` | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { /* stripped */ }` | **-98.5%** |
+| **Java** | `public UserResponse getUser(UserId id) { ... 120 lines ... }` | `public UserResponse getUser(UserId id) { /* stripped */ }` | Method name, arguments, types, annotations |
+| **Go** | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { ... 85 lines ... }` | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { /* stripped */ }` | Receiver, function name, parameters, return types |
+| **TypeScript**| `const getBilling = async (id: string): Promise<Billing> => { ... 90 lines ... };` | `const getBilling = async (id: string): Promise<Billing> => { /* stripped */ };` | Const binding, arrow signature, async, return type |
+| **Python** | `def get_user(self, user_id: str) -> UserResponse: ... 60 lines ...` | `def get_user(self, user_id: str) -> UserResponse: ...` | Function name, self, type hints, return annotations |
+| **Rust** | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { ... 140 lines ... }` | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { /* stripped */ }` | Visibility, async fn, parameters, Result types |
 
 ---
 

@@ -91,7 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Config::load_from_str(default)?, PathBuf::from("."))
     };
 
-    let allowed_roots = match expand_roots(&config.workspace.roots, &base_dir) {
+    let allowed_roots = match expand_roots(
+        &config.workspace.roots,
+        &base_dir,
+        &config.workspace.workspace_root,
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "meshd", "Failed to expand roots: {e}. Falling back to cwd.");
@@ -111,7 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Initial ingestion ─────────────────────────────────────────────────────
     tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
-    for root in &allowed_roots {
+    for (repo_idx, root) in allowed_roots.iter().enumerate() {
+        let repo_id = repo_idx as mesh_core::RepoId;
         if let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots) {
             let files = FilesystemCrawler::crawl_scope(
                 &scope,
@@ -131,16 +136,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prop_reg.ingest_properties_str(&content);
                     } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
                         let _ = prop_reg.ingest_yaml_str(&content);
-                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
                     } else {
-                        PolyglotIndexer::index_file(&file, &content, 0, &mut graph);
+                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
                     }
 
                     if let Some(ref contracts_cfg) = state.config.load().engines.contracts {
                         PolyglotIndexer::apply_custom_patterns(
                             &file,
                             &content,
-                            0,
+                            repo_id,
                             &contracts_cfg.patterns,
                             &mut graph,
                         );

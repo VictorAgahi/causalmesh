@@ -53,11 +53,25 @@ impl TypeScriptExtractor {
                             .trim()
                             .trim_matches('\'')
                             .trim_matches('"');
-                        let file_stem = file_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("Module");
-                        imports.push((file_stem.to_string(), from_str.to_string()));
+
+                        // Always keep a module-path-level entry: reverse
+                        // dependency lookups (find_dependents on a package
+                        // name) key off this, and it's the only signal
+                        // available for default/namespace imports which have
+                        // no discrete named symbol below.
+                        imports.push((String::new(), from_str.to_string()));
+
+                        // Additionally record each individually NAMED import
+                        // (`import { A, B } from 'x'`) as its own resolvable
+                        // target. Without this, an Imports edge only ever
+                        // knows the whole module string ("@volontariapp/contracts"),
+                        // which can never exactly equal any single node's
+                        // name/package — so it's always silently dropped as
+                        // unresolved. Matching by the exact original export
+                        // name instead lets it resolve to the real declaration.
+                        for named in Self::collect_named_import_specifiers(node, source) {
+                            imports.push((String::new(), named));
+                        }
                     }
                 }
             }
@@ -174,6 +188,38 @@ impl TypeScriptExtractor {
         }
     }
 
+    /// Walks an `import_statement` node's `import_clause` -> `named_imports`
+    /// children to collect each individually named specifier's *original*
+    /// exported identifier (the `name` field — never the local `alias`,
+    /// since matching needs the name as declared in the source file, not
+    /// however the importer chose to rebind it locally).
+    fn collect_named_import_specifiers<'a>(node: Node<'a>, source: &'a [u8]) -> Vec<String> {
+        let mut specifiers = Vec::new();
+
+        for clause in node.children(&mut node.walk()) {
+            if clause.kind() != "import_clause" {
+                continue;
+            }
+            for part in clause.children(&mut clause.walk()) {
+                if part.kind() != "named_imports" {
+                    continue;
+                }
+                for spec in part.children(&mut part.walk()) {
+                    if spec.kind() != "import_specifier" {
+                        continue;
+                    }
+                    if let Some(name_node) = spec.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(source) {
+                            specifiers.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        specifiers
+    }
+
     fn extract_grpc_method(text: &str) -> Option<String> {
         if let Some(idx) = text.find("@GrpcMethod") {
             let rest = &text[idx + 11..];
@@ -226,8 +272,13 @@ export class AuthController {
             &mut imports,
         );
 
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].1, "@volontariapp/domain-user");
+        // One module-path-level entry plus one entry per named specifier
+        // (here just `UserAuthRequest`).
+        assert_eq!(imports.len(), 2);
+        assert!(imports
+            .iter()
+            .any(|(_, t)| t == "@volontariapp/domain-user"));
+        assert!(imports.iter().any(|(_, t)| t == "UserAuthRequest"));
         assert!(nodes.iter().any(|n| n.name == "AuthController"));
         assert!(nodes
             .iter()

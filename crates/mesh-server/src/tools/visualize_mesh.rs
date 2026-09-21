@@ -42,12 +42,22 @@ impl VisualizeMeshTool {
         let graph = state.contract_graph.load();
         let config = state.config.load();
         let workspace_name = &config.workspace.name;
+        let repo_names: Vec<String> = state
+            .allowed_roots
+            .load()
+            .iter()
+            .map(|r| {
+                r.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| r.display().to_string())
+            })
+            .collect();
 
         let output = match format_choice.as_str() {
-            "html" => GraphRenderer::to_html(&graph, workspace_name),
-            "json" => GraphRenderer::to_json(&graph, workspace_name),
+            "html" => GraphRenderer::to_html(&graph, workspace_name, &repo_names),
+            "json" => GraphRenderer::to_json(&graph, workspace_name, &repo_names),
             _ => {
-                let mermaid_code = GraphRenderer::to_mermaid(&graph, workspace_name);
+                let mermaid_code = GraphRenderer::to_mermaid(&graph, workspace_name, &repo_names);
                 format!(
                     "## Polyglot Architecture Mesh Topology\n\n```mermaid\n{}\n```\n",
                     mermaid_code.trim()

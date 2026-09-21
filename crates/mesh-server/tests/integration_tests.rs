@@ -58,7 +58,12 @@ roots = ["./services/*", "./proto-registry"]
 "#;
 
     let config = Config::load_from_str(cfg_str).expect("parse config");
-    let allowed_roots = expand_roots(&config.workspace.roots, &base_path).expect("expand roots");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &base_path,
+        &config.workspace.workspace_root,
+    )
+    .expect("expand roots");
 
     let log_file = base_path.join("audit.log");
     let audit = Arc::new(AuditLogger::new(Some(log_file)).expect("audit logger"));

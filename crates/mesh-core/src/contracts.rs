@@ -1,5 +1,5 @@
 use crate::types::CompactStr;
-use crate::types::{ContractEdge, ContractNode, EdgeKind, NodeId, NodeKind};
+use crate::types::{ContractEdge, ContractNode, EdgeKind, NodeId, NodeKind, RepoId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -229,18 +229,50 @@ impl ContractGraph {
             if edge.kind == EdgeKind::Imports && edge.to == 0 {
                 if let Some(ref target) = edge.metadata {
                     let target_str = target.as_str();
+                    // Path::file_stem() strips everything after the LAST '.', so it
+                    // treats a scoped package ("@volontariapp/contracts" -> "contracts")
+                    // exactly the same as a dotted relative filename
+                    // ("./post.endpoints" -> "post", discarding ".endpoints" as if it
+                    // were an extension). Both are intentional here — see below — but
+                    // this is why the two cases must never share a matching branch.
                     let target_stem = Path::new(target_str)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(target_str);
+
+                    let is_relative_or_absolute_path =
+                        target_str.starts_with('.') || target_str.starts_with('/');
+                    // NOTE: matching a scoped package specifier ("@volontariapp/contracts")
+                    // against `n.package` was tried and reverted — the extractor only ever
+                    // records the raw "from '...'" module string, never which SPECIFIC
+                    // named symbol was imported (`import { A, B, C } from 'x'` collapses to
+                    // just "x"). Any package-name match therefore has to `.find()` an
+                    // arbitrary node that merely shares that package, in HashMap iteration
+                    // order — observed live picking an unrelated symbol out of dozens of
+                    // real candidates. A silently wrong specific edge is worse than no
+                    // edge; fixing this for real needs the extractor to capture and resolve
+                    // each named import individually, not a matching-branch tweak here.
+                    let is_qualified = target_str.contains('/') || target_str.contains('.');
+
+                    // Relative imports can only ever resolve to a file inside the SAME
+                    // repo as the importer — never across a repo boundary. Without this,
+                    // a generic stem like "post" (from "../endpoints/post.endpoints")
+                    // matches any same-named symbol anywhere in the whole multi-repo
+                    // graph (e.g. an unrelated `post()` HTTP helper method in a
+                    // completely different repo's e2e test helpers).
+                    let importer_repo_id = self.nodes.get(&edge.from).map(|n| n.repo_id);
 
                     let matched_id = self
                         .nodes
                         .values()
                         .find(|n| {
                             n.name.as_str() == target_str
-                                || n.name.as_str() == target_stem
-                                || n.package.as_str() == target_str
+                                || (is_relative_or_absolute_path
+                                    && n.name.as_str() == target_stem
+                                    && importer_repo_id == Some(n.repo_id))
+                                || (is_qualified
+                                    && !is_relative_or_absolute_path
+                                    && n.package.as_str() == target_str)
                                 || format!("{}.{}", n.package, n.name) == target_str
                         })
                         .map(|n| n.id);
@@ -272,7 +304,7 @@ impl ContractGraph {
                 .values()
                 .find(|n| {
                     n.package == "event-bus"
-                        && n.kind == NodeKind::KafkaTopic
+                        && n.kind == NodeKind::EventStream
                         && n.name.eq_ignore_ascii_case(topic_key.as_str())
                 })
                 .map(|n| n.id);
@@ -280,15 +312,25 @@ impl ContractGraph {
             let topic_id = match existing_topic_id {
                 Some(id) => id,
                 None => {
+                    // Declarative `[[engines.contracts.patterns]]` hits are transport-agnostic
+                    // (Kafka, Redis Streams, BullMQ, SQS, ...) — label them EventStream, not
+                    // KafkaTopic. Real Kafka usage is still tagged NodeKind::KafkaTopic by the
+                    // language-specific extractors that actually detect it (e.g. Spring @KafkaListener).
                     let node = ContractNode {
                         id: 0,
                         name: topic_key.clone(),
-                        kind: NodeKind::KafkaTopic,
+                        kind: NodeKind::EventStream,
                         file_path: PathBuf::from("event-bus"),
                         line_start: 1,
                         line_end: 1,
                         package: CompactStr::new("event-bus"),
-                        repo_id: 0,
+                        // This node is a synthetic cross-repo hub, not something
+                        // scanned from any configured root — `repo_id: 0` would
+                        // silently alias it to whichever repo happens to be
+                        // first in `[workspace] roots`, misattributing every
+                        // event/topic in the mesh to that one repo. `RepoId::MAX`
+                        // is a sentinel no real root index can ever reach.
+                        repo_id: RepoId::MAX,
                         signature: Some(CompactStr::new(format!("topic://{topic_key}"))),
                         docstring: None,
                     };
@@ -380,7 +422,11 @@ impl ContractGraph {
                     if n.file_path.to_string_lossy().ends_with(".proto") {
                         return false;
                     }
-                    if n.kind == NodeKind::Interface || n.kind == NodeKind::ProtoMessage {
+                    // Only nodes the language extractors actually tagged as a gRPC
+                    // handler (e.g. TS `@GrpcMethod`/`@GrpcService`) may implement an
+                    // RPC. Without this, any same-named REST handler, factory method,
+                    // or unrelated function matches by bare name alone.
+                    if n.kind != NodeKind::GrpcMethod && n.kind != NodeKind::GrpcService {
                         return false;
                     }
                     if n.name.starts_with("rpc:")

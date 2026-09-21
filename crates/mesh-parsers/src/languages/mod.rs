@@ -82,20 +82,7 @@ impl PolyglotIndexer {
                             if imported.is_empty() {
                                 continue;
                             }
-                            // Module-path-level entries ("@volontariapp/contracts",
-                            // "./local-file") never appear verbatim inside a
-                            // declaration's own body, so a usage check would
-                            // always fail — keep propagating those to every node
-                            // unconditionally; they're what find_dependents'
-                            // package-level lookups key off, and reconcile_edges
-                            // already drops them as unresolved Imports edges.
-                            //
-                            // A bare named-import symbol ("CreateEventRequest")
-                            // DOES appear literally in whichever declaration
-                            // actually uses it — so only wire the edge to
-                            // declarations whose own source text references it,
-                            // instead of blindly cross-producing every
-                            // declaration in the file against every import.
+
                             let is_module_path_entry =
                                 imported.contains('/') || imported.starts_with('.');
                             let is_used = is_module_path_entry

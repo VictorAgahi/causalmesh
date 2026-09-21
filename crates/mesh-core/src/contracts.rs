@@ -229,12 +229,7 @@ impl ContractGraph {
             if edge.kind == EdgeKind::Imports && edge.to == 0 {
                 if let Some(ref target) = edge.metadata {
                     let target_str = target.as_str();
-                    // Path::file_stem() strips everything after the LAST '.', so it
-                    // treats a scoped package ("@volontariapp/contracts" -> "contracts")
-                    // exactly the same as a dotted relative filename
-                    // ("./post.endpoints" -> "post", discarding ".endpoints" as if it
-                    // were an extension). Both are intentional here — see below — but
-                    // this is why the two cases must never share a matching branch.
+                   
                     let target_stem = Path::new(target_str)
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -242,24 +237,9 @@ impl ContractGraph {
 
                     let is_relative_or_absolute_path =
                         target_str.starts_with('.') || target_str.starts_with('/');
-                    // NOTE: matching a scoped package specifier ("@volontariapp/contracts")
-                    // against `n.package` was tried and reverted — the extractor only ever
-                    // records the raw "from '...'" module string, never which SPECIFIC
-                    // named symbol was imported (`import { A, B, C } from 'x'` collapses to
-                    // just "x"). Any package-name match therefore has to `.find()` an
-                    // arbitrary node that merely shares that package, in HashMap iteration
-                    // order — observed live picking an unrelated symbol out of dozens of
-                    // real candidates. A silently wrong specific edge is worse than no
-                    // edge; fixing this for real needs the extractor to capture and resolve
-                    // each named import individually, not a matching-branch tweak here.
+                    
                     let is_qualified = target_str.contains('/') || target_str.contains('.');
 
-                    // Relative imports can only ever resolve to a file inside the SAME
-                    // repo as the importer — never across a repo boundary. Without this,
-                    // a generic stem like "post" (from "../endpoints/post.endpoints")
-                    // matches any same-named symbol anywhere in the whole multi-repo
-                    // graph (e.g. an unrelated `post()` HTTP helper method in a
-                    // completely different repo's e2e test helpers).
                     let importer_repo_id = self.nodes.get(&edge.from).map(|n| n.repo_id);
 
                     let matched_id = self

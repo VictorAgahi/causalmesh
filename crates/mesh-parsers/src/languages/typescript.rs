@@ -54,21 +54,10 @@ impl TypeScriptExtractor {
                             .trim_matches('\'')
                             .trim_matches('"');
 
-                        // Always keep a module-path-level entry: reverse
-                        // dependency lookups (find_dependents on a package
-                        // name) key off this, and it's the only signal
-                        // available for default/namespace imports which have
-                        // no discrete named symbol below.
+
                         imports.push((String::new(), from_str.to_string()));
 
-                        // Additionally record each individually NAMED import
-                        // (`import { A, B } from 'x'`) as its own resolvable
-                        // target. Without this, an Imports edge only ever
-                        // knows the whole module string ("@volontariapp/contracts"),
-                        // which can never exactly equal any single node's
-                        // name/package — so it's always silently dropped as
-                        // unresolved. Matching by the exact original export
-                        // name instead lets it resolve to the real declaration.
+
                         for named in Self::collect_named_import_specifiers(node, source) {
                             imports.push((String::new(), named));
                         }

@@ -106,7 +106,11 @@ impl GraphRenderer {
     /// levels deep — outer subgraph per repo, inner subgraph per package — so
     /// e.g. a `database` package renders visibly inside its owning `ms-user`
     /// repo instead of floating as an ambiguous top-level group.
-    pub fn to_mermaid(graph: &ContractGraph, workspace_name: &str, repo_names: &[String]) -> String {
+    pub fn to_mermaid(
+        graph: &ContractGraph,
+        workspace_name: &str,
+        repo_names: &[String],
+    ) -> String {
         let mut out = String::with_capacity(4096);
         out.push_str(&format!("%% CausalMesh Topology: {workspace_name}\n"));
         out.push_str("graph TD\n");
@@ -124,7 +128,12 @@ impl GraphRenderer {
             } else {
                 node.package.to_string()
             };
-            repos.entry(repo).or_default().entry(pkg).or_default().push(node);
+            repos
+                .entry(repo)
+                .or_default()
+                .entry(pkg)
+                .or_default()
+                .push(node);
         }
 
         let mut sorted_repos: Vec<_> = repos.into_iter().collect();
@@ -132,16 +141,16 @@ impl GraphRenderer {
 
         for (repo_name, packages) in sorted_repos {
             let clean_repo_id = repo_name.replace(['-', '.', '/', '@'], "_");
-            out.push_str(&format!("  subgraph repo_{clean_repo_id}[\"{repo_name}\"]\n"));
+            out.push_str(&format!(
+                "  subgraph repo_{clean_repo_id}[\"{repo_name}\"]\n"
+            ));
 
             let mut sorted_packages: Vec<_> = packages.into_iter().collect();
             sorted_packages.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (pkg_name, nodes) in sorted_packages {
-                let clean_subgraph_id = format!("{clean_repo_id}_{pkg_name}").replace(
-                    ['-', '.', '/', '@'],
-                    "_",
-                );
+                let clean_subgraph_id =
+                    format!("{clean_repo_id}_{pkg_name}").replace(['-', '.', '/', '@'], "_");
                 out.push_str(&format!(
                     "    subgraph sg_{clean_subgraph_id}[\"{pkg_name}\"]\n"
                 ));

@@ -367,6 +367,10 @@ impl Config {
     }
 
     pub fn resolve_allowed_roots(&self, base_dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
-        expand_roots(&self.workspace.roots, base_dir, &self.workspace.workspace_root)
+        expand_roots(
+            &self.workspace.roots,
+            base_dir,
+            &self.workspace.workspace_root,
+        )
     }
 }

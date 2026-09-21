@@ -373,6 +373,15 @@ A self-contained polyglot demonstration monorepo is bundled in [`examples/polygl
 - **`services/inventory-manager`** (*Rust*): Subscribes to stock decrement events.
 
 ### Test in 10 Seconds:
+
+> [!NOTE]
+> **No Rust or Cargo required!** If you do not have Rust installed on your machine, simply use the 1-liner installer:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
+> ```
+> It delivers the precompiled native binary directly to `~/.local/bin/mesh-mcp` with zero build tools needed.
+
+#### Option A: Using the installed `mesh-mcp` binary:
 ```bash
 # 1. Visualize cross-service topology in your browser:
 mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
@@ -380,8 +389,20 @@ mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
 # 2. Export Mermaid diagram:
 mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
 
-# 3. Check health:
+# 3. Check health and verify scope jail:
 mesh-mcp doctor --config examples/polyglot-shop/mesh-mcp.toml
+```
+
+#### Option B: If testing directly from source with Rust/Cargo:
+```bash
+# 1. Visualize cross-service topology in your browser:
+cargo run --bin mesh-mcp -- graph --config examples/polyglot-shop/mesh-mcp.toml --open
+
+# 2. Export Mermaid diagram:
+cargo run --bin mesh-mcp -- graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
+
+# 3. Check health:
+cargo run --bin mesh-mcp -- doctor --config examples/polyglot-shop/mesh-mcp.toml
 ```
 
 ---

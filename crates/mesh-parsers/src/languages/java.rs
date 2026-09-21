@@ -47,7 +47,7 @@ impl JavaExtractor {
                         .trim_start_matches("package ")
                         .trim_end_matches(';')
                         .trim();
-                    *package_name = CompactStr::new(clean);
+                    *package_name = mesh_core::detect_service_package(file_path, Some(clean));
                 }
             }
             "class_declaration" | "interface_declaration" => {

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package shop.payment.v1;
+
+service PaymentService {
+  rpc ProcessPayment(ProcessPaymentRequest) returns (ProcessPaymentResponse);
+  rpc RefundPayment(RefundPaymentRequest) returns (RefundPaymentResponse);
+}
+
+message ProcessPaymentRequest {
+  string order_id = 1;
+  double amount = 2;
+  string currency = 3;
+  string payment_method = 4;
+}
+
+message ProcessPaymentResponse {
+  string payment_id = 1;
+  string order_id = 2;
+  string status = 3;
+}
+
+message RefundPaymentRequest {
+  string payment_id = 1;
+  double amount = 2;
+  string reason = 3;
+}
+
+message RefundPaymentResponse {
+  string refund_id = 1;
+  string status = 2;
+}
+
+message PaymentSettledEvent {
+  string payment_id = 1;
+  string order_id = 2;
+  double amount = 3;
+  int64 timestamp = 4;
+}

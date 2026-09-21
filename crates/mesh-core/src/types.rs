@@ -116,3 +116,59 @@ pub struct RepoState {
     pub root: PathBuf,
     pub file_count: usize,
 }
+
+/// Heuristic to detect a clean service or package name from file path and optional AST package
+pub fn detect_service_package(
+    file_path: &std::path::Path,
+    raw_package: Option<&str>,
+) -> CompactStr {
+    // 1. If inside a services/, apps/, or packages/ directory, microservice folder is canonical!
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        if let Some(parent) = dir.parent() {
+            if let Some(pname) = parent.file_name().and_then(|s| s.to_str()) {
+                if pname == "services" || pname == "apps" || pname == "packages" {
+                    if let Some(svc_name) = dir.file_name().and_then(|s| s.to_str()) {
+                        return CompactStr::new(svc_name);
+                    }
+                }
+            }
+        }
+        current = dir.parent();
+    }
+
+    // 2. Otherwise use explicit non-generic raw package (e.g. proto package shop.checkout.v1)
+    if let Some(pkg) = raw_package {
+        let trimmed = pkg.trim();
+        if !trimmed.is_empty()
+            && trimmed != "main"
+            && trimmed != "app"
+            && trimmed != "crate"
+            && trimmed != "src"
+            && trimmed != "module"
+            && trimmed != "custom"
+        {
+            return CompactStr::new(trimmed);
+        }
+    }
+
+    // 3. Fallback directory inspection
+    current = file_path.parent();
+    while let Some(dir) = current {
+        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+            if name != "src"
+                && name != "lib"
+                && name != "cmd"
+                && name != "pkg"
+                && name != "internal"
+                && name != "services"
+                && name != "proto"
+            {
+                return CompactStr::new(name);
+            }
+        }
+        current = dir.parent();
+    }
+
+    CompactStr::new("shared")
+}

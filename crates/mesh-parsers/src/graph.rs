@@ -488,14 +488,21 @@ impl GraphRenderer {
         <div class="property-label">Signature / Schema</div>
         <pre id="node-signature" class="property-value" style="white-space: pre-wrap; font-size: 11px;"></pre>
       </div>
+
+      <div id="connections-group" class="property-group">
+        <div class="property-label">Causal Relationships</div>
+        <div id="node-connections" style="font-size: 11px; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 6px;"></div>
+      </div>
     </div>
 
     <div class="legend">
-      <div class="legend-item"><div class="legend-color" style="background: #38bdf8;"></div>gRPC Service / Method</div>
-      <div class="legend-item"><div class="legend-color" style="background: #fbbf24;"></div>Kafka / Queue Topic</div>
-      <div class="legend-item"><div class="legend-color" style="background: #34d399;"></div>Protobuf Message</div>
-      <div class="legend-item"><div class="legend-color" style="background: #a855f7;"></div>HTTP Endpoint</div>
-      <div class="legend-item"><div class="legend-color" style="background: #fb7185;"></div>Saga / Outbox</div>
+      <div class="legend-item"><div class="legend-color" style="background: #38bdf8;"></div>Produces / Topic</div>
+      <div class="legend-item"><div class="legend-color" style="background: #a855f7;"></div>Consumes (Dashed)</div>
+      <div class="legend-item"><div class="legend-color" style="background: #10b981;"></div>CallsRpc</div>
+      <div class="legend-item"><div class="legend-color" style="background: #f59e0b;"></div>Implements</div>
+      <div class="legend-item"><div class="legend-color" style="background: #ec4899;"></div>DispatchesTo</div>
+      <div class="legend-item"><div class="legend-color" style="background: #fbbf24;"></div>Kafka Topic</div>
+      <div class="legend-item"><div class="legend-color" style="background: #34d399;"></div>Protobuf</div>
     </div>
 
     <div id="toast" class="toast">Mermaid Copied to Clipboard!</div>
@@ -714,6 +721,35 @@ impl GraphRenderer {
       }} else {{
         sigGroup.style.display = 'none';
       }}
+
+      const connDiv = document.getElementById('node-connections');
+      if (connDiv) {{
+        connDiv.innerHTML = '';
+        const relevantEdges = edges.filter(e => e.from === node.id || e.to === node.id);
+        if (relevantEdges.length === 0) {{
+          connDiv.innerHTML = '<span style="color: var(--text-muted); font-style: italic;">No active causal links</span>';
+        }} else {{
+          relevantEdges.forEach(e => {{
+            const isOutgoing = e.from === node.id;
+            const other = isOutgoing ? e.target : e.source;
+            const badge = document.createElement('div');
+            badge.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; border-radius: 4px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);';
+
+            let actionLabel = e.kind;
+            let arrowIcon = isOutgoing ? '&rarr;' : '&larr;';
+            let color = '#38bdf8';
+            if (e.kind === 'Produces') color = '#38bdf8';
+            else if (e.kind === 'Consumes') color = '#a855f7';
+            else if (e.kind === 'CallsRpc') color = '#10b981';
+            else if (e.kind === 'Implements') color = '#f59e0b';
+            else if (e.kind === 'DispatchesTo') color = '#ec4899';
+            else color = '#64748b';
+
+            badge.innerHTML = `<span style="color: ${{color}}; font-weight: 600; font-size: 10px;">${{isOutgoing ? '' : arrowIcon + ' '}}${{actionLabel}}${{isOutgoing ? ' ' + arrowIcon : ''}}</span> <span style="color: #fff; font-family: var(--font-mono); font-size: 11px;">${{other ? other.name : 'unknown'}}</span>`;
+            connDiv.appendChild(badge);
+          }});
+        }}
+      }}
     }}
 
     document.getElementById('btn-close-sidebar').addEventListener('click', () => {{
@@ -793,16 +829,55 @@ impl GraphRenderer {
         const normalX = -dy * 0.15;
         const normalY = dx * 0.15;
 
-        ctx.moveTo(e.source.x, e.source.y);
-        ctx.quadraticCurveTo(midX + normalX, midY + normalY, e.target.x, e.target.y);
+        const ctrlX = midX + normalX;
+        const ctrlY = midY + normalY;
 
+        ctx.moveTo(e.source.x, e.source.y);
+        ctx.quadraticCurveTo(ctrlX, ctrlY, e.target.x, e.target.y);
+
+        let edgeColor = '#38bdf8';
+        let isDashed = false;
+        switch(e.kind) {{
+          case 'Produces': edgeColor = '#38bdf8'; break;
+          case 'Consumes': edgeColor = '#a855f7'; isDashed = true; break;
+          case 'CallsRpc': edgeColor = '#10b981'; break;
+          case 'Implements': edgeColor = '#f59e0b'; break;
+          case 'DispatchesTo': edgeColor = '#ec4899'; break;
+          default: edgeColor = '#64748b'; break;
+        }}
+
+        ctx.setLineDash(isDashed ? [4, 4] : []);
         ctx.strokeStyle = isConnected
-          ? '#38bdf8'
+          ? edgeColor
           : isDimmed
             ? 'rgba(255, 255, 255, 0.03)'
-            : 'rgba(56, 189, 248, 0.25)';
-        ctx.lineWidth = isConnected ? 2.5 : 1.2;
+            : edgeColor + '66';
+        ctx.lineWidth = isConnected ? 2.5 : 1.4;
         ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Draw directional arrow along curve
+        if (!isDimmed) {{
+          const t = 0.72;
+          const arrowX = (1 - t) * (1 - t) * e.source.x + 2 * (1 - t) * t * ctrlX + t * t * e.target.x;
+          const arrowY = (1 - t) * (1 - t) * e.source.y + 2 * (1 - t) * t * ctrlY + t * t * e.target.y;
+          const tangentX = 2 * (1 - t) * (ctrlX - e.source.x) + 2 * t * (e.target.x - ctrlX);
+          const tangentY = 2 * (1 - t) * (ctrlY - e.source.y) + 2 * t * (e.target.y - ctrlY);
+          const angle = Math.atan2(tangentY, tangentX);
+
+          ctx.save();
+          ctx.translate(arrowX, arrowY);
+          ctx.rotate(angle);
+          ctx.fillStyle = isConnected ? edgeColor : edgeColor + 'aa';
+          ctx.beginPath();
+          ctx.moveTo(6, 0);
+          ctx.lineTo(-5, -4);
+          ctx.lineTo(-3, 0);
+          ctx.lineTo(-5, 4);
+          ctx.closePath();
+          ctx.fill();
+          ctx.restore();
+        }}
       }});
 
       // 3. Draw Nodes with Smart Level of Detail

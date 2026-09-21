@@ -19,13 +19,7 @@ impl PythonExtractor {
 
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
-        let package_name = CompactStr::new(
-            file_path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("app"),
-        );
+        let package_name = mesh_core::detect_service_package(file_path, None);
 
         Self::visit_node(
             root,

@@ -28,8 +28,8 @@ pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
 pub use state::AppState;
 pub use types::{
-    to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge, ContractNode, EdgeKind, NodeId,
-    NodeKind, PathStr, RepoId, RepoState, SymbolName,
+    detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
+    ContractNode, EdgeKind, NodeId, NodeKind, PathStr, RepoId, RepoState, SymbolName,
 };
 pub use vfs::DifferentialVfs;
 pub use watcher::FileWatcherService;

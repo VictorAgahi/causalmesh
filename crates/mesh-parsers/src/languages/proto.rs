@@ -61,7 +61,7 @@ impl ProtoExtractor {
             if trimmed.starts_with("rpc ") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let rpc_name = parts[1].trim_end_matches('(').trim();
+                    let rpc_name = parts[1].split('(').next().unwrap_or(parts[1]).trim();
                     let full_service = in_service
                         .as_ref()
                         .map(|s| s.as_str())

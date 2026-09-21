@@ -218,6 +218,7 @@ impl FileWatcherService {
             }
         }
 
+        new_graph.reconcile_edges();
         state.contract_graph.store(Arc::new(new_graph));
         state.doc_index.store(Arc::new(new_doc_index));
         state.property_registry.store(Arc::new(new_prop_reg));

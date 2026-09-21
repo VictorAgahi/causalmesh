@@ -110,13 +110,7 @@ impl PolyglotIndexer {
         }
 
         let path_str = file_path.to_string_lossy();
-        let package_name = CompactStr::new(
-            file_path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("custom"),
-        );
+        let package_name = mesh_core::detect_service_package(file_path, None);
 
         for pat in patterns {
             if let Some(ref fp) = pat.file_pattern {
@@ -144,20 +138,28 @@ impl PolyglotIndexer {
 
                     let (node_name, kind, signature) = match pat.kind {
                         PatternKind::TopicProducer => (
-                            target,
+                            format!("produce:{target}"),
                             NodeKind::EventStream,
                             format!("Producer of {target}"),
                         ),
                         PatternKind::TopicConsumer => (
-                            consumer_name,
+                            if consumer_name != target {
+                                consumer_name.to_string()
+                            } else {
+                                format!("consume:{target}")
+                            },
                             NodeKind::PostProcessor,
                             format!("Consumer of {target}"),
                         ),
-                        PatternKind::Saga => (target, NodeKind::Saga, format!("Saga: {target}")),
+                        PatternKind::Saga => (
+                            target.to_string(),
+                            NodeKind::Saga,
+                            format!("Saga: {target}"),
+                        ),
                         PatternKind::Rpc => (
-                            target,
+                            format!("rpc:{target}"),
                             NodeKind::GrpcMethod,
-                            format!("RPC endpoint: {target}"),
+                            format!("RPC call: {target}"),
                         ),
                     };
 
@@ -181,6 +183,9 @@ impl PolyglotIndexer {
                         }
                         PatternKind::TopicConsumer => {
                             graph.add_consumer(nid, target);
+                        }
+                        PatternKind::Rpc => {
+                            graph.add_rpc_call(nid, target);
                         }
                         _ => {}
                     }

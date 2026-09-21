@@ -75,6 +75,8 @@ impl GraphCommand {
             }
         }
 
+        graph.reconcile_edges();
+
         eprintln!(
             "✔ Scanned {file_count} files across {} roots: {} contracts/nodes, {} causal links/edges.",
             allowed_roots.len(),

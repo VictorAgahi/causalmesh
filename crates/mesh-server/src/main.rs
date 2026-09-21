@@ -322,6 +322,7 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
                 }
             }
 
+            graph.reconcile_edges();
             state.contract_graph.store(Arc::new(graph));
             state.doc_index.store(Arc::new(doc_index));
             state.property_registry.store(Arc::new(prop_reg));

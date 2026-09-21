@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package shop.inventory.v1;
+
+service InventoryService {
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+  rpc ReleaseStock(ReleaseStockRequest) returns (ReleaseStockResponse);
+}
+
+message ReserveStockRequest {
+  string order_id = 1;
+  string item_id = 2;
+  int32 quantity = 3;
+}
+
+message ReserveStockResponse {
+  string reservation_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+message ReleaseStockRequest {
+  string reservation_id = 1;
+}
+
+message ReleaseStockResponse {
+  bool success = 2;
+}
+
+message StockReservedEvent {
+  string reservation_id = 1;
+  string order_id = 2;
+  string item_id = 3;
+  int32 quantity = 4;
+}

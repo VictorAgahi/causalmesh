@@ -5,21 +5,39 @@ import (
 	"fmt"
 )
 
-// PaymentWorker consumes events from order-created-topic and triggers payment settlement
+// PaymentServer implements the protobuf PaymentService contract
+type PaymentServer struct{}
+
+func (s *PaymentServer) ProcessPayment(ctx context.Context, orderID string, amount float64) (string, error) {
+	fmt.Printf("[PaymentService.ProcessPayment] Processing $%.2f for order %s\n", amount, orderID)
+	return fmt.Sprintf("pay-%s", orderID), nil
+}
+
+// PaymentWorker handles event stream consumption and settlement dispatch
 type PaymentWorker struct {
-	topic string
+	consumeTopic string
+	produceTopic string
 }
 
 func NewPaymentWorker() *PaymentWorker {
-	return &PaymentWorker{topic: "order-created-topic"}
+	return &PaymentWorker{
+		consumeTopic: "order-created-topic",
+		produceTopic: "payment-settled-topic",
+	}
 }
 
-func (w *PaymentWorker) HandleOrderCreated(ctx context.Context, orderId string, amount float64) error {
-	fmt.Printf("Processing payment of $%.2f for order %s\n", amount, orderId)
+func (w *PaymentWorker) HandleOrderCreated(ctx context.Context, orderID string, amount float64) error {
+	server := &PaymentServer{}
+	paymentID, err := server.ProcessPayment(ctx, orderID, amount)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("[Kafka -> %s] Emitting PaymentSettledEvent for %s (payment: %s)\n", w.produceTopic, orderID, paymentID)
 	return nil
 }
 
 func main() {
 	worker := NewPaymentWorker()
-	_ = worker.HandleOrderCreated(context.Background(), "ord-1234", 99.99)
+	_ = worker.HandleOrderCreated(context.Background(), "ord-9921", 149.50)
 }

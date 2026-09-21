@@ -44,7 +44,7 @@ impl GoExtractor {
             "package_clause" => {
                 if let Ok(text) = node.utf8_text(source) {
                     let clean = text.trim_start_matches("package ").trim();
-                    *package_name = CompactStr::new(clean);
+                    *package_name = mesh_core::detect_service_package(file_path, Some(clean));
                 }
             }
             "type_declaration" => {

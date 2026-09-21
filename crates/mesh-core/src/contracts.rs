@@ -35,6 +35,7 @@ pub struct ContractGraph {
     reverse_deps: HashMap<CompactStr, Vec<NodeId>>,
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
     topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
+    rpc_calls: Vec<(NodeId, CompactStr)>,
 
     next_node_id: u32,
 }
@@ -167,6 +168,11 @@ impl ContractGraph {
             .push(consumer_node_id);
     }
 
+    pub fn add_rpc_call(&mut self, caller_node_id: NodeId, target_rpc: &str) {
+        self.rpc_calls
+            .push((caller_node_id, CompactStr::new(target_rpc)));
+    }
+
     pub fn patch_file(&mut self, file_path: &Path) {
         let stale_ids: Vec<NodeId> = self.file_to_nodes.remove(file_path).unwrap_or_default();
 
@@ -203,10 +209,252 @@ impl ContractGraph {
             ids.retain(|id| !stale_set.contains(id));
             !ids.is_empty()
         });
+        self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
 
         // Remove edges referencing stale nodes
         self.edges
             .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
+    }
+
+    /// Reconciles causal edges across microservices:
+    /// 1. Links topic producers & consumers to canonical Kafka/Event topic nodes.
+    /// 2. Creates direct causal dispatch edges from producers to downstream consumers.
+    /// 3. Links service handlers to protobuf RPC declarations (EdgeKind::Implements).
+    /// 4. Links RPC client calls to proto methods (EdgeKind::CallsRpc).
+    /// 5. Resolves or filters placeholder import edges (removes dangling to == 0).
+    pub fn reconcile_edges(&mut self) {
+        // 1. Resolve / filter existing edges with placeholder target (to == 0)
+        let mut resolved_edges = Vec::with_capacity(self.edges.len() + 64);
+        for mut edge in self.edges.drain(..) {
+            if edge.kind == EdgeKind::Imports && edge.to == 0 {
+                if let Some(ref target) = edge.metadata {
+                    let target_str = target.as_str();
+                    let target_stem = Path::new(target_str)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(target_str);
+
+                    let matched_id = self
+                        .nodes
+                        .values()
+                        .find(|n| {
+                            n.name.as_str() == target_str
+                                || n.name.as_str() == target_stem
+                                || n.package.as_str() == target_str
+                                || format!("{}.{}", n.package, n.name) == target_str
+                        })
+                        .map(|n| n.id);
+
+                    if let Some(to_id) = matched_id {
+                        edge.to = to_id;
+                        resolved_edges.push(edge);
+                    }
+                    // If target is external (e.g. '@nestjs/common'), drop placeholder edge to 0.
+                }
+            } else {
+                resolved_edges.push(edge);
+            }
+        }
+        self.edges = resolved_edges;
+
+        let mut all_topics = std::collections::BTreeSet::new();
+        for t in self.topic_producers.keys() {
+            all_topics.insert(t.clone());
+        }
+        for t in self.topic_consumers.keys() {
+            all_topics.insert(t.clone());
+        }
+
+        for topic_key in all_topics {
+            // Find existing topic node or create a canonical one
+            let existing_topic_id = self
+                .nodes
+                .values()
+                .find(|n| {
+                    n.package == "event-bus"
+                        && n.kind == NodeKind::KafkaTopic
+                        && n.name.eq_ignore_ascii_case(topic_key.as_str())
+                })
+                .map(|n| n.id);
+
+            let topic_id = match existing_topic_id {
+                Some(id) => id,
+                None => {
+                    let node = ContractNode {
+                        id: 0,
+                        name: topic_key.clone(),
+                        kind: NodeKind::KafkaTopic,
+                        file_path: PathBuf::from("event-bus"),
+                        line_start: 1,
+                        line_end: 1,
+                        package: CompactStr::new("event-bus"),
+                        repo_id: 0,
+                        signature: Some(CompactStr::new(format!("topic://{topic_key}"))),
+                        docstring: None,
+                    };
+                    self.add_node(node)
+                }
+            };
+
+            // Edge: Producer -> Topic (Produces)
+            if let Some(producers) = self.topic_producers.get(&topic_key).cloned() {
+                for prod_id in producers {
+                    let exists = self.edges.iter().any(|e| {
+                        e.from == prod_id && e.to == topic_id && e.kind == EdgeKind::Produces
+                    });
+                    if !exists {
+                        self.edges.push(ContractEdge {
+                            from: prod_id,
+                            to: topic_id,
+                            kind: EdgeKind::Produces,
+                            metadata: Some(topic_key.clone()),
+                        });
+                    }
+                }
+            }
+
+            // Edge: Topic -> Consumer (Consumes)
+            if let Some(consumers) = self.topic_consumers.get(&topic_key).cloned() {
+                for cons_id in consumers {
+                    let exists = self.edges.iter().any(|e| {
+                        e.from == topic_id && e.to == cons_id && e.kind == EdgeKind::Consumes
+                    });
+                    if !exists {
+                        self.edges.push(ContractEdge {
+                            from: topic_id,
+                            to: cons_id,
+                            kind: EdgeKind::Consumes,
+                            metadata: Some(topic_key.clone()),
+                        });
+                    }
+                }
+            }
+
+            // Edge: Direct Causal Dispatch (Producer -> Consumer)
+            if let (Some(prods), Some(cons)) = (
+                self.topic_producers.get(&topic_key).cloned(),
+                self.topic_consumers.get(&topic_key).cloned(),
+            ) {
+                for prod_id in &prods {
+                    for cons_id in &cons {
+                        if prod_id != cons_id {
+                            let exists = self.edges.iter().any(|e| {
+                                e.from == *prod_id
+                                    && e.to == *cons_id
+                                    && e.kind == EdgeKind::DispatchesTo
+                            });
+                            if !exists {
+                                self.edges.push(ContractEdge {
+                                    from: *prod_id,
+                                    to: *cons_id,
+                                    kind: EdgeKind::DispatchesTo,
+                                    metadata: Some(CompactStr::new(format!("stream:{topic_key}"))),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Reconcile gRPC Proto Definitions <-> Service Handlers (Implements)
+        let proto_methods: Vec<(NodeId, CompactStr)> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.file_path.to_string_lossy().ends_with(".proto") && n.kind == NodeKind::GrpcMethod
+            })
+            .map(|n| (n.id, n.name.clone()))
+            .collect();
+
+        for (proto_id, method_fqcn) in &proto_methods {
+            let bare_method_name = method_fqcn
+                .split('.')
+                .next_back()
+                .unwrap_or(method_fqcn.as_str());
+
+            let implementor_ids: Vec<NodeId> = self
+                .nodes
+                .values()
+                .filter(|n| {
+                    if n.file_path.to_string_lossy().ends_with(".proto") {
+                        return false;
+                    }
+                    if n.kind == NodeKind::Interface || n.kind == NodeKind::ProtoMessage {
+                        return false;
+                    }
+                    if n.name.starts_with("rpc:")
+                        || n.name.starts_with("produce:")
+                        || n.name.starts_with("consume:")
+                    {
+                        return false;
+                    }
+
+                    n.name == *method_fqcn
+                        || n.name.as_str().eq_ignore_ascii_case(bare_method_name)
+                        || crate::types::to_pascal_case(n.name.as_str()) == bare_method_name
+                        || n.signature
+                            .as_ref()
+                            .map(|s| {
+                                s.contains(&format!("@{bare_method_name}"))
+                                    || s.contains(&format!("'{bare_method_name}'"))
+                                    || s.contains(&format!("\"{bare_method_name}\""))
+                                    || s.contains(&format!("fn {bare_method_name}"))
+                                    || s.contains(&format!("func {bare_method_name}"))
+                                    || s.contains(&format!("def {bare_method_name}"))
+                            })
+                            .unwrap_or(false)
+                })
+                .map(|n| n.id)
+                .collect();
+
+            for impl_id in implementor_ids {
+                let exists = self.edges.iter().any(|e| {
+                    e.from == impl_id && e.to == *proto_id && e.kind == EdgeKind::Implements
+                });
+                if !exists {
+                    self.edges.push(ContractEdge {
+                        from: impl_id,
+                        to: *proto_id,
+                        kind: EdgeKind::Implements,
+                        metadata: Some(method_fqcn.clone()),
+                    });
+                }
+            }
+        }
+
+        // 4. Reconcile RPC Client Calls (CallsRpc)
+        let rpc_calls = self.rpc_calls.clone();
+        for (caller_id, target_rpc) in rpc_calls {
+            let target_str = target_rpc.as_str();
+            let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
+
+            let matched_proto = proto_methods
+                .iter()
+                .find(|(_, m_name)| {
+                    m_name.as_str().eq_ignore_ascii_case(target_str)
+                        || m_name
+                            .split('.')
+                            .next_back()
+                            .unwrap_or("")
+                            .eq_ignore_ascii_case(target_bare)
+                })
+                .map(|(id, _)| *id);
+
+            if let Some(target_id) = matched_proto {
+                let exists = self.edges.iter().any(|e| {
+                    e.from == caller_id && e.to == target_id && e.kind == EdgeKind::CallsRpc
+                });
+                if !exists {
+                    self.edges.push(ContractEdge {
+                        from: caller_id,
+                        to: target_id,
+                        kind: EdgeKind::CallsRpc,
+                        metadata: Some(target_rpc.clone()),
+                    });
+                }
+            }
+        }
     }
 
     /// O(1) in-memory reverse dependency resolution

@@ -6,7 +6,9 @@ roots = [
   "proto",
   "services/order-gateway",
   "services/payment-worker",
-  "services/inventory-manager"
+  "services/inventory-manager",
+  "services/notification-hub",
+  "services/billing-saga"
 ]
 exclude_patterns = [
   "**/target/**",
@@ -23,6 +25,7 @@ enabled = true
 proto_dirs = ["proto"]
 controller_annotations = ["@GrpcMethod"]
 
+# ── TypeScript Patterns (Order Gateway) ───────────────────────────────────────
 [[engines.contracts.patterns]]
 name = "kafka-producer-ts"
 kind = "topic_producer"
@@ -31,8 +34,61 @@ regex = "topic:\\s*['\"]([^'\"]+)['\"]"
 target_group = 1
 
 [[engines.contracts.patterns]]
+name = "grpc-client-call-ts"
+kind = "rpc"
+file_pattern = "*.ts"
+regex = "this\\.paymentClient\\.([A-Za-z0-9_]+)"
+target_group = 1
+
+# ── Go Patterns (Payment Worker) ──────────────────────────────────────────────
+[[engines.contracts.patterns]]
 name = "kafka-consumer-go"
 kind = "topic_consumer"
 file_pattern = "*.go"
-regex = "topic:\\s*['\"]([^'\"]+)['\"]"
+regex = "consumeTopic:\\s*['\"]([^'\"]+)['\"]"
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "kafka-producer-go"
+kind = "topic_producer"
+file_pattern = "*.go"
+regex = "produceTopic:\\s*['\"]([^'\"]+)['\"]"
+target_group = 1
+
+# ── Rust Patterns (Inventory Manager) ─────────────────────────────────────────
+[[engines.contracts.patterns]]
+name = "kafka-consumer-rust"
+kind = "topic_consumer"
+file_pattern = "*.rs"
+regex = "subscribe\\(['\"]([^'\"]+)['\"]\\)"
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "kafka-producer-rust"
+kind = "topic_producer"
+file_pattern = "*.rs"
+regex = "publish\\(['\"]([^'\"]+)['\"]\\)"
+target_group = 1
+
+# ── Python Patterns (Notification Hub) ────────────────────────────────────────
+[[engines.contracts.patterns]]
+name = "kafka-consumer-python"
+kind = "topic_consumer"
+file_pattern = "*.py"
+regex = "@kafka_consumer\\(['\"]([^'\"]+)['\"]\\)"
+target_group = 1
+
+# ── Java Patterns (Billing Saga) ──────────────────────────────────────────────
+[[engines.contracts.patterns]]
+name = "kafka-producer-java"
+kind = "topic_producer"
+file_pattern = "*.java"
+regex = "kafkaTemplate\\.send\\(['\"]([^'\"]+)['\"]"
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "saga-billing-java"
+kind = "saga"
+file_pattern = "*.java"
+regex = "class\\s+([A-Za-z0-9_]+Saga)"
 target_group = 1

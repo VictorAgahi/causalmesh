@@ -120,19 +120,28 @@ mod tests {
         let is_changed_second = vfs.check_and_update(&path, "content v1");
         assert!(!is_changed_second, "Unmodified content must return false");
 
-        // Simulate modification: write different content to disk and change mtime
-        // We must re-create to force a new mtime
-        std::fs::write(&path, "content v2").unwrap();
+        // Simulate modification: ensure mtime tick has passed on filesystems with low timer granularity (e.g. Windows NTFS ~15ms)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "content v2 - modified payload").unwrap();
 
         // Third check with modified content: must detect as changed
-        let is_changed_third = vfs.check_and_update(&path, "content v2");
+        let is_changed_third = vfs.check_and_update(&path, "content v2 - modified payload");
         assert!(is_changed_third, "Modified content must return true");
 
         // Fourth check after modification with same content: unchanged
-        let is_changed_fourth = vfs.check_and_update(&path, "content v2");
+        let is_changed_fourth = vfs.check_and_update(&path, "content v2 - modified payload");
         assert!(
             !is_changed_fourth,
             "Same content after update must return false"
+        );
+
+        // Fifth check: touch file (mtime changes, but content identical) - should detect as unchanged
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "content v2 - modified payload").unwrap();
+        let is_changed_fifth = vfs.check_and_update(&path, "content v2 - modified payload");
+        assert!(
+            !is_changed_fifth,
+            "Touched file with identical hash must return false"
         );
 
         // Remove

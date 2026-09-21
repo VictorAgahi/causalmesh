@@ -79,6 +79,32 @@ spec_files = ["${workspace_root}/docs/asyncapi.yaml"]
 infer_string_topics = true
 
 # ==============================================================================
+# Declarative Custom Pattern Engine (Zero-Hardcoding Polyglot Mapping)
+# Map your custom CQRS outboxes, BullMQ jobs, sagas, and event listeners via regex:
+# ==============================================================================
+# [[engines.contracts.patterns]]
+# name = "transactional-outbox"
+# kind = "topic_producer" # topic_producer | topic_consumer | saga | rpc
+# file_pattern = "*.ts"
+# regex = 'createEvent<([^>]+)>'
+# target_group = 1
+
+# [[engines.contracts.patterns]]
+# name = "event-post-processor"
+# kind = "topic_consumer"
+# file_pattern = "*.ts"
+# regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
+# target_group = 2
+# consumer_group = 1
+
+# [[engines.contracts.patterns]]
+# name = "saga-coordinator"
+# kind = "saga"
+# file_pattern = "*.ts"
+# regex = 'class\s+(\w+Saga)\b'
+# target_group = 1
+
+# ==============================================================================
 # Engine 3: Policy Steering, Audit & Git Enforcement (Active Defense)
 # ==============================================================================
 [engines.policy]

@@ -188,10 +188,11 @@ MeshMCP implements five specialized MCP tools designed for deep architecture nav
 - **Output**: End-to-end trace matrix mapping Schema -> Servers -> Clients across all polyglot repositories.
 
 ### 4. `analyze_impact`
-- **Purpose**: Causal impact analysis tracking asynchronous event flows (Kafka, RabbitMQ, SQS) and synchronous HTTP/gRPC pipelines.
+- **Purpose**: Causal impact analysis tracking asynchronous event flows (Kafka, RabbitMQ, SQS, Redis Streams, Transactional Outbox, Sagas) and synchronous HTTP/gRPC pipelines.
+- **Resolution Engines**: Evaluates formal AsyncAPI/OpenAPI specifications alongside the **Declarative Custom Pattern Engine** (`[[engines.contracts.patterns]]`), enabling zero-hardcoding extraction of custom company sagas, post-processors, and outbox events.
 - **Parameters**:
-  - `changed_file` *(string, required)*: Relative path of the modified file or schema.
-- **Output**: Blast radius report detailing potentially impacted downstream services, schemas, and event topics.
+  - `target` *(string, required)*: Name of the event, Kafka topic, queue, stream, post-processor class, or saga to analyze.
+- **Output**: Full causal flow mapping upstream producers -> topics/channels -> downstream consumers -> related sagas.
 
 ### 5. `search_docs`
 - **Purpose**: Architecture and ADR documentation search with adversarial prompt-injection sanitization.
@@ -320,6 +321,32 @@ exclude_patterns = [
 [engines.policy.stop_rules]
 "proto-registry" = "STOP CASCADE CI: Contracts must be committed independently."
 
+# ==============================================================================
+# Declarative Custom Pattern Engine (Zero-Hardcoding Architecture Mapping)
+# Map custom CQRS outbox events, BullMQ jobs, Sagas, or RPCs via regex:
+# ==============================================================================
+[[engines.contracts.patterns]]
+name = "transactional-outbox"
+kind = "topic_producer" # topic_producer | topic_consumer | saga | rpc
+file_pattern = "*.ts"
+regex = 'createEvent<([^>]+)>'
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "event-post-processor"
+kind = "topic_consumer"
+file_pattern = "*.ts"
+regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
+target_group = 2
+consumer_group = 1
+
+[[engines.contracts.patterns]]
+name = "saga-orchestrator"
+kind = "saga"
+file_pattern = "*.ts"
+regex = 'class\s+(\w+Saga)\b'
+target_group = 1
+
 [engines.watcher]
 enabled = true
 debounce_ms = 150
@@ -330,7 +357,7 @@ interval_seconds = 300
 thread_priority = "background"
 
 [engines.audit]
-db_path = "~/.cache/mesh-mcp/audit.db"
+db_path = "~/.cache/mesh-mcp/audit.db" # Or ":memory:" for zero-disk-overhead in-memory mode
 ```
 
 ---

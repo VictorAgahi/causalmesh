@@ -1,46 +1,22 @@
-use mesh_core::AppState;
+use crate::indexer::WorkspaceIndexer;
+use mesh_core::{AppState, ReloadFn};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// High-level FileWatcherService binding PolyglotIndexer to the in-kernel core watcher per RFC-001 Commandment 7.
+/// High-level FileWatcherService binding the workspace indexer to the in-kernel core watcher per RFC-001 Commandment 7.
 pub struct FileWatcherService;
 
 impl FileWatcherService {
     pub const DEBOUNCE_INTERVAL: std::time::Duration =
         mesh_core::FileWatcherService::DEBOUNCE_INTERVAL;
 
-    /// Spawns the debounced file watcher actor wired with the polyglot indexer
+    /// Spawns the debounced file watcher actor wired to the differential reload.
     pub fn spawn(
         state: Arc<AppState>,
         cancel_token: CancellationToken,
     ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
-        let patterns = state
-            .config
-            .load()
-            .engines
-            .contracts
-            .as_ref()
-            .map(|c| c.patterns.clone())
-            .unwrap_or_default();
-        let roots = state.allowed_roots.load_full();
-
-        mesh_core::FileWatcherService::spawn(state, cancel_token, move |file, content, graph| {
-            let repo_id = Self::repo_id_for_file(file, &roots);
-            mesh_parsers::PolyglotIndexer::index_file(file, content, repo_id, graph);
-            mesh_parsers::PolyglotIndexer::apply_custom_patterns(
-                file, content, repo_id, &patterns, graph,
-            );
-        })
-    }
-
-    /// Finds which configured root a changed file belongs to, so hot-reloaded
-    /// nodes keep the same `repo_id` (and therefore repo identity) they'd get
-    /// from the initial full workspace scan.
-    fn repo_id_for_file(file: &std::path::Path, roots: &[std::path::PathBuf]) -> mesh_core::RepoId {
-        roots
-            .iter()
-            .position(|root| file.starts_with(root))
-            .unwrap_or(0) as mesh_core::RepoId
+        let reload: ReloadFn = Arc::new(WorkspaceIndexer::reload);
+        mesh_core::FileWatcherService::spawn(state, cancel_token, reload)
     }
 
     #[inline]
@@ -48,24 +24,9 @@ impl FileWatcherService {
         mesh_core::FileWatcherService::is_relevant_path(path)
     }
 
+    /// Runs one differential reload synchronously on the calling thread.
     pub fn execute_reload_sync(state: &AppState) {
-        let patterns = state
-            .config
-            .load()
-            .engines
-            .contracts
-            .as_ref()
-            .map(|c| c.patterns.clone())
-            .unwrap_or_default();
-        let roots = state.allowed_roots.load_full();
-
-        mesh_core::FileWatcherService::execute_reload_sync(state, &|file, content, graph| {
-            let repo_id = Self::repo_id_for_file(file, &roots);
-            mesh_parsers::PolyglotIndexer::index_file(file, content, repo_id, graph);
-            mesh_parsers::PolyglotIndexer::apply_custom_patterns(
-                file, content, repo_id, &patterns, graph,
-            );
-        });
+        WorkspaceIndexer::reload(state);
     }
 }
 
@@ -142,7 +103,7 @@ roots = ["."]
 
         // Initial sync reload
         FileWatcherService::execute_reload_sync(&state);
-        assert_eq!(state.contract_graph.load().node_count(), 2);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 2);
 
         // Spawn live watcher
         let cancel_token = CancellationToken::new();
@@ -164,7 +125,7 @@ roots = ["."]
         let mut reloaded = false;
         for _ in 0..25 {
             std::thread::sleep(Duration::from_millis(100));
-            if state.contract_graph.load().node_count() > 2 {
+            if state.snapshot().contract_graph.node_count() > 2 {
                 reloaded = true;
                 break;
             }
@@ -176,8 +137,8 @@ roots = ["."]
         assert!(
             reloaded,
             "ContractGraph in AppState must be automatically reloaded by FileWatcherService upon file change! Expected > 2 nodes, got: {}",
-            state.contract_graph.load().node_count()
+            state.snapshot().contract_graph.node_count()
         );
-        assert_eq!(state.contract_graph.load().node_count(), 4);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 4);
     }
 }

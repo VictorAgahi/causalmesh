@@ -1,9 +1,9 @@
 use crate::protocol::RequestMeta;
+use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr};
 use mesh_parsers::MarkdownFormatter;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -20,31 +20,27 @@ pub struct FindDependentsArgs {
 
 pub struct FindDependentsTool;
 
-impl FindDependentsTool {
-    pub const NAME: &'static str = "find_dependents";
-    pub const DESCRIPTION: &'static str = "Resolves in-memory O(1) reverse dependency graph across packages and shared modules. DO NOT USE to search freeform text or method signatures (use smart_search).";
+impl McpTool for FindDependentsTool {
+    const NAME: &'static str = "find_dependents";
+    const DESCRIPTION: &'static str = "Resolves in-memory O(1) reverse dependency graph across packages and shared modules. DO NOT USE to search freeform text or method signatures (use smart_search).";
+    type Args = FindDependentsArgs;
 
-    pub async fn execute(
-        args: FindDependentsArgs,
-        state: Arc<AppState>,
-    ) -> Result<String, (i32, String)> {
-        let graph = state.contract_graph.load();
-        let dependents = graph.find_dependents(args.target.as_str());
+    fn meta(args: &Self::Args) -> Option<&RequestMeta> {
+        args._meta.as_ref()
+    }
 
-        let owned_nodes: Vec<_> = dependents.into_iter().cloned().collect();
-        let formatted = MarkdownFormatter::format_dependents(args.target.as_str(), &owned_nodes);
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.target.as_str())
+    }
 
-        let trace_id = args._meta.as_ref().and_then(|m| m.extract_trace_id());
-        let _ = state.audit.record_entry(
-            "active-session",
-            trace_id.as_deref(),
-            Self::NAME,
-            &serde_json::to_string(&args).unwrap_or_default(),
-            "SUCCESS",
-            vec![],
-            0,
-        );
-
-        Ok(formatted)
+    fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
+        let snapshot = state.snapshot();
+        let dependents = snapshot
+            .contract_graph
+            .find_dependents(args.target.as_str());
+        Ok(ToolOutput::text(MarkdownFormatter::format_dependents(
+            args.target.as_str(),
+            &dependents,
+        )))
     }
 }

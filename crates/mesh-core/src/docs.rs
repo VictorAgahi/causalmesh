@@ -11,6 +11,34 @@ pub struct DocSection {
     pub start_line: usize,
     pub end_line: usize,
     pub content: String,
+    /// Lowercased title/content computed once at index time; scoring is
+    /// case-insensitive and used to re-lowercase every section on every query.
+    #[serde(skip)]
+    title_lower: String,
+    #[serde(skip)]
+    content_lower: String,
+}
+
+impl DocSection {
+    fn new(
+        file_path: &Path,
+        title: CompactStr,
+        level: usize,
+        start_line: usize,
+        end_line: usize,
+        content: String,
+    ) -> Self {
+        Self {
+            file_path: file_path.to_path_buf(),
+            title_lower: title.as_str().to_lowercase(),
+            content_lower: content.to_lowercase(),
+            title,
+            level,
+            start_line,
+            end_line,
+            content,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,18 +78,48 @@ impl DocIndex {
         }
     }
 
+    /// An empty index carrying the same aliases / stop-words / sanitisation
+    /// settings, for parsing sections on another thread.
+    pub fn clone_settings(&self) -> Self {
+        Self {
+            sections: Vec::new(),
+            aliases: self.aliases.clone(),
+            stop_words: self.stop_words.clone(),
+            exact_phrase_boost: self.exact_phrase_boost,
+            sanitize_injections: self.sanitize_injections,
+        }
+    }
+
     #[inline]
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
 
     pub fn index_markdown_file(&mut self, path: &Path, raw_content: &str) {
+        let sections = self.parse_sections(path, raw_content);
+        self.sections.extend(sections);
+    }
+
+    /// Drops every section that came from `path` (used before re-indexing a changed file).
+    pub fn remove_file(&mut self, path: &Path) {
+        self.sections.retain(|s| s.file_path != path);
+    }
+
+    /// Appends pre-parsed sections (from `parse_sections` on another thread).
+    pub fn extend_sections(&mut self, sections: Vec<DocSection>) {
+        self.sections.extend(sections);
+    }
+
+    /// Splits a markdown document into sections without touching the index —
+    /// pure, so it can run on the Rayon pool during a workspace scan.
+    pub fn parse_sections(&self, path: &Path, raw_content: &str) -> Vec<DocSection> {
         let content = if self.sanitize_injections {
             Self::sanitize_prompt_injections(raw_content)
         } else {
-            raw_content.to_string()
+            std::borrow::Cow::Borrowed(raw_content)
         };
 
+        let mut sections = Vec::new();
         let mut current_title = CompactStr::new(
             path.file_stem()
                 .and_then(|s| s.to_str())
@@ -69,29 +127,29 @@ impl DocIndex {
         );
         let mut current_level = 1usize;
         let mut current_start_line = 1usize;
-        let mut section_lines = Vec::new();
+        let mut section_lines: Vec<&str> = Vec::new();
+        let mut line_num = 0usize;
 
-        for (line_idx, line) in content.lines().enumerate() {
-            let line_num = line_idx + 1;
+        for line in content.lines() {
+            line_num += 1;
             let trimmed = line.trim_start();
 
             if trimmed.starts_with('#') {
-                let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-                if hashes <= 6 && trimmed.chars().nth(hashes) == Some(' ') {
+                let hashes = trimmed.bytes().take_while(|&c| c == b'#').count();
+                if hashes <= 6 && trimmed.as_bytes().get(hashes) == Some(&b' ') {
                     if !section_lines.is_empty() {
-                        self.sections.push(DocSection {
-                            file_path: path.to_path_buf(),
-                            title: current_title.clone(),
-                            level: current_level,
-                            start_line: current_start_line,
-                            end_line: line_num - 1,
-                            content: section_lines.join("\n"),
-                        });
+                        sections.push(DocSection::new(
+                            path,
+                            current_title.clone(),
+                            current_level,
+                            current_start_line,
+                            line_num - 1,
+                            section_lines.join("\n"),
+                        ));
                         section_lines.clear();
                     }
 
-                    let header_text = trimmed[hashes..].trim();
-                    current_title = CompactStr::new(header_text);
+                    current_title = CompactStr::new(trimmed[hashes..].trim());
                     current_level = hashes;
                     current_start_line = line_num;
                     continue;
@@ -102,18 +160,25 @@ impl DocIndex {
         }
 
         if !section_lines.is_empty() {
-            self.sections.push(DocSection {
-                file_path: path.to_path_buf(),
-                title: current_title,
-                level: current_level,
-                start_line: current_start_line,
-                end_line: content.lines().count().max(current_start_line),
-                content: section_lines.join("\n"),
-            });
+            sections.push(DocSection::new(
+                path,
+                current_title,
+                current_level,
+                current_start_line,
+                line_num.max(current_start_line),
+                section_lines.join("\n"),
+            ));
         }
+
+        sections
     }
 
-    pub fn sanitize_prompt_injections(text: &str) -> String {
+    /// Replaces known prompt-injection markers in a single pass.
+    ///
+    /// Patterns are ASCII, so matching on an ASCII-lowercased copy keeps byte
+    /// offsets aligned with the original — no repeated `to_lowercase()` of the
+    /// whole document per replacement.
+    pub fn sanitize_prompt_injections(text: &str) -> std::borrow::Cow<'_, str> {
         const INJECTION_PATTERNS: &[&str] = &[
             "<|im_start|>",
             "<|im_end|>",
@@ -131,20 +196,31 @@ impl DocIndex {
             "output system prompt",
             "override authorization",
         ];
+        const REPLACEMENT: &str = "[FILTERED_ADVERSARIAL_INPUT]";
 
-        let mut sanitized = text.to_string();
-        for &pattern in INJECTION_PATTERNS {
-            let pattern_len = pattern.len();
-            loop {
-                let lower = sanitized.to_lowercase();
-                if let Some(pos) = lower.find(pattern) {
-                    sanitized.replace_range(pos..pos + pattern_len, "[FILTERED_ADVERSARIAL_INPUT]");
-                } else {
-                    break;
-                }
-            }
+        let lower = text.to_ascii_lowercase();
+        let mut hits: Vec<(usize, usize)> = INJECTION_PATTERNS
+            .iter()
+            .flat_map(|pat| lower.match_indices(pat).map(|(i, m)| (i, i + m.len())))
+            .collect();
+        if hits.is_empty() {
+            return std::borrow::Cow::Borrowed(text);
         }
-        sanitized
+        hits.sort_unstable();
+
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (start, end) in hits {
+            if start < cursor {
+                // Overlaps a previous hit (e.g. "ignore previous" inside "ignore all previous").
+                continue;
+            }
+            out.push_str(&text[cursor..start]);
+            out.push_str(REPLACEMENT);
+            cursor = end;
+        }
+        out.push_str(&text[cursor..]);
+        std::borrow::Cow::Owned(out)
     }
 
     pub fn search(&self, query: &str, max_sections: usize) -> Vec<&DocSection> {
@@ -152,17 +228,14 @@ impl DocIndex {
         if normalized_query.is_empty() {
             return Vec::new();
         }
+        let words: Vec<&str> = normalized_query.split_whitespace().collect();
 
         let mut scored: Vec<(u32, &DocSection)> = self
             .sections
             .iter()
             .filter_map(|section| {
-                let score = self.calculate_score(section, &normalized_query);
-                if score > 0 {
-                    Some((score, section))
-                } else {
-                    None
-                }
+                let score = self.calculate_score(section, &normalized_query, &words);
+                (score > 0).then_some((score, section))
             })
             .collect();
 
@@ -190,27 +263,25 @@ impl DocIndex {
         words.join(" ")
     }
 
-    fn calculate_score(&self, section: &DocSection, norm_query: &str) -> u32 {
-        let lower_title = section.title.to_lowercase();
-        let lower_content = section.content.to_lowercase();
+    fn calculate_score(&self, section: &DocSection, norm_query: &str, words: &[&str]) -> u32 {
         let mut score = 0u32;
 
         // Exact title match boost
-        if lower_title.contains(norm_query) {
+        if section.title_lower.contains(norm_query) {
             score += self.exact_phrase_boost;
         }
 
         // Exact content match
-        if lower_content.contains(norm_query) {
+        if section.content_lower.contains(norm_query) {
             score += 20;
         }
 
         // Keyword matches
-        for word in norm_query.split_whitespace() {
-            if lower_title.contains(word) {
+        for word in words {
+            if section.title_lower.contains(word) {
                 score += 15;
             }
-            if lower_content.contains(word) {
+            if section.content_lower.contains(word) {
                 score += 5;
             }
         }

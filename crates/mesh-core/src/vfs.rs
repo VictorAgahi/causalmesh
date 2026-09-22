@@ -29,50 +29,61 @@ impl DifferentialVfs {
             Ok(m) => m,
             Err(_) => return true,
         };
+        if self.is_unchanged_fast(path, &metadata) {
+            return false;
+        }
+        let sig = Self::compute_signature(&metadata, content.as_bytes());
+        self.upsert(path, sig)
+    }
 
+    /// Fast path: `true` when mtime and size both match the cached signature, so the
+    /// file need not even be read. Call this *before* `fs::read` on a reload.
+    #[inline]
+    pub fn is_unchanged_fast(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
+        let (mtime_nanos, file_size) = Self::stat_parts(metadata);
+        self.signatures
+            .get(path)
+            .is_some_and(|s| s.mtime_nanos == mtime_nanos && s.file_size == file_size)
+    }
+
+    /// Builds the full signature (stat + SHA-256). Pure — safe on any thread.
+    pub fn compute_signature(metadata: &std::fs::Metadata, content: &[u8]) -> FileSignature {
+        let (mtime_nanos, file_size) = Self::stat_parts(metadata);
+        let hash = ring::digest::digest(&ring::digest::SHA256, content);
+        let mut content_hash = [0u8; 32];
+        content_hash.copy_from_slice(hash.as_ref());
+        FileSignature {
+            mtime_nanos,
+            file_size,
+            content_hash,
+        }
+    }
+
+    /// Records `sig` for `path`. Returns `true` if the content hash is new or differs
+    /// from the cached one (i.e. the file must be re-indexed); a bare `touch` returns `false`.
+    pub fn upsert(&mut self, path: &Path, sig: FileSignature) -> bool {
+        let changed = self
+            .signatures
+            .get(path)
+            .is_none_or(|existing| existing.content_hash != sig.content_hash);
+        self.signatures.insert(path.to_path_buf(), sig);
+        changed
+    }
+
+    /// Paths currently tracked, for detecting deletions against a fresh crawl.
+    pub fn tracked_paths(&self) -> impl Iterator<Item = &Path> {
+        self.signatures.keys().map(PathBuf::as_path)
+    }
+
+    #[inline]
+    fn stat_parts(metadata: &std::fs::Metadata) -> (u128, u64) {
         let mtime_nanos = metadata
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let file_size = metadata.len();
-
-        if let Some(existing) = self.signatures.get(path) {
-            if existing.mtime_nanos == mtime_nanos && existing.file_size == file_size {
-                return false; // Fast path: mtime and file size match exactly
-            }
-        }
-
-        // Slow path: compute cryptographic hash to avoid false positives (e.g. touch or formatting without diff)
-        let hash = ring::digest::digest(&ring::digest::SHA256, content.as_bytes());
-        let mut content_hash = [0u8; 32];
-        content_hash.copy_from_slice(hash.as_ref());
-
-        if let Some(existing) = self.signatures.get(path) {
-            if existing.content_hash == content_hash {
-                // Content is identical even if mtime was touched; update mtime to avoid rehashing
-                self.signatures.insert(
-                    path.to_path_buf(),
-                    FileSignature {
-                        mtime_nanos,
-                        file_size,
-                        content_hash,
-                    },
-                );
-                return false;
-            }
-        }
-
-        self.signatures.insert(
-            path.to_path_buf(),
-            FileSignature {
-                mtime_nanos,
-                file_size,
-                content_hash,
-            },
-        );
-        true
+        (mtime_nanos, metadata.len())
     }
 
     /// Removes a file from the VFS cache (e.g. when deleted from disk).

@@ -1,140 +1,153 @@
-# MeshMCP Performance Benchmarks & Context Efficiency Analysis
+# Benchmarks
 
-This document provides empirical benchmarks, systems latency measurements, and context efficiency analysis for MeshMCP (RFC-001 Rev. 2.9.1).
+This document explains what MeshMCP measures, how to reproduce it on your own hardware, and —
+just as importantly — what is *not* measured.
 
----
-
-## 1. Executive Summary
-
-All measurements were conducted on modern developer workstations (Apple Silicon, macOS 15, APFS) and Linux systems (Ubuntu 24.04 LTS, Linux 6.8 kernel) across polyglot microservice topologies:
-- **52 distinct Git repositories**
-- **48,150 total source files**
-- **Polyglot codebases** (Java, Go, Python, TypeScript, Rust, Protobuf, YAML)
-
-```mermaid
-graph LR
-    subgraph Traditional Agent Flow
-        A1[Agent Query] --> A2[Raw Whole-File Read]
-        A2 --> A3[Full 500-1000 line implementations]
-        A3 --> A4[Context Window Cluttered by Loops & Locals]
-        A4 --> A5[Attention Drift & High Token Ingestion]
-    end
-
-    subgraph MeshMCP Flow
-        M1[Agent Query] --> M2[Tree-sitter Bounded Search]
-        M2 --> M3[AST Decapitation: Signatures & Types]
-        M3 --> M4[Dense Markdown Format with 48KB Cap]
-        M4 --> M5[Clean Architectural Context]
-    end
-```
+Every number here comes from `cargo bench -p mesh-server` on the machine named in the run
+header. Latency is hardware- and workload-dependent; treat these as a baseline to compare
+against, not as a specification.
 
 ---
 
-## 2. Context Engineering & AST Decapitation
-
-Large Language Models (Claude 3.5 Sonnet, GPT-4o, Gemini) experience degraded reasoning depth when their attention context is flooded with verbose implementation details, routine loops, and local variable allocations.
-
-### 2.1 How AST Decapitation Works
-
-When an agent needs to locate an interface, understand parameters, or inspect method declarations, MeshMCP's `smart_search` parses the code with Tree-sitter and decapitates the bodies:
-- **Function/Method Bodies**: Replaced with `{ /* stripped */ }` or `...` (for Python).
-- **TypeScript Arrow Functions**: `const getBilling = (id) => ({ x, y })` is synthesized into typed signatures with stripped bodies.
-- **Contract Information Preserved**: Function names, visibility, argument lists, type annotations, return types, and docstrings/annotations (`@Service`, `@Transactional`, etc.) are fully preserved.
-- **Full Implementation on Demand**: If the agent actually needs to inspect or edit the internal implementation of a specific function, it sets `include_body: true` for that exact scope.
-
-### 2.2 Measured Empirical Reductions
-
-Based on empirical runs against real production codebases (see Section 4 for benchmark reproduction):
-
-| Language | Sample Type | Full File Tokens | Decapitated Tokens | Context Reduction |
-| :--- | :--- | :--- | :--- | :--- |
-| **Go** | gRPC Handlers & Server structs | ~1,850 tokens | ~575 tokens | **~68.9%** |
-| **Rust** | Tokio actors & Trait implementations | ~2,100 tokens | ~895 tokens | **~57.4%** |
-| **TypeScript** | NestJS / Express API controllers | ~1,650 tokens | ~750 tokens | **~54.5%** |
-| **Java** | Spring Boot `@RestController` / `@Service` | ~3,200 tokens | ~1,100 tokens | **~65.6%** |
-| **Python** | FastAPI / Pydantic routes | ~1,900 tokens | ~720 tokens | **~62.1%** |
-
-*Note: Context reduction varies based on codebase style. Files with short methods see ~40-50% reduction; files with long, complex business logic bodies see 70%+ reduction.*
-
-### 2.3 Serialization Efficiency: Compact Markdown vs Raw JSON
-
-Most MCP servers transmit results serialized as escaped JSON strings, adding syntax overhead (`\n`, `\"`, `{ "file_path": ... }`):
-- **Clean Markdown Formatting**: Headers (`### [1] path/to/file.rs`), fenced code blocks, and line numbers provide immediate structure without JSON punctuation bloat.
-- **Affordance-Driven Truncation (48 KB Cap)**: Prevents runaway queries from overflowing the context window. When truncated, MeshMCP provides structured sub-scope guidance so the agent can narrow its inquiry intelligently.
-
----
-
-## 3. Systems Latency & Resource Utilization
-
-### 3.1 Systems Latency Profile
-
-| Metric | Target Specification | Measured Result | Margin |
-| :--- | :--- | :--- | :--- |
-| **Stdio Loopback Latency** | `< 1.0 ms` | **`0.02 ms`** (20 µs) | 50x faster than target |
-| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** | 4x faster than target |
-| **In-Memory Reverse Dependency Query** | `< 2.0 ms` | **`3.97 µs`** | Instantaneous |
-| **Synchronous gRPC Trace Pipeline** | `< 2.0 ms` | **`121.7 µs`** | 16x faster than target |
-| **Scoped Tree-sitter Parse + Decapitate** | `< 50.0 ms` | **`0.11 ms`** per file | Sub-millisecond |
-| **Full Topology Scan (`init --auto`)** | `< 5.0 s` | **`4.2 s`** | Within budget |
-
-### 3.2 Memory & CPU Profile
-
-- **Resident Set Size (RSS)**: MeshMCP stabilizes at **< 20 MiB** resident memory under active query load, achieved through `mimalloc` allocation recycling and stack-inlined `CompactString` (24 bytes inline).
-- **Background Daemon (`meshd`)**: Multiplexes multiple concurrent agent sessions over a single Unix Domain Socket (`.sock`). A single OS watcher (`notify-debouncer-mini`, 150ms debounce) handles workspace file changes without spawning redundant background processes.
-- **Differential VFS (`DifferentialVfs`)**: Fast-paths unchanged files using Blake3/SHA-256 + mtime/size checks, eliminating redundant Tree-sitter parsing on hot reloads.
-- **Zero Editor Keystroke Interference**: Background rescans executed in the dedicated Rayon thread pool with OS QoS throttling (`QOS_CLASS_BACKGROUND` on Darwin and `nice(10)` on Linux) yield **0ms recorded UI stuttering** in VS Code and Cursor.
-
----
-
-## 4. Comparison with Alternative Approaches
-
-| Feature | Standard Grep / Ripgrep | Language Server (LSP) | Traditional MCP Indexer | MeshMCP (RFC-001) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Context Quality** | Raw grep matches without context | High (complex AST symbol dumps) | Raw whole-file chunks | **Signatures & docstrings (AST Decap)** |
-| **Cross-Repo gRPC Tracing** | None (unlinked strings) | Limited to single project | Limited | **Native cross-language trace matrix** |
-| **Reverse Dependency Index** | Brute force text search | Slow cross-project indexing | Ad-hoc | **In-memory reverse index (O(1) lookups)** |
-| **RAM Footprint** | Low (< 10 MB) | High (500 MB - 2 GB) | Medium (150 MB - 500 MB) | **Very Low (< 20 MiB RSS)** |
-| **Output Bounding** | None (can dump megabytes) | Structured | Often unbounded | **48 KB Hard Affordance Cap** |
-| **Active Governance (RSAH)** | None | None | None | **Refusal with Structured Action Handoff** |
-| **Cryptographic Audit Log** | None | None | None | **Append-Only SHA-256 SQLite WAL** |
-
----
-
-## 5. How to Reproduce Real-World Empirical Benchmarks
-
-MeshMCP includes a dedicated empirical benchmark harness (`crates/mesh-server/benches/real_benchmarks.rs`) measuring real execution latencies, throughput, and token reductions across multi-kilobyte polyglot samples (Rust, TypeScript, Go, Protobuf) and 1,000-node graph topologies.
-
-### 5.1 Running the Benchmarks
-
-Execute the suite directly using Cargo:
+## 1. Running the suite
 
 ```bash
-cargo bench
+cargo bench -p mesh-server
 ```
 
-Or run the benchmark regression suite within the test harness:
+The harness lives in [`crates/mesh-server/benches/real_benchmarks.rs`](../crates/mesh-server/benches/real_benchmarks.rs).
+It runs 20 warm-up iterations then 500 measured ones per case, against real source samples and a
+live 1,000-node graph — no mocks, no synthetic stubs.
+
+A regression test asserts the budgets still hold, so a performance regression fails CI like any
+other bug:
 
 ```bash
 cargo test -p mesh-server test_real_benchmarks_regression_budgets
 ```
 
-### 5.2 Measured Empirical Benchmark Results (Workstation Environment)
+---
+
+## 2. Reference run
+
+Apple Silicon, 8 cores, macOS, release profile (thin LTO, `codegen-units = 1`, mimalloc):
 
 ```
-=========================================================================================================
-                                     EMPIRICAL BENCHMARK RESULTS
-=========================================================================================================
-Category           | Benchmark                    | Avg(µs) | Min(µs) | Max(µs) | p95(µs) |   Ops/sec | Throughput |   Tokens
----------------------------------------------------------------------------------------------------------
-AST Decapitation   | TypeScript (n=500)           |  114.68 |  110.96 |  274.33 |  122.46 |      8720 |  14.4 MB/s |   -54.5%
-AST Decapitation   | Rust (n=500)                 |  113.61 |  108.46 |  238.58 |  118.42 |      8802 |  12.9 MB/s |   -57.4%
-AST Decapitation   | Go (n=500)                   |  114.86 |  112.38 |  310.88 |  118.83 |      8706 |  11.6 MB/s |   -68.9%
-Lexical Guard      | AstGuard::max_nesting_depth  |    1.25 |    1.21 |    1.42 |    1.33 |    798004 | 944.4 MB/s |        -
-Contract Graph     | find_dependents (O(1))       |    3.97 |    3.83 |    5.71 |    4.21 |    251927 |          - |        -
-Contract Graph     | analyze_grpc (Pipeline trace)|  121.77 |  119.54 |  156.00 |  127.54 |      8212 |          - |        -
-Audit Logging      | record_entry (Flock+SHA-256) |    5.46 |    4.92 |   30.71 |    7.29 |    183273 |          - |        -
-Markdown Formatting| format_search_results (48KB) |   35.47 |   33.00 |  153.96 |   37.96 |     28194 |          - |        -
-=========================================================================================================
+Category            | Benchmark                            | Avg(µs) | p95(µs) |   Ops/sec | Throughput |  Tokens
+------------------------------------------------------------------------------------------------------------------
+AST Decapitation    | TypeScript (n=500)                   |  150.57 |  264.21 |      6642 |  11.0 MB/s |  -54.5%
+AST Decapitation    | Rust (n=500)                         |  107.03 |  116.33 |      9343 |  13.7 MB/s |  -57.4%
+AST Decapitation    | Go (n=500)                           |  109.86 |  121.58 |      9103 |  12.2 MB/s |  -68.9%
+Lexical Guard       | AstGuard::max_nesting_depth (n=1000) |    1.20 |    1.29 |    835424 | 988.7 MB/s |       -
+Contract Graph      | find_dependents (n=500)              |    3.95 |    4.17 |    252928 |          - |       -
+Contract Graph      | analyze_grpc pipeline trace (n=500)  |    9.12 |    9.17 |    109658 |          - |       -
+Audit Logging       | record_entry (SHA-256 chain, n=500)  |   12.22 |   22.29 |     81842 |          - |       -
+Markdown Formatting | format_search_results 48 KB (n=500)  |   34.40 |   37.42 |     29066 |          - |       -
 ```
 
-All benchmarks are 100% deterministic and execute against actual source code and live graph data structures.
+Binary and memory, same machine:
+
+| | |
+| :--- | :--- |
+| `mesh-mcp` release binary | 12.3 MB |
+| `meshd` release binary | 12.1 MB |
+| Peak RSS indexing this repo (60 files) | 20.5 MiB |
+
+RSS scales with workspace size — the graph, the doc index and the file-signature cache all grow
+with it. Measure on your own repo rather than extrapolating from this one.
+
+---
+
+## 3. What each number means
+
+**AST decapitation** — parse a source file and strip function bodies to `{ /* stripped */ }`
+(or `...` in Python). The `Tokens` column is the measured reduction in token count for that
+sample, computed by the harness, not an estimate.
+
+Reduction depends entirely on code style: a file of one-line delegating methods barely shrinks,
+a file of long business-logic bodies shrinks a lot. The 54–69% range above reflects the three
+samples in the harness (TypeScript, Rust, Go). To know your own figure, run the suite — do not
+assume a single headline percentage applies to your codebase.
+
+Signatures, parameter types, return types, annotations (`@Service`, `@GrpcMethod`, …) and
+docstrings are always preserved. An agent that genuinely needs an implementation asks for it
+with `include_body: true` on that one scope.
+
+**Lexical guard** — the pre-parse scan that rejects pathological files (nesting beyond 64
+levels), skipping brackets inside strings and comments. It runs over every candidate file, so it
+has to be effectively free; ~989 MB/s means it is.
+
+**Contract graph queries** — `find_dependents` and `analyze_grpc` against a 1,000-node graph.
+Both resolve through in-memory indices, not scans, so they stay in the microsecond range as the
+graph grows.
+
+**Audit logging** — one `record_entry`: a `BEGIN IMMEDIATE` SQLite WAL transaction, reading the
+committed tail of the hash chain, computing the SHA-256 link and inserting. This is the slowest
+per-call operation in the server and it still costs ~12 µs. It runs on the blocking pool, never
+on the async executor.
+
+**Markdown formatting** — rendering search results under the hard 48 KB output cap, including
+the truncation path that tells the agent how to narrow its query.
+
+---
+
+## 4. What is not measured here
+
+Be sceptical of any figure in this section's absence — if it isn't in the harness, it isn't a
+benchmark:
+
+- **Cold boot / full workspace scan.** Dominated by your disk, file count and file sizes. Time
+  it yourself: `time mesh-mcp graph --format json > /dev/null`.
+- **End-to-end tool latency through an MCP client.** Depends on the client and transport.
+- **Stdio round-trip latency.** `mesh-mcp doctor` prints a loopback measurement for your
+  machine.
+- **Incremental reload time.** Proportional to the number of *changed* files, not workspace
+  size, because unchanged files are rejected on a `stat` before being read.
+- **Memory at scale.** Measure with `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux) on
+  your workspace.
+
+---
+
+## 5. Where the performance comes from
+
+The design decisions behind the numbers, in rough order of impact:
+
+- **Index-first queries.** `smart_search` consults the in-memory symbol index and reads only the
+  files that declare a match. It does not crawl or parse the scope unless you pass `fuzzy: true`.
+- **One atomic snapshot.** Readers take a pointer copy of an immutable `MeshSnapshot`; writers
+  build a new one and swap it in. No locks in the query path, and no chance of observing a
+  half-updated index.
+- **Linear reconciliation.** Edge de-duplication goes through a `HashSet` and target resolution
+  through the graph's own indices, so a rescan is linear in nodes plus edges.
+- **Differential reloads.** A file whose mtime and size are unchanged is never read, let alone
+  parsed. Changed content is confirmed with a SHA-256 hash, so a bare `touch` costs nothing.
+- **Amortised resources.** Regexes from `[[engines.contracts.patterns]]` compile once per run;
+  tree-sitter parsers are cached per thread instead of being rebuilt per file.
+- **Interned paths and compact strings.** `Arc<Path>` gives one path buffer per file rather than
+  one per symbol; `CompactString` keeps names up to 24 bytes on the stack.
+- **Bounded work.** 15 ms parse timeout, 384 KB file budget (1.5 MB for schemas), 1 KB max line
+  length, 48 KB output cap. Worst-case cost per file is bounded by construction.
+- **Background priority.** Rescans run on a Rayon pool with `QOS_CLASS_BACKGROUND` (macOS) or
+  `nice(10)` (Linux) so re-indexing does not compete with your editor. The boot scan
+  deliberately uses the normal-priority pool — you are waiting for it.
+
+For the reasoning behind each, see [architecture.md](architecture.md).
+
+---
+
+## 6. Comparing honestly
+
+The table below is qualitative on purpose. Published RAM and latency figures for other tools
+depend on their configuration and corpus, and reproducing them fairly is a project of its own.
+
+| | grep / ripgrep | Language server | MeshMCP |
+| :--- | :--- | :--- | :--- |
+| Result granularity | text matches | full AST symbols | signatures, bodies stripped |
+| Cross-language links | none | rarely | gRPC, events, imports across repos |
+| Reverse dependencies | brute-force search | per-project | in-memory index |
+| Output bounding | none | structured | 48 KB cap with narrowing guidance |
+| Secret masking | none | none | redacted before reaching the prompt |
+| Audit trail | none | none | SHA-256 chained SQLite log |
+
+If you benchmark MeshMCP against something else, publish the corpus and the commands. We will
+link to it.

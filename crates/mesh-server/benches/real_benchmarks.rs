@@ -330,7 +330,8 @@ fn main() {
             } else {
                 NodeKind::ServiceClass
             },
-            file_path: format!("services/srv_{repo_id}/node_{i}.rs").into(),
+            file_path: std::path::PathBuf::from(format!("services/srv_{repo_id}/node_{i}.rs"))
+                .into(),
             line_start: 1,
             line_end: 100,
             package: CompactStr::new(format!("corp.mesh.srv_{repo_id}")),

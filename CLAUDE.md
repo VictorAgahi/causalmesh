@@ -18,7 +18,7 @@ cargo build --workspace
 # Build optimized release binary with Thin LTO and mimalloc (6.8 MB)
 cargo build --workspace --release
 
-# Run all 33 unit and integration tests across workspace
+# Run all unit and integration tests across workspace
 cargo test --workspace
 
 # Strict Clippy validation (MUST have 0 warnings and 0 errors)
@@ -84,14 +84,14 @@ Claude Code must strictly enforce these invariants on every edit:
 
 - **Pure Rust**: No mock code, no stubs (`todo!()`, `unimplemented!()`).
 - **Zero Unwrap in Production**: Use `?` operator and `thiserror` for error management. `unwrap()` is strictly forbidden outside `#[cfg(test)]`.
-- **AST Decapitation**: Strip function bodies into `{ /* stripped */ }` or `...` to minimize token consumption (-98.1%).
-- **Markdown Payloads**: Format tool outputs in dense GitHub Flavored Markdown (-37.2% tokens vs raw JSON).
+- **AST Decapitation**: Strip function bodies into `{ /* stripped */ }` or `...` to minimize token consumption (measured 54-69% fewer tokens depending on language; run `cargo bench -p mesh-server`).
+- **Markdown Payloads**: Format tool outputs in dense GitHub Flavored Markdown rather than raw JSON (avoids escaping overhead).
 
 ---
 
 ## 4. Key References & Documentation
 - High-level architecture: [`docs/architecture.md`](docs/architecture.md)
-- 5 MCP Tools & Schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md)
+- 6 MCP Tools & Schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md)
 - Developer & Tree-sitter guide: [`docs/development.md`](docs/development.md)
 - Governance & RSAH: [`docs/governance-rsah.md`](docs/governance-rsah.md)
 - Performance & Token benchmarks: [`docs/benchmarks.md`](docs/benchmarks.md)

@@ -109,7 +109,10 @@ impl AuditLogger {
                  secrets_redacted_count INTEGER NOT NULL,
                  entry_hash TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit_entries(entry_seq);",
+             -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
+             -- table's B-tree key. The secondary index earlier versions created on it
+             -- only doubled every insert's write cost.
+             DROP INDEX IF EXISTS idx_audit_seq;",
         )?;
 
         #[cfg(unix)]
@@ -155,8 +158,10 @@ impl AuditLogger {
         // BEGIN IMMEDIATE acquires write lock on SQLite instantly, serializing concurrent processes
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // Read the true committed tail from SQLite (never stale RAM memory)
-        let mut stmt = tx.prepare(
+        // Read the true committed tail from SQLite (never stale RAM memory): another
+        // process may share this DB. Cheap — `entry_seq` is the rowid, so this is a
+        // single B-tree descent. Statements are cached across calls.
+        let mut stmt = tx.prepare_cached(
             "SELECT entry_seq, entry_hash FROM audit_entries ORDER BY entry_seq DESC LIMIT 1",
         )?;
         let last_entry: Option<(u64, String)> = stmt
@@ -178,25 +183,25 @@ impl AuditLogger {
 
         let files_json = serde_json::to_string(&files_accessed)?;
 
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO audit_entries (
                 entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
                 args_digest, status, files_accessed, secrets_redacted_count, entry_hash
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                seq,
-                prev_hash,
-                timestamp,
-                session_id,
-                trace_id,
-                tool,
-                args_digest,
-                status,
-                files_json,
-                secrets_redacted_count as i64,
-                entry_hash,
-            ],
-        )?;
+        )?
+        .execute(params![
+            seq,
+            prev_hash,
+            timestamp,
+            session_id,
+            trace_id,
+            tool,
+            args_digest,
+            status,
+            files_json,
+            secrets_redacted_count as i64,
+            entry_hash,
+        ])?;
 
         tx.commit()?;
 

@@ -20,16 +20,16 @@ pub use config::{
     expand_roots, Config, ConfigError, CustomPatternConfig, PatternKind, WorkspaceConfig,
 };
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
-pub use crawler::FilesystemCrawler;
+pub use crawler::{ExcludeMatcher, FilesystemCrawler};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use properties::PropertyRegistry;
 pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
-pub use state::AppState;
+pub use state::{AppState, MeshSnapshot};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
-    ContractNode, EdgeKind, NodeId, NodeKind, PathStr, RepoId, RepoState, SymbolName,
+    ContractNode, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState, SymbolName,
 };
 pub use vfs::DifferentialVfs;
-pub use watcher::FileWatcherService;
+pub use watcher::{FileWatcherService, ReloadFn};

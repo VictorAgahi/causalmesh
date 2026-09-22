@@ -34,12 +34,13 @@ path-clean = "1.0"
 glob = "0.3"
 shellexpand = "3.1"
 ignore = "0.4"
+globset = "0.4"
 
 compact_str = { version = "0.8", features = ["serde"] }
 mimalloc = { version = "0.1", default-features = false }
 
 schemars = "0.8"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "0.8"
@@ -65,6 +66,7 @@ tree-sitter-rust = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
+tree-sitter-cpp = "0.23"
 
 [profile.release]
 opt-level = 3

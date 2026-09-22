@@ -1,5 +1,5 @@
-use mesh_core::{expand_roots, Config, ContractGraph, FilesystemCrawler, ValidatedScope};
-use mesh_parsers::{GraphRenderer, PolyglotIndexer};
+use crate::indexer::WorkspaceIndexer;
+use mesh_parsers::GraphRenderer;
 use std::path::{Path, PathBuf};
 
 pub struct GraphCommand;
@@ -13,74 +13,9 @@ impl GraphCommand {
     ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Indexing Polyglot Architecture Mesh Topology...");
 
-        let config_paths = [
-            config_path.map(|p| p.to_path_buf()),
-            Some(PathBuf::from(".agents/mesh-mcp.toml")),
-            Some(PathBuf::from("mesh-mcp.toml")),
-        ];
-
-        let found_path = config_paths.into_iter().flatten().find(|p| p.exists());
-        let (config, base_dir) = if let Some(ref path) = found_path {
-            let cfg = Config::load_from_file(path)?;
-            let base = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            (cfg, base)
-        } else {
-            let default =
-                "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
-            (Config::load_from_str(default)?, PathBuf::from("."))
-        };
-
-        let allowed_roots = match expand_roots(
-            &config.workspace.roots,
-            &base_dir,
-            &config.workspace.workspace_root,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(target: "mesh::graph", "Failed to expand roots: {e}");
-                vec![dunce::canonicalize(&base_dir).unwrap_or(base_dir)]
-            }
-        };
-
-        let mut graph = ContractGraph::new();
-        let mut file_count = 0usize;
-
-        for (repo_idx, root) in allowed_roots.iter().enumerate() {
-            let repo_id = repo_idx as mesh_core::RepoId;
-            if let Ok(validated_scope) =
-                ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
-            {
-                let files = FilesystemCrawler::crawl_scope(
-                    &validated_scope,
-                    &config.workspace.exclude_patterns,
-                    Some(10),
-                );
-
-                for file in files {
-                    if let Ok(content) = std::fs::read_to_string(&file) {
-                        file_count += 1;
-                        let path_str = file.to_string_lossy();
-                        if !path_str.ends_with(".md") && !path_str.ends_with(".properties") {
-                            PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
-                            if let Some(ref contracts_cfg) = config.engines.contracts {
-                                PolyglotIndexer::apply_custom_patterns(
-                                    &file,
-                                    &content,
-                                    repo_id,
-                                    &contracts_cfg.patterns,
-                                    &mut graph,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        graph.reconcile_edges();
+        let (config, base_dir) = WorkspaceIndexer::discover_config(config_path)?;
+        let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
+        let (graph, file_count) = WorkspaceIndexer::build_graph(&config, &allowed_roots);
 
         eprintln!(
             "✔ Scanned {file_count} files across {} roots: {} contracts/nodes, {} causal links/edges.",
@@ -90,14 +25,7 @@ impl GraphCommand {
         );
 
         let workspace_name = &config.workspace.name;
-        let repo_names: Vec<String> = allowed_roots
-            .iter()
-            .map(|r| {
-                r.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| r.display().to_string())
-            })
-            .collect();
+        let repo_names = WorkspaceIndexer::repo_names(&allowed_roots);
         let rendered = match format.to_lowercase().as_str() {
             "mermaid" => GraphRenderer::to_mermaid(&graph, workspace_name, &repo_names),
             "json" => GraphRenderer::to_json(&graph, workspace_name, &repo_names),

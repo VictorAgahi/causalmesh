@@ -1,112 +1,150 @@
-# DEEPENING: Advanced Tree-Sitter C-FFI & Zero-Copy AST Decapitation
+# DEEPENING: Tree-sitter Lifetimes, the Depth Scanner & Bounded Queries
 
-This document provides deep architectural and memory-safety reference material for the `mesh-parser-engineering` skill.
+Deep reference for the `mesh-parser-engineering` skill. Read the skill first.
 
 ---
 
-## 1. The Tree-sitter 0.24 Streaming Iterator Borrow Problem
+## 1. The streaming-iterator borrow problem
 
-In `tree-sitter` 0.24+, `QueryMatches` implements `streaming_iterator::StreamingIterator` rather than Rust's standard `Iterator`.
+In `tree-sitter` 0.24+, `QueryMatches` implements `streaming_iterator::StreamingIterator`
+rather than `Iterator`. `StreamingIterator::next()` returns `Option<&Self::Item>`, and the
+item borrows from the cursor, so matches cannot be collected while the cursor advances:
 
-### The Problem:
-`StreamingIterator::next()` returns `Option<&Self::Item>`. The item borrows directly from the cursor (`'cursor`), which prevents callers from storing matches into a standard vector or yielding them while advancing the cursor:
 ```rust
-// ILLEGAL in Tree-sitter 0.24:
+// Does not compile: the match borrows from `matches`, which `next()` mutates.
 while let Some(m) = matches.next() {
-    results.push(m); // Compile error: lifetime 'cursor is tied to matches
+    results.push(m);
 }
 ```
 
-### The Solution: `BoundedMatch<'tree>`
-MeshMCP introduces [`BoundedMatch<'tree>`](../../../crates/mesh-parsers/src/guard.rs):
+The workaround in [`guard.rs`](../../../crates/mesh-parsers/src/guard.rs):
+
 ```rust
 pub struct BoundedMatch<'tree> {
     pub pattern_index: usize,
     pub captures: Vec<tree_sitter::QueryCapture<'tree>>,
 }
 ```
-`BoundedMatch` clones the small `QueryCapture<'tree>` struct (which consists of only a `Node<'tree>` and a `u32` index). Since `Node<'tree>` borrows from the parsed `Tree<'tree>` (not the cursor), `BoundedMatch` safely outlives the streaming iterator cursor.
+
+`execute_bounded_query` copies the captures out of each match with `m.captures.to_vec()`.
+A `QueryCapture<'tree>` is a `Node<'tree>` plus a `u32` index, and `Node<'tree>` borrows
+from the `Tree`, not from the cursor — so the collected `BoundedMatch` values outlive the
+iterator while staying tied to the tree that must remain alive.
+
+Practical consequence: the `Tree` must outlive every `BoundedMatch` you hold. Keep the
+tree in a local binding for the whole extraction; do not return `BoundedMatch` values from
+a function that owns the tree.
 
 ---
 
-## 2. Zero-Copy AST Body Replacement Algorithm
+## 2. `execute_bounded_query`: two independent limits
 
-In [`AstDecapitator`](../../../crates/mesh-parsers/src/decapitate.rs), we replace function bodies without constructing intermediate string buffers or regex passes:
-
-```mermaid
-graph TD
-    A[Collect Byte Ranges: start_byte, end_byte] --> B[Sort Replacements Ascending by start_byte]
-    B --> C[Iterate Source Slices]
-    C -->|Slice 0..start_0| Out[Output Buffer]
-    Out -->|Push Replacement: { /* stripped */ }| Out
-    Out -->|Slice end_0..start_1| Out
-```
-
-### Invariants:
-1. **Sorted Non-Overlapping Slices**:
-   ```rust
-   replacements.sort_by_key(|&(start, _, _)| start);
-   ```
-2. **Byte Index vs Char Index**: Tree-sitter reports byte offsets (`node.start_byte()`, `node.end_byte()`). Never index UTF-8 strings by character count; always slice using byte ranges:
-   ```rust
-   if start > cursor && start <= source.len() {
-       output.push_str(&source[cursor..start]);
-   }
-   output.push_str(replacement);
-   cursor = end;
-   ```
-3. **Trailing Slices**: Always flush remaining source text:
-   ```rust
-   if cursor < source.len() {
-       output.push_str(&source[cursor..]);
-   }
-   ```
-
----
-
-## 3. Lexical Nesting Depth Pre-Check (Commandment 2)
-
-Tree-sitter's C parser allocates stack frames proportional to grammar recursion depth. Malicious or generated files with 1,000+ nested parentheses can cause native C stack overflow, terminating the Rust process instantly (`SIGSEGV`).
-
-MeshMCP avoids this with a 0-allocation linear pre-scan in [`AstGuard::check_nesting_depth`](../../../crates/mesh-parsers/src/guard.rs):
 ```rust
-pub fn check_nesting_depth(source: &str, max_depth: usize) -> bool {
-    let mut current_depth: usize = 0;
-    for b in source.bytes() {
-        match b {
-            b'{' | b'(' | b'[' => {
-                current_depth += 1;
-                if current_depth > max_depth {
-                    return false;
-                }
-            }
-            b'}' | b')' | b']' => {
-                current_depth = current_depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-    }
-    true
-}
-```
-This check runs in $< 50\mu\text{s}$ over a 384 KB file, rejecting dangerous payloads before Tree-sitter's C runtime is touched.
+cursor.set_match_limit(Self::QUERY_MATCH_LIMIT);
+let mut matches = Vec::new();
+let mut step_count = 0usize;
 
----
-
-## 4. ReDoS & Step Counter Protection
-
-Tree-sitter queries with recursive wildcards (e.g., `(class_declaration (_)*)`) can induce exponential backtracking.
-
-In [`AstGuard::execute_query_bounded`](../../../crates/mesh-parsers/src/guard.rs):
-```rust
-let mut steps = 0;
-while let Some(m) = matches.next() {
-    steps += 1;
-    if steps > 10_000 {
-        tracing::warn!("Tree-sitter query aborted: exceeded 10,000 steps");
+let mut matches_iter = cursor.matches(query, node, source);
+while let Some(m) = matches_iter.next() {
+    matches.push(BoundedMatch {
+        pattern_index: m.pattern_index,
+        captures: m.captures.to_vec(),
+    });
+    step_count += 1;
+    if step_count >= Self::MAX_QUERY_STEPS {
+        tracing::warn!(target: "mesh::parser", "Query execution step limit reached (ReDoS guard triggered)");
         break;
     }
-    // Process match...
 }
 ```
-This guarantees deterministic execution bounds even when evaluating complex, ambiguous grammar queries.
+
+`QUERY_MATCH_LIMIT` (500) is tree-sitter's own cap on *in-progress* matches the cursor
+tracks, which bounds memory during matching. `MAX_QUERY_STEPS` (10 000) is MeshMCP's own
+cap on *yielded* matches, which bounds the caller's work and time. They are not the same
+number and not the same thing; queries with recursive wildcards such as
+`(class_declaration (_)*)` are why both exist.
+
+Hitting either limit is silent truncation from the extractor's point of view — the result
+is simply shorter. Check the `mesh::parser` warnings on stderr when an extractor mysteriously
+misses symbols in a large file.
+
+---
+
+## 3. The lexical depth pre-scan
+
+Tree-sitter's C parser allocates stack proportional to grammar recursion depth; a file
+with a thousand nested parentheses can overflow the native stack and take the whole
+process down with `SIGSEGV` — a crash Rust cannot catch. `AstGuard::max_nesting_depth`
+runs a single-pass byte scan before the C runtime is ever touched.
+
+It is context-aware, which the naive version was not. It skips, in order: `//` comments to
+end of line; `/* ... */` comments; `#` comments (Python, YAML, shell); and `"`, `'` and
+backtick literals, honouring `\` escapes inside each. Only brackets surviving all of that
+count:
+
+```rust
+match b {
+    b'{' | b'(' | b'[' => {
+        depth += 1;
+        if depth > max_depth {
+            max_depth = depth;
+        }
+    }
+    b'}' | b')' | b']' => {
+        depth = depth.saturating_sub(1);
+    }
+    _ => {}
+}
+```
+
+Two details worth preserving: it returns the **maximum** depth reached rather than
+short-circuiting at the limit (the caller compares against `MAX_NESTING_DEPTH`), and the
+closing-bracket arm uses `saturating_sub`, so an unbalanced file cannot underflow. The
+test `test_nesting_depth_ignores_strings_and_comments` pins the literal handling — a
+regex-y "improvement" that re-counts brackets inside strings will fail it.
+
+---
+
+## 4. Why the parser is reset, not rebuilt
+
+```rust
+let out = f(parser);
+// A timed-out parse leaves the parser mid-state; reset so the next file starts clean.
+parser.reset();
+Some(out)
+```
+
+`set_timeout_micros(PARSER_TIMEOUT_MICROS)` makes `parser.parse()` return `None` when it
+runs out of budget, but the parser keeps its partial state and, without `reset()`, the
+*next* file parsed on that thread resumes from it. The timeout is set once at construction
+in `create_bounded_parser`, so every parser handed out by `with_parser` is bounded for its
+whole life; only the state needs clearing.
+
+The slot array is indexed by `tree_sitter_slot()` and sized by `TREE_SITTER_COUNT`:
+
+```rust
+static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
+    const { RefCell::new([None, None, None, None, None, None]) };
+```
+
+Adding a variant without extending both the slot mapping and this initialiser is a
+compile error at best and a wrong-grammar parse at worst. `Protobuf`, `Yaml` and `Unknown`
+return `None` from both `tree_sitter_slot()` and `language()`, which is how `with_parser`
+declines them.
+
+---
+
+## 5. Decapitation edge cases
+
+`decapitate` returns `BOUNDED_ERROR_STUB` whenever `parser.parse(content, None)` returns
+`None` — timeout or C-FFI failure — rather than the raw file, because returning a
+multi-hundred-kilobyte file into an agent's context is the failure mode the whole guard
+exists to prevent.
+
+`collect_body_replacements` matches on `(lang_kind, node.kind())` and takes the `body`
+field via `child_by_field_name("body")`, returning early once a body is replaced so nested
+functions inside an already-stripped body are not visited. The TypeScript arm does more
+than strip: when a function has no explicit `return_type`, it inspects the returned object
+literal (`extract_returned_object_keys`) and synthesises a type hint, so the decapitated
+signature still tells the reader the shape of the result. If you add a language, decide
+explicitly whether you want that behaviour; the plain Java/Go arms are the simpler model.

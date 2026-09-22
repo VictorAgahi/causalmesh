@@ -7,7 +7,10 @@ pub struct DoctorCommand;
 
 impl DoctorCommand {
     pub fn run(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!("🔍 Running MeshMCP Diagnostic Healthcheck (RFC-001 Rev. 2.9.0)...\n");
+        eprintln!(
+            "🔍 Running MeshMCP Diagnostic Healthcheck (v{})...\n",
+            env!("CARGO_PKG_VERSION")
+        );
 
         // 1. Config syntax
         let default_paths = [
@@ -41,6 +44,46 @@ impl DoctorCommand {
             }
         } else {
             eprintln!("ℹ Config syntax: No local config file found (run 'mesh-mcp init --auto')");
+        }
+
+        // 1b. Configured skill files must exist, or the recommendation silently never fires.
+        if let Some(p) = cfg_path {
+            if let Ok(mut cfg) = Config::load_from_file(p) {
+                let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
+                cfg.resolve_skill_paths(base_dir);
+                let skills = cfg
+                    .engines
+                    .policy
+                    .as_ref()
+                    .map(|pol| pol.skills.clone())
+                    .unwrap_or_default();
+
+                if skills.is_empty() {
+                    eprintln!("ℹ Project skills: none configured ([engines.policy.skills])");
+                } else {
+                    let mut missing = Vec::new();
+                    for (key, resolved) in &skills {
+                        if !Path::new(resolved).exists() {
+                            missing.push(format!("{key} -> {resolved}"));
+                        }
+                    }
+                    if missing.is_empty() {
+                        eprintln!(
+                            "✔ Project skills: {} configured, all files found",
+                            skills.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "✖ Project skills: {} of {} file(s) missing — these keys will never recommend anything:",
+                            missing.len(),
+                            skills.len()
+                        );
+                        for m in missing {
+                            eprintln!("    {m}");
+                        }
+                    }
+                }
+            }
         }
 
         // 2. Symlink invariants
@@ -94,7 +137,9 @@ impl DoctorCommand {
 
         // 6. Tree-sitter parsers initialization
         if AstGuard::verify_all_parsers() {
-            eprintln!("✔ Tree-sitter parsers initialized (Java, Go, Python, TS, Rust)");
+            eprintln!(
+                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++)"
+            );
         } else {
             eprintln!("✖ Tree-sitter parsers: Initialization error");
         }

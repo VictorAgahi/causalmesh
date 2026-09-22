@@ -44,6 +44,33 @@ impl GovernanceEngine {
         self.skills.get(tool_or_key).map(|s| s.as_str())
     }
 
+    /// Every configured `key = skill path` pair, for validation (`mesh-mcp doctor`).
+    pub fn skills(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.skills.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Picks the playbook to point the agent at for this call.
+    ///
+    /// Keys are matched exactly against the MCP tool name first (`smart_search`,
+    /// `analyze_grpc`, ...), then as a case-insensitive substring of the call's
+    /// subject — the scope or target the agent asked about — so
+    /// `"proto-registry" = "..."` fires for any query touching that area, exactly
+    /// like `[engines.policy.stop_rules]`.
+    pub fn recommend_skill(&self, tool: &str, subject: Option<&str>) -> Option<&str> {
+        if let Some(path) = self.get_skill_path(tool) {
+            return Some(path);
+        }
+
+        let subject = subject?.to_lowercase();
+        // Longest key wins, so a specific rule beats a generic one regardless of
+        // HashMap iteration order.
+        self.skills
+            .iter()
+            .filter(|(key, _)| subject.contains(key.to_lowercase().as_str()))
+            .max_by_key(|(key, _)| key.len())
+            .map(|(_, path)| path.as_str())
+    }
+
     /// Evaluates if a given scope or target triggers an architectural STOP rule
     pub fn evaluate_guard(&self, target_or_scope: &str) -> Option<RsahResponse> {
         let lower = target_or_scope.to_lowercase();
@@ -125,6 +152,36 @@ mod tests {
         assert_eq!(rsah.status, "GOVERNANCE_BLOCKED");
         assert_eq!(rsah.policy, "CONTRACT_FIRST_CASCADE_CI");
         assert_eq!(rsah.agent_next_action, "STOP_AND_REPORT_TO_USER");
+    }
+
+    #[test]
+    fn test_skill_recommendation_by_tool_then_subject() {
+        let mut skills = HashMap::new();
+        skills.insert(
+            CompactStr::new("smart_search"),
+            ".agents/skills/search.md".to_string(),
+        );
+        skills.insert(
+            CompactStr::new("proto-registry"),
+            ".agents/skills/proto.md".to_string(),
+        );
+        let engine = GovernanceEngine::new(HashMap::new(), skills);
+
+        // Exact tool-name key wins over any subject match.
+        assert_eq!(
+            engine.recommend_skill("smart_search", Some("/w/proto-registry")),
+            Some(".agents/skills/search.md")
+        );
+        // Otherwise the subject is matched like a stop rule.
+        assert_eq!(
+            engine.recommend_skill("analyze_grpc", Some("/w/Proto-Registry/auth.proto")),
+            Some(".agents/skills/proto.md")
+        );
+        assert_eq!(
+            engine.recommend_skill("analyze_grpc", Some("/w/billing")),
+            None
+        );
+        assert_eq!(engine.recommend_skill("analyze_grpc", None), None);
     }
 
     #[test]

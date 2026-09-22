@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Re-export CompactString as CompactStr for zero-allocation hot loops per RFC-001 Commandment 1
 pub type CompactStr = compact_str::CompactString;
@@ -10,6 +11,10 @@ pub type SymbolName = CompactStr;
 pub type PathStr = CompactStr;
 pub type NodeId = u32;
 pub type EdgeId = u32;
+
+/// Interned file path shared by every node declared in the same file
+/// (Commandment 1: one heap buffer per file, not one per symbol).
+pub type FilePath = Arc<Path>;
 
 /// Canonical FQCN projection: package.ServiceName/MethodName
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -81,7 +86,7 @@ pub struct ContractNode {
     pub id: NodeId,
     pub name: SymbolName,
     pub kind: NodeKind,
-    pub file_path: PathBuf,
+    pub file_path: FilePath,
     pub line_start: usize,
     pub line_end: usize,
     pub package: CompactStr,

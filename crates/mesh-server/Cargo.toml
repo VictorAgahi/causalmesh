@@ -34,6 +34,7 @@ clap.workspace = true
 thiserror.workspace = true
 dunce.workspace = true
 num_cpus.workspace = true
+rayon.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 libc.workspace = true

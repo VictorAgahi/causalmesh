@@ -46,6 +46,13 @@ impl BackgroundRescanEngine {
         rx
     }
 
+    /// Runs `op` inside the QoS-throttled pool so any `par_iter` it spawns executes on
+    /// background-priority threads instead of Rayon's global (normal-priority) pool.
+    #[inline]
+    pub fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.thread_pool.install(op)
+    }
+
     #[inline]
     pub fn thread_count(&self) -> usize {
         self.thread_pool.current_num_threads()

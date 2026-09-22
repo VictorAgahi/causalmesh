@@ -1,8 +1,14 @@
-# mesh-mcp.toml — Enterprise Production Configuration (RFC-001 Rev. 2.9.0 Section 9)
+# mesh-mcp.toml — annotated reference configuration
+#
+# This is the full-featured example referenced by SETUP.md. It targets a monorepo laid out as
+# proto-registry / api-gateway / services/* / k8s-infrastructure / docs — adapt the roots to
+# yours. Every section below is optional except [workspace].
+#
+# Paths are resolved relative to THIS FILE's directory, not your shell's working directory.
 
 [workspace]
 name = "enterprise-polyglot-mesh"
-version = "2.9.0"
+version = "1.0.0"
 
 workspace_root = "${WORKSPACE_ROOT:-.}"
 roots = [
@@ -116,5 +122,20 @@ cryptographic_audit_trail = true
 "proto-registry" = "🛑 STOP CASCADE CI : proto-registry génère les stubs TS/Go/Java. Ne touche pas aux microservices !"
 "k8s-infrastructure" = "🛑 STOP INFRASTRUCTURE : Modification des manifests K8s sous revue DevOps obligatoire !"
 
-[engines.policy.skills]
-"engines.contracts.grpc" = ".agents/skills/proto-contract-evolution.md"
+# ------------------------------------------------------------------------------
+# Project skills: hand the agent your playbook before it proposes a change.
+#
+# Key   = an MCP tool name (smart_search, find_dependents, analyze_grpc,
+#         analyze_impact, search_docs), or any fragment of the scope/target queried.
+#         Exact tool names win over path fragments; among path fragments the longest wins.
+# Value = a Markdown file. Its `description:` frontmatter (or first `# H1`) is quoted
+#         inline in the tool response so the agent can judge relevance before opening it.
+#
+# `mesh-mcp doctor` reports any key whose file is missing — without that check a typo
+# would silently never recommend anything.
+# ------------------------------------------------------------------------------
+# Commented out because these example files do not exist in this repository:
+# point the keys at playbooks you actually have, then run `mesh-mcp doctor` to confirm.
+# [engines.policy.skills]
+# "proto-registry" = ".agents/skills/proto-contract-evolution.md"
+# "k8s-infrastructure" = ".agents/skills/k8s-manifest-review.md"

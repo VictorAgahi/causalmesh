@@ -580,6 +580,7 @@ dependencies = [
  "compact_str",
  "dunce",
  "glob",
+ "globset",
  "ignore",
  "libc",
  "mimalloc",
@@ -647,6 +648,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tree-sitter",
+ "tree-sitter-cpp",
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-language",
@@ -669,6 +671,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "num_cpus",
+ "rayon",
  "schemars",
  "serde",
  "serde_json",
@@ -1373,6 +1376,16 @@ dependencies = [
  "regex",
  "regex-syntax",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-cpp"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

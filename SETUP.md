@@ -1,334 +1,523 @@
-# MeshMCP Setup & Verification Guide
+# Setting up MeshMCP
 
-Comprehensive guide for building, testing, configuring, and running **MeshMCP** locally and integrating it with AI coding agents (Claude Code, Cursor, Windsurf, VS Code).
+This guide takes you from nothing to an AI agent that understands your architecture. Budget
+about 20 minutes: five to install, fifteen to write a config that actually reflects your repo.
 
----
+If you only want to see it work, jump to [Step 1](#step-1-install) then
+[the demo](#try-it-on-the-bundled-demo).
 
-## 1. System Requirements & Prerequisites
+**Contents**
 
-MeshMCP is built in zero-copy Rust and uses Tree-sitter parsers compiled via C-FFI.
-
-### Supported Operating Systems
-- **macOS**: Apple Silicon (M1/M2/M3/M4) or Intel, macOS 13+ (Ventura, Sonoma, Sequoia)
-- **Linux**: x86_64 or aarch64, kernel 5.15+ (glibc 2.31+ or musl)
-- **Windows**: Supported via WSL2 (Ubuntu 22.04 / 24.04 recommended)
-
-### Required Tools
-- **Rust Toolchain**: 1.80.0 or later (stable). Install via [rustup](https://rustup.rs):
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  rustup update stable
-  ```
-- **C Compiler**: `clang` or `gcc` (required to compile Tree-sitter C grammar runtimes):
-  - macOS: `xcode-select --install`
-  - Debian/Ubuntu: `sudo apt update && sudo apt install -y build-essential clang`
-  - Fedora/RHEL: `sudo dnf groupinstall "Development Tools"`
-- **Git**: 2.30+
+1. [Install](#step-1-install)
+2. [Generate a starting config](#step-2-generate-a-starting-config)
+3. [Tell it where your code is](#step-3-tell-it-where-your-code-is)
+4. [Check it actually indexed something](#step-4-check-it-actually-indexed-something)
+5. [Connect your agent](#step-5-connect-your-agent)
+6. [Teach it your conventions](#step-6-teach-it-your-conventions)
+7. [Put your playbooks in front of the agent](#step-7-put-your-playbooks-in-front-of-the-agent)
+8. [Guard critical paths](#step-8-guard-critical-paths-optional)
+9. [Config reference](#config-reference)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
-## 2. Workspace Overview & Crates
+## Step 1 — Install
 
-MeshMCP is organized as a Cargo workspace with four specialized crates:
+### Prebuilt binary (no Rust needed)
 
-| Crate | Path | Role |
-| :--- | :--- | :--- |
-| **`mesh-core`** | [`crates/mesh-core`](crates/mesh-core) | Core domain logic, `ValidatedScope` security jail, `DifferentialVfs`, in-memory `ContractGraph`, `ArcSwap` state, SQLite WAL audit logger, and background rescan. |
-| **`mesh-parsers`** | [`crates/mesh-parsers`](crates/mesh-parsers) | Polyglot Tree-sitter C-FFI runtimes (Java, Go, Python, TypeScript, Rust, Protobuf, YAML), `AstDecapitator` body stripper, `AstGuard` timeout and depth limits, and Markdown generator. |
-| **`mesh-server`** | [`crates/mesh-server`](crates/mesh-server) | MCP JSON-RPC stdio protocol framing, CLI subcommands (`doctor`, `init`, `install-hooks`, `run`), and transparent UDS client proxy. |
-| **`mesh-daemon`** | [`crates/mesh-daemon`](crates/mesh-daemon) | Background `meshd` server. Multiplexes concurrent agent sessions over a single Unix Domain Socket (`.sock`), runs the single inotify/FSEvents watcher, and shuts down automatically after idle timeout. |
-
----
-
-## 3. Building the Workspace
-
-### Development Build (Fast Compilation)
 ```bash
-cargo build --workspace
+curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
 ```
-Binaries will be placed in:
-- `target/debug/mesh-mcp` (Main CLI & MCP stdio proxy)
-- `target/debug/meshd` (Background daemon)
 
-### Production Build (Optimized with mimalloc & Thin LTO)
+Installs `mesh-mcp` and `meshd` into `~/.local/bin/`. Make sure that's on your `PATH`:
+
 ```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+exec $SHELL
+mesh-mcp --version
+```
+
+Prebuilt targets: macOS (Apple Silicon and Intel), Linux x86-64 (gnu and musl), Windows x86-64.
+
+### From source
+
+Needs Rust 1.80+ (`rustup toolchain install stable`).
+
+```bash
+git clone https://github.com/VictorAgahi/causalmesh.git
+cd causalmesh
 cargo build --workspace --release
+cp target/release/mesh-mcp target/release/meshd ~/.local/bin/
 ```
-Binaries will be placed in:
-- `target/release/mesh-mcp` (~6.8 MB)
-- `target/release/meshd` (~6.5 MB)
+
+Both binaries are needed: `mesh-mcp` is the MCP server your agent talks to, `meshd` is the
+shared background index it connects to.
+
+### Try it on the bundled demo
+
+Before touching your own repo, confirm the install works on the sample monorepo:
+
+```bash
+cd causalmesh   # only if you cloned the source
+mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid | head -30
+```
+
+You should see a Mermaid graph listing services and topics. `--open` renders it in a browser
+instead.
 
 ---
 
-## 4. Running Tests & Quality Verification
+## Step 2 — Generate a starting config
 
-MeshMCP enforces a zero-warning, zero-compromise engineering standard.
-
-### 4.1 Run the Full Test Suite
 ```bash
-cargo test --workspace
-```
-This executes **67 automated tests** across all crates:
-- **`mesh-core`** (22 tests): Reverse dependency indexing, gRPC flow analysis, differential VFS hashing, symlink escape rejection, Unicode NFC normalization, secret redaction, and multi-threaded SQLite WAL audit logging.
-- **`mesh-parsers`** (24 tests): AST body decapitation across Java, Go, TypeScript (including arrow functions), Python, and Rust; Tree-sitter 15ms C-FFI timeouts; AST guard depth limits; and Markdown formatting.
-- **`mesh-daemon`** (8 tests): Unix Domain Socket binding, ping/pong protocol, client counter, 20 concurrent multiplexed clients, and idle watchdog timeout auto-shutdown.
-- **`mesh-server`** (4 unit + 9 integration tests): Stdio loopback, tool registry, W3C `traceparent` propagation, live hot-reload, and end-to-end MCP tool invocations (`smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`).
-
-### 4.2 Check Code Formatting (CI Requirement)
-```bash
-cargo fmt --all -- --check
-```
-To auto-format code according to repo standards:
-```bash
-cargo fmt --all
+cd /path/to/your/monorepo
+mesh-mcp init --auto
 ```
 
-### 4.3 Run Strict Clippy
-```bash
-cargo clippy --all-targets -- -D warnings
-```
-Must exit with 0 warnings.
+This writes `.agents/mesh-mcp.toml`, guessing your roots from directory names it recognises
+(`services/`, `packages/`, `crates/`, `proto*/`, `docs/`, `k8s*/`, …).
+
+**Treat the result as a draft.** It cannot know that your contracts live in `schemas/v2`, or
+that `legacy/` should be ignored. Step 3 is where the real work happens.
+
+MeshMCP looks for its config in this order:
+
+1. the path given to `--config`
+2. `.agents/mesh-mcp.toml`
+3. `mesh-mcp.toml` in the current directory
 
 ---
 
-## 5. Diagnostic Healthcheck (`doctor`)
+## Step 3 — Tell it where your code is
 
-Before connecting MeshMCP to your AI agent, run the built-in diagnostic tool to verify environment readiness, permissions, parsers, and latency:
+Open `.agents/mesh-mcp.toml`. The `roots` list is the single most important setting: it defines
+both **what gets indexed** and **what the agent is allowed to read at all**. Anything outside is
+refused.
+
+```toml
+[workspace]
+name = "my-mesh"
+version = "1.0.0"
+
+# Every root below is resolved against this. Overridable per-machine via $WORKSPACE_ROOT.
+workspace_root = "${WORKSPACE_ROOT:-..}"
+
+roots = [
+  "${workspace_root}/proto-registry",
+  "${workspace_root}/api-gateway",
+  "${workspace_root}/services/*",      # a glob becomes one root per match
+  "${workspace_root}/docs",
+]
+```
+
+### The mistake everyone makes
+
+**Paths resolve relative to the config file, not to where you run the command.**
+
+`init --auto` writes the config into `.agents/`, one level below your repo root. So a root
+written `./services` would resolve to `.agents/services` — which doesn't exist, and you'd get an
+empty index with no error. That's why the generated file starts from `..`.
+
+| Config file location | To reach `<repo>/services` |
+| :--- | :--- |
+| `<repo>/.agents/mesh-mcp.toml` | `../services`, or `${workspace_root}/services` with `workspace_root = "${WORKSPACE_ROOT:-..}"` |
+| `<repo>/mesh-mcp.toml` | `./services`, or `${workspace_root}/services` with `workspace_root = "${WORKSPACE_ROOT:-.}"` |
+
+### Exclusions
+
+Gitignore-style globs. Excluded directories are pruned from the walk, so listing
+`node_modules` costs nothing rather than scanning and discarding it.
+
+```toml
+exclude_patterns = [
+  "**/node_modules/**", "**/target/**", "**/dist/**", "**/.venv/**",
+  "**/*.pem", "**/*.key", "**/*.p12", "**/.env*", "**/secrets/**",
+  "**/generated/**",   # add yours
+]
+```
+
+A pattern without a slash matches a path *component*, so `build` excludes any `build/`
+directory but leaves `build.rs` and `build_tools/` alone.
+
+### Running in containers
+
+If your agent sees `/workspace` but your files live elsewhere on the host:
+
+```toml
+[workspace.mount_aliases]
+"/workspace" = "/Users/me/dev/monorepo"
+```
+
+Requests arriving with the container path are translated before the security check.
+
+---
+
+## Step 4 — Check it actually indexed something
+
+Two commands. Do not skip these — a misconfigured root fails quietly, by indexing nothing.
 
 ```bash
-cargo run -p mesh-server -- doctor
-# or with the release binary:
-./target/release/mesh-mcp doctor
+mesh-mcp doctor
 ```
 
-### Example Diagnostic Output
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (RFC-001 Rev. 2.9.1)...
+🔍 Running MeshMCP Diagnostic Healthcheck (v2.9.1)...
 
-✔ Config syntax: Valid (mesh-mcp.toml)
+✔ Config syntax: Valid (.agents/mesh-mcp.toml)
+✔ Jailed roots verified (6/6 allowed roots, 0 escapes detected)
+ℹ Project skills: none configured ([engines.policy.skills])
 ✔ Symlink invariants: follow_links=false verified across all engines
-✔ Unicode NFC normalization: Active (APFS/NFC compliant, zero NFD divergence)
-✔ Container mount aliases: Configured (Docker / DevContainer bridge ready)
 ✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)
-✔ Host OS event subsystem: Native (APFS FSEvents/inotify active, 150ms debounced watcher)
-✔ Audit log engine: SQLite WAL (audit.db with multi-process concurrent SHA-256 chaining)
-✔ Stdio loopback latency: 0.02ms
-✔ Tree-sitter parsers initialized (Java, Go, Python, TS [incl. arrow functions], Rust [incl. Tonic macros])
+✔ Host OS event subsystem: Native (APFS FSEvents/kqueue active)
+✔ Stdio loopback latency: 0.43ms
+✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++)
 ✔ Memory baseline: < 20 MiB RSS (mimalloc + compact_str)
+✔ Toolchain utilities: git & ripgrep detected
 
 ✔ All systems operational. Ready for AI agents.
 ```
 
+`doctor` validates syntax and roots — it does not tell you whether the *content* was understood.
+For that:
+
+```bash
+mesh-mcp graph --format mermaid | head -40
+```
+
+Read the output against your mental model:
+
+| What you see | What it means |
+| :--- | :--- |
+| `Scanned 0 files` | Your roots point nowhere. Re-read Step 3. |
+| Files scanned, few nodes | Indexed, but your conventions aren't recognised yet → Step 6. |
+| Services and topics you recognise | Working. Go to Step 5. |
+
 ---
 
-## 6. Configuring Your Workspace (`mesh-mcp.toml`)
+## Step 5 — Connect your agent
 
-MeshMCP looks for configuration in:
-1. Path passed via `--config <path>`
-2. `.agents/mesh-mcp.toml`
-3. `mesh-mcp.toml` in the current working directory
+### Claude Code
 
-### 6.1 Automatic Initialization
-To auto-detect repositories, services, and schemas in your current workspace:
 ```bash
-cargo run -p mesh-server -- init --auto
+claude mcp add mesh-mcp -- mesh-mcp run
 ```
-This generates a validated `mesh-mcp.toml` tailored to your repository structure.
 
-### 6.2 Manual Configuration Example
-Create `mesh-mcp.toml` in your project root:
+### Cursor, VS Code, Windsurf
+
+`.cursor/mcp.json` or `.vscode/mcp.json` at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "mesh-mcp": {
+      "command": "mesh-mcp",
+      "args": ["run"]
+    }
+  }
+}
+```
+
+`mesh-mcp init --auto --write-ide-config` writes both files for you.
+
+### Verify by hand
+
+The server speaks JSON-RPC on stdio, so you can test it without an agent:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | mesh-mcp run --standalone
+```
+
+You should get six tools back. To try a real query:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_dependents","arguments":{"target":"YourSharedType"}}}' \
+  | mesh-mcp run --standalone
+```
+
+### Daemon vs standalone
+
+`mesh-mcp run` (default) connects to a shared `meshd` daemon over a Unix socket, auto-spawning
+it if needed. Several IDE windows then share one index. The daemon exits on its own once idle.
+
+`mesh-mcp run --standalone` keeps everything in one process — use it in containers, in CI, or
+anywhere a Unix socket isn't available.
+
+To manage the daemon explicitly:
+
+```bash
+meshd --idle-timeout-minutes 30    # foreground
+pkill meshd                        # stop it; the next run respawns it
+```
+
+---
+
+## Step 6 — Teach it your conventions
+
+gRPC, Spring, OpenAPI and AsyncAPI are recognised out of the box. Your in-house event bus is
+not. If Step 4 showed services but no topics or events, this is the missing piece.
+
+### Search vocabulary
 
 ```toml
-[workspace]
-name = "my-polyglot-mesh"
-version = "2.9.1"
-roots = [
-  "proto-registry",
-  "services/billing-service",
-  "services/auth-service",
-  "services/api-gateway",
-  "docs"
-]
-
-# Exclude heavy or sensitive directories from crawler & VFS
-exclude_patterns = [
-  "**/.git/**",
-  "**/node_modules/**",
-  "**/target/**",
-  "**/dist/**",
-  "**/.env*",
-  "**/secrets/**",
-  "**/*.pem",
-  "**/*.key"
-]
-
-# Bridge Docker/container paths to host paths
-[workspace.mount_aliases]
-"/app" = "."
-
-# Active Governance rules: prevent direct modification of critical contract repositories
-[engines.policy.stop_rules]
-"proto-registry" = "STOP: Contract schemas must be reviewed and published independently before service updates."
-
-[engines.watcher]
+[engines.docs]
 enabled = true
-debounce_ms = 150
+paths = ["${workspace_root}/docs"]
 
-[engines.audit]
-db_path = "~/.cache/mesh-mcp/audit.db"
+# Your shorthand → the term actually written in your docs.
+aliases = { "k8s" = "kubernetes", "dlq" = "dead-letter-queue" }
+stop_words = ["the", "how", "what"]
+exact_phrase_boost = 60
+sanitize_prompt_injections = true
 ```
+
+Without `aliases`, an agent asking about "the DLQ" finds nothing in a document that only says
+"dead-letter-queue".
+
+### Custom contract patterns
+
+Describe how your codebase declares producers, consumers, sagas and RPC calls:
+
+```toml
+[[engines.contracts.patterns]]
+name = "transactional-outbox"
+kind = "topic_producer"        # topic_producer | topic_consumer | saga | rpc
+file_pattern = "*.ts"          # optional; matched against the path
+regex = 'createEvent<([^>]+)>'
+target_group = 1               # capture group holding the event/topic name
+
+[[engines.contracts.patterns]]
+name = "event-post-processor"
+kind = "topic_consumer"
+file_pattern = "*.ts"
+regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
+target_group = 2               # the event name
+consumer_group = 1             # the class consuming it
+```
+
+Producers and consumers naming the same topic get linked automatically, which is what makes
+`analyze_impact` able to trace an event end to end.
+
+Use single-quoted TOML strings for regexes so you don't have to double every backslash. Check
+your work with `mesh-mcp graph --format mermaid`; an invalid regex is logged and skipped rather
+than failing the run, so watch stderr.
+
+[`examples/polyglot-shop/mesh-mcp.toml`](examples/polyglot-shop/mesh-mcp.toml) has working
+patterns for TypeScript, Go, Rust, Python and Java — start from those.
+
+### gRPC specifics
+
+```toml
+[engines.contracts.grpc]
+proto_dirs = ["${workspace_root}/proto-registry/proto"]
+controller_annotations = ["@GrpcMethod", "@GrpcService"]
+canonical_fqcn_projection = true
+```
+
+### Spring properties
+
+```toml
+[engines.contracts.spring]
+enabled = true
+property_files = [
+  "**/src/main/resources/application*.yml",
+  "**/src/main/resources/application*.properties",
+]
+resolve_placeholders = true
+auto_redact_secrets = true      # keep this on
+```
+
+Any key whose name looks like a secret (`password`, `token`, `secret`, `key`, …) is replaced
+with `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` before it can reach a prompt.
 
 ---
 
-## 7. Running MeshMCP
+## Step 7 — Put your playbooks in front of the agent
 
-MeshMCP supports two operating modes:
+An indexed repo tells the agent what the code *is*. It doesn't tell it how your team works.
+Skills close that gap: a Markdown file you already have (or write once), surfaced automatically
+whenever the agent touches the area it covers.
 
-### Mode A: Daemon Architecture (Default & Recommended)
-In this mode, `mesh-mcp run` acts as an ultra-lightweight client proxy (< 2 MiB memory):
-1. It looks for a running `meshd` background daemon on the local Unix Domain Socket.
-2. If `meshd` is not running, it automatically spawns it in the background.
-3. It transparently bridges stdio JSON-RPC requests to the daemon over UDS.
-4. The daemon keeps the in-memory architecture graph hot, handles file changes with a single OS watcher, and auto-terminates after idle timeout when all clients disconnect.
+### 1. Write the playbook
 
-```bash
-# Run via cargo (auto-spawns daemon)
-cargo run -p mesh-server -- run
+`.agents/skills/proto-contract-evolution.md`:
 
-# Or using the built binary
-./target/release/mesh-mcp run
+```markdown
+---
+name: proto-contract-evolution
+description: How to evolve a proto contract without breaking consumers.
+---
+
+# Evolving a proto contract
+
+1. Never renumber or reuse a field tag. Mark removed fields `reserved`.
+2. Open the PR against `proto-registry` alone and wait for CI to publish the stubs.
+3. Only then bump the dependency in consuming services.
 ```
 
-#### Socket Path Resolution
-The Unix Domain Socket path is determined in the following priority:
-1. Environment variable `$MESH_SOCKET_PATH` (if set)
-2. `$XDG_RUNTIME_DIR/mesh/meshd.sock` (Linux)
-3. `$HOME/.cache/mesh/meshd.sock` (macOS / Linux)
-4. `/tmp/mesh-<UID>.sock` (Fallback)
+The `description:` line is what the agent sees first, so make it a concrete trigger, not a
+title. If there's no frontmatter, the first `# H1` is used instead.
 
-### Mode B: Standalone Mode
-If you prefer running a self-contained, single-process instance without a background daemon (useful in air-gapped CI or containers):
+### 2. Map it to an area
+
+```toml
+[engines.policy.skills]
+# Key = an MCP tool name, or any fragment of the scope/target being queried.
+"proto-registry"   = ".agents/skills/proto-contract-evolution.md"
+"services/billing" = ".agents/skills/billing-invariants.md"
+"smart_search"     = ".agents/skills/how-we-search.md"
+```
+
+Matching rules:
+
+- An exact **tool name** key (`smart_search`, `find_dependents`, `analyze_grpc`,
+  `analyze_impact`, `search_docs`) fires on every call to that tool.
+- Otherwise the key is matched case-insensitively against the **scope or target** of the call —
+  the same way `stop_rules` are matched.
+- Among several matching path keys, the **longest** wins, so `services/billing` beats
+  `services`.
+
+### 3. See it work
+
+Any matching tool call now comes back with a footer:
+
+```
+---
+**Project skill for this area**: `.agents/skills/proto-contract-evolution.md` — How to evolve a proto contract without breaking consumers.
+Read it before proposing changes here.
+```
+
+The agent reads the file and follows your process instead of inventing one.
+
+### 4. Verify
 
 ```bash
-cargo run -p mesh-server -- run --standalone --config mesh-mcp.toml
-# or
-./target/release/mesh-mcp run --standalone --config mesh-mcp.toml
+mesh-mcp doctor
 ```
+
+```
+✔ Project skills: 3 configured, all files found
+```
+
+If a path is wrong, `doctor` names the offending key — without this check, a typo would just
+silently never recommend anything:
+
+```
+✖ Project skills: 1 of 3 file(s) missing — these keys will never recommend anything:
+    proto-registry -> .agents/skills/typo.md
+```
+
+Paths are resolved as given, or relative to the config file's directory.
 
 ---
 
-## 8. Manual Testing via JSON-RPC Stdio
+## Step 8 — Guard critical paths (optional)
 
-You can verify the MCP server directly using `echo` or standard input pipes:
+Skills advise. Stop rules refuse.
 
-### 8.1 List Available Tools (`tools/list`)
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | ./target/release/mesh-mcp run --standalone
+```toml
+[engines.policy]
+enabled = true
+enforce_git_hooks = true
+cryptographic_audit_trail = true
+
+[engines.policy.stop_rules]
+"proto-registry" = "STOP: proto-registry generates the TS/Go/Java stubs. Land the contract PR and let CI publish before touching consumers."
+"k8s-infrastructure" = "STOP: manifest changes require DevOps review."
 ```
-Response contains definitions and JSON schemas for all 5 tools: `smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`.
 
-### 8.2 Perform AST-Decapitated Code Search (`smart_search`)
-```bash
-echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"smart_search","arguments":{"query":"fn ","scope":"crates/mesh-core","include_body":false}}}' | ./target/release/mesh-mcp run --standalone
-```
-Notice that functions are returned with their signatures and docstrings, with implementation bodies replaced by `{ /* stripped */ }`.
+Install the hook that enforces them:
 
-### 8.3 Query Reverse Dependencies (`find_dependents`)
 ```bash
-echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_dependents","arguments":{"target":"ContractGraph"}}}' | ./target/release/mesh-mcp run --standalone
+mesh-mcp install-hooks
 ```
+
+A commit touching a guarded path is now rejected with a structured explanation of the required
+workflow. Read-only queries are never blocked — inspecting a guarded contract is allowed and
+expected; only mutations are.
+
+Every tool call is appended to a SHA-256 hash-chained SQLite log at
+`~/.cache/mesh-mcp/audit.db` (mode `0600`). Details in
+[docs/governance-rsah.md](docs/governance-rsah.md).
 
 ---
 
-## 9. AI IDE & MCP Client Integration
+## Config reference
 
-Add MeshMCP to your agent configuration.
+Only these sections exist. The parser rejects unknown keys, so a typo or an invented section
+fails loudly at startup rather than being ignored.
 
-### 9.1 Cursor & Windsurf
-Add to `.cursor/mcp.json` (or `~/.cursor/mcp.json`):
+| Section | Purpose |
+| :--- | :--- |
+| `[workspace]` | `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` |
+| `[workspace.mount_aliases]` | container path → host path translation |
+| `[engines.docs]` | `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` |
+| `[engines.contracts]` | `enabled` |
+| `[engines.contracts.grpc]` | `proto_dirs`, `controller_annotations`, `canonical_fqcn_projection` |
+| `[engines.contracts.spring]` | `enabled`, `property_files`, `resolve_placeholders`, `auto_redact_secrets` |
+| `[engines.contracts.openapi]` | `enabled`, `spec_files` |
+| `[engines.contracts.asyncapi]` | `enabled`, `spec_files`, `infer_string_topics` |
+| `[[engines.contracts.patterns]]` | `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` |
+| `[engines.policy]` | `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` |
+| `[engines.policy.stop_rules]` | guarded path fragment → refusal message |
+| `[engines.policy.skills]` | tool name or path fragment → skill file |
 
-```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "/absolute/path/to/causalmesh/target/release/mesh-mcp",
-      "args": ["run", "--config", "/absolute/path/to/mesh-mcp.toml"]
-    }
-  }
-}
-```
+There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
+a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.
 
-### 9.2 Claude Code
-Add to your Claude Code MCP settings (`~/.claude/claude_code_config.json` or run `claude mcp add`):
-
-```bash
-claude mcp add mesh-mcp -- /absolute/path/to/causalmesh/target/release/mesh-mcp run --config /absolute/path/to/mesh-mcp.toml
-```
-
-Or manually in `~/.claude.json`:
-```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "/absolute/path/to/causalmesh/target/release/mesh-mcp",
-      "args": ["run", "--config", "/absolute/path/to/mesh-mcp.toml"]
-    }
-  }
-}
-```
-
-### 9.3 Claude Desktop
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "/absolute/path/to/causalmesh/target/release/mesh-mcp",
-      "args": ["run", "--config", "/absolute/path/to/mesh-mcp.toml"]
-    }
-  }
-}
-```
+A complete annotated example lives in [`mesh-mcp.toml`](mesh-mcp.toml) at the repo root.
 
 ---
 
-## 10. Installing Active Governance Git Hooks
+## Troubleshooting
 
-To install physical pre-commit hooks that prevent autonomous agents from committing direct changes to guarded repositories:
+**`mesh-mcp: command not found`**
+`~/.local/bin` isn't on your `PATH`. See Step 1.
 
+**`doctor` says the config is valid but `graph` scans 0 files**
+Your roots resolve to the wrong place. Almost always the `.agents/` relative-path trap —
+see [Step 3](#the-mistake-everyone-makes). Print what's actually resolved:
 ```bash
-./target/release/mesh-mcp install-hooks
+RUST_LOG=info mesh-mcp graph --format json 2>&1 >/dev/null | grep -i root
 ```
-This writes an executable script into `.git/hooks/pre-commit` that inspects staged files and enforces the rules defined in `[engines.policy.stop_rules]`.
+
+**`unknown field` on startup**
+A section or key that doesn't exist — check it against the [config reference](#config-reference).
+Common culprits: `[engines.watcher]`, `[engines.audit]`.
+
+**Files are scanned but produce no nodes**
+The files parsed, but nothing matched a known contract shape. Either the language isn't
+supported, or your conventions need [custom patterns](#custom-contract-patterns).
+
+**A specific file is never indexed**
+It probably tripped a guard: over 384 KB (1.5 MB for `.proto` and generated schema stubs), a
+line longer than 1 KB (minified), a null byte, or nesting deeper than 64. Run with
+`RUST_LOG=debug` to see the rejection.
+
+**`smart_search` returns nothing for a name you can see in the code**
+By design: it searches *declared symbols*, not raw text. For a full-text scan of the scope, pass
+`fuzzy: true`.
+
+**`Sandbox escape attempt detected`**
+The requested path is outside every configured root. That's the security jail working — add the
+directory to `roots` if it should be readable.
+
+**Changes aren't picked up**
+The watcher debounces 150 ms and rescans in the background. On Linux, a large workspace can
+exhaust inotify watches:
+```bash
+echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+```
+
+**Stale index after switching branches**
+`pkill meshd` — the next `mesh-mcp run` respawns it with a fresh scan.
 
 ---
 
-## 11. Troubleshooting & FAQ
+## Next
 
-### Stale Socket File
-If the daemon was forcefully killed (`kill -9`), a stale `.sock` file might remain on disk.
-- **Resolution**: `mesh-mcp` automatically detects stale sockets on startup. You can also manually remove the socket:
-  ```bash
-  rm -f ~/.cache/mesh/meshd.sock /tmp/mesh-*.sock
-  ```
-
-### Linux inotify Watcher Limit
-On large workspaces (10,000+ files) on Linux, inotify watcher limits may be reached.
-- **Check limit**: `cat /proc/sys/fs/inotify/max_user_watches`
-- **Resolution**: Increase limit to 524,288:
-  ```bash
-  sudo sysctl -w fs.inotify.max_user_watches=524288
-  echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.d/99-inotify.conf
-  ```
-
-### C-FFI Tree-sitter Compiler Errors
-If building fails on Tree-sitter C files:
-- Verify that `clang` or `gcc` is in your `$PATH`.
-- On macOS, ensure Xcode command line tools are installed: `xcode-select --install`.
-
-### Checking Audit Logs
-All tool calls and operations are logged in SQLite Write-Ahead Logging format:
-```bash
-sqlite3 ~/.cache/mesh-mcp/audit.db "SELECT timestamp, session_id, tool_name, hash FROM audit_log ORDER BY id DESC LIMIT 10;"
-```
+- [docs/mcp-tools.md](docs/mcp-tools.md) — every tool's arguments and output format
+- [docs/architecture.md](docs/architecture.md) — how indexing and the security jail work
+- [docs/development.md](docs/development.md) — building, testing, adding a language
+- [README.md](README.md) — overview and CLI reference

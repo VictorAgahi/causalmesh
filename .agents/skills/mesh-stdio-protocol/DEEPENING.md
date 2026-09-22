@@ -1,86 +1,157 @@
-# DEEPENING: Stdio Actor Mechanics, W3C Tracing & BPE Token Density
+# DEEPENING: Stdio Actor Mechanics, Drain Barriers & Truncation Affordance
 
-This document provides deep technical reference material for the `mesh-stdio-protocol` skill.
+Deep reference for the `mesh-stdio-protocol` skill. Read the skill first.
 
 ---
 
-## 1. Tokio Actor Model & Non-Blocking Stdin EOF
+## 1. Two tasks, two bounded channels
 
-Standard synchronous `std::io::stdin().read_line()` blocks the thread. If the client terminates, the thread hangs indefinitely unless an interrupt is delivered.
+`StdioFramingActor::spawn` creates both directions up front:
 
-In [`StdioFramingActor`](../../../crates/mesh-server/src/framing.rs):
 ```rust
-let (tx_out, mut rx_out) = mpsc::channel::<String>(64);
-let (tx_in, rx_in) = mpsc::channel::<String>(64);
+let (tx_in, rx_in) = mpsc::channel::<String>(MPSC_BUFFER_CAPACITY);
+let (tx_out, mut rx_out) = mpsc::channel::<String>(MPSC_BUFFER_CAPACITY);
 ```
 
-### Ingestion Actor:
-- Uses asynchronous `tokio::io::AsyncBufReadExt::read_line`.
-- Detects `Ok(0)`: This indicates that the parent IDE process closed the standard input pipe.
-- When `Ok(0)` is detected:
-  ```rust
-  tracing::info!("Stdin EOF detected. Initiating shutdown.");
-  cancel_reader.cancel();
-  break;
-  ```
-- Broadcasts `tokio_util::sync::CancellationToken` cancellation to gracefully shut down the server loop without zombie processes.
+`MPSC_BUFFER_CAPACITY` is 64 in both directions. The bound is the backpressure: a client
+that floods stdin stalls the reader task rather than growing an unbounded queue, and a
+slow stdout stalls `run_server` at the `tx_out.send(...).await` rather than buffering
+responses in memory.
 
-### Egress Actor:
-- Owns `tokio::io::BufWriter<tokio::io::Stdout>`.
-- Batches writes when multiple frames are queued.
-- Flushes `writer.flush().await` after every completed JSON-RPC line to ensure instantaneous delivery to the agent.
+The function returns `(tx_out, rx_in, writer_done)`. The third element is the piece that
+is easy to drop on a refactor and expensive to lose — see section 3.
 
----
+### Reader task
 
-## 2. W3C Distributed Trace Context (`traceparent`)
+Synchronous `std::io::stdin().read_line()` blocks its thread and cannot be cancelled, so
+the reader uses `tokio::io::AsyncBufReadExt::read_line` inside a `select!` against the
+cancellation token:
 
-To correlate agent queries with APM traces (Datadog, OpenTelemetry, Jaeger), MeshMCP extracts and propagates the W3C Trace Context over JSON-RPC.
-
-In [`crates/mesh-server/src/protocol.rs`](../../../crates/mesh-server/src/protocol.rs):
 ```rust
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RequestMeta {
-    pub traceparent: Option<String>,
-    pub tracestate: Option<String>,
+tokio::select! {
+    _ = cancel_reader.cancelled() => break,
+    read_res = reader.read_line(&mut line) => {
+        match read_res {
+            Ok(0) => {
+                tracing::info!(target: "mesh::framing", "Stdin EOF detected. Closing reader channel.");
+                break;
+            }
+            Ok(_) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() && tx_in.send(trimmed).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => { /* log and break */ }
+        }
+    }
 }
 ```
 
-### Format:
-```
-traceparent: {version}-{trace_id}-{parent_id}-{trace_flags}
-Example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-```
+`Ok(0)` is EOF — the parent IDE closed the pipe. Breaking drops `tx_in`, which ends
+`run_server`'s `while let Some(line) = rx_in.recv().await`, which reaches the drain
+barrier. That is the whole shutdown path for a normal client exit; no signal is needed.
 
-When present:
-1. MeshMCP extracts the 128-bit `trace_id` and 64-bit `parent_id`.
-2. Creates a corresponding `tracing::Span` configured with the parent trace context.
-3. Propagates the span across background Rayon jobs and audit logging.
+`ErrorKind::Interrupted` is retried deliberately: a `SIGWINCH` or similar during a read
+must not be read as end-of-session.
+
+### Writer task
+
+Owns the only `BufWriter<Stdout>`. Per frame it writes the bytes, appends `\n` if the
+frame does not end with one, and flushes. Flushing every frame trades throughput for
+latency on purpose: the client is waiting on a line-delimited stream, and a buffered
+response that never flushes looks exactly like a hung server. A write or flush error
+breaks the loop rather than retrying — the pipe is gone.
+
+On cancellation the writer flushes before breaking, and on channel closure (`None`) it
+flushes and exits cleanly.
 
 ---
 
-## 3. Sub-Scope Affordance Calculation Algorithm
+## 2. Why `run` is synchronous and dispatch uses `spawn_blocking`
 
-When a query yields more results than can fit in the 48 KB buffer, cutting off abruptly leaves the agent blind to remaining matches.
+The event loop is a single `while let` over `rx_in`. Everything it awaits must be short,
+or the next request waits. Tool bodies are not short: they read files, run tree-sitter and
+write SQLite. `ToolRegistry::invoke` therefore wraps `T::run` in
+`tokio::task::spawn_blocking`, and `McpTool::run` is declared synchronous so it cannot
+accidentally be awaited inline.
 
-In [`MarkdownFormatter::build_truncated_search_output`](../../../crates/mesh-parsers/src/markdown.rs):
+Consequences worth remembering: a snapshot guard must not cross an `.await` (it does not
+need to — `run` is sync), and a `JoinError` from the blocking task surfaces as `-32603`
+(`"Tool task failed: ..."`), which is the internal-error code, not `-32602`.
+
+---
+
+## 3. The drain barrier
+
+```rust
+// Drop tx_out so the writer task sees channel closure and flushes, then
+// wait for it to complete before returning — this is the key drain barrier.
+drop(tx_out);
+let _ = writer_done.await;
+```
+
+Without the `drop`, `run_server` still holds a sender, the writer's `rx_out.recv()` never
+returns `None`, and the task never exits. Without the `await`, `run_server` returns, `main`
+returns, and the process exits while the final frame is still in the `BufWriter`. The
+symptom is a test or CI step that pipes one request in with `echo` and gets no response
+back — the exact race the comment records.
+
+`run_proxy_mode` has the same hazard in a different shape:
+
+```rust
+tokio::select! {
+    _ = stdin_to_daemon => {
+        let _ = (&mut daemon_to_stdout).await;
+    }
+    _ = daemon_to_stdout => {}
+}
+```
+
+If stdin closes first (a piped `echo`), the proxy must keep waiting for the daemon to
+finish writing. If the daemon disconnects first, there is nothing left to drain and the
+proxy exits immediately.
+
+---
+
+## 4. Truncation affordance
+
+When a query yields more than fits, cutting off leaves the agent blind to the remainder,
+and an agent that cannot see the remainder either guesses or gives up. `MarkdownFormatter`
+tracks sub-scope frequencies while it renders, so at the moment of truncation it already
+knows where the matches were concentrated:
 
 ```mermaid
 graph TD
-    A[Output Buffer Approaching 48 KB] --> B[Capture Current Rendered Matches]
-    B --> C[Aggregate Scope Frequencies: services/billing: 14, api-gateway: 8]
-    C --> D[Generate Actionable Follow-Up Suggestions]
-    D --> E[Append Warning & Sub-Scope Breakdown]
-    E --> F[Flush Output to Agent]
+    A[Entry would exceed MAX_OUTPUT_BYTES - 1024] --> B[Keep the rendered prefix]
+    B --> C[Sort scope_counts descending]
+    C --> D[Emit displayed/total counts]
+    D --> E[List top 3 sub-scopes with counts]
+    E --> F[Emit a concrete follow-up call on the busiest scope]
 ```
 
-### Truncation Payload Template:
-```markdown
-⚠️ **Output truncated: Showing 12 of 48 matches (48 KB payload budget reached).**
+`extract_sub_scope` reduces `services/billing/handlers/charge.ts` to `services/billing` —
+the first two path components, falling back to the first component, then to `"root"`. The
+footer is written into a `String::with_capacity(MAX_OUTPUT_BYTES)` so the tail does not
+reallocate.
 
-### Recommendations for Refinement:
-- Scope: `services/billing` (14 matching definitions)
-  `smart_search(query: "processPayment", scope: "services/billing")`
-- Scope: `api-gateway` (8 matching definitions)
-  `smart_search(query: "processPayment", scope: "api-gateway")`
-```
-This enables the agent to immediately narrow its search without hallucinating or requiring human intervention.
+The 1 KB reserved headroom is sized for that footer. If you make the footer richer, raise
+the reserve in the same commit, or a pathological result set can push the response past
+the cap the reserve exists to guarantee.
+
+---
+
+## 5. Method table details that bite
+
+- `notifications/initialized` must `continue` without sending anything. JSON-RPC
+  notifications have no `id`, and answering one makes strict clients error.
+- `JsonRpcResponse.jsonrpc` is a `Cow<'static, str>` borrowed from `"2.0"`, saving a heap
+  allocation per response. Do not change it to `String` for tidiness.
+- `result` and `error` are both `skip_serializing_if = "Option::is_none"`, so a response
+  carries exactly one of them.
+- A parse error answers with `id: None`, because the id could not be read. That is correct
+  per JSON-RPC and clients expect it.
+- `initialize` advertises `protocolVersion` `"2024-11-05"` and
+  `capabilities.tools.listChanged: false`. If tools ever become dynamic, that flag and
+  `ToolRegistry::list_tools`'s `LazyLock` must change together.

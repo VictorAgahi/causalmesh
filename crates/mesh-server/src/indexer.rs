@@ -46,12 +46,15 @@ impl WorkspaceIndexer {
         ];
         match candidates.into_iter().flatten().find(|p| p.exists()) {
             Some(path) => {
-                let cfg = Config::load_from_file(&path)?;
+                let mut cfg = Config::load_from_file(&path)?;
                 let base = path
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."))
                     .to_path_buf();
+                // Skill paths are written relative to the config file; the server is
+                // spawned by an IDE with an arbitrary cwd.
+                cfg.resolve_skill_paths(&base);
                 Ok((cfg, base))
             }
             None => {

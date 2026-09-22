@@ -37,6 +37,10 @@ impl McpTool for SearchDocsTool {
         args._meta.as_ref()
     }
 
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.query.as_str())
+    }
+
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let max_sec = args.max_sections.unwrap_or(3);
         let snapshot = state.snapshot();

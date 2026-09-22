@@ -56,6 +56,10 @@ impl McpTool for SmartSearchTool {
         args._meta.as_ref()
     }
 
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.scope.as_str())
+    }
+
     /// Index-first: the contract graph already knows every declared symbol and
     /// the file it lives in, so the nominal path reads only the files that
     /// contain a hit. The full crawl + parse of the whole scope that used to run

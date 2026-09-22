@@ -29,6 +29,10 @@ impl McpTool for FindDependentsTool {
         args._meta.as_ref()
     }
 
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.target.as_str())
+    }
+
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let snapshot = state.snapshot();
         let dependents = snapshot

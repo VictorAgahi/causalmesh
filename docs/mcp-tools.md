@@ -40,9 +40,26 @@ graph LR
 ### Tool 1: `smart_search`
 
 #### Description
-Fast scoped regular expression search over polyglot source code. Definitions are automatically AST-decapitated into signatures only (function bodies stripped) to save LLM context window.
+Finds **declared symbols** in the in-memory contract graph and returns them AST-decapitated
+(function bodies stripped) to save context window.
 
-**Negative Constraints**: Do NOT use this tool for full-file inspection or documentation reading. Use `include_body: true` only when expanding a specific implementation.
+The query is a plain **case-insensitive substring match on symbol names**, not a regular
+expression. `Auth` matches `AuthController` and `authenticate`; `fn getUser` matches nothing,
+because no symbol is named that.
+
+Resolution order:
+
+1. The symbol index is consulted, restricted to `scope`. Only the files declaring a match are
+   then read and decapitated.
+2. If nothing matches and `fuzzy: true` was passed, the whole scope is crawled and searched as
+   full text — slower, and the way to find a term that appears only inside a function body.
+3. If nothing matches and `fuzzy` is absent or false, zero results are returned. This is
+   deliberate: it means "no symbol by that name is declared here", not "the file doesn't
+   mention it".
+
+**Negative Constraints**: Do NOT use for full-file inspection, documentation (`search_docs`), or
+mapping import hierarchies (`find_dependents`). Use `include_body: true` only to expand one
+specific implementation.
 
 #### JSON Schema
 ```json
@@ -52,7 +69,7 @@ Fast scoped regular expression search over polyglot source code. Definitions are
   "properties": {
     "query": {
       "type": "string",
-      "description": "Case-insensitive regular expression pattern to search for (e.g. 'fn getUser', 'class OrderService')"
+      "description": "Symbol, class, or method name to search for (case-insensitive substring, not a regex). Example: 'UserAuthRequest', 'createEvent'"
     },
     "scope": {
       "type": "string",
@@ -61,6 +78,10 @@ Fast scoped regular expression search over polyglot source code. Definitions are
     "include_body": {
       "type": "boolean",
       "description": "If false (default), strips function/method bodies into '{ /* stripped */ }' or '...' preserving only signatures, types, and contract docstrings. If true, returns full implementation body."
+    },
+    "fuzzy": {
+      "type": "boolean",
+      "description": "If true and the symbol index has no match, falls back to a full-text scan of the scope (slower). Defaults to false."
     }
   },
   "additionalProperties": false
@@ -264,6 +285,6 @@ MeshMCP maps all internal failure modes into standard JSON-RPC 2.0 error respons
 | Code | Label | Cause | Agent Guidance |
 | :--- | :--- | :--- | :--- |
 | **`-32602`** | `InvalidParams` | Scope path escaped sandbox jail (`ValidatedScope`), or unknown parameters sent | Verify path exists within declared `roots` in `mesh-mcp.toml`. |
-| **`-32601`** | `MethodNotFound`| Unrecognized tool requested | Use one of the 5 registered tools (`smart_search`, etc.). |
+| **`-32601`** | `MethodNotFound`| Unrecognized tool requested | Use one of the 6 registered tools (`smart_search`, etc.). |
 | **`-32603`** | `InternalError` | Tree-sitter timeout (15ms exceeded) or file > 384 KB | Reduce query scope or check file size. |
 | **`200 OK`** | `RSAH Governance Block` | Attempted write to guarded repo (e.g. `proto-registry`) | Follow structured action handoff to human engineer. |

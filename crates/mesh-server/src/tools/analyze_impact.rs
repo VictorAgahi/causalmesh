@@ -29,6 +29,10 @@ impl McpTool for AnalyzeImpactTool {
         args._meta.as_ref()
     }
 
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.target.as_str())
+    }
+
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let snapshot = state.snapshot();
         let flow = snapshot.contract_graph.analyze_impact(args.target.as_str());

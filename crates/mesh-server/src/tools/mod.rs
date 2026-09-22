@@ -49,6 +49,13 @@ pub trait McpTool {
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta>;
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError>;
+
+    /// The scope or target this call is about, used to match
+    /// `[engines.policy.skills]` keys the same way stop rules are matched.
+    /// `None` means only an exact tool-name key can recommend a skill.
+    fn subject(_args: &Self::Args) -> Option<&str> {
+        None
+    }
 }
 
 pub struct ToolRegistry;
@@ -107,6 +114,36 @@ impl ToolRegistry {
         }))
     }
 
+    /// Footer pointing the agent at a configured skill file. The path is what the
+    /// agent needs (it can read the file itself); the title, when the file starts
+    /// with a `name:` frontmatter or an `# H1`, saves it a read when it is not relevant.
+    fn render_skill_hint(skill_path: &str) -> String {
+        let title = std::fs::read_to_string(skill_path)
+            .ok()
+            .and_then(|content| Self::skill_title(&content));
+
+        match title {
+            Some(t) => format!("\n---\n**Project skill for this area**: `{skill_path}` — {t}\nRead it before proposing changes here.\n"),
+            None => format!("\n---\n**Project skill for this area**: `{skill_path}`\nRead it before proposing changes here.\n"),
+        }
+    }
+
+    fn skill_title(content: &str) -> Option<String> {
+        for line in content.lines().take(20) {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("description:") {
+                let rest = rest.trim().trim_matches(['"', '\'', '>', '|']).trim();
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+            if let Some(rest) = line.strip_prefix("# ") {
+                return Some(rest.trim().to_string());
+            }
+        }
+        None
+    }
+
     /// Parses arguments, runs the tool body and the audit write on the blocking
     /// pool, and returns the rendered text.
     async fn invoke<T: McpTool>(
@@ -117,7 +154,16 @@ impl ToolRegistry {
             .map_err(|e| (-32602, format!("Invalid arguments for {}: {e}", T::NAME)))?;
 
         tokio::task::spawn_blocking(move || {
-            let result = T::run(&args, &state);
+            let mut result = T::run(&args, &state);
+
+            // Surface the team's own playbook for this area, so the agent reads the
+            // house rules before acting instead of inferring them from the code.
+            if let Ok(out) = &mut result {
+                if let Some(skill) = state.governance.recommend_skill(T::NAME, T::subject(&args)) {
+                    out.text.push_str(&Self::render_skill_hint(skill));
+                }
+            }
+
             let (status, files, redacted) = match &result {
                 Ok(out) => ("SUCCESS", out.files_accessed.clone(), out.secrets_redacted),
                 Err(_) => ("ERROR", Vec::new(), 0),

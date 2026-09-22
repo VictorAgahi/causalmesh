@@ -29,6 +29,10 @@ impl McpTool for AnalyzeGrpcTool {
         args._meta.as_ref()
     }
 
+    fn subject(args: &Self::Args) -> Option<&str> {
+        Some(args.target.as_str())
+    }
+
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let snapshot = state.snapshot();
         let trace = snapshot.contract_graph.analyze_grpc(args.target.as_str());

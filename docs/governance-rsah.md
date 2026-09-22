@@ -119,3 +119,77 @@ On Unix systems (macOS, Linux), `install-hooks` sets POSIX file mode `0755` (`rw
 | **EU AI Act (Article 14)** | High-risk AI systems must enable effective human oversight during execution. | RSAH enforces human review and delegation before cross-repository contracts can be mutated. |
 | **SOC2 Type II (Change Management)** | Traceability and authorization of all production schema modifications. | Chained SHA-256 audit log records all agent attempts, and pre-commit hooks prevent unauthorized merges. |
 | **Contract-First Architecture** | Schema changes must undergo validation and automated artifact generation. | Enforces sequential CI/CD promotion before service consumers are updated. |
+
+---
+
+## 6. Project Skills: guidance before refusal
+
+Stop rules are a wall. Skills are a briefing — they hand the agent your team's playbook for an
+area *before* it proposes a change, which in practice prevents far more bad edits than a refusal
+after the fact.
+
+### Configuration
+
+```toml
+[engines.policy.skills]
+# Key = an MCP tool name, or any fragment of the scope/target being queried.
+"proto-registry"   = ".agents/skills/proto-contract-evolution.md"
+"services/billing" = ".agents/skills/billing-invariants.md"
+"smart_search"     = ".agents/skills/how-we-search.md"
+```
+
+The value is a path to a Markdown file. Anything is valid content; if the file opens with YAML
+frontmatter containing `description:`, or with an `# H1`, that line is quoted inline so the
+agent can judge relevance without opening the file.
+
+### Matching
+
+Implemented by `GovernanceEngine::recommend_skill` ([`crates/mesh-core/src/governance.rs`](../crates/mesh-core/src/governance.rs)):
+
+1. **Exact MCP tool name** (`smart_search`, `find_dependents`, `analyze_grpc`,
+   `analyze_impact`, `search_docs`) — fires on every call to that tool and takes precedence.
+2. Otherwise, **case-insensitive substring match against the call's subject**: the `scope` for
+   `smart_search`, the `target` for the analysis tools, the `query` for `search_docs`. This is
+   the same matching model as `stop_rules`.
+3. Among several matching path keys, the **longest key wins**, so `services/billing` overrides
+   a broader `services` rule regardless of map ordering.
+
+### Effect
+
+`ToolRegistry::invoke` appends a footer to the tool's output:
+
+```
+---
+**Project skill for this area**: `.agents/skills/proto-contract-evolution.md` — How to evolve a proto contract without breaking consumers.
+Read it before proposing changes here.
+```
+
+The footer is appended only on success, and only when a key matches. It costs a handful of
+tokens and is well inside the 48 KB output cap.
+
+### Validation
+
+A mistyped path would silently never fire, so `mesh-mcp doctor` checks every configured skill
+file and names the ones it cannot find:
+
+```
+✔ Project skills: 3 configured, all files found
+```
+```
+✖ Project skills: 1 of 3 file(s) missing — these keys will never recommend anything:
+    proto-registry -> .agents/skills/typo.md
+```
+
+Paths are resolved as written, or relative to the config file's own directory.
+
+### Relationship to stop rules
+
+| | Skills | Stop rules |
+| :--- | :--- | :--- |
+| Trigger | any matching tool call | commit touching a guarded path |
+| Effect | appends guidance to the response | rejects the commit (RSAH) |
+| Enforcement point | MCP server, at query time | git pre-commit hook |
+| Blocks the agent | no | yes |
+
+They compose: a skill explains the contract-first workflow while the agent is still exploring,
+and the stop rule catches it if the advice is ignored.

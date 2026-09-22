@@ -355,6 +355,26 @@ pub fn expand_roots(
 }
 
 impl Config {
+    /// Rewrites relative `[engines.policy.skills]` paths so they resolve against the
+    /// config file's own directory rather than the process working directory.
+    ///
+    /// Without this, a skill would be found by `doctor` (run from the repo root) but
+    /// not by the server (spawned by an IDE with an arbitrary cwd), or vice versa.
+    pub fn resolve_skill_paths(&mut self, base_dir: &Path) {
+        let Some(policy) = self.engines.policy.as_mut() else {
+            return;
+        };
+        for path in policy.skills.values_mut() {
+            let p = Path::new(path.as_str());
+            if p.is_absolute() || p.exists() {
+                continue;
+            }
+            let joined = base_dir.join(p);
+            if joined.exists() {
+                *path = joined.to_string_lossy().into_owned();
+            }
+        }
+    }
     pub fn load_from_str(content: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(content)?;
         Ok(cfg)
@@ -372,5 +392,44 @@ impl Config {
             base_dir,
             &self.workspace.workspace_root,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skill_paths_resolve_against_config_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agents = tmp.path().join(".agents");
+        std::fs::create_dir_all(agents.join("skills")).expect("mkdir");
+        std::fs::write(agents.join("skills/proto.md"), "# Proto").expect("write");
+
+        let mut cfg = Config::load_from_str(
+            r#"
+[workspace]
+name = "t"
+version = "0"
+roots = ["."]
+
+[engines.policy.skills]
+"proto-registry" = "skills/proto.md"
+"absent" = "skills/nope.md"
+"#,
+        )
+        .expect("config");
+
+        cfg.resolve_skill_paths(&agents);
+        let skills = &cfg.engines.policy.as_ref().expect("policy").skills;
+
+        // An existing file is rewritten to a path that resolves from any cwd.
+        let resolved = skills.get("proto-registry").expect("key");
+        assert!(std::path::Path::new(resolved).exists(), "{resolved}");
+        // A path that resolves nowhere is left untouched so doctor reports it verbatim.
+        assert_eq!(
+            skills.get("absent").map(String::as_str),
+            Some("skills/nope.md")
+        );
     }
 }

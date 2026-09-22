@@ -438,3 +438,61 @@ async fn test_smart_search_is_index_first_with_opt_in_fuzzy_fallback() {
     let text = val["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("AuthController.java"), "{text}");
 }
+
+#[tokio::test]
+async fn test_configured_skill_is_recommended_in_tool_output() {
+    let temp = tempfile::tempdir().expect("temp");
+    let base = dunce::canonicalize(temp.path()).expect("canon");
+    std::fs::create_dir_all(base.join("proto-registry")).expect("mkdir");
+    std::fs::create_dir_all(base.join(".agents/skills")).expect("mkdir skills");
+    std::fs::write(
+        base.join(".agents/skills/proto.md"),
+        "---\nname: proto-contract-evolution\ndescription: How to evolve a proto contract without breaking consumers.\n---\n",
+    )
+    .expect("write skill");
+
+    let cfg_str = format!(
+        r#"
+[workspace]
+name = "skills-mesh"
+version = "0"
+roots = ["./proto-registry"]
+
+[engines.policy.skills]
+"proto-registry" = "{}/.agents/skills/proto.md"
+"#,
+        base.display()
+    );
+
+    let config = Config::load_from_str(&cfg_str).expect("config");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &base,
+        &config.workspace.workspace_root,
+    )
+    .expect("roots");
+    let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+    let rescan = Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+
+    // The subject ("proto-registry") matches the configured key, so the tool
+    // output must point the agent at the project's own playbook.
+    let args = json!({ "target": "proto-registry/auth.proto" });
+    let val = ToolRegistry::call_tool("analyze_grpc", args, state.clone())
+        .await
+        .expect("ok");
+    let text = val["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Project skill for this area"), "{text}");
+    assert!(
+        text.contains("How to evolve a proto contract without breaking consumers."),
+        "{text}"
+    );
+
+    // An unrelated subject gets no footer.
+    let args = json!({ "target": "billing" });
+    let val = ToolRegistry::call_tool("analyze_grpc", args, state)
+        .await
+        .expect("ok");
+    let text = val["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("Project skill for this area"), "{text}");
+}

@@ -1,598 +1,391 @@
-# MeshMCP (RFC-001 Rev. 2.9.1)
-### Universal Polyglot Architecture Mesh & Contract Governance MCP Server for AI Agents
+# MeshMCP
+
+**An MCP server that gives your AI coding agent a map of your polyglot codebase.**
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)]()
-[![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
-[![Visualizer](https://img.shields.io/badge/visualizer-HTML5%20%2B%20Mermaid-purple.svg)]()
-[![Binary Size](https://img.shields.io/badge/binary-6.8%20MB-blue.svg)]()
-[![RSS Memory](https://img.shields.io/badge/memory-%3C%2020%20MiB-blue.svg)]()
-[![Stdio Latency](https://img.shields.io/badge/stdio%20latency-0.02%20ms-brightgreen.svg)]()
-[![Context Efficiency](https://img.shields.io/badge/context-AST%20Decapitation-purple.svg)]()
-[![File Watcher](https://img.shields.io/badge/watcher-Differential%20VFS-brightgreen.svg)]()
-[![Audit Engine](https://img.shields.io/badge/audit-SQLite%20WAL%20%2B%20SHA--256-blue.svg)]()
 
-MeshMCP is an industrial-grade, local-first multi-root architecture mesh and high-performance Model Context Protocol (MCP) server written in pure, zero-copy Rust. Designed for multi-repository codebases and enterprise architectures spanning 50+ local repositories and millions of lines of code across **Java, Go, Python, TypeScript, Rust, Protobuf, and AsyncAPI/OpenAPI YAML**, MeshMCP eliminates the context bottleneck, cognitive overload, and security risks of modern AI coding agents (Claude Code, Cursor, Windsurf, Antigravity, Copilot).
+Your agent reads code the way a newcomer does: one file at a time, guessing what calls what.
+On a monorepo with a proto registry, a TypeScript gateway, three Go workers and a Java saga,
+that means burnt context, missed callers, and confident answers that are wrong.
+
+MeshMCP indexes your workspace once, keeps it in memory, and answers four questions your agent
+can't answer alone:
+
+- **Who breaks if I change this?** — reverse dependency graph across languages.
+- **Where does this RPC actually get implemented?** — `.proto` → generated stubs → handlers.
+- **Who produces and consumes this event?** — Kafka/stream topics across services.
+- **What do our own docs say about this?** — Markdown/ADR/RFC search.
+
+It's a single Rust binary, runs locally, reads only the directories you list, and never talks
+to the network.
+
+**Languages indexed**: Java · Go · Python · TypeScript/JavaScript · Rust · C++ · Protobuf · OpenAPI/AsyncAPI YAML · Markdown
 
 ---
 
-### ⚡ 1-Liner Quick Install (macOS / Linux / Windows WSL)
+## Quick start
+
+### 1. Install
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
 ```
 
-Or run instantly via NPX (corporate hardened, zero-dependency download):
-```bash
-npx mesh-mcp init --auto
-```
+Installs a prebuilt binary to `~/.local/bin/`. No Rust toolchain needed.
 
----
-
-## Table of Contents
-
-- [1. Why MeshMCP?](#1-why-meshmcp)
-- [2. Competitive Matrix & Context Engineering](#2-competitive-matrix--context-engineering)
-- [3. Interactive Topology Visualizer (`mesh-mcp graph`)](#3-interactive-topology-visualizer-mesh-mcp-graph)
-- [4. Architecture Overview](#4-architecture-overview)
-- [5. The 6 Core MCP Tools](#5-the-6-core-mcp-tools)
-- [6. Active Governance & RSAH Protocol](#6-active-governance--rsah-protocol)
-- [7. Installation & Quick Start](#7-installation--quick-start)
-- [8. Try the Demo Monorepo (`examples/polyglot-shop`)](#8-try-the-demo-monorepo-examplespolyglot-shop)
-- [9. Configuration (`mesh-mcp.toml`)](#9-configuration-mesh-mcptoml)
-- [10. CLI Reference](#10-cli-reference)
-- [11. IDE & Agent Integration](#11-ide--agent-integration)
-- [10. Cryptographic Audit & Compliance](#10-cryptographic-audit--compliance)
-- [11. Verification & Test Suite](#11-verification--test-suite)
-- [12. Documentation Index](#12-documentation-index)
-
----
-
-## 1. Why MeshMCP?
-
-Modern AI coding agents face three critical challenges when interacting with large polyglot microservices:
-
-1. **Context Window Exhaustion & Cognitive Overload**: Standard tools (like raw `grep`, `find`, or whole-file readers) flood the LLM context window with hundreds of thousands of tokens of business logic and function bodies. This degrades reasoning accuracy ("lost in the middle"), increases hallucination rates, and wastes prompt budget on routine implementation boilerplate.
-2. **Reverse Dependency Blindness & Distributed Breakages**: When an engineer or agent modifies a Protobuf schema, an API Gateway route, or an internal library, standard agents cannot detect that 14 downstream microservices across three different languages depend on that contract. Breaking changes escape into staging and production.
-3. **Security Invariants & Boundary Escapes**: Unsandboxed agents run commands across root filesystems, leak local credentials (`.env`, `.npmrc`, AWS keys), traverse malicious symlinks, and mutate critical contract repositories without human delegation or CI synchronization.
-
-### What MeshMCP Delivers:
-- **Instant AST Decapitation & Bounded Stubs**: Strips method and function bodies (including TypeScript arrow functions `const fn = () => { ... }`) into `{ /* stripped */ }` or `...`. Returns clear signatures, parameter types, and docstrings. Parser timeouts (>15ms) and minified lines (>1024b) yield a compact 122-byte safe stub, preventing prompt blowup on minified assets.
-- **Background Architecture Daemon (`meshd`) & Differential VFS**: A single background daemon multiplexes multiple agent sessions over a local Unix Domain Socket (`.sock`). A single OS watcher (`notify-debouncer-mini` with 150ms debounce) and differential hashing (Blake3/SHA-256 + mtime) eliminate redundant parsing across hot reloads.
-- **Polyglot Graph Reconciliation & Macro Support**: Cross-references Protobuf RPCs, Tonic Rust macros (`include_proto!`), Spring `@GrpcService`, Go `pb.Register*Server`, TypeScript gRPC clients, and Kafka/AsyncAPI channels into an in-memory reverse dependency graph.
-- **Zero-Copy, Lock-Free Performance**: 0.02ms stdio dispatch, `< 20 MiB` RAM baseline, 3.97 µs reverse dependency queries, and zero editor keystroke interference via OS-level background QoS scheduling.
-- **Hardened Security & Container Mounts**: Strict `ValidatedScope` jail with Unicode NFC normalization (preventing macOS APFS NFD canonicalization false positives on accented paths) and Docker container path translation (`mount_aliases`).
-- **Double-Barrier Governance (RSAH)**: Refusal with Structured Action Handoff prevents autonomous edits to guarded repos, accompanied by OS-level Git pre-commit hooks.
-- **Multi-Process Concurrent SQLite WAL Audit**: Multi-agent concurrent audit logging via SQLite in WAL mode (`audit.db`, `BEGIN IMMEDIATE`, >36,000 writes/s) with tamper-evident SHA-256 hash chaining and JSONL export.
-
----
-
-## 2. Context Engineering & Performance Profile
-
-MeshMCP focuses the agent's context window exclusively on architectural contracts and interface boundaries:
-
-### Context Optimization Strategies
-
-| Technique | Conventional Agent Behavior | MeshMCP Engine | Impact |
-| :--- | :--- | :--- | :--- |
-| **Interface Inspection** | Ingests entire implementation files (`500 - 3,000` lines/file) | **AST Decapitation**: Strips bodies into `{ /* stripped */ }` / `...`; preserves signatures, types, and annotations | Eliminates routine internal loops and private variables; leaves full context for cross-service reasoning |
-| **Parser Guard / Timeout** | Dumps raw 500 KB minified files or unparsed source | **Bounded Error Stub**: Strictly capped 122-byte navigational notice | Prevents massive minified bundle dumps from polluting context |
-| **Payload Formatting** | Verbose raw JSON strings with escaped quotes and newlines | **Dense High-Density Markdown**: Compact code blocks & navigation metadata | Clean formatting directly consumable by LLMs without JSON escaping overhead |
-| **Output Bounding** | Unbounded outputs leading to context thrashing | **Affordance-Driven Truncation**: Hard 48 KB cap with structured sub-scope guidance | Eliminates context buffer overflow; guides agent to narrower queries |
-| **Cross-Repo Navigation** | Crawls dozens of files via raw grep/find | **Reverse Dependency Index**: Instant O(1) in-memory contract graph lookups | Pinpoints callers and impact without mass file reads |
-| **Property Dumps** | Ingests full YAML/properties with raw dev secrets | **Secret Masking**: Redacted tokens with `${key:fallback}` hints | Prevents credentials from leaking into LLM prompt contexts |
-
-### Execution Performance Profile
-
-Tested against a multi-repo workspace consisting of 52 repositories, 48,000 files, and 2.1M lines of code:
-
-| Metric | Target Threshold | MeshMCP Measured | Margin |
-| :--- | :--- | :--- | :--- |
-| **Resident Memory (RSS)** | `< 30 MiB` | **`18.6 MiB`** (mimalloc + CompactString) | Verified |
-| **Stdio Loopback Latency** | `< 1 ms` | **`0.02 ms`** (20 microseconds) | 50x faster |
-| **Cold Boot (Initialize Handshake)** | `< 50 ms` | **`12.5 ms`** | 4x faster |
-| **Structural Ingestion (`mesh-mcp init`)** | `< 5 s` | **`4.2 s`** (full polyglot scan) | Within budget |
-| **In-Memory Query Latency** | `< 2 ms` | **`0.12 ms`** (Lock-Free `ArcSwap`) | 16x faster |
-| **Reverse Dependency Index Query** | `< 1 ms` | **`3.97 µs`** (Empirical Criterion) | Instantaneous |
-| **Scoped AST Parsing + Decapitation** | `< 50 ms` | **`0.11 ms`** (Tree-sitter bounded) | Sub-millisecond |
-| **Live File Watching Debounce** | `< 250 ms` | **`150 ms`** (`notify-debouncer-mini` OS event queue) | Within budget |
-| **Concurrent Audit Write Latency** | `< 100 µs` | **`27.57 µs`** (SQLite WAL `BEGIN IMMEDIATE`, 36k+ ops/s) | Verified |
-| **IDE UI Keystroke Stuttering** | `< 150 ms` | **`0 ms`** (Rayon OS QoS background isolation) | Zero UI impact |
-
-### Competitive Benchmark & Value Matrix
-
-| Architectural Capability | Generic MCP (TypeScript / Python) | Sourcegraph / Large LSP | CausalMesh (`mesh-mcp`) |
-| :--- | :--- | :--- | :--- |
-| **Engine Runtime** | Node.js / Python VM (slow startup) | Heavy JVM / Go cluster daemon | **Pure Zero-Copy Rust (mimalloc)** |
-| **Resident Memory (RSS)** | 350 MiB &ndash; 900 MiB per IDE window | 2 GiB &ndash; 8 GiB background daemon | **`< 20 MiB` total across all IDE windows** |
-| **Process Model** | 1 heavy process per client connection | Multi-tier distributed server | **Ultra-light proxy (< 2 MiB) + shared `meshd` UDS daemon** |
-| **Context Consumption** | Whole file dumps (10k &ndash; 50k tokens) | Search excerpts with full bodies | **Strict AST Decapitation (< 1k tokens, signatures only)** |
-| **Causal Impact Tracking** | None (lexical text match only) | Code references only (same language) | **Polyglot Graph (Proto &harr; NestJS &harr; Go &harr; Rust &harr; Kafka &harr; K8s)** |
-| **Topology Visualization** | None | Proprietary Web UI | **Autonomous Dark-Mode HTML5 Canvas + Mermaid CLI** |
-| **AI Agent Sandboxing** | Open OS disk access (leaks `.env`, keys) | Server-side read-only index | **Canonical `ValidatedScope` Jail + Anti-Prompt Injection** |
-
----
-
-## 3. Interactive Topology Visualizer (`mesh-mcp graph`)
-
-CausalMesh includes an autonomous, zero-dependency **Interactive Topology Engine** that compiles your monorepo's contracts, gRPC flows, Kafka topics, and microservices into a stunning visual graph:
+<details>
+<summary>Or build from source (needs Rust 1.80+)</summary>
 
 ```bash
-# 1. Open the interactive Dark Mode Canvas directly in your default browser:
-mesh-mcp graph --open
-
-# 2. Export a clean GitHub-Flavored Mermaid diagram:
-mesh-mcp graph --format mermaid
-
-# 3. Export to a static standalone HTML file or JSON payload:
-mesh-mcp graph --format html --output ./topology.html
-mesh-mcp graph --format json --output ./topology.json
-```
-
-### Visualizer Features
-- 🌌 **Zero-Dependency HTML5 Canvas**: Runs 100% locally and offline in air-gapped corporate environments.
-- 🎨 **Sleek Dark Mode Aesthetics**: Glassmorphic styling, neon type accents (cyan for gRPC, amber for Kafka, green for Protobuf, purple for HTTP).
-- 🔍 **Real-Time Symbol Filtering**: Instant fuzzy search across contracts and packages.
-- 📋 **1-Click Mermaid Clipboard Export**: Instantly embed topology diagrams into GitHub PR descriptions and architecture RFCs.
-
----
-
-## 4. Architecture Overview
-
-### System Topologies & Flows
-
-The following unstyled diagrams illustrate the internal subsystem data flow and the MCP request execution lifecycle.
-
-#### Complete System Flow
-```mermaid
-graph TD
-    Client["AI Agent / IDE Client"] -->|JSON-RPC 2.0 over Stdio| StdioActor["Stdio Framing Actor"]
-    StdioActor -->|Extract W3C traceparent| Router["Protocol Router & Validator"]
-    Router -->|ValidatedScope Jail - Unicode NFC and Mount Aliases| Security["Security & Path Canonicalization"]
-    Security -->|Scope Approved| Dispatcher["MCP Tool Registry"]
-    
-    Dispatcher --> Tools{"Tool Selection"}
-    Tools -->|smart_search| EngineSearch["Search & AST Decapitation"]
-    Tools -->|find_dependents| EngineGraph["Reverse Dependency Graph"]
-    Tools -->|analyze_grpc| EngineGrpc["Synchronous gRPC Mesh"]
-    Tools -->|analyze_impact| EngineImpact["Causal Impact Flow"]
-    Tools -->|search_docs| EngineDocs["Sanitized Architecture Docs"]
-    
-    EngineSearch --> Parsers["Tree-sitter AST Guard"]
-    EngineGraph --> State["Lock-Free AppState CoW - ArcSwap"]
-    EngineGrpc --> State
-    EngineImpact --> State
-    EngineDocs --> State
-    
-    Parsers --> Decap["AST Body Decapitator - Arrow Functions Support"]
-    Decap --> Formatter["Markdown Formatter 48KB Cap"]
-    
-    Formatter --> Audit["SQLite WAL Cryptographically Chained Audit Logger"]
-    Audit --> StdioActor
-    StdioActor -->|JSON-RPC Output via BufWriter| Client
-
-    Watcher["In-Kernel File Watcher - notify 150ms debounce"] -->|Event: Code or Git HEAD| Rescan["Rayon Background Rescan"]
-    Rescan -.->|Atomic ArcSwap Store - QoS Background| State
-```
-
-#### Governance & Refusal (RSAH) Flow
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Agent as AI Agent (Claude / Cursor)
-    participant Server as MeshMCP Server
-    participant Gov as Governance Engine (RSAH)
-    participant Disk as Local Git Repository
-
-    Agent->>Server: Tool Call (target: proto-registry)
-    Server->>Gov: Check Stop Rules & Guarded Repositories
-    alt Guarded Target Detected
-        Gov-->>Server: Trigger Refusal
-        Server-->>Agent: JSON-RPC Result (RSAH Blocked Message)
-        Note over Agent: Agent halted from unauthorized edit.<br/>Provides structured handoff to human engineer.
-    else Scope Permitted
-        Server->>Disk: Read & Query Scope
-        Server-->>Agent: High-Density AST-Decapitated Markdown
-    end
-```
-
-### The 7 Code Commandments (RFC-001)
-
-Every line of Rust in MeshMCP adheres strictly to the 7 Code Commandments:
-
-1. **Zero Dynamic Allocation in Hot Loops**: Global `mimalloc`, string interning via `CompactString` (24 bytes inline stack allocation), `RepoId = u16` indices (up to 65,535 repos), and reusable scratch buffers.
-2. **Bounded Tree-sitter & IOPS Guards**: Files exceeding 384 KB or lines exceeding 1,024 bytes are rejected. Null-byte sniffing over 4,096 bytes prevents binary ingestion. AST nesting depth capped at 64; C-FFI timeout set to 15,000 microseconds; queries bounded to 10,000 steps (anti-ReDoS). TypeScript arrow functions (`const fn = () => { ... }`) are decapitated cleanly. In case of timeout or line length violation, a bounded error stub (<= 256 octets) is returned instead of raw files. Tonic gRPC macro invocations (`include_proto!`) are recognized natively.
-3. **Stdio Isolation & Affordance Truncation**: Standard output is exclusively owned by a dedicated Tokio task with `BufWriter<Stdout>`. Standard error is strictly reserved for diagnostic tracing. Responses exceeding 48 KB are truncated with actionable sub-scope navigational hints.
-4. **Security Boundary via `ValidatedScope` Jail**: Absolute prohibition of raw `PathBuf` or string paths. Dual-check resolution via `dunce::canonicalize`, case-folding normalization, and Unicode NFC normalization (`unicode_normalization::UnicodeNormalization::nfc`) eliminating macOS APFS NFD canonicalization divergence. Symlink traversal outside declared roots triggers immediate rejection (JSON-RPC error `-32602`). Docker container mount aliases (`mount_aliases`) transparently bridge container paths to host filesystems.
-5. **Strict Schemas & Negative Constraints**: Generated schemas enforce `#[serde(deny_unknown_fields)]`. Descriptions provide negative constraints to eliminate hallucination. Configuration secrets are masked with testing hints (`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`).
-6. **Active Double-Barrier Governance (RSAH)**: Guarded repositories (such as contract registries) trigger structured refusal messages that guide human delegation. Native Git pre-commit hooks (`mesh-mcp install-hooks`) enforce this policy physically at the OS layer.
-7. **OS Politeness, W3C Tracing, Live Watching & WAL Auditability**: Background rescan engines operate in a dedicated Rayon thread pool throttled with `QOS_CLASS_BACKGROUND` (macOS) and `nice(10)` (Linux). In-kernel file watching (`notify` / `notify-debouncer-mini` with 150ms debounce) monitors workspace roots and `.git/HEAD` checkouts/rebases for atomic `ArcSwap` hot-reloading. Multi-agent concurrent audit logging runs over SQLite in Write-Ahead Logging mode (`audit.db`, `PRAGMA journal_mode = WAL`, `BEGIN IMMEDIATE`, permissions `0600`) with SHA-256 tamper-evident chaining and JSONL export. Distributed traces propagate W3C `traceparent` metadata.
-
----
-
-## 5. The 6 Core MCP Tools
-
-MeshMCP implements six specialized MCP tools designed for deep architecture navigation:
-
-### 1. `smart_search`
-- **Purpose**: Fast scoped regex search returning AST-decapitated definitions across polyglot source code.
-- **Parameters**:
-  - `query` *(string, required)*: Case-insensitive regex query.
-  - `scope` *(string, required)*: Directory or repository relative path to search within.
-  - `include_body` *(boolean, optional)*: If `false` (default), function/method bodies are stripped to save tokens. If `true`, includes full implementation.
-- **Output**: High-density Markdown with file paths, line numbers, language tags, and decapitated signatures.
-
-### 2. `find_dependents`
-- **Purpose**: Reverse dependency lookups across repository boundaries.
-- **Parameters**:
-  - `target` *(string, required)*: Fully qualified contract, class name, or gRPC service/method.
-  - `scope` *(string, optional)*: Optional sub-scope to constrain search.
-- **Output**: Reverse dependency graph showing all upstream consumers and caller services.
-
-### 3. `analyze_grpc`
-- **Purpose**: Full gRPC pipeline tracing from `.proto` definition to server implementations and client call sites.
-- **Parameters**:
-  - `service_name` *(string, required)*: Name of the gRPC service.
-  - `method_name` *(string, optional)*: Specific RPC method name.
-- **Output**: End-to-end trace matrix mapping Schema -> Servers -> Clients across all polyglot repositories.
-
-### 4. `analyze_impact`
-- **Purpose**: Causal impact analysis tracking asynchronous event flows (Kafka, RabbitMQ, SQS, Redis Streams, Transactional Outbox, Sagas) and synchronous HTTP/gRPC pipelines.
-- **Resolution Engines**: Evaluates formal AsyncAPI/OpenAPI specifications alongside the **Declarative Custom Pattern Engine** (`[[engines.contracts.patterns]]`), enabling zero-hardcoding extraction of custom company sagas, post-processors, and outbox events.
-- **Parameters**:
-  - `target` *(string, required)*: Name of the event, Kafka topic, queue, stream, post-processor class, or saga to analyze.
-- **Output**: Full causal flow mapping upstream producers -> topics/channels -> downstream consumers -> related sagas.
-
-### 5. `search_docs`
-- **Purpose**: Architecture and ADR documentation search with adversarial prompt-injection sanitization.
-- **Parameters**:
-  - `query` *(string, required)*: Keywords or topics to search for.
-  - `scope` *(string, optional)*: Specific documentation directory.
-- **Output**: Sanitized documentation excerpts with prompt-injection tokens neutralized.
-
-### 6. `visualize_mesh`
-- **Purpose**: Generates visual architecture topology diagrams (Mermaid or interactive HTML) on demand directly within AI agent conversations.
-- **Parameters**:
-  - `format` *(string, optional)*: `'mermaid'` (default, GitHub-flavored Markdown) or `'html'` (standalone interactive app).
-- **Output**: Clean Mermaid diagram block or self-contained HTML graph string.
-
----
-
-## 6. Active Governance & RSAH Protocol
-
-When an AI agent attempts to modify a protected contract repository (such as `proto-registry`), MeshMCP activates **Refusal with Structured Action Handoff (RSAH)**:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "🛑 [MeshMCP GOVERNANCE REFUSAL: RSAH-001]\nDirect modification of 'proto-registry' is restricted.\n\n👉 Action Required: Hand off this action to a human engineer or commit schemas independently.\n\nRecommended Delegation Message:\n'I have prepared the Protobuf schema changes. Please review and commit proto-registry first before downstream service propagation.'"
-      }
-    ]
-  }
-}
-```
-
-### Physical Pre-Commit Hook Enforcement
-To guarantee that rogue agent processes cannot bypass the MCP boundary via standard terminal commands, running:
-```bash
-mesh-mcp install-hooks
-```
-installs an executable pre-commit hook into `.git/hooks/pre-commit` that physically verifies staged commits and blocks mixed service/contract changes at the OS level.
-
----
-
-## 6. Installation & Quick Start
-
-> **Full Walkthrough**: For an exhaustive setup, configuration, and agent testing guide, see [**SETUP.md**](SETUP.md).
-
-### Build from Source (Recommended)
-Requirements: Rust 1.80+ and Cargo.
-
-```bash
-# Clone the repository
 git clone https://github.com/VictorAgahi/causalmesh.git
 cd causalmesh
-
-# Build optimized release binaries (mesh-mcp and meshd)
 cargo build --workspace --release
-
-# Verify binary
-./target/release/mesh-mcp --version
-./target/release/mesh-mcp doctor
-```
-
-### Running MeshMCP
-- **Daemon Mode (Default)**: Runs `mesh-mcp run` as a lightweight UDS proxy (< 2 MiB RAM) connecting to the background `meshd` daemon (auto-spawned if not running).
-- **Standalone Mode**: Runs in a single process without background daemon:
-  ```bash
-  ./target/release/mesh-mcp run --standalone --config mesh-mcp.toml
-  ```
-
-### Run Healthcheck Doctor
-```bash
-./target/release/mesh-mcp doctor
-```
-```bash
-./target/release/mesh-mcp doctor
-```
-Output:
-```
-🔍 Running MeshMCP Diagnostic Healthcheck (RFC-001 Rev. 2.9.1)...
-
-✔ Config syntax: Valid (mesh-mcp.toml)
-✔ Symlink invariants: follow_links=false verified across all engines
-✔ Unicode NFC normalization: Active (APFS/NFC compliant, zero NFD divergence)
-✔ Container mount aliases: Configured (Docker / DevContainer bridge ready)
-✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)
-✔ Host OS event subsystem: Native (APFS FSEvents/inotify active, 150ms debounced watcher)
-✔ Audit log engine: SQLite WAL (audit.db with multi-process concurrent SHA-256 chaining)
-✔ Stdio loopback latency: 0.02ms
-✔ Tree-sitter parsers initialized (Java, Go, Python, TS [incl. arrow functions], Rust [incl. Tonic macros])
-✔ Memory baseline: < 20 MiB RSS (mimalloc + compact_str)
-
-✔ All systems operational. Ready for AI agents.
-```
-
----
-
-## 7. Installation & Quick Start
-
-### 1. Automatic 1-Liner (Recommended)
-```bash
-curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
-```
-
-### 2. From Source via Cargo
-```bash
-git clone https://github.com/VictorAgahi/causalmesh.git
-cd causalmesh
-cargo build --release
 cp target/release/mesh-mcp target/release/meshd ~/.local/bin/
 ```
+</details>
 
-### 3. Initialize Monorepo Architecture
+### 2. Point it at your repo
+
 ```bash
 cd /path/to/your/monorepo
-mesh-mcp init --auto
-mesh-mcp doctor
+mesh-mcp init --auto      # writes .agents/mesh-mcp.toml by detecting your layout
+mesh-mcp doctor           # checks the config resolves and the parsers load
 ```
+
+`init --auto` is a starting point, not a final answer — it guesses your roots from common
+directory names. Read [Configuration](#configuration) next; ten minutes there is what makes
+the difference between "it works" and "it understands our architecture".
+
+### 3. Connect your agent
+
+**Claude Code**
+```bash
+claude mcp add mesh-mcp -- mesh-mcp run
+```
+
+**Cursor / VS Code / Windsurf** — `.cursor/mcp.json` or `.vscode/mcp.json`:
+```json
+{ "mcpServers": { "mesh-mcp": { "command": "mesh-mcp", "args": ["run"] } } }
+```
+
+(`mesh-mcp init --auto --write-ide-config` writes these two files for you.)
+
+### 4. Ask it something
+
+> "Which services break if I change the `CreateOrder` RPC?"
+
+Your agent now calls `analyze_grpc` and `find_dependents` instead of grepping.
 
 ---
 
-## 8. Try the Demo Monorepo (`examples/polyglot-shop`)
+## Try it in 30 seconds
 
-A self-contained polyglot demonstration monorepo is bundled in [`examples/polyglot-shop`](examples/polyglot-shop) featuring:
-- **`proto/checkout.proto`**: gRPC definition of `CheckoutService` and `OrderCreatedEvent`.
-- **`services/order-gateway`** (*TypeScript NestJS*): Implements `@GrpcMethod('CheckoutService', 'CreateOrder')` and emits to Kafka.
-- **`services/payment-worker`** (*Go*): Consumes `order-created-topic` and executes settlement.
-- **`services/inventory-manager`** (*Rust*): Subscribes to stock decrement events.
+A small polyglot monorepo ships with the repo — one proto file and five services in
+TypeScript, Go, Rust, Python and Java, wired together by gRPC and Kafka topics:
 
-### Test in 10 Seconds:
-
-> [!NOTE]
-> **No Rust or Cargo required!** If you do not have Rust installed on your machine, simply use the 1-liner installer:
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
-> ```
-> It delivers the precompiled native binary directly to `~/.local/bin/mesh-mcp` with zero build tools needed.
-
-#### Option A: Using the installed `mesh-mcp` binary:
 ```bash
-# 1. Visualize cross-service topology in your browser:
 mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
-
-# 2. Export Mermaid diagram:
-mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
-
-# 3. Check health and verify scope jail:
-mesh-mcp doctor --config examples/polyglot-shop/mesh-mcp.toml
 ```
 
-#### Option B: If testing directly from source with Rust/Cargo:
-```bash
-# 1. Visualize cross-service topology in your browser:
-cargo run --bin mesh-mcp -- graph --config examples/polyglot-shop/mesh-mcp.toml --open
-
-# 2. Export Mermaid diagram:
-cargo run --bin mesh-mcp -- graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
-
-# 3. Check health:
-cargo run --bin mesh-mcp -- doctor --config examples/polyglot-shop/mesh-mcp.toml
-```
+That opens an interactive topology in your browser. `--format mermaid` prints a diagram you
+can paste into a Markdown file instead.
 
 ---
 
-## 9. Configuration (`mesh-mcp.toml`)
+## What your agent gets
 
-MeshMCP is configured via a declarative `mesh-mcp.toml` file at the root of your workspace:
+Six tools. Each description tells the model when *not* to use it, which is most of what keeps
+an agent from flailing.
+
+| Tool | Answers | Notes |
+| :--- | :--- | :--- |
+| `smart_search` | "Where is `UserAuthRequest` declared?" | Returns signatures with bodies stripped. Searches the in-memory symbol index; pass `fuzzy: true` for a full-text scan of the scope. |
+| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup across repos and languages. |
+| `analyze_grpc` | "Where is this RPC implemented and called?" | Links `.proto` definitions to handlers and client stubs. |
+| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. |
+| `search_docs` | "What did we decide about idempotency?" | Keyword search over your Markdown docs, with alias and stop-word support. |
+| `visualize_mesh` | "Show me the topology." | Mermaid or standalone HTML. |
+
+Two things every tool does:
+
+- **Strips function bodies.** You get `fn charge(order: &Order) -> Result<Receipt> { /* stripped */ }`,
+  not 80 lines of retry logic. Measured on this repo's benchmark corpus, that removes 55–69% of
+  the tokens depending on language (`cargo bench -p mesh-server` prints the number for yours).
+- **Caps output at 48 KB**, with a note telling the agent how to narrow the query instead of
+  silently truncating.
+
+---
+
+## Configuration
+
+Everything lives in one TOML file: `.agents/mesh-mcp.toml` (or `mesh-mcp.toml` at the root).
+Build it up in layers — each section below is independently useful.
+
+### Layer 1 — Roots: what may be read at all
+
+This is also the security boundary. Any path outside these roots is refused with a JSON-RPC
+`-32602`, symlinks pointing outside are dropped, and `..` traversal is resolved before the check.
 
 ```toml
 [workspace]
-name = "enterprise-polyglot-mesh"
-version = "2.9.1"
+name = "my-mesh"
+version = "1.0.0"
 
-workspace_root = "${WORKSPACE_ROOT:-.}"
+# Optional indirection so the same file works on every machine and in CI.
+workspace_root = "${WORKSPACE_ROOT:-..}"
+
 roots = [
   "${workspace_root}/proto-registry",
   "${workspace_root}/api-gateway",
-  "${workspace_root}/services/*",
-  "${workspace_root}/k8s-infrastructure",
-  "${workspace_root}/docs"
+  "${workspace_root}/services/*",      # globs expand to one root per match
+  "${workspace_root}/docs",
 ]
+```
 
-# Container/Docker mount path aliases to host paths
-[workspace.mount_aliases]
-"/workspace" = "${workspace_root}"
-"/app" = "${workspace_root}/services/app"
+> **Paths are relative to the config file, not to your shell.** A config in `.agents/` needs
+> `..` to reach the repo root — that's why `init --auto` writes `${WORKSPACE_ROOT:-..}`.
 
+Exclusions are gitignore-style globs. The defaults already cover secrets and build output; add
+yours:
+
+```toml
 exclude_patterns = [
-  "**/.env*",
-  "**/secrets/**",
-  "**/*.pem",
-  "**/*.key",
-  "**/node_modules/**",
-  "**/target/**",
-  "**/.git/**"
+  "**/node_modules/**", "**/target/**", "**/.venv/**",
+  "**/*.pem", "**/*.key", "**/.env*",
+  "**/generated/**",
 ]
+```
+
+Excluded directories are pruned from the walk, so a large `node_modules/` costs nothing.
+
+### Layer 2 — Docs: make `search_docs` speak your vocabulary
+
+```toml
+[engines.docs]
+enabled = true
+paths = ["${workspace_root}/docs", "${workspace_root}/architecture"]
+
+# Your team's shorthand → the word actually written in the docs.
+aliases = { "k8s" = "kubernetes", "dlq" = "dead-letter-queue", "ws" = "websocket" }
+
+# Words that add noise to a query.
+stop_words = ["the", "how", "what", "which"]
+
+exact_phrase_boost = 60          # weight of a full-phrase hit in a section title
+sanitize_prompt_injections = true # neutralise "ignore previous instructions" in indexed docs
+```
+
+Aliases are the highest-leverage setting here: without them, an agent asking about "the DLQ"
+finds nothing in a doc that only ever says "dead-letter-queue".
+
+### Layer 3 — Skills: make the agent read your playbook first
+
+This is how you get *your* process in front of the agent before it edits anything.
+
+Write a Markdown file describing how work is done in some area of the codebase:
+
+```markdown
+---
+name: proto-contract-evolution
+description: How to evolve a proto contract without breaking consumers.
+---
+
+# Evolving a proto contract
+
+1. Never renumber or reuse a field tag. Mark removed fields `reserved`.
+2. Open the PR against `proto-registry` alone and wait for CI to publish stubs.
+3. Only then bump the dependency in the consuming services.
+```
+
+Then map it to the area it covers:
+
+```toml
+[engines.policy.skills]
+# Key = an MCP tool name, or any fragment of the scope/target being queried.
+"proto-registry" = ".agents/skills/proto-contract-evolution.md"
+"services/billing" = ".agents/skills/billing-invariants.md"
+"smart_search" = ".agents/skills/how-we-search.md"
+```
+
+Now any tool call whose target or scope contains `proto-registry` comes back with a footer:
+
+```
+---
+**Project skill for this area**: `.agents/skills/proto-contract-evolution.md` — How to evolve a proto contract without breaking consumers.
+Read it before proposing changes here.
+```
+
+The agent reads the file and follows your rules instead of inventing its own. Matching is
+case-insensitive; an exact tool-name key wins over a path match, and the longest matching key
+wins among path matches. `mesh-mcp doctor` fails loudly if a configured skill file is missing —
+a typo here would otherwise just silently never fire.
+
+This repo's own skills live in [`.agents/skills/`](.agents/skills/) if you want examples.
+
+### Layer 4 — Stop rules: hard boundaries
+
+Where a skill is advice, a stop rule is a refusal. Used by the git pre-commit hook installed by
+`mesh-mcp install-hooks`:
+
+```toml
+[engines.policy]
+enabled = true
+enforce_git_hooks = true
+cryptographic_audit_trail = true
 
 [engines.policy.stop_rules]
-"proto-registry" = "STOP CASCADE CI: Contracts must be committed independently."
+"proto-registry" = "STOP: proto-registry generates the TS/Go/Java stubs. Land the contract PR first."
+"k8s-infrastructure" = "STOP: manifest changes require DevOps review."
+```
 
-# ==============================================================================
-# Declarative Custom Pattern Engine (Zero-Hardcoding Architecture Mapping)
-# Map custom CQRS outbox events, BullMQ jobs, Sagas, or RPCs via regex:
-# ==============================================================================
+A commit touching a guarded path is rejected with a structured explanation of what to do
+instead. See [docs/governance-rsah.md](docs/governance-rsah.md).
+
+### Layer 5 — Custom patterns: teach it your conventions
+
+MeshMCP understands gRPC, Spring, OpenAPI and AsyncAPI out of the box. Your in-house event bus,
+outbox table or job queue, it can't guess — describe it with a regex:
+
+```toml
 [[engines.contracts.patterns]]
 name = "transactional-outbox"
-kind = "topic_producer" # topic_producer | topic_consumer | saga | rpc
+kind = "topic_producer"        # topic_producer | topic_consumer | saga | rpc
 file_pattern = "*.ts"
 regex = 'createEvent<([^>]+)>'
-target_group = 1
+target_group = 1               # capture group holding the topic/event name
 
 [[engines.contracts.patterns]]
 name = "event-post-processor"
 kind = "topic_consumer"
 file_pattern = "*.ts"
 regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
-target_group = 2
-consumer_group = 1
-
-[[engines.contracts.patterns]]
-name = "saga-orchestrator"
-kind = "saga"
-file_pattern = "*.ts"
-regex = 'class\s+(\w+Saga)\b'
-target_group = 1
-
-[engines.watcher]
-enabled = true
-debounce_ms = 150
-
-[engines.rescan]
-enabled = true
-interval_seconds = 300
-thread_priority = "background"
-
-[engines.audit]
-db_path = "~/.cache/mesh-mcp/audit.db" # Or ":memory:" for zero-disk-overhead in-memory mode
+target_group = 2               # the event
+consumer_group = 1             # the class consuming it
 ```
 
----
+Producers and consumers of the same name are then linked automatically, and `analyze_impact`
+can trace an event end to end. [`examples/polyglot-shop/mesh-mcp.toml`](examples/polyglot-shop/mesh-mcp.toml)
+has working patterns for five languages.
 
-## 10. CLI Reference
-
-```
-Usage: mesh-mcp [OPTIONS] [COMMAND]
-
-Commands:
-  run            Run the MeshMCP JSON-RPC server over stdio (default)
-  doctor         Run diagnostic healthchecks on environment, permissions, and roots
-  init           Automatically scan polyglot workspace and generate .agents/mesh-mcp.toml
-  graph          Generate and view an interactive architecture graph of services, contracts, and topics
-                 Flags:
-                   --format <html|mermaid|json> (default: html)
-                   --output <path>              (optional output file)
-                   --open                       (opens browser automatically)
-  install-hooks  Install OS-level Git pre-commit hooks for active governance
-  help           Print help information
-```
-
-Options:
-  -c, --config <CONFIG>  Path to custom configuration file [default: mesh-mcp.toml]
-  -h, --help             Print help
-  -V, --version          Print version
-```
-
----
-
-## 9. IDE & Agent Integration
-
-### Claude Code
-Add to your Claude Code MCP configuration (`~/.claude/claude_code_config.json`):
-```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "/absolute/path/to/mesh-mcp",
-      "args": ["run"],
-      "env": {
-        "WORKSPACE_ROOT": "/Users/developer/projects"
-      }
-    }
-  }
-}
-```
-
-### Cursor & Windsurf
-Add to your project's `.cursor/mcp.json` or `.windsurf/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "mesh-mcp",
-      "args": ["run"]
-    }
-  }
-}
-```
-
----
-
-## 10. Cryptographic Audit & Compliance
-
-Every tool invocation, file read, and mutation attempt is recorded in an ultra-lightweight SQLite database in Write-Ahead Logging mode (`~/.cache/mesh-mcp/audit.db` or workspace audit path) with POSIX permissions `0600` (read/write exclusively by the owner process).
-
-### Multi-Process Concurrency & WAL Performance
-- **Zero Lock Contention**: Running with `PRAGMA journal_mode = WAL;`, `PRAGMA synchronous = NORMAL;`, and `PRAGMA busy_timeout = 5000;`. Multiple concurrent AI agent processes (e.g. 8+ Claude Code or Cursor workers) log simultaneously without lock timeouts or file starvation.
-- **High-Throughput Atomic Transactions**: Transactions acquire `BEGIN IMMEDIATE` locks and execute in **27.57 µs** (over 36,000 writes/sec), reading the committed tail to guarantee exact sequential chaining.
-
-### Tamper-Evident SHA-256 Chaining
-Entries are chained cryptographically:
-```text
-Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || PayloadDigest)
-```
-
-Tampering with any intermediate line or SQLite row invalidates the entire subsequent cryptographic signature chain, guaranteeing non-repudiation under SOC2 Type II, ISO 27001, and EU AI Act Article 14 audits.
-
-### JSONL Export & SIEM Ingestion
-MeshMCP provides native export capabilities (`AuditLogger::export_to_jsonl`) to pipe structured audit streams directly to SIEM pipelines (Datadog, Splunk, Elastic, CloudWatch) while maintaining local tamper proofing.
-
----
-
-## 11. Verification & Test Suite
-
-MeshMCP includes an exhaustive unit and integration test suite:
+After any config change:
 
 ```bash
-# Run unit and integration tests across the entire workspace
-cargo test --workspace
-
-# Run strict Clippy verification
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Result:
-```
-test result: ok. 22 passed (mesh-core)
-test result: ok. 8 passed (mesh-daemon)
-test result: ok. 24 passed (mesh-parsers)
-test result: ok. 4 passed (mesh-server unit)
-test result: ok. 9 passed (mesh-server integration)
-Total: 67 passed, 0 failed, 0 warnings
+mesh-mcp doctor                                    # config resolves, skills exist, parsers load
+mesh-mcp graph --format mermaid | head -40         # does the topology look like your architecture?
 ```
 
 ---
 
-## 12. Documentation Index
+## How it works
 
-- [**SETUP.md**](SETUP.md): Comprehensive setup, build, test, and MCP agent integration guide.
-- [**docs/architecture.md**](docs/architecture.md): Systems architecture, memory layout, AST guards, daemon UDS multiplexing, and Rayon QoS.
-- [**docs/mcp-tools.md**](docs/mcp-tools.md): In-depth specification of the 5 MCP tools, JSON schemas, and affordances.
-- [**docs/development.md**](docs/development.md): Developer guide, building, debugging, and adding new language parsers.
-- [**docs/governance-rsah.md**](docs/governance-rsah.md): Double-barrier governance, RSAH patterns, and Git hook mechanics.
-- [**docs/benchmarks.md**](docs/benchmarks.md): Comprehensive benchmark data, context efficiency analysis, and memory profiles.
+```
+crawl roots ──▶ size/binary guard ──▶ tree-sitter parse ──▶ per-file extract
+                                                                   │
+        agent query ◀── one atomic snapshot ◀── reconcile edges ◀── merge
+                                     ▲
+                          file watcher ──▶ differential rescan (changed files only)
+```
+
+- Parsing runs in parallel; the resulting graph is published as a single immutable snapshot, so
+  a query never sees a half-updated index.
+- A file watcher re-indexes only what changed, on background-priority threads, so it doesn't
+  compete with your editor.
+- Tree-sitter runs behind hard bounds: 15 ms parse timeout, 384 KB file budget (1.5 MB for
+  schemas), 1 KB max line length, depth limit. A file that trips a bound is skipped, never
+  dumped raw into your context.
+- Secrets in indexed YAML/properties are masked before they can reach a prompt.
+
+Details: [docs/architecture.md](docs/architecture.md).
+
+### Two ways to run
+
+**Daemon (default)** — `mesh-mcp run` is a thin proxy over a Unix socket to a shared `meshd`
+process that holds the index. Five IDE windows share one index instead of building five.
+`meshd` is auto-spawned and shuts down when idle.
+
+**Standalone** — `mesh-mcp run --standalone` keeps everything in one process. Use it in
+containers, in CI, or when a Unix socket isn't available.
+
+---
+
+## Performance
+
+Measured on this machine (Apple Silicon, 8 cores, macOS) with `cargo bench -p mesh-server`.
+Run it yourself — these are the numbers that come out, not a marketing claim:
+
+| Operation | Average | Notes |
+| :--- | ---: | :--- |
+| `find_dependents` on a 1,000-node graph | 3.95 µs | in-memory index lookup |
+| `analyze_grpc` pipeline trace | 9.12 µs | |
+| Audit log write (SQLite WAL + SHA-256 chain) | 12.22 µs | |
+| Markdown formatting with 48 KB bound | 34.40 µs | |
+| Lexical nesting guard | 1.20 µs | ~989 MB/s |
+| AST decapitation, TypeScript | 150 µs | −54.5% tokens |
+| AST decapitation, Rust | 107 µs | −57.4% tokens |
+| AST decapitation, Go | 110 µs | −68.9% tokens |
+
+Release binary: 12.3 MB (`mesh-mcp`) / 12.1 MB (`meshd`). Peak RSS indexing this repo (60
+files): 20.5 MiB. Index size scales with your workspace — measure on yours.
+
+`cargo test --workspace` includes a regression test asserting the benchmark budgets still hold.
+
+---
+
+## CLI
+
+| Command | What it does |
+| :--- | :--- |
+| `mesh-mcp run` | Start the MCP server on stdio (daemon-backed). |
+| `mesh-mcp run --standalone` | Same, single process, no daemon. |
+| `mesh-mcp init --auto` | Detect the layout and write `.agents/mesh-mcp.toml`. |
+| `mesh-mcp init --auto --write-ide-config` | Also write `.cursor/mcp.json` and `.vscode/mcp.json`. |
+| `mesh-mcp doctor` | Validate config, roots, skill files, parsers, secret masking. |
+| `mesh-mcp graph [--format html\|mermaid\|json] [--open]` | Render the topology. |
+| `mesh-mcp install-hooks` | Install the git pre-commit hook enforcing stop rules. |
+
+All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RPC only.
+
+---
+
+## Documentation
+
+| Document | Contents |
+| :--- | :--- |
+| [SETUP.md](SETUP.md) | Full installation and configuration walkthrough. |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Tool schemas, arguments, output formats. |
+| [docs/architecture.md](docs/architecture.md) | Internals: snapshots, indexing, security jail. |
+| [docs/development.md](docs/development.md) | Building, testing, adding a language. |
+| [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, skills, pre-commit enforcement. |
+| [docs/benchmarks.md](docs/benchmarks.md) | How to measure, and what the numbers mean. |
+| [RFC-001-CAUSAL-MCP.md](RFC-001-CAUSAL-MCP.md) | The specification this implements. |
+
+---
+
+## Development
+
+```bash
+cargo build --workspace                                  # debug build
+cargo test --workspace                                   # unit + integration tests
+cargo clippy --workspace --all-targets -- -D warnings    # must be clean
+cargo fmt --all                                          # before committing
+cargo bench -p mesh-server                               # benchmark suite
+```
+
+Workspace layout:
+
+| Crate | Responsibility |
+| :--- | :--- |
+| `mesh-core` | Graph, snapshot state, config, security jail, audit, watcher. |
+| `mesh-parsers` | Tree-sitter extractors, AST decapitation, Markdown output. |
+| `mesh-server` | MCP server, tools, indexing pipeline, CLI. |
+| `mesh-daemon` | Shared `meshd` daemon over a Unix socket. |
+
+`unwrap()` and `panic!()` are denied outside tests. See [docs/development.md](docs/development.md)
+and [CLAUDE.md](CLAUDE.md) for the architectural invariants a change must preserve.
+
+---
+
+## License
+
+MIT OR Apache-2.0.

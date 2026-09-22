@@ -9,9 +9,121 @@ pub mod typescript;
 use crate::decapitate::LanguageKind;
 use crate::guard::AstGuard;
 use mesh_core::{
-    CompactStr, ContractGraph, ContractNode, CustomPatternConfig, NodeKind, PatternKind, RepoId,
+    CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, NodeKind,
+    PatternKind, RepoId,
 };
 use std::path::Path;
+
+/// Default TS decorator that marks a method as a gRPC handler when
+/// `[engines.contracts.grpc] controller_annotations` is not configured.
+const DEFAULT_CONTROLLER_ANNOTATION: &str = "@GrpcMethod";
+
+/// Resolved extraction-time knobs pulled from `[engines.contracts.*]`. Bundled
+/// so `PolyglotIndexer` call sites only thread one value through the pool
+/// instead of four independent config lookups per file.
+#[derive(Debug, Clone)]
+pub struct ExtractConfig {
+    /// Directories (matched as a path substring) that scope where `.proto`
+    /// files are extracted from. Empty means unrestricted (legacy behaviour:
+    /// every `.proto` file, wherever it lives).
+    pub proto_dirs: Vec<String>,
+    /// TS decorators that mark a method as a gRPC handler. Empty falls back
+    /// to the historical hardcoded `@GrpcMethod`.
+    pub controller_annotations: Vec<String>,
+    /// When true (default), a proto RPC node is named `Service.Method`
+    /// (canonical). When false, it is projected as the bare method name.
+    pub canonical_fqcn_projection: bool,
+    /// Path patterns (substring/suffix match) that scope which files are
+    /// treated as OpenAPI specs. Empty falls back to filename/content sniffing.
+    pub openapi_spec_files: Vec<String>,
+    /// Same as `openapi_spec_files`, for AsyncAPI.
+    pub asyncapi_spec_files: Vec<String>,
+    /// When true (default), AsyncAPI extraction also infers topics from a
+    /// non-standard top-level `topics:` string list, not just `channels`.
+    pub infer_string_topics: bool,
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            proto_dirs: Vec::new(),
+            controller_annotations: vec![DEFAULT_CONTROLLER_ANNOTATION.to_string()],
+            canonical_fqcn_projection: true,
+            openapi_spec_files: Vec::new(),
+            asyncapi_spec_files: Vec::new(),
+            infer_string_topics: true,
+        }
+    }
+}
+
+impl ExtractConfig {
+    /// Builds the extraction config from `[engines.contracts]`. Missing
+    /// sub-tables (`grpc`/`openapi`/`asyncapi`) fall back to their defaults.
+    pub fn from_contracts(contracts: &ContractsConfig) -> Self {
+        let default = Self::default();
+        let (proto_dirs, controller_annotations, canonical_fqcn_projection) =
+            match &contracts.grpc {
+                Some(g) => {
+                    let annotations = if g.controller_annotations.is_empty() {
+                        default.controller_annotations.clone()
+                    } else {
+                        g.controller_annotations.clone()
+                    };
+                    (
+                        g.proto_dirs.clone(),
+                        annotations,
+                        g.canonical_fqcn_projection,
+                    )
+                }
+                None => (
+                    default.proto_dirs.clone(),
+                    default.controller_annotations.clone(),
+                    default.canonical_fqcn_projection,
+                ),
+            };
+        let openapi_spec_files = contracts
+            .openapi
+            .as_ref()
+            .map(|o| o.spec_files.clone())
+            .unwrap_or_default();
+        let (asyncapi_spec_files, infer_string_topics) = match &contracts.asyncapi {
+            Some(a) => (a.spec_files.clone(), a.infer_string_topics),
+            None => (Vec::new(), default.infer_string_topics),
+        };
+
+        Self {
+            proto_dirs,
+            controller_annotations,
+            canonical_fqcn_projection,
+            openapi_spec_files,
+            asyncapi_spec_files,
+            infer_string_topics,
+        }
+    }
+
+    /// Whether `path` falls under one of `proto_dirs` (or `proto_dirs` is
+    /// empty, i.e. unrestricted).
+    fn allows_proto_path(&self, path_str: &str) -> bool {
+        if self.proto_dirs.is_empty() {
+            return true;
+        }
+        let normalized = path_str.replace('\\', "/");
+        self.proto_dirs.iter().any(|d| {
+            let needle = d.trim_matches('/').replace('\\', "/");
+            !needle.is_empty() && normalized.contains(needle.as_str())
+        })
+    }
+}
+
+/// Matches `path_str` (already lowercased) against a configured spec-file
+/// pattern by suffix or substring, mirroring `CompiledPattern::matches_path`.
+fn spec_file_matches(path_str: &str, pattern: &str) -> bool {
+    let needle = pattern
+        .trim_start_matches("./")
+        .trim_start_matches('*')
+        .to_lowercase();
+    !needle.is_empty() && (path_str.ends_with(needle.as_str()) || path_str.contains(needle.as_str()))
+}
 
 /// Everything extracted from one file, expressed against *local* node indices.
 ///
@@ -133,14 +245,34 @@ impl PolyglotIndexer {
     }
 
     /// Parses a source file into a graph-independent `FileIndex`. Safe to call from any thread.
+    /// Uses the default `ExtractConfig` — legacy behaviour for callers that don't
+    /// thread `[engines.contracts]` through (tests, ad-hoc CLI usage).
     pub fn extract(file_path: &Path, content: &str, repo_id: RepoId) -> FileIndex {
+        Self::extract_with_config(file_path, content, repo_id, &ExtractConfig::default())
+    }
+
+    /// Same as [`Self::extract`], but honours `[engines.contracts.grpc]` /
+    /// `.openapi` / `.asyncapi` extraction knobs. Safe to call from any thread.
+    pub fn extract_with_config(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        cfg: &ExtractConfig,
+    ) -> FileIndex {
         let path_str = file_path.to_string_lossy();
         let lang_kind = LanguageKind::from_path(&path_str);
         let mut out = FileIndex::default();
 
         match lang_kind {
             LanguageKind::Protobuf => {
-                out.nodes = proto::ProtoExtractor::extract(file_path, content, repo_id);
+                if cfg.allows_proto_path(&path_str) {
+                    out.nodes = proto::ProtoExtractor::extract_with_config(
+                        file_path,
+                        content,
+                        repo_id,
+                        cfg.canonical_fqcn_projection,
+                    );
+                }
             }
             LanguageKind::Java => {
                 if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
@@ -171,12 +303,13 @@ impl PolyglotIndexer {
             LanguageKind::TypeScript => {
                 let mut imports = Vec::new();
                 let nodes = AstGuard::with_parser(lang_kind, |parser| {
-                    typescript::TypeScriptExtractor::extract(
+                    typescript::TypeScriptExtractor::extract_with_config(
                         file_path,
                         content,
                         repo_id,
                         parser,
                         &mut imports,
+                        &cfg.controller_annotations,
                     )
                 })
                 .unwrap_or_default();
@@ -219,7 +352,7 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Yaml => {
-                Self::extract_yaml_contracts(file_path, content, repo_id, &mut out);
+                Self::extract_yaml_contracts(file_path, content, repo_id, &mut out, cfg);
             }
             LanguageKind::Unknown => {}
         }
@@ -346,12 +479,21 @@ impl PolyglotIndexer {
         content: &str,
         repo_id: RepoId,
         out: &mut FileIndex,
+        cfg: &ExtractConfig,
     ) {
         let path_str = file_path.to_string_lossy().to_lowercase();
         let interned: mesh_core::FilePath = std::sync::Arc::from(file_path);
 
-        // Check for AsyncAPI spec
-        if path_str.contains("asyncapi") || content.contains("asyncapi:") {
+        // Check for AsyncAPI spec. `asyncapi_spec_files`, when configured, scopes
+        // detection to those files exactly instead of the filename/content sniff.
+        let is_asyncapi = if cfg.asyncapi_spec_files.is_empty() {
+            path_str.contains("asyncapi") || content.contains("asyncapi:")
+        } else {
+            cfg.asyncapi_spec_files
+                .iter()
+                .any(|f| spec_file_matches(&path_str, f))
+        };
+        if is_asyncapi {
             if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
                 if let Some(channels) = yaml_val.get("channels").and_then(|c| c.as_mapping()) {
                     for (ch_name, _) in channels {
@@ -374,14 +516,47 @@ impl PolyglotIndexer {
                         }
                     }
                 }
+
+                // `infer_string_topics`: beyond the structured `channels` mapping,
+                // also pick up a non-standard top-level `topics: [..]` string list.
+                if cfg.infer_string_topics {
+                    if let Some(topics) = yaml_val.get("topics").and_then(|t| t.as_sequence()) {
+                        for entry in topics {
+                            if let Some(name_str) = entry.as_str() {
+                                let node = ContractNode {
+                                    id: 0,
+                                    name: CompactStr::new(name_str),
+                                    kind: NodeKind::EventStream,
+                                    file_path: interned.clone(),
+                                    line_start: 1,
+                                    line_end: 1,
+                                    package: CompactStr::new("asyncapi"),
+                                    repo_id,
+                                    signature: Some(CompactStr::new(format!(
+                                        "inferred topic {name_str}"
+                                    ))),
+                                    docstring: None,
+                                };
+                                out.producers
+                                    .push((out.nodes.len(), CompactStr::new(name_str)));
+                                out.nodes.push(node);
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Check for OpenAPI spec
-        if path_str.contains("openapi")
-            || content.contains("openapi:")
-            || content.contains("swagger:")
-        {
+        // Check for OpenAPI spec. `spec_files`, when configured, scopes detection
+        // to those files exactly instead of the filename/content sniff.
+        let is_openapi = if cfg.openapi_spec_files.is_empty() {
+            path_str.contains("openapi") || content.contains("openapi:") || content.contains("swagger:")
+        } else {
+            cfg.openapi_spec_files
+                .iter()
+                .any(|f| spec_file_matches(&path_str, f))
+        };
+        if is_openapi {
             if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
                 if let Some(paths) = yaml_val.get("paths").and_then(|p| p.as_mapping()) {
                     for (path_name, methods) in paths {
@@ -505,5 +680,152 @@ channels:
             impact.downstream_consumers[0].name.as_str(),
             "UserCreatedPostProcessor"
         );
+    }
+
+    #[test]
+    fn test_proto_dirs_scopes_extraction() {
+        let proto = "syntax = \"proto3\"; package test.v1; service TestService { rpc DoTest (Req) returns (Resp); }";
+
+        // Unrestricted (default): a `.proto` file anywhere is extracted.
+        let default_cfg = ExtractConfig::default();
+        let unrestricted = PolyglotIndexer::extract_with_config(
+            Path::new("services/other/test.proto"),
+            proto,
+            0,
+            &default_cfg,
+        );
+        assert_eq!(unrestricted.nodes.len(), 2);
+
+        // `proto_dirs` configured: files outside every configured dir are not
+        // extracted as protobuf at all.
+        let scoped_cfg = ExtractConfig {
+            proto_dirs: vec!["proto-registry".to_string()],
+            ..ExtractConfig::default()
+        };
+        let outside = PolyglotIndexer::extract_with_config(
+            Path::new("services/other/test.proto"),
+            proto,
+            0,
+            &scoped_cfg,
+        );
+        assert!(outside.nodes.is_empty());
+
+        let inside = PolyglotIndexer::extract_with_config(
+            Path::new("proto-registry/test.proto"),
+            proto,
+            0,
+            &scoped_cfg,
+        );
+        assert_eq!(inside.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_openapi_asyncapi_spec_files_scopes_detection() {
+        let openapi_yaml = r#"
+paths:
+  /users:
+    get:
+      summary: list users
+"#;
+        // File neither named nor containing an "openapi"/"swagger" sniff hint,
+        // so the default (unconfigured) sniffing misses it entirely.
+        let default_cfg = ExtractConfig::default();
+        let missed = PolyglotIndexer::extract_with_config(
+            Path::new("services/billing/api-contract.yaml"),
+            openapi_yaml,
+            0,
+            &default_cfg,
+        );
+        assert!(missed.nodes.is_empty());
+
+        // `spec_files` configured to name this exact file: now it is scoped in,
+        // regardless of filename/content sniffing.
+        let scoped_cfg = ExtractConfig {
+            openapi_spec_files: vec!["api-contract.yaml".to_string()],
+            ..ExtractConfig::default()
+        };
+        let scoped = PolyglotIndexer::extract_with_config(
+            Path::new("services/billing/api-contract.yaml"),
+            openapi_yaml,
+            0,
+            &scoped_cfg,
+        );
+        assert_eq!(scoped.nodes.len(), 1);
+        assert!(scoped.nodes.iter().any(|n| n.name == "GET /users"));
+    }
+
+    #[test]
+    fn test_infer_string_topics_toggle() {
+        let yaml = r#"
+asyncapi: 2.6.0
+channels:
+  billing.events:
+    description: Billing event topic
+topics:
+  - legacy.orders.created
+"#;
+        // Default: `infer_string_topics = true` picks up both the structured
+        // `channels` entry and the non-standard `topics:` string list.
+        let default_cfg = ExtractConfig::default();
+        let with_inference =
+            PolyglotIndexer::extract_with_config(Path::new("asyncapi.yaml"), yaml, 0, &default_cfg);
+        assert_eq!(with_inference.nodes.len(), 2);
+        assert!(with_inference
+            .nodes
+            .iter()
+            .any(|n| n.name == "legacy.orders.created"));
+
+        // Disabled: only the structured `channels` entry is extracted.
+        let disabled_cfg = ExtractConfig {
+            infer_string_topics: false,
+            ..ExtractConfig::default()
+        };
+        let without_inference = PolyglotIndexer::extract_with_config(
+            Path::new("asyncapi.yaml"),
+            yaml,
+            0,
+            &disabled_cfg,
+        );
+        assert_eq!(without_inference.nodes.len(), 1);
+        assert!(!without_inference
+            .nodes
+            .iter()
+            .any(|n| n.name == "legacy.orders.created"));
+    }
+
+    #[test]
+    fn test_extract_config_from_contracts() {
+        use mesh_core::config::{AsyncApiConfig, ContractsConfig, GrpcConfig, OpenApiConfig};
+
+        let contracts = ContractsConfig {
+            enabled: true,
+            grpc: Some(GrpcConfig {
+                proto_dirs: vec!["proto-registry".to_string()],
+                controller_annotations: vec!["@RpcHandler".to_string()],
+                canonical_fqcn_projection: false,
+            }),
+            spring: None,
+            openapi: Some(OpenApiConfig {
+                enabled: true,
+                spec_files: vec!["openapi.yaml".to_string()],
+            }),
+            asyncapi: Some(AsyncApiConfig {
+                enabled: true,
+                spec_files: vec!["asyncapi.yaml".to_string()],
+                infer_string_topics: false,
+            }),
+            patterns: Vec::new(),
+        };
+
+        let cfg = ExtractConfig::from_contracts(&contracts);
+        assert_eq!(cfg.proto_dirs, vec!["proto-registry".to_string()]);
+        assert_eq!(
+            cfg.controller_annotations,
+            vec!["@RpcHandler".to_string()]
+        );
+        assert!(!cfg.canonical_fqcn_projection);
+        assert_eq!(cfg.openapi_spec_files, vec!["openapi.yaml".to_string()]);
+        assert_eq!(cfg.asyncapi_spec_files, vec!["asyncapi.yaml".to_string()]);
+        assert!(!cfg.infer_string_topics);
     }
 }

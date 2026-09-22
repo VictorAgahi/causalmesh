@@ -11,7 +11,7 @@ use mesh_core::{
     DocIndex, DocSection, FilesystemCrawler, MeshSnapshot, PropertyRegistry, PropertySourceMatcher,
     RepoId, ValidatedScope,
 };
-use mesh_parsers::{AstGuard, CompiledPattern, FileIndex, LanguageKind, PolyglotIndexer};
+use mesh_parsers::{AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -162,12 +162,13 @@ impl WorkspaceIndexer {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
+        let extract_cfg = Self::extract_config(config);
 
         let work = || {
             files
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
+                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
                 })
                 .collect::<Vec<_>>()
         };
@@ -209,11 +210,12 @@ impl WorkspaceIndexer {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
+        let extract_cfg = Self::extract_config(config);
         let mut graph = ContractGraph::new();
         let fragments: Vec<_> = files
             .par_iter()
             .filter_map(|(repo_id, path)| {
-                Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
+                Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
             })
             .collect();
         for frag in fragments {
@@ -233,6 +235,7 @@ impl WorkspaceIndexer {
         let files = Self::crawl_all(config, &state.allowed_roots);
         let patterns = Self::compiled_patterns(config);
         let spring = SpringSettings::from_config(config);
+        let extract_cfg = Self::extract_config(config);
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -265,7 +268,7 @@ impl WorkspaceIndexer {
             candidates
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
+                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
                 })
                 .collect()
         });
@@ -349,6 +352,19 @@ impl WorkspaceIndexer {
             .unwrap_or_default()
     }
 
+    /// Builds the extraction knobs from `[engines.contracts.grpc]` /
+    /// `.openapi` / `.asyncapi` so `proto_dirs`, `controller_annotations`,
+    /// `canonical_fqcn_projection`, `spec_files` and `infer_string_topics`
+    /// actually apply instead of being parsed and ignored.
+    fn extract_config(config: &Config) -> ExtractConfig {
+        config
+            .engines
+            .contracts
+            .as_ref()
+            .map(ExtractConfig::from_contracts)
+            .unwrap_or_default()
+    }
+
     /// Crawls all roots, tagging each file with the `RepoId` of its root.
     fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
         let mut out = Vec::new();
@@ -378,6 +394,7 @@ impl WorkspaceIndexer {
         patterns: &[CompiledPattern],
         doc_template: &DocIndex,
         spring: &SpringSettings,
+        extract_cfg: &ExtractConfig,
     ) -> Option<FileFragment> {
         let metadata = std::fs::metadata(path).ok()?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
@@ -427,9 +444,11 @@ impl WorkspaceIndexer {
                     let _ = reg.ingest_yaml_str(content);
                     frag.props = Some(reg);
                 }
-                frag.code = PolyglotIndexer::extract(path, content, repo_id);
+                frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
             }
-            _ => frag.code = PolyglotIndexer::extract(path, content, repo_id),
+            _ => {
+                frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+            }
         }
         if !patterns.is_empty() {
             frag.code.merge(PolyglotIndexer::extract_custom_patterns(

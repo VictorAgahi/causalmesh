@@ -5,13 +5,48 @@ use tree_sitter::{Node, Parser};
 
 pub struct TypeScriptExtractor;
 
+/// Historical hardcoded gRPC decorator, used when `controller_annotations`
+/// is not configured.
+const DEFAULT_GRPC_ANNOTATION: &str = "@GrpcMethod";
+
+/// Per-file invariants threaded through the recursive `visit_node` walk,
+/// bundled to keep its argument count down.
+struct VisitCtx<'a> {
+    file_path: &'a FilePath,
+    repo_id: RepoId,
+    package_name: &'a CompactStr,
+    grpc_annotations: &'a [String],
+}
+
 impl TypeScriptExtractor {
+    /// Extracts using the legacy hardcoded `@GrpcMethod` decorator.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+    ) -> Vec<ContractNode> {
+        Self::extract_with_config(
+            file_path,
+            content,
+            repo_id,
+            parser,
+            imports,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        )
+    }
+
+    /// Same as [`Self::extract`], but `grpc_annotations` (from
+    /// `[engines.contracts.grpc] controller_annotations`) replaces the
+    /// hardcoded `@GrpcMethod` decorator list used to recognise gRPC handlers.
+    pub fn extract_with_config(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        parser: &mut Parser,
+        imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+        grpc_annotations: &[String],
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
@@ -23,28 +58,28 @@ impl TypeScriptExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
-
-        Self::visit_node(
-            root,
-            source_bytes,
-            &file_path,
+        let ctx = VisitCtx {
+            file_path: &file_path,
             repo_id,
-            &package_name,
-            &mut nodes,
-            imports,
-        );
+            package_name: &package_name,
+            grpc_annotations,
+        };
+
+        Self::visit_node(root, source_bytes, &ctx, &mut nodes, imports);
         nodes
     }
 
     fn visit_node(
         node: Node,
         source: &[u8],
-        file_path: &FilePath,
-        repo_id: RepoId,
-        package_name: &CompactStr,
+        ctx: &VisitCtx,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<(String, String)>,
     ) {
+        let file_path = ctx.file_path;
+        let repo_id = ctx.repo_id;
+        let package_name = ctx.package_name;
+        let grpc_annotations = ctx.grpc_annotations;
         match node.kind() {
             "import_statement" => {
                 if let Ok(text) = node.utf8_text(source) {
@@ -125,9 +160,12 @@ impl TypeScriptExtractor {
                     full_text.push_str(t);
                 }
 
-                if full_text.contains("@GrpcMethod") {
+                let matched_annotation = grpc_annotations
+                    .iter()
+                    .find(|a| full_text.contains(a.as_str()));
+                if let Some(annotation) = matched_annotation {
                     kind = NodeKind::GrpcMethod;
-                    grpc_target = Self::extract_grpc_method(&full_text);
+                    grpc_target = Self::extract_grpc_method(&full_text, annotation);
                 } else if full_text.contains("@Get")
                     || full_text.contains("@Post")
                     || full_text.contains("@Put")
@@ -165,15 +203,7 @@ impl TypeScriptExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(
-                child,
-                source,
-                file_path,
-                repo_id,
-                package_name,
-                nodes,
-                imports,
-            );
+            Self::visit_node(child, source, ctx, nodes, imports);
         }
     }
 
@@ -209,9 +239,9 @@ impl TypeScriptExtractor {
         specifiers
     }
 
-    fn extract_grpc_method(text: &str) -> Option<String> {
-        if let Some(idx) = text.find("@GrpcMethod") {
-            let rest = &text[idx + 11..];
+    fn extract_grpc_method(text: &str, annotation: &str) -> Option<String> {
+        if let Some(idx) = text.find(annotation) {
+            let rest = &text[idx + annotation.len()..];
             if let Some(paren_open) = rest.find('(') {
                 if let Some(paren_close) = rest[paren_open + 1..].find(')') {
                     let args = &rest[paren_open + 1..paren_open + 1 + paren_close];
@@ -270,6 +300,51 @@ export class AuthController {
         assert!(imports.iter().any(|(_, t)| t == "UserAuthRequest"));
         assert!(nodes.iter().any(|n| n.name == "AuthController"));
         assert!(nodes
+            .iter()
+            .any(|n| n.name == "AuthService.AuthenticateUser" && n.kind == NodeKind::GrpcMethod));
+    }
+
+    #[test]
+    fn test_ts_extractor_configurable_controller_annotations() {
+        let code = r#"
+@Controller('auth')
+export class AuthController {
+    @RpcHandler('AuthService', 'AuthenticateUser')
+    async authenticateUser(data: any): Promise<any> {
+        return null;
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+
+        // Default decorator list (`@GrpcMethod`) does not recognise `@RpcHandler`.
+        let default_nodes = TypeScriptExtractor::extract(
+            Path::new("auth.controller.ts"),
+            code,
+            4,
+            &mut parser,
+            &mut imports,
+        );
+        assert!(!default_nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::GrpcMethod));
+
+        // A configured `controller_annotations` list must produce an
+        // observably different result: the method is now recognised as a
+        // gRPC handler and projected via the same `Service.Method` parsing.
+        let mut imports2 = Vec::new();
+        let configured_nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("auth.controller.ts"),
+            code,
+            4,
+            &mut parser,
+            &mut imports2,
+            &["@RpcHandler".to_string()],
+        );
+        assert!(configured_nodes
             .iter()
             .any(|n| n.name == "AuthService.AuthenticateUser" && n.kind == NodeKind::GrpcMethod));
     }

@@ -5,61 +5,78 @@ pub mod search_docs;
 pub mod smart_search;
 pub mod visualize_mesh;
 
-use analyze_grpc::{AnalyzeGrpcArgs, AnalyzeGrpcTool};
-use analyze_impact::{AnalyzeImpactArgs, AnalyzeImpactTool};
-use find_dependents::{FindDependentsArgs, FindDependentsTool};
+use crate::protocol::RequestMeta;
+use analyze_grpc::AnalyzeGrpcTool;
+use analyze_impact::AnalyzeImpactTool;
+use find_dependents::FindDependentsTool;
 use mesh_core::AppState;
-use schemars::schema_for;
-use search_docs::{SearchDocsArgs, SearchDocsTool};
+use schemars::{schema_for, JsonSchema};
+use search_docs::SearchDocsTool;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::{json, Value};
-use smart_search::{SmartSearchArgs, SmartSearchTool};
-use std::sync::Arc;
-use visualize_mesh::{VisualizeMeshArgs, VisualizeMeshTool};
+use smart_search::SmartSearchTool;
+use std::sync::{Arc, LazyLock};
+use visualize_mesh::VisualizeMeshTool;
+
+/// JSON-RPC error tuple used throughout tool dispatch.
+pub type ToolError = (i32, String);
+
+/// Result of one tool invocation, before audit and MCP framing.
+pub struct ToolOutput {
+    pub text: String,
+    pub files_accessed: Vec<String>,
+    pub secrets_redacted: usize,
+}
+
+impl ToolOutput {
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            files_accessed: Vec::new(),
+            secrets_redacted: 0,
+        }
+    }
+}
+
+/// One MCP tool. `run` is synchronous on purpose: every tool touches the disk,
+/// tree-sitter or SQLite, and the registry executes it on the blocking pool so
+/// the JSON-RPC event loop (and, in daemon mode, other clients) never stalls.
+pub trait McpTool {
+    const NAME: &'static str;
+    const DESCRIPTION: &'static str;
+    type Args: DeserializeOwned + Serialize + JsonSchema + Send + 'static;
+
+    fn meta(args: &Self::Args) -> Option<&RequestMeta>;
+    fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError>;
+}
 
 pub struct ToolRegistry;
 
 impl ToolRegistry {
-    /// Returns the schema definition for all enterprise MCP tools
+    /// Returns the schema definition for all enterprise MCP tools.
+    /// Built once: `schema_for!` walks the whole type graph and `tools/list` is
+    /// called by every client on connect.
     pub fn list_tools() -> Value {
-        let smart_search_schema = schema_for!(SmartSearchArgs);
-        let find_dependents_schema = schema_for!(FindDependentsArgs);
-        let analyze_grpc_schema = schema_for!(AnalyzeGrpcArgs);
-        let analyze_impact_schema = schema_for!(AnalyzeImpactArgs);
-        let search_docs_schema = schema_for!(SearchDocsArgs);
-        let visualize_mesh_schema = schema_for!(VisualizeMeshArgs);
+        static TOOLS: LazyLock<Value> = LazyLock::new(|| {
+            json!([
+                ToolRegistry::describe::<SmartSearchTool>(),
+                ToolRegistry::describe::<FindDependentsTool>(),
+                ToolRegistry::describe::<AnalyzeGrpcTool>(),
+                ToolRegistry::describe::<AnalyzeImpactTool>(),
+                ToolRegistry::describe::<SearchDocsTool>(),
+                ToolRegistry::describe::<VisualizeMeshTool>(),
+            ])
+        });
+        TOOLS.clone()
+    }
 
-        json!([
-            {
-                "name": SmartSearchTool::NAME,
-                "description": SmartSearchTool::DESCRIPTION,
-                "inputSchema": smart_search_schema,
-            },
-            {
-                "name": FindDependentsTool::NAME,
-                "description": FindDependentsTool::DESCRIPTION,
-                "inputSchema": find_dependents_schema,
-            },
-            {
-                "name": AnalyzeGrpcTool::NAME,
-                "description": AnalyzeGrpcTool::DESCRIPTION,
-                "inputSchema": analyze_grpc_schema,
-            },
-            {
-                "name": AnalyzeImpactTool::NAME,
-                "description": AnalyzeImpactTool::DESCRIPTION,
-                "inputSchema": analyze_impact_schema,
-            },
-            {
-                "name": SearchDocsTool::NAME,
-                "description": SearchDocsTool::DESCRIPTION,
-                "inputSchema": search_docs_schema,
-            },
-            {
-                "name": VisualizeMeshTool::NAME,
-                "description": VisualizeMeshTool::DESCRIPTION,
-                "inputSchema": visualize_mesh_schema,
-            }
-        ])
+    fn describe<T: McpTool>() -> Value {
+        json!({
+            "name": T::NAME,
+            "description": T::DESCRIPTION,
+            "inputSchema": schema_for!(T::Args),
+        })
     }
 
     /// Dispatches an incoming MCP tools/call request
@@ -67,62 +84,16 @@ impl ToolRegistry {
         name: &str,
         arguments: Value,
         state: Arc<AppState>,
-    ) -> Result<Value, (i32, String)> {
+    ) -> Result<Value, ToolError> {
         let text_output = match name {
-            SmartSearchTool::NAME => {
-                let args: SmartSearchArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", SmartSearchTool::NAME),
-                    )
-                })?;
-                SmartSearchTool::execute(args, state).await?
-            }
+            SmartSearchTool::NAME => Self::invoke::<SmartSearchTool>(arguments, state).await?,
             FindDependentsTool::NAME => {
-                let args: FindDependentsArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", FindDependentsTool::NAME),
-                    )
-                })?;
-                FindDependentsTool::execute(args, state).await?
+                Self::invoke::<FindDependentsTool>(arguments, state).await?
             }
-            AnalyzeGrpcTool::NAME => {
-                let args: AnalyzeGrpcArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", AnalyzeGrpcTool::NAME),
-                    )
-                })?;
-                AnalyzeGrpcTool::execute(args, state).await?
-            }
-            AnalyzeImpactTool::NAME => {
-                let args: AnalyzeImpactArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", AnalyzeImpactTool::NAME),
-                    )
-                })?;
-                AnalyzeImpactTool::execute(args, state).await?
-            }
-            SearchDocsTool::NAME => {
-                let args: SearchDocsArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", SearchDocsTool::NAME),
-                    )
-                })?;
-                SearchDocsTool::execute(args, state).await?
-            }
-            VisualizeMeshTool::NAME => {
-                let args: VisualizeMeshArgs = serde_json::from_value(arguments).map_err(|e| {
-                    (
-                        -32602,
-                        format!("Invalid arguments for {}: {e}", VisualizeMeshTool::NAME),
-                    )
-                })?;
-                VisualizeMeshTool::execute(args, state).await?
-            }
+            AnalyzeGrpcTool::NAME => Self::invoke::<AnalyzeGrpcTool>(arguments, state).await?,
+            AnalyzeImpactTool::NAME => Self::invoke::<AnalyzeImpactTool>(arguments, state).await?,
+            SearchDocsTool::NAME => Self::invoke::<SearchDocsTool>(arguments, state).await?,
+            VisualizeMeshTool::NAME => Self::invoke::<VisualizeMeshTool>(arguments, state).await?,
             unknown => return Err((-32601, format!("Unknown tool: {unknown}"))),
         };
 
@@ -134,6 +105,43 @@ impl ToolRegistry {
                 }
             ]
         }))
+    }
+
+    /// Parses arguments, runs the tool body and the audit write on the blocking
+    /// pool, and returns the rendered text.
+    async fn invoke<T: McpTool>(
+        arguments: Value,
+        state: Arc<AppState>,
+    ) -> Result<String, ToolError> {
+        let args: T::Args = serde_json::from_value(arguments)
+            .map_err(|e| (-32602, format!("Invalid arguments for {}: {e}", T::NAME)))?;
+
+        tokio::task::spawn_blocking(move || {
+            let result = T::run(&args, &state);
+            let (status, files, redacted) = match &result {
+                Ok(out) => ("SUCCESS", out.files_accessed.clone(), out.secrets_redacted),
+                Err(_) => ("ERROR", Vec::new(), 0),
+            };
+
+            // Audit is best-effort and off the executor; the SQLite write never
+            // gates the response but always happens on the same blocking thread.
+            let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
+            if let Err(e) = state.audit.record_entry(
+                "active-session",
+                trace_id.as_deref(),
+                T::NAME,
+                &serde_json::to_string(&args).unwrap_or_default(),
+                status,
+                files,
+                redacted,
+            ) {
+                tracing::warn!(target: "mesh::audit", "Audit write failed for {}: {e}", T::NAME);
+            }
+
+            result.map(|out| out.text)
+        })
+        .await
+        .map_err(|e| (-32603, format!("Tool task failed: {e}")))?
     }
 }
 

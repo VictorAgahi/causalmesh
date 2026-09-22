@@ -96,17 +96,29 @@ pub type RepoId = u16;
 ```
 All graph lookups index into flat arrays or contiguous maps indexed by `RepoId`, scaling seamlessly to 65,535 microservices and libraries.
 
-### 3.4 Lock-Free State Management via `ArcSwap`
-State updates never acquire mutexes or read-write locks in the query path:
+### 3.4 Lock-Free State Management via `ArcSwap<MeshSnapshot>`
+State updates never acquire mutexes or read-write locks in the query path. Everything that
+changes at runtime lives in **one** immutable snapshot, so a reader can never observe a new
+contract graph next to a stale doc index:
 ```rust
+pub struct MeshSnapshot {
+    pub contract_graph: ContractGraph,
+    pub doc_index: DocIndex,
+    pub property_registry: PropertyRegistry,
+    pub generation: u64,
+}
+
 pub struct AppState {
-    pub config: ArcSwap<Config>,
-    pub doc_index: ArcSwap<DocIndex>,
-    pub contract_graph: ArcSwap<ContractGraph>,
-    pub property_registry: ArcSwap<PropertyRegistry>,
+    pub config: Arc<Config>,            // fixed for the process lifetime
+    pub allowed_roots: Arc<[PathBuf]>,  // fixed
+    pub governance: Arc<GovernanceEngine>,
+    pub snapshot: ArcSwap<MeshSnapshot>, // the only hot-swapped state
+    // ...
 }
 ```
-Queries take an atomic `load()` snapshot (`Arc<T>`) using pointer copying. Background rescans build an updated snapshot and swap it in atomically via `store()`, delivering **0ns lock contention** for agent queries.
+Queries take an atomic `state.snapshot()` guard using pointer copying. Background rescans
+build an updated snapshot and publish it atomically via `install_snapshot()`, delivering
+**0ns lock contention** for agent queries.
 
 ---
 

@@ -33,6 +33,13 @@ impl PropertyRegistry {
         }
     }
 
+    /// Absorbs another registry (later keys win) — lets per-file registries be
+    /// built in parallel and folded into one.
+    pub fn merge(&mut self, other: PropertyRegistry) {
+        self.flat_properties.extend(other.flat_properties);
+        self.redacted_count += other.redacted_count;
+    }
+
     #[inline]
     pub fn redacted_count(&self) -> usize {
         self.redacted_count

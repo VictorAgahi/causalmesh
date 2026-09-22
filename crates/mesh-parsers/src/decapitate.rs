@@ -7,12 +7,59 @@ pub enum LanguageKind {
     Python,
     TypeScript,
     Rust,
+    Cpp,
     Protobuf,
     Yaml,
     Unknown,
 }
 
 impl LanguageKind {
+    /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust, Cpp).
+    pub const TREE_SITTER_COUNT: usize = 6;
+
+    /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Java => "java",
+            Self::Go => "go",
+            Self::Python => "python",
+            Self::TypeScript => "typescript",
+            Self::Rust => "rust",
+            Self::Cpp => "cpp",
+            Self::Protobuf => "protobuf",
+            Self::Yaml => "yaml",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Slot index for the thread-local parser cache; `None` for non tree-sitter languages.
+    #[inline]
+    pub(crate) fn tree_sitter_slot(self) -> Option<usize> {
+        match self {
+            Self::Java => Some(0),
+            Self::Go => Some(1),
+            Self::Python => Some(2),
+            Self::TypeScript => Some(3),
+            Self::Rust => Some(4),
+            Self::Cpp => Some(5),
+            Self::Protobuf | Self::Yaml | Self::Unknown => None,
+        }
+    }
+
+    /// Tree-sitter grammar for this language, if any.
+    pub fn language(self) -> Option<tree_sitter::Language> {
+        match self {
+            Self::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            Self::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            Self::Protobuf | Self::Yaml | Self::Unknown => None,
+        }
+    }
+
     pub fn from_path(path_str: &str) -> Self {
         if path_str.ends_with(".proto") {
             Self::Protobuf
@@ -29,6 +76,15 @@ impl LanguageKind {
             Self::TypeScript
         } else if path_str.ends_with(".rs") {
             Self::Rust
+        } else if path_str.ends_with(".cpp")
+            || path_str.ends_with(".cc")
+            || path_str.ends_with(".cxx")
+            || path_str.ends_with(".hpp")
+            || path_str.ends_with(".hh")
+            || path_str.ends_with(".hxx")
+            || path_str.ends_with(".h")
+        {
+            Self::Cpp
         } else if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
             Self::Yaml
         } else {
@@ -51,37 +107,22 @@ impl AstDecapitator {
             return content.to_string();
         }
 
-        let parser_res = match lang_kind {
-            LanguageKind::Java => {
-                crate::guard::AstGuard::create_bounded_parser(&tree_sitter_java::LANGUAGE.into())
-            }
-            LanguageKind::Go => {
-                crate::guard::AstGuard::create_bounded_parser(&tree_sitter_go::LANGUAGE.into())
-            }
-            LanguageKind::Python => {
-                crate::guard::AstGuard::create_bounded_parser(&tree_sitter_python::LANGUAGE.into())
-            }
-            LanguageKind::TypeScript => crate::guard::AstGuard::create_bounded_parser(
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            ),
-            LanguageKind::Rust => {
-                crate::guard::AstGuard::create_bounded_parser(&tree_sitter_rust::LANGUAGE.into())
-            }
+        match lang_kind {
             LanguageKind::Protobuf | LanguageKind::Yaml => return content.to_string(),
-            _ => {
-                if content.len() > 1024 {
-                    return Self::BOUNDED_ERROR_STUB.to_string();
+            LanguageKind::Unknown => {
+                return if content.len() > 1024 {
+                    Self::BOUNDED_ERROR_STUB.to_string()
                 } else {
-                    return content.to_string();
-                }
+                    content.to_string()
+                };
             }
-        };
-
-        if let Ok(mut parser) = parser_res {
-            Self::decapitate(content, lang_kind, &mut parser, false)
-        } else {
-            Self::BOUNDED_ERROR_STUB.to_string()
+            _ => {}
         }
+
+        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
+            Self::decapitate(content, lang_kind, parser, false)
+        })
+        .unwrap_or_else(|| Self::BOUNDED_ERROR_STUB.to_string())
     }
 
     /// Decapitates imperative method bodies while preserving docstrings, annotations, and contracts.
@@ -219,6 +260,16 @@ impl AstDecapitator {
                     return;
                 }
             }
+            LanguageKind::Cpp if kind == "function_definition" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
+                    return;
+                }
+            }
             LanguageKind::Python if kind == "function_definition" => {
                 if let Some(body) = node.child_by_field_name("body") {
                     replacements.push((
@@ -332,6 +383,28 @@ fn authenticate_user(id: u64) -> bool {
         assert!(decapitated.contains("/// Contract docstring to keep"));
         assert!(decapitated.contains("fn authenticate_user(id: u64) -> bool { /* stripped */ }"));
         assert!(!decapitated.contains("x > 50"));
+    }
+
+    #[test]
+    fn test_cpp_decapitation() {
+        let code = r#"
+/// Keep this doc comment
+bool AuthService::Authenticate(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+    return validate(token);
+}
+"#;
+        let decapitated = AstDecapitator::decapitate_auto(code, LanguageKind::Cpp, false);
+        assert!(decapitated.contains("/// Keep this doc comment"));
+        assert!(decapitated.contains(
+            "bool AuthService::Authenticate(const std::string& token) { /* stripped */ }"
+        ));
+        assert!(!decapitated.contains("validate(token)"));
+        assert_eq!(LanguageKind::from_path("include/auth.h"), LanguageKind::Cpp);
+        assert_eq!(LanguageKind::from_path("src/auth.cc"), LanguageKind::Cpp);
+        assert_eq!(LanguageKind::Cpp.as_str(), "cpp");
     }
 
     #[test]

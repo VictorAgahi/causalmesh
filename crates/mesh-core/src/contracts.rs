@@ -1,24 +1,27 @@
 use crate::types::CompactStr;
-use crate::types::{ContractEdge, ContractNode, EdgeKind, NodeId, NodeKind, RepoId};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use crate::types::{ContractEdge, ContractNode, EdgeKind, FilePath, NodeId, NodeKind, RepoId};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrpcTrace {
+/// Query results borrow from the graph: the snapshot guard held by the caller
+/// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
+/// request is what the formatter never needed.
+#[derive(Debug, Clone, Serialize)]
+pub struct GrpcTrace<'g> {
     pub target: CompactStr,
-    pub proto_definition: Option<ContractNode>,
-    pub client_stubs: Vec<ContractNode>,
-    pub server_handlers: Vec<ContractNode>,
+    pub proto_definition: Option<&'g ContractNode>,
+    pub client_stubs: Vec<&'g ContractNode>,
+    pub server_handlers: Vec<&'g ContractNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImpactFlow {
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactFlow<'g> {
     pub target: CompactStr,
-    pub upstream_producers: Vec<ContractNode>,
-    pub topics: Vec<ContractNode>,
-    pub downstream_consumers: Vec<ContractNode>,
-    pub related_sagas: Vec<ContractNode>,
+    pub upstream_producers: Vec<&'g ContractNode>,
+    pub topics: Vec<&'g ContractNode>,
+    pub downstream_consumers: Vec<&'g ContractNode>,
+    pub related_sagas: Vec<&'g ContractNode>,
 }
 
 /// In-memory graph of polyglot architecture contracts and dependencies.
@@ -30,7 +33,7 @@ pub struct ContractGraph {
     // O(1) in-memory indices
     name_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
     package_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
-    file_to_nodes: HashMap<PathBuf, Vec<NodeId>>,
+    file_to_nodes: HashMap<FilePath, Vec<NodeId>>,
     fqcn_to_node: HashMap<CompactStr, NodeId>,
     reverse_deps: HashMap<CompactStr, Vec<NodeId>>,
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
@@ -174,94 +177,151 @@ impl ContractGraph {
     }
 
     pub fn patch_file(&mut self, file_path: &Path) {
-        let stale_ids: Vec<NodeId> = self.file_to_nodes.remove(file_path).unwrap_or_default();
+        self.patch_files(std::iter::once(file_path));
+    }
 
-        if stale_ids.is_empty() {
+    /// Purges every node declared in any of `file_paths` in a single pass over the
+    /// secondary indices, instead of one full `retain` sweep per file.
+    pub fn patch_files<'a>(&mut self, file_paths: impl IntoIterator<Item = &'a Path>) {
+        let mut stale_set: HashSet<NodeId> = HashSet::new();
+        for path in file_paths {
+            if let Some(ids) = self.file_to_nodes.remove(path) {
+                stale_set.extend(ids);
+            }
+        }
+        if stale_set.is_empty() {
             return;
         }
 
-        let stale_set: std::collections::HashSet<NodeId> = stale_ids.iter().copied().collect();
-
-        // Remove nodes from primary store
-        for &id in &stale_ids {
-            self.nodes.remove(&id);
+        // Targeted removal from the indices keyed by a node attribute we know.
+        for id in &stale_set {
+            let Some(node) = self.nodes.remove(id) else {
+                continue;
+            };
+            Self::remove_from_index(&mut self.name_to_nodes, &node.name, *id);
+            if node.kind == NodeKind::KafkaTopic
+                || node.kind == NodeKind::EventStream
+                || node.kind == NodeKind::Queue
+            {
+                let key = CompactStr::new(node.name.to_lowercase());
+                Self::remove_from_index(&mut self.name_to_nodes, &key, *id);
+            }
+            if !node.package.is_empty() {
+                Self::remove_from_index(&mut self.package_to_nodes, &node.package, *id);
+            }
+            if node.kind == NodeKind::GrpcMethod || node.kind == NodeKind::GrpcService {
+                let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
+                if self.fqcn_to_node.get(&fqcn) == Some(id) {
+                    self.fqcn_to_node.remove(&fqcn);
+                }
+            }
         }
 
-        // Purge from secondary indices
-        self.name_to_nodes.retain(|_, ids| {
-            ids.retain(|id| !stale_set.contains(id));
-            !ids.is_empty()
-        });
-        self.package_to_nodes.retain(|_, ids| {
-            ids.retain(|id| !stale_set.contains(id));
-            !ids.is_empty()
-        });
-        self.fqcn_to_node.retain(|_, id| !stale_set.contains(id));
-        self.reverse_deps.retain(|_, ids| {
-            ids.retain(|id| !stale_set.contains(id));
-            !ids.is_empty()
-        });
-        self.topic_producers.retain(|_, ids| {
-            ids.retain(|id| !stale_set.contains(id));
-            !ids.is_empty()
-        });
-        self.topic_consumers.retain(|_, ids| {
-            ids.retain(|id| !stale_set.contains(id));
-            !ids.is_empty()
-        });
+        // Indices keyed by *target* (not node) need one sweep — done once for the whole batch.
+        for map in [
+            &mut self.reverse_deps,
+            &mut self.topic_producers,
+            &mut self.topic_consumers,
+        ] {
+            map.retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        }
         self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
-
-        // Remove edges referencing stale nodes
         self.edges
             .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
     }
 
+    fn remove_from_index(
+        index: &mut HashMap<CompactStr, Vec<NodeId>>,
+        key: &CompactStr,
+        id: NodeId,
+    ) {
+        if let Some(ids) = index.get_mut(key) {
+            ids.retain(|x| *x != id);
+            if ids.is_empty() {
+                index.remove(key);
+            }
+        }
+    }
+
+    /// Resolves the target of a placeholder `Imports` edge using the O(1) indices.
+    fn resolve_import_target(&self, importer: NodeId, target_str: &str) -> Option<NodeId> {
+        // 1. Exact symbol name anywhere in the mesh.
+        if let Some(ids) = self.name_to_nodes.get(target_str) {
+            if let Some(&id) = ids.first() {
+                return Some(id);
+            }
+        }
+
+        let is_relative_or_absolute_path =
+            target_str.starts_with('.') || target_str.starts_with('/');
+        let is_qualified = target_str.contains('/') || target_str.contains('.');
+
+        // 2. Relative import: match on file stem, same repo as the importer.
+        if is_relative_or_absolute_path {
+            let target_stem = Path::new(target_str)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(target_str);
+            let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
+            if let Some(ids) = self.name_to_nodes.get(target_stem) {
+                if let Some(&id) = ids
+                    .iter()
+                    .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                {
+                    return Some(id);
+                }
+            }
+        }
+
+        // 3. Qualified package identifier (e.g. '@scope/pkg', 'com.acme.billing').
+        if is_qualified && !is_relative_or_absolute_path {
+            if let Some(ids) = self.package_to_nodes.get(target_str) {
+                if let Some(&id) = ids.first() {
+                    return Some(id);
+                }
+            }
+        }
+
+        // 4. `package.Name` — split at the last dot and check the name within that package.
+        if let Some((pkg, name)) = target_str.rsplit_once('.') {
+            if let Some(ids) = self.name_to_nodes.get(name) {
+                if let Some(&id) = ids
+                    .iter()
+                    .find(|id| self.nodes.get(id).is_some_and(|n| n.package == pkg))
+                {
+                    return Some(id);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Reconciles causal edges across microservices:
-    /// 1. Links topic producers & consumers to canonical Kafka/Event topic nodes.
-    /// 2. Creates direct causal dispatch edges from producers to downstream consumers.
-    /// 3. Links service handlers to protobuf RPC declarations (EdgeKind::Implements).
-    /// 4. Links RPC client calls to proto methods (EdgeKind::CallsRpc).
-    /// 5. Resolves or filters placeholder import edges (removes dangling to == 0).
+    /// 1. Resolves or filters placeholder import edges (removes dangling to == 0).
+    /// 2. Links topic producers & consumers to canonical Kafka/Event topic nodes.
+    /// 3. Creates direct causal dispatch edges from producers to downstream consumers.
+    /// 4. Links service handlers to protobuf RPC declarations (EdgeKind::Implements).
+    /// 5. Links RPC client calls to proto methods (EdgeKind::CallsRpc).
+    ///
+    /// Every lookup goes through the O(1) indices and edge de-duplication uses a
+    /// `HashSet`, so the whole pass is linear in nodes + edges (was O(E²)).
     pub fn reconcile_edges(&mut self) {
         // 1. Resolve / filter existing edges with placeholder target (to == 0)
-        let mut resolved_edges = Vec::with_capacity(self.edges.len() + 64);
-        for mut edge in self.edges.drain(..) {
+        let pending = std::mem::take(&mut self.edges);
+        let mut resolved_edges = Vec::with_capacity(pending.len() + 64);
+        for mut edge in pending {
             if edge.kind == EdgeKind::Imports && edge.to == 0 {
-                if let Some(ref target) = edge.metadata {
-                    let target_str = target.as_str();
-
-                    let target_stem = Path::new(target_str)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(target_str);
-
-                    let is_relative_or_absolute_path =
-                        target_str.starts_with('.') || target_str.starts_with('/');
-
-                    let is_qualified = target_str.contains('/') || target_str.contains('.');
-
-                    let importer_repo_id = self.nodes.get(&edge.from).map(|n| n.repo_id);
-
-                    let matched_id = self
-                        .nodes
-                        .values()
-                        .find(|n| {
-                            n.name.as_str() == target_str
-                                || (is_relative_or_absolute_path
-                                    && n.name.as_str() == target_stem
-                                    && importer_repo_id == Some(n.repo_id))
-                                || (is_qualified
-                                    && !is_relative_or_absolute_path
-                                    && n.package.as_str() == target_str)
-                                || format!("{}.{}", n.package, n.name) == target_str
-                        })
-                        .map(|n| n.id);
-
-                    if let Some(to_id) = matched_id {
-                        edge.to = to_id;
-                        resolved_edges.push(edge);
-                    }
-                    // If target is external (e.g. '@nestjs/common'), drop placeholder edge to 0.
+                let Some(target) = edge.metadata.as_deref() else {
+                    continue;
+                };
+                // External targets (e.g. '@nestjs/common') drop the placeholder edge.
+                if let Some(to_id) = self.resolve_import_target(edge.from, target) {
+                    edge.to = to_id;
+                    resolved_edges.push(edge);
                 }
             } else {
                 resolved_edges.push(edge);
@@ -269,25 +329,29 @@ impl ContractGraph {
         }
         self.edges = resolved_edges;
 
-        let mut all_topics = std::collections::BTreeSet::new();
-        for t in self.topic_producers.keys() {
-            all_topics.insert(t.clone());
-        }
-        for t in self.topic_consumers.keys() {
-            all_topics.insert(t.clone());
-        }
+        let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> =
+            self.edges.iter().map(|e| (e.from, e.to, e.kind)).collect();
+
+        // 2 & 3. Topic hubs and causal dispatch.
+        let mut all_topics: Vec<CompactStr> = self
+            .topic_producers
+            .keys()
+            .chain(self.topic_consumers.keys())
+            .cloned()
+            .collect();
+        all_topics.sort_unstable();
+        all_topics.dedup();
 
         for topic_key in all_topics {
-            // Find existing topic node or create a canonical one
-            let existing_topic_id = self
-                .nodes
-                .values()
-                .find(|n| {
-                    n.package == "event-bus"
-                        && n.kind == NodeKind::EventStream
-                        && n.name.eq_ignore_ascii_case(topic_key.as_str())
+            // `add_node` indexes stream-like nodes under their lowercase name, and
+            // `topic_key` is already lowercase.
+            let existing_topic_id = self.name_to_nodes.get(&topic_key).and_then(|ids| {
+                ids.iter().copied().find(|id| {
+                    self.nodes.get(id).is_some_and(|n| {
+                        n.package == "event-bus" && n.kind == NodeKind::EventStream
+                    })
                 })
-                .map(|n| n.id);
+            });
 
             let topic_id = match existing_topic_id {
                 Some(id) => id,
@@ -300,7 +364,7 @@ impl ContractGraph {
                         id: 0,
                         name: topic_key.clone(),
                         kind: NodeKind::EventStream,
-                        file_path: PathBuf::from("event-bus"),
+                        file_path: FilePath::from(Path::new("event-bus")),
                         line_start: 1,
                         line_end: 1,
                         package: CompactStr::new("event-bus"),
@@ -318,129 +382,120 @@ impl ContractGraph {
                 }
             };
 
-            // Edge: Producer -> Topic (Produces)
-            if let Some(producers) = self.topic_producers.get(&topic_key).cloned() {
-                for prod_id in producers {
-                    let exists = self.edges.iter().any(|e| {
-                        e.from == prod_id && e.to == topic_id && e.kind == EdgeKind::Produces
+            let producers = self
+                .topic_producers
+                .get(&topic_key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let consumers = self
+                .topic_consumers
+                .get(&topic_key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
+            for &prod_id in producers {
+                if edge_set.insert((prod_id, topic_id, EdgeKind::Produces)) {
+                    self.edges.push(ContractEdge {
+                        from: prod_id,
+                        to: topic_id,
+                        kind: EdgeKind::Produces,
+                        metadata: Some(topic_key.clone()),
                     });
-                    if !exists {
-                        self.edges.push(ContractEdge {
-                            from: prod_id,
-                            to: topic_id,
-                            kind: EdgeKind::Produces,
-                            metadata: Some(topic_key.clone()),
-                        });
-                    }
                 }
             }
 
-            // Edge: Topic -> Consumer (Consumes)
-            if let Some(consumers) = self.topic_consumers.get(&topic_key).cloned() {
-                for cons_id in consumers {
-                    let exists = self.edges.iter().any(|e| {
-                        e.from == topic_id && e.to == cons_id && e.kind == EdgeKind::Consumes
+            for &cons_id in consumers {
+                if edge_set.insert((topic_id, cons_id, EdgeKind::Consumes)) {
+                    self.edges.push(ContractEdge {
+                        from: topic_id,
+                        to: cons_id,
+                        kind: EdgeKind::Consumes,
+                        metadata: Some(topic_key.clone()),
                     });
-                    if !exists {
-                        self.edges.push(ContractEdge {
-                            from: topic_id,
-                            to: cons_id,
-                            kind: EdgeKind::Consumes,
-                            metadata: Some(topic_key.clone()),
-                        });
-                    }
                 }
             }
 
-            // Edge: Direct Causal Dispatch (Producer -> Consumer)
-            if let (Some(prods), Some(cons)) = (
-                self.topic_producers.get(&topic_key).cloned(),
-                self.topic_consumers.get(&topic_key).cloned(),
-            ) {
-                for prod_id in &prods {
-                    for cons_id in &cons {
-                        if prod_id != cons_id {
-                            let exists = self.edges.iter().any(|e| {
-                                e.from == *prod_id
-                                    && e.to == *cons_id
-                                    && e.kind == EdgeKind::DispatchesTo
+            if !producers.is_empty() && !consumers.is_empty() {
+                let dispatch_meta = CompactStr::new(format!("stream:{topic_key}"));
+                for &prod_id in producers {
+                    for &cons_id in consumers {
+                        if prod_id != cons_id
+                            && edge_set.insert((prod_id, cons_id, EdgeKind::DispatchesTo))
+                        {
+                            self.edges.push(ContractEdge {
+                                from: prod_id,
+                                to: cons_id,
+                                kind: EdgeKind::DispatchesTo,
+                                metadata: Some(dispatch_meta.clone()),
                             });
-                            if !exists {
-                                self.edges.push(ContractEdge {
-                                    from: *prod_id,
-                                    to: *cons_id,
-                                    kind: EdgeKind::DispatchesTo,
-                                    metadata: Some(CompactStr::new(format!("stream:{topic_key}"))),
-                                });
-                            }
                         }
                     }
                 }
             }
         }
 
-        // 3. Reconcile gRPC Proto Definitions <-> Service Handlers (Implements)
+        // 4. Reconcile gRPC Proto Definitions <-> Service Handlers (Implements)
         let proto_methods: Vec<(NodeId, CompactStr)> = self
             .nodes
             .values()
-            .filter(|n| {
-                n.file_path.to_string_lossy().ends_with(".proto") && n.kind == NodeKind::GrpcMethod
-            })
+            .filter(|n| n.kind == NodeKind::GrpcMethod && Self::is_proto_file(&n.file_path))
             .map(|n| (n.id, n.name.clone()))
             .collect();
 
+        // Only nodes the language extractors actually tagged as a gRPC handler
+        // (e.g. TS `@GrpcMethod`/`@GrpcService`) may implement an RPC. Without
+        // this, any same-named REST handler, factory method, or unrelated
+        // function matches by bare name alone. Collected once, not per proto method.
+        struct Handler<'a> {
+            id: NodeId,
+            name: &'a str,
+            pascal_name: String,
+            signature: Option<&'a str>,
+        }
+        let handlers: Vec<Handler<'_>> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                (n.kind == NodeKind::GrpcMethod || n.kind == NodeKind::GrpcService)
+                    && !Self::is_proto_file(&n.file_path)
+                    && !n.name.starts_with("rpc:")
+                    && !n.name.starts_with("produce:")
+                    && !n.name.starts_with("consume:")
+            })
+            .map(|n| Handler {
+                id: n.id,
+                name: n.name.as_str(),
+                pascal_name: crate::types::to_pascal_case(n.name.as_str()),
+                signature: n.signature.as_deref(),
+            })
+            .collect();
+
+        let mut new_edges = Vec::new();
         for (proto_id, method_fqcn) in &proto_methods {
-            let bare_method_name = method_fqcn
+            let bare = method_fqcn
                 .split('.')
                 .next_back()
                 .unwrap_or(method_fqcn.as_str());
+            // Six needles allocated once per proto method (was six per candidate node).
+            let needles = [
+                format!("@{bare}"),
+                format!("'{bare}'"),
+                format!("\"{bare}\""),
+                format!("fn {bare}"),
+                format!("func {bare}"),
+                format!("def {bare}"),
+            ];
 
-            let implementor_ids: Vec<NodeId> = self
-                .nodes
-                .values()
-                .filter(|n| {
-                    if n.file_path.to_string_lossy().ends_with(".proto") {
-                        return false;
-                    }
-                    // Only nodes the language extractors actually tagged as a gRPC
-                    // handler (e.g. TS `@GrpcMethod`/`@GrpcService`) may implement an
-                    // RPC. Without this, any same-named REST handler, factory method,
-                    // or unrelated function matches by bare name alone.
-                    if n.kind != NodeKind::GrpcMethod && n.kind != NodeKind::GrpcService {
-                        return false;
-                    }
-                    if n.name.starts_with("rpc:")
-                        || n.name.starts_with("produce:")
-                        || n.name.starts_with("consume:")
-                    {
-                        return false;
-                    }
+            for h in &handlers {
+                let matched = h.name == method_fqcn.as_str()
+                    || h.name.eq_ignore_ascii_case(bare)
+                    || h.pascal_name == bare
+                    || h.signature
+                        .is_some_and(|s| needles.iter().any(|n| s.contains(n.as_str())));
 
-                    n.name == *method_fqcn
-                        || n.name.as_str().eq_ignore_ascii_case(bare_method_name)
-                        || crate::types::to_pascal_case(n.name.as_str()) == bare_method_name
-                        || n.signature
-                            .as_ref()
-                            .map(|s| {
-                                s.contains(&format!("@{bare_method_name}"))
-                                    || s.contains(&format!("'{bare_method_name}'"))
-                                    || s.contains(&format!("\"{bare_method_name}\""))
-                                    || s.contains(&format!("fn {bare_method_name}"))
-                                    || s.contains(&format!("func {bare_method_name}"))
-                                    || s.contains(&format!("def {bare_method_name}"))
-                            })
-                            .unwrap_or(false)
-                })
-                .map(|n| n.id)
-                .collect();
-
-            for impl_id in implementor_ids {
-                let exists = self.edges.iter().any(|e| {
-                    e.from == impl_id && e.to == *proto_id && e.kind == EdgeKind::Implements
-                });
-                if !exists {
-                    self.edges.push(ContractEdge {
-                        from: impl_id,
+                if matched && edge_set.insert((h.id, *proto_id, EdgeKind::Implements)) {
+                    new_edges.push(ContractEdge {
+                        from: h.id,
                         to: *proto_id,
                         kind: EdgeKind::Implements,
                         metadata: Some(method_fqcn.clone()),
@@ -448,32 +503,34 @@ impl ContractGraph {
                 }
             }
         }
+        self.edges.extend(new_edges);
 
-        // 4. Reconcile RPC Client Calls (CallsRpc)
-        let rpc_calls = self.rpc_calls.clone();
-        for (caller_id, target_rpc) in rpc_calls {
+        // 5. Reconcile RPC Client Calls (CallsRpc) — proto methods indexed by
+        // lowercase full and bare name; first declaration wins, as before.
+        let mut proto_by_name: HashMap<String, NodeId> =
+            HashMap::with_capacity(proto_methods.len() * 2);
+        for (id, name) in &proto_methods {
+            proto_by_name
+                .entry(name.as_str().to_lowercase())
+                .or_insert(*id);
+            if let Some(bare) = name.split('.').next_back() {
+                proto_by_name.entry(bare.to_lowercase()).or_insert(*id);
+            }
+        }
+
+        let mut rpc_edges = Vec::new();
+        for (caller_id, target_rpc) in &self.rpc_calls {
             let target_str = target_rpc.as_str();
             let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
-
-            let matched_proto = proto_methods
-                .iter()
-                .find(|(_, m_name)| {
-                    m_name.as_str().eq_ignore_ascii_case(target_str)
-                        || m_name
-                            .split('.')
-                            .next_back()
-                            .unwrap_or("")
-                            .eq_ignore_ascii_case(target_bare)
-                })
-                .map(|(id, _)| *id);
+            let matched_proto = proto_by_name
+                .get(&target_str.to_lowercase())
+                .or_else(|| proto_by_name.get(&target_bare.to_lowercase()))
+                .copied();
 
             if let Some(target_id) = matched_proto {
-                let exists = self.edges.iter().any(|e| {
-                    e.from == caller_id && e.to == target_id && e.kind == EdgeKind::CallsRpc
-                });
-                if !exists {
-                    self.edges.push(ContractEdge {
-                        from: caller_id,
+                if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
+                    rpc_edges.push(ContractEdge {
+                        from: *caller_id,
                         to: target_id,
                         kind: EdgeKind::CallsRpc,
                         metadata: Some(target_rpc.clone()),
@@ -481,6 +538,12 @@ impl ContractGraph {
                 }
             }
         }
+        self.edges.extend(rpc_edges);
+    }
+
+    #[inline]
+    fn is_proto_file(path: &Path) -> bool {
+        path.extension().is_some_and(|e| e == "proto")
     }
 
     /// O(1) in-memory reverse dependency resolution
@@ -514,53 +577,59 @@ impl ContractGraph {
     }
 
     /// Synchronous end-to-end gRPC trace resolution
-    pub fn analyze_grpc(&self, target: &str) -> GrpcTrace {
+    pub fn analyze_grpc(&self, target: &str) -> GrpcTrace<'_> {
         let norm_target = target.trim();
         let mut proto_definition = None;
-        let mut client_stubs = Vec::new();
-        let mut server_handlers = Vec::new();
+        let mut client_stubs: Vec<&ContractNode> = Vec::new();
+        let mut server_handlers: Vec<&ContractNode> = Vec::new();
 
         // Search for matching proto methods or services
         for node in self.nodes.values() {
+            if !matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod) {
+                continue;
+            }
             let matches_name = node.name.eq_ignore_ascii_case(norm_target);
             let matches_fqcn = node.package.contains(norm_target)
-                || format!("{}/{}", node.package, node.name).contains(norm_target);
+                || Self::fqcn_contains(&node.package, &node.name, norm_target);
+            if !(matches_name || matches_fqcn) {
+                continue;
+            }
 
-            if matches_name || matches_fqcn {
-                match node.kind {
-                    NodeKind::GrpcService | NodeKind::GrpcMethod => {
-                        let path_str = node.file_path.to_string_lossy();
-                        if path_str.ends_with(".proto") {
-                            proto_definition = Some(node.clone());
-                        } else if path_str.contains("controller")
-                            || path_str.contains("handler")
-                            || path_str.contains("service")
-                        {
-                            server_handlers.push(node.clone());
-                        } else {
-                            client_stubs.push(node.clone());
-                        }
-                    }
-                    _ => {}
-                }
+            let path_str = node.file_path.to_string_lossy();
+            if Self::is_proto_file(&node.file_path) {
+                proto_definition = Some(node);
+            } else if path_str.contains("controller")
+                || path_str.contains("handler")
+                || path_str.contains("service")
+            {
+                server_handlers.push(node);
+            } else {
+                client_stubs.push(node);
             }
         }
 
         // If a formal proto definition is identified, resolve implementors and callers via graph edges
-        if let Some(ref proto) = proto_definition {
+        if let Some(proto) = proto_definition {
             for edge in &self.edges {
-                if edge.to == proto.id && edge.kind == EdgeKind::Implements {
-                    if let Some(handler) = self.nodes.get(&edge.from) {
-                        if !server_handlers.iter().any(|h| h.id == handler.id) {
-                            server_handlers.push(handler.clone());
+                if edge.to != proto.id {
+                    continue;
+                }
+                match edge.kind {
+                    EdgeKind::Implements => {
+                        if let Some(handler) = self.nodes.get(&edge.from) {
+                            if !server_handlers.iter().any(|h| h.id == handler.id) {
+                                server_handlers.push(handler);
+                            }
                         }
                     }
-                } else if edge.to == proto.id && edge.kind == EdgeKind::CallsRpc {
-                    if let Some(client) = self.nodes.get(&edge.from) {
-                        if !client_stubs.iter().any(|c| c.id == client.id) {
-                            client_stubs.push(client.clone());
+                    EdgeKind::CallsRpc => {
+                        if let Some(client) = self.nodes.get(&edge.from) {
+                            if !client_stubs.iter().any(|c| c.id == client.id) {
+                                client_stubs.push(client);
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -573,8 +642,20 @@ impl ContractGraph {
         }
     }
 
+    /// `format!("{package}/{name}").contains(needle)` without the allocation.
+    fn fqcn_contains(package: &str, name: &str, needle: &str) -> bool {
+        if package.contains(needle) || name.contains(needle) {
+            return true;
+        }
+        // Needle may straddle the '/' separator.
+        let Some((head, tail)) = needle.split_once('/') else {
+            return false;
+        };
+        package.ends_with(head) && name.starts_with(tail)
+    }
+
     /// Asynchronous causal impact flow resolution
-    pub fn analyze_impact(&self, target: &str) -> ImpactFlow {
+    pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
         let norm_target = target.trim().to_lowercase();
         let mut upstream_producers = Vec::new();
         let mut topics = Vec::new();
@@ -583,41 +664,35 @@ impl ContractGraph {
 
         // 1. Check topic registry
         for (topic_name, producer_ids) in &self.topic_producers {
-            if topic_name.contains(&norm_target) {
-                for &pid in producer_ids {
-                    if let Some(p_node) = self.nodes.get(&pid) {
-                        upstream_producers.push(p_node.clone());
-                    }
-                }
+            if topic_name.contains(norm_target.as_str()) {
+                upstream_producers.extend(producer_ids.iter().filter_map(|id| self.nodes.get(id)));
             }
         }
 
         for (topic_name, consumer_ids) in &self.topic_consumers {
-            if topic_name.contains(&norm_target) {
-                for &cid in consumer_ids {
-                    if let Some(c_node) = self.nodes.get(&cid) {
-                        downstream_consumers.push(c_node.clone());
-                    }
-                }
+            if topic_name.contains(norm_target.as_str()) {
+                downstream_consumers
+                    .extend(consumer_ids.iter().filter_map(|id| self.nodes.get(id)));
             }
         }
 
         // 2. Check nodes for topics and sagas
         for node in self.nodes.values() {
-            let lower_name = node.name.to_lowercase();
-            if lower_name.contains(&norm_target) {
-                match node.kind {
-                    NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => {
-                        topics.push(node.clone());
-                    }
-                    NodeKind::Saga => {
-                        related_sagas.push(node.clone());
-                    }
-                    NodeKind::PostProcessor => {
-                        downstream_consumers.push(node.clone());
-                    }
-                    _ => {}
-                }
+            let interesting = matches!(
+                node.kind,
+                NodeKind::KafkaTopic
+                    | NodeKind::EventStream
+                    | NodeKind::Queue
+                    | NodeKind::Saga
+                    | NodeKind::PostProcessor
+            );
+            if !interesting || !contains_ignore_ascii_case(node.name.as_str(), &norm_target) {
+                continue;
+            }
+            match node.kind {
+                NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => topics.push(node),
+                NodeKind::Saga => related_sagas.push(node),
+                _ => downstream_consumers.push(node),
             }
         }
 
@@ -630,20 +705,40 @@ impl ContractGraph {
         }
     }
 
-    /// Search symbol declarations in memory
+    /// Case-insensitive substring search over symbol declarations, restricted to
+    /// files under `scope_filter` when given. Exact-name hits come first.
     pub fn search_symbols(&self, query: &str, scope_filter: Option<&Path>) -> Vec<&ContractNode> {
-        let lower_query = query.to_lowercase();
-        let mut matches = Vec::new();
+        let mut matches: Vec<&ContractNode> = Vec::new();
+        let mut seen: HashSet<NodeId> = HashSet::new();
 
-        for node in self.nodes.values() {
-            if let Some(scope) = scope_filter {
-                if !node.file_path.starts_with(scope) {
-                    continue;
+        // Fast path: exact symbol name via the O(1) index.
+        if let Some(ids) = self.name_to_nodes.get(query) {
+            for id in ids {
+                if let Some(node) = self.nodes.get(id) {
+                    if scope_filter.is_none_or(|s| node.file_path.starts_with(s))
+                        && seen.insert(node.id)
+                    {
+                        matches.push(node);
+                    }
                 }
             }
+        }
 
-            if node.name.to_lowercase().contains(&lower_query) {
-                matches.push(node);
+        // Substring path: walk only the files inside the scope instead of every node.
+        let in_scope = self
+            .file_to_nodes
+            .iter()
+            .filter(|(path, _)| scope_filter.is_none_or(|s| path.starts_with(s)))
+            .flat_map(|(_, ids)| ids.iter());
+        for id in in_scope {
+            if seen.contains(id) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(id) {
+                if contains_ignore_ascii_case(node.name.as_str(), query) {
+                    seen.insert(node.id);
+                    matches.push(node);
+                }
             }
         }
 
@@ -651,9 +746,19 @@ impl ContractGraph {
     }
 }
 
+/// Allocation-free `haystack.to_lowercase().contains(&needle.to_lowercase())` for ASCII needles.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_reverse_dependency_graph() {
@@ -662,7 +767,7 @@ mod tests {
             id: 0,
             name: CompactStr::new("AuthConsumer"),
             kind: NodeKind::ServiceClass,
-            file_path: PathBuf::from("services/auth/AuthConsumer.java"),
+            file_path: Path::new("services/auth/AuthConsumer.java").into(),
             line_start: 10,
             line_end: 50,
             package: CompactStr::new("com.mesh.auth"),
@@ -685,7 +790,7 @@ mod tests {
             id: 0,
             name: CompactStr::new("AuthenticateUser"),
             kind: NodeKind::GrpcMethod,
-            file_path: PathBuf::from("proto-registry/auth.proto"),
+            file_path: Path::new("proto-registry/auth.proto").into(),
             line_start: 20,
             line_end: 25,
             package: CompactStr::new("auth.v1"),
@@ -715,7 +820,7 @@ mod tests {
                 id: 0,
                 name: CompactStr::new(format!("ServiceHandler{repo_idx}")),
                 kind: NodeKind::ServiceClass,
-                file_path: PathBuf::from(format!("services/service_{repo_idx}/Handler.go")),
+                file_path: PathBuf::from(format!("services/service_{repo_idx}/Handler.go")).into(),
                 line_start: 1,
                 line_end: 100,
                 package: CompactStr::new(format!("service.{repo_idx}")),

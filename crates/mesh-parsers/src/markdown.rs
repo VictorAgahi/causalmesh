@@ -121,7 +121,7 @@ impl MarkdownFormatter {
         output
     }
 
-    pub fn format_dependents(target: &str, dependents: &[ContractNode]) -> String {
+    pub fn format_dependents(target: &str, dependents: &[&ContractNode]) -> String {
         let mut out = format!(
             "## In-Memory Reverse Dependency Graph for `{target}`\n*Total Dependents: {} consumer node(s) found (O(1) in-memory resolution)*\n\n",
             dependents.len()
@@ -155,7 +155,7 @@ impl MarkdownFormatter {
         );
 
         out.push_str("### 1. Protobuf Contract Definition\n");
-        if let Some(ref proto) = trace.proto_definition {
+        if let Some(proto) = trace.proto_definition {
             let pkg = &proto.package;
             let name = &proto.name;
             out.push_str(&format!(

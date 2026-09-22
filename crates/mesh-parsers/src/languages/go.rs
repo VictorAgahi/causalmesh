@@ -1,5 +1,6 @@
-use mesh_core::{CompactStr, ContractNode, NodeKind, RepoId};
+use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 pub struct GoExtractor;
@@ -11,6 +12,7 @@ impl GoExtractor {
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
+        let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let tree = match parser.parse(content, None) {
             Some(t) => t,
@@ -24,7 +26,7 @@ impl GoExtractor {
         Self::visit_node(
             root,
             source_bytes,
-            file_path,
+            &file_path,
             repo_id,
             &mut package_name,
             &mut nodes,
@@ -35,7 +37,7 @@ impl GoExtractor {
     fn visit_node(
         node: Node,
         source: &[u8],
-        file_path: &Path,
+        file_path: &FilePath,
         repo_id: RepoId,
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
@@ -63,7 +65,7 @@ impl GoExtractor {
                             id: 0,
                             name: CompactStr::new(type_name),
                             kind,
-                            file_path: file_path.to_path_buf(),
+                            file_path: file_path.clone(),
                             line_start: node.start_position().row + 1,
                             line_end: node.end_position().row + 1,
                             package: package_name.clone(),
@@ -95,7 +97,7 @@ impl GoExtractor {
                     id: 0,
                     name: CompactStr::new(func_name),
                     kind,
-                    file_path: file_path.to_path_buf(),
+                    file_path: file_path.clone(),
                     line_start: node.start_position().row + 1,
                     line_end: node.end_position().row + 1,
                     package: package_name.clone(),

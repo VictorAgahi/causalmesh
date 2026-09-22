@@ -1,10 +1,12 @@
-use mesh_core::{CompactStr, ContractNode, NodeKind, RepoId};
+use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct ProtoExtractor;
 
 impl ProtoExtractor {
     pub fn extract(file_path: &Path, content: &str, repo_id: RepoId) -> Vec<ContractNode> {
+        let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut current_package = CompactStr::default();
         let mut in_service = None::<CompactStr>;
@@ -63,7 +65,7 @@ impl ProtoExtractor {
                         id: 0,
                         name: s_name_compact,
                         kind: NodeKind::GrpcService,
-                        file_path: file_path.to_path_buf(),
+                        file_path: file_path.clone(),
                         line_start: line_num,
                         line_end: line_num,
                         package: current_package.clone(),
@@ -90,7 +92,7 @@ impl ProtoExtractor {
                         id: 0,
                         name: CompactStr::new(&fqcn_name),
                         kind: NodeKind::GrpcMethod,
-                        file_path: file_path.to_path_buf(),
+                        file_path: file_path.clone(),
                         line_start: line_num,
                         line_end: line_num,
                         package: current_package.clone(),
@@ -116,7 +118,7 @@ impl ProtoExtractor {
                         id: 0,
                         name: CompactStr::new(msg_name),
                         kind: NodeKind::ProtoMessage,
-                        file_path: file_path.to_path_buf(),
+                        file_path: file_path.clone(),
                         line_start: line_num,
                         line_end: line_num,
                         package: current_package.clone(),

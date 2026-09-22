@@ -1,9 +1,10 @@
+use crate::indexer::WorkspaceIndexer;
 use crate::protocol::RequestMeta;
+use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr};
 use mesh_parsers::GraphRenderer;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -25,39 +26,32 @@ fn default_format() -> Option<CompactStr> {
 
 pub struct VisualizeMeshTool;
 
-impl VisualizeMeshTool {
-    pub const NAME: &'static str = "visualize_mesh";
-    pub const DESCRIPTION: &'static str = "Generate an architecture topology graph of the polyglot mesh (services, contracts, gRPC endpoints, Kafka topics) in Mermaid or HTML format.";
+impl McpTool for VisualizeMeshTool {
+    const NAME: &'static str = "visualize_mesh";
+    const DESCRIPTION: &'static str = "Generate an architecture topology graph of the polyglot mesh (services, contracts, gRPC endpoints, Kafka topics) in Mermaid or HTML format.";
+    type Args = VisualizeMeshArgs;
 
-    pub async fn execute(
-        args: VisualizeMeshArgs,
-        state: Arc<AppState>,
-    ) -> Result<String, (i32, String)> {
+    fn meta(args: &Self::Args) -> Option<&RequestMeta> {
+        args._meta.as_ref()
+    }
+
+    fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let format_choice = args
             .format
             .as_deref()
             .unwrap_or("mermaid")
             .to_ascii_lowercase();
 
-        let graph = state.contract_graph.load();
-        let config = state.config.load();
-        let workspace_name = &config.workspace.name;
-        let repo_names: Vec<String> = state
-            .allowed_roots
-            .load()
-            .iter()
-            .map(|r| {
-                r.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| r.display().to_string())
-            })
-            .collect();
+        let snapshot = state.snapshot();
+        let graph = &snapshot.contract_graph;
+        let workspace_name = &state.config.workspace.name;
+        let repo_names = WorkspaceIndexer::repo_names(&state.allowed_roots);
 
         let output = match format_choice.as_str() {
-            "html" => GraphRenderer::to_html(&graph, workspace_name, &repo_names),
-            "json" => GraphRenderer::to_json(&graph, workspace_name, &repo_names),
+            "html" => GraphRenderer::to_html(graph, workspace_name, &repo_names),
+            "json" => GraphRenderer::to_json(graph, workspace_name, &repo_names),
             _ => {
-                let mermaid_code = GraphRenderer::to_mermaid(&graph, workspace_name, &repo_names);
+                let mermaid_code = GraphRenderer::to_mermaid(graph, workspace_name, &repo_names);
                 format!(
                     "## Polyglot Architecture Mesh Topology\n\n```mermaid\n{}\n```\n",
                     mermaid_code.trim()
@@ -65,17 +59,6 @@ impl VisualizeMeshTool {
             }
         };
 
-        let trace_id = args._meta.as_ref().and_then(|m| m.extract_trace_id());
-        let _ = state.audit.record_entry(
-            "active-session",
-            trace_id.as_deref(),
-            Self::NAME,
-            &serde_json::to_string(&args).unwrap_or_default(),
-            "SUCCESS",
-            vec![],
-            0,
-        );
-
-        Ok(output)
+        Ok(ToolOutput::text(output))
     }
 }

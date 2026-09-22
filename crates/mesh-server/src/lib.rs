@@ -2,10 +2,12 @@
 
 pub mod cli;
 pub mod framing;
+pub mod indexer;
 pub mod protocol;
 pub mod tools;
 pub mod watcher;
 
+pub use indexer::WorkspaceIndexer;
 pub use watcher::FileWatcherService;
 
 use framing::StdioFramingActor;
@@ -50,7 +52,7 @@ pub async fn run_server(
                     },
                     "serverInfo": {
                         "name": "mesh-mcp",
-                        "version": "2.9.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 });
                 JsonRpcResponse::success(req_id, init_result)

@@ -1,5 +1,6 @@
-use mesh_core::{CompactStr, ContractNode, NodeKind, RepoId};
+use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 pub struct PythonExtractor;
@@ -11,6 +12,7 @@ impl PythonExtractor {
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
+        let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let tree = match parser.parse(content, None) {
             Some(t) => t,
@@ -19,12 +21,12 @@ impl PythonExtractor {
 
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
-        let package_name = mesh_core::detect_service_package(file_path, None);
+        let package_name = mesh_core::detect_service_package(&file_path, None);
 
         Self::visit_node(
             root,
             source_bytes,
-            file_path,
+            &file_path,
             repo_id,
             &package_name,
             &mut nodes,
@@ -35,7 +37,7 @@ impl PythonExtractor {
     fn visit_node(
         node: Node,
         source: &[u8],
-        file_path: &Path,
+        file_path: &FilePath,
         repo_id: RepoId,
         package_name: &CompactStr,
         nodes: &mut Vec<ContractNode>,
@@ -62,7 +64,7 @@ impl PythonExtractor {
                     id: 0,
                     name: CompactStr::new(class_name),
                     kind,
-                    file_path: file_path.to_path_buf(),
+                    file_path: file_path.clone(),
                     line_start: node.start_position().row + 1,
                     line_end: node.end_position().row + 1,
                     package: package_name.clone(),
@@ -101,7 +103,7 @@ impl PythonExtractor {
                     id: 0,
                     name: CompactStr::new(func_name),
                     kind,
-                    file_path: file_path.to_path_buf(),
+                    file_path: file_path.clone(),
                     line_start: node.start_position().row + 1,
                     line_end: node.end_position().row + 1,
                     package: package_name.clone(),

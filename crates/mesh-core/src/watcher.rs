@@ -1,35 +1,33 @@
-use crate::contracts::ContractGraph;
-use crate::crawler::FilesystemCrawler;
-use crate::security::ValidatedScope;
 use crate::state::AppState;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Reload routine invoked on the background pool after a relevant filesystem change.
+/// Kept as a callback because the concrete indexer lives in `mesh-parsers`, which
+/// `mesh-core` cannot depend on.
+pub type ReloadFn = Arc<dyn Fn(&AppState) + Send + Sync>;
+
 /// In-kernel filesystem watcher service providing debounced change notifications
-/// and atomic ArcSwap reloading per RFC-001 Commandment 7.
+/// and atomic snapshot reloading per RFC-001 Commandment 7.
 pub struct FileWatcherService;
 
 impl FileWatcherService {
     pub const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(150);
 
     /// Spawns the debounced file watcher actor in a background thread
-    pub fn spawn<F>(
+    pub fn spawn(
         state: Arc<AppState>,
         cancel_token: CancellationToken,
-        indexer: F,
-    ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Fn(&Path, &str, &mut ContractGraph) + Send + Sync + 'static,
-    {
-        let indexer = Arc::new(indexer);
+        reload: ReloadFn,
+    ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Self::DEBOUNCE_INTERVAL, tx)?;
 
-        let allowed_roots = state.allowed_roots.load().clone();
-        for root in allowed_roots.as_ref() {
+        for root in state.allowed_roots.iter() {
             if root.exists() {
                 debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
                 tracing::info!(target: "mesh::watcher", "FileWatcher watching root: {}", root.display());
@@ -56,22 +54,20 @@ impl FileWatcherService {
                     }
 
                     match rx.recv_timeout(Duration::from_millis(300)) {
-                        Ok(event_res) => match event_res {
-                            Ok(events) => {
-                                let relevant = events.iter().any(|ev| Self::is_relevant_path(&ev.path));
-                                if relevant {
-                                    tracing::info!(
-                                        target: "mesh::watcher",
-                                        "Detected filesystem mutations ({} events). Scheduling atomic graph rescan.",
-                                        events.len()
-                                    );
-                                    Self::schedule_reload(state.clone(), indexer.clone());
-                                }
+                        Ok(Ok(events)) => {
+                            let relevant = events.iter().any(|ev| Self::is_relevant_path(&ev.path));
+                            if relevant {
+                                tracing::info!(
+                                    target: "mesh::watcher",
+                                    "Detected filesystem mutations ({} events). Scheduling atomic graph rescan.",
+                                    events.len()
+                                );
+                                Self::schedule_reload(state.clone(), reload.clone());
                             }
-                            Err(errs) => {
-                                tracing::warn!(target: "mesh::watcher", "File watch error: {:?}", errs);
-                            }
-                        },
+                        }
+                        Ok(Err(errs)) => {
+                            tracing::warn!(target: "mesh::watcher", "File watch error: {:?}", errs);
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -81,155 +77,58 @@ impl FileWatcherService {
         Ok(handle)
     }
 
-    /// Determines if a changed path is relevant for index rebuilding
-    pub fn is_relevant_path(path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-
-        if path_str.starts_with("target/")
-            || path_str.contains("/target/")
-            || path_str.starts_with("node_modules/")
-            || path_str.contains("/node_modules/")
-            || path_str.starts_with(".git/objects/")
-            || path_str.contains("/.git/objects/")
-            || path_str.ends_with(".swp")
-            || path_str.ends_with('~')
-            || path_str.ends_with(".tmp")
-            || path_str.ends_with(".lock")
-        {
-            return false;
+    /// Queues one reload on the QoS-throttled pool. Bursts arriving before the queued
+    /// job starts are coalesced into it; events arriving *during* a run queue exactly
+    /// one follow-up, which the differential VFS keeps cheap.
+    pub fn schedule_reload(state: Arc<AppState>, reload: ReloadFn) {
+        if state.reload_pending.swap(true, Ordering::AcqRel) {
+            return;
         }
-
-        if path_str.ends_with(".git/HEAD")
-            || path_str.ends_with("/.git/HEAD")
-            || path_str.contains(".git/refs/")
-        {
-            return true;
-        }
-
-        path_str.ends_with(".rs")
-            || path_str.ends_with(".go")
-            || path_str.ends_with(".java")
-            || path_str.ends_with(".ts")
-            || path_str.ends_with(".tsx")
-            || path_str.ends_with(".js")
-            || path_str.ends_with(".py")
-            || path_str.ends_with(".proto")
-            || path_str.ends_with(".yaml")
-            || path_str.ends_with(".yml")
-            || path_str.ends_with(".properties")
-            || path_str.ends_with(".md")
-    }
-
-    /// Reloads the polyglot contract graph, doc index, and property registry on the background Rayon pool.
-    /// Uses DifferentialVfs to avoid re-parsing files whose content hasn't changed.
-    pub fn schedule_reload<F>(state: Arc<AppState>, indexer: Arc<F>)
-    where
-        F: Fn(&Path, &str, &mut ContractGraph) + Send + Sync + 'static,
-    {
-        let state_clone = state.clone();
-        std::mem::drop(state.rescan.spawn(move || {
-            Self::execute_reload_sync(&state_clone, indexer.as_ref());
+        let job_state = state.clone();
+        drop(state.rescan.spawn(move || {
+            job_state.reload_pending.store(false, Ordering::Release);
+            reload(&job_state);
         }));
     }
 
-    /// Synchronous rescan logic executed on the QoS-throttled thread pool.
-    /// Performs a differential reload: only files with changed content hashes are re-indexed.
-    /// For massive filesystem mutations (>200 files changed, e.g. `git checkout`),
-    /// processes files in throttled batches to prevent I/O thrashing and IDE stuttering.
-    pub fn execute_reload_sync<F>(state: &AppState, indexer: &F)
-    where
-        F: Fn(&Path, &str, &mut ContractGraph),
-    {
-        let allowed_roots = state.allowed_roots.load().clone();
-        let exclude_patterns = state.config.load().workspace.exclude_patterns.clone();
+    /// Determines if a changed path is relevant for index rebuilding
+    pub fn is_relevant_path(path: &Path) -> bool {
+        let mut components = path.components().map(|c| c.as_os_str());
+        if components.any(|c| c == "target" || c == "node_modules") {
+            return false;
+        }
 
-        // Collect all files across all roots
-        let mut all_files = Vec::new();
-        for root in allowed_roots.iter() {
-            if let Ok(validated_scope) =
-                ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots)
-            {
-                let files =
-                    FilesystemCrawler::crawl_scope(&validated_scope, &exclude_patterns, Some(10));
-                all_files.extend(files);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with('~') || name.ends_with(".swp") {
+            return false;
+        }
+
+        // .git/HEAD and refs matter (checkout / rebase); objects and everything else in .git do not.
+        let mut in_git = false;
+        for c in path.components() {
+            let c = c.as_os_str();
+            if in_git {
+                return c == "HEAD" || c == "refs";
             }
+            in_git = c == ".git";
         }
 
-        // Use a thread-local VFS cache to avoid re-parsing unchanged files.
-        // For the first run, all files are considered changed.
-        use once_cell::sync::Lazy;
-        use std::sync::Mutex;
-        static VFS_CACHE: Lazy<Mutex<crate::vfs::DifferentialVfs>> =
-            Lazy::new(|| Mutex::new(crate::vfs::DifferentialVfs::new()));
-
-        let mut vfs = VFS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-
-        let mut changed_files: Vec<(std::path::PathBuf, String)> = Vec::new();
-        for file in &all_files {
-            if let Ok(content) = std::fs::read_to_string(file) {
-                if vfs.check_and_update(file, &content) {
-                    changed_files.push((file.clone(), content));
-                }
-            }
-        }
-
-        if changed_files.is_empty() {
-            tracing::debug!(
-                target: "mesh::watcher",
-                "VFS differential: 0 files changed, skipping reload."
-            );
-            return;
-        }
-
-        let is_mass_checkout = changed_files.len() > 200;
-        if is_mass_checkout {
-            tracing::info!(
-                target: "mesh::watcher",
-                "Mass filesystem mutation detected ({} files). Running throttled full rebuild.",
-                changed_files.len()
-            );
-        }
-
-        // Clone the current graph and apply incremental patches
-        let current_graph = state.contract_graph.load();
-        let mut new_graph = (**current_graph).clone();
-        let mut new_doc_index = (**state.doc_index.load()).clone();
-        let mut new_prop_reg = (**state.property_registry.load()).clone();
-
-        for (batch_idx, (file, content)) in changed_files.iter().enumerate() {
-            // Throttle I/O on massive checkouts to preserve IDE responsiveness
-            if is_mass_checkout && batch_idx % 50 == 49 {
-                std::thread::yield_now();
-            }
-
-            // Purge stale nodes for this file path before re-indexing
-            new_graph.patch_file(file);
-
-            let path_str = file.to_string_lossy();
-            if path_str.ends_with(".md") {
-                new_doc_index.index_markdown_file(file, content);
-            } else if path_str.ends_with(".properties") {
-                new_prop_reg.ingest_properties_str(content);
-            } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
-                let _ = new_prop_reg.ingest_yaml_str(content);
-                indexer(file, content, &mut new_graph);
-            } else {
-                indexer(file, content, &mut new_graph);
-            }
-        }
-
-        new_graph.reconcile_edges();
-        state.contract_graph.store(Arc::new(new_graph));
-        state.doc_index.store(Arc::new(new_doc_index));
-        state.property_registry.store(Arc::new(new_prop_reg));
-
-        tracing::info!(
-            target: "mesh::watcher",
-            "Incremental reload completed: {}/{} files re-indexed, {} total contract nodes.",
-            changed_files.len(),
-            all_files.len(),
-            state.contract_graph.load().node_count()
-        );
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some(
+                "rs" | "go"
+                    | "java"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "py"
+                    | "proto"
+                    | "yaml"
+                    | "yml"
+                    | "properties"
+                    | "md"
+            )
+        )
     }
 }
 

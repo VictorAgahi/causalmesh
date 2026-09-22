@@ -18,7 +18,7 @@ cargo build --workspace
 # Build optimized release binary with Thin LTO and mimalloc (6.8 MB)
 cargo build --workspace --release
 
-# Run all 33 unit and integration tests across workspace
+# Run all unit and integration tests across workspace
 cargo test --workspace
 
 # Strict Clippy validation (MUST have 0 warnings and 0 errors)

@@ -41,7 +41,8 @@ pub struct JsonRpcError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
-    pub jsonrpc: String,
+    /// Always "2.0"; a static str avoids one heap allocation per response.
+    pub jsonrpc: std::borrow::Cow<'static, str>,
     pub id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -52,7 +53,7 @@ pub struct JsonRpcResponse {
 impl JsonRpcResponse {
     pub fn success(id: Option<Value>, result: Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
             id,
             result: Some(result),
             error: None,
@@ -66,7 +67,7 @@ impl JsonRpcResponse {
         data: Option<Value>,
     ) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
             id,
             result: None,
             error: Some(JsonRpcError {

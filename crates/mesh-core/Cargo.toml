@@ -21,6 +21,7 @@ path-clean.workspace = true
 glob.workspace = true
 shellexpand.workspace = true
 ignore.workspace = true
+globset.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

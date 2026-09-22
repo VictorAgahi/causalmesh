@@ -1,3 +1,5 @@
+use crate::decapitate::LanguageKind;
+use std::cell::RefCell;
 use std::fs;
 use streaming_iterator::StreamingIterator;
 use thiserror::Error;
@@ -53,18 +55,37 @@ impl AstGuard {
             || filename == "asyncapi.json"
     }
 
+    /// Size budget for `path` (schemas/stubs get 1.5 MB, source files 384 KB).
+    #[inline]
+    pub fn size_budget(path: &std::path::Path) -> u64 {
+        if Self::is_contract_or_schema(path) {
+            Self::MAX_SCHEMA_FILE_SIZE_BYTES
+        } else {
+            Self::MAX_FILE_SIZE_BYTES
+        }
+    }
+
+    /// Stat-only pre-check, usable *before* reading the file so an oversized
+    /// file never costs its full read.
+    #[inline]
+    pub fn within_size_budget(path: &std::path::Path, metadata: &fs::Metadata) -> bool {
+        metadata.len() <= Self::size_budget(path)
+    }
+
+    /// Null-byte sniff over the first 4 KB.
+    #[inline]
+    pub fn looks_binary(content: &[u8]) -> bool {
+        let inspect_len = content.len().min(Self::BINARY_SNIFF_LEN);
+        content[..inspect_len].contains(&0)
+    }
+
     /// Lexical pre-check with path-aware sizing (1.5 MB budget for schemas/stubs, 384 KB for source files)
     pub fn should_parse_path(
         path: &std::path::Path,
         metadata: &fs::Metadata,
         content: &[u8],
     ) -> bool {
-        let budget = if Self::is_contract_or_schema(path) {
-            Self::MAX_SCHEMA_FILE_SIZE_BYTES
-        } else {
-            Self::MAX_FILE_SIZE_BYTES
-        };
-        Self::should_parse_with_budget(metadata, content, budget)
+        Self::should_parse_with_budget(metadata, content, Self::size_budget(path))
     }
 
     /// Default lexical pre-check rejecting oversized, binary, long-line, or deeply nested files
@@ -88,8 +109,7 @@ impl AstGuard {
             return false;
         }
 
-        let inspect_len = content.len().min(Self::BINARY_SNIFF_LEN);
-        if content[..inspect_len].contains(&0) {
+        if Self::looks_binary(content) {
             tracing::debug!(target: "mesh::parser", "Rejected file: binary null byte detected");
             return false;
         }
@@ -224,6 +244,7 @@ impl AstGuard {
             && Self::create_bounded_parser(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
                 .is_ok()
             && Self::create_bounded_parser(&tree_sitter_rust::LANGUAGE.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_cpp::LANGUAGE.into()).is_ok()
     }
 
     /// Initializes a bounded tree-sitter parser with a strict 15ms C-FFI timeout
@@ -234,6 +255,40 @@ impl AstGuard {
             .map_err(|e| ParserError::LanguageError(e.to_string()))?;
         parser.set_timeout_micros(Self::PARSER_TIMEOUT_MICROS);
         Ok(parser)
+    }
+
+    /// Runs `f` with a thread-local bounded parser for `lang_kind`, creating it on first use.
+    ///
+    /// `Parser::new` + `set_language` are not free (C-FFI allocation and grammar binding);
+    /// recreating one per file on a 20k-file workspace is pure overhead. Rayon workers and
+    /// the tokio blocking pool each keep their own instance, so no locking is needed.
+    /// Returns `None` for languages without a tree-sitter grammar.
+    pub fn with_parser<R>(lang_kind: LanguageKind, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
+        thread_local! {
+            static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
+                const { RefCell::new([None, None, None, None, None, None]) };
+        }
+
+        let slot = lang_kind.tree_sitter_slot()?;
+        let language = lang_kind.language()?;
+
+        PARSERS.with(|cell| {
+            let mut parsers = cell.borrow_mut();
+            let parser = match &mut parsers[slot] {
+                Some(p) => p,
+                empty => match Self::create_bounded_parser(&language) {
+                    Ok(p) => empty.insert(p),
+                    Err(e) => {
+                        tracing::error!(target: "mesh::parser", "Cannot initialize parser: {e}");
+                        return None;
+                    }
+                },
+            };
+            let out = f(parser);
+            // A timed-out parse leaves the parser mid-state; reset so the next file starts clean.
+            parser.reset();
+            Some(out)
+        })
     }
 
     /// Executes query with both match limits and hard iteration step counter preventing ReDoS

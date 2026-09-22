@@ -15,13 +15,9 @@ mod server;
 mod socket;
 
 use clap::Parser;
-use mesh_core::{
-    expand_roots, AppState, AuditLogger, BackgroundRescanEngine, Config, FilesystemCrawler,
-    ValidatedScope,
-};
-use mesh_parsers::PolyglotIndexer;
-use mesh_server::FileWatcherService;
-use std::path::{Path, PathBuf};
+use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
+use mesh_server::{FileWatcherService, WorkspaceIndexer};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +29,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser, Debug)]
 #[command(
     name = "meshd",
-    version = "2.9.0",
+    version,
     about = "MeshMCP background daemon — shared graph + UDS multiplexer"
 )]
 struct Args {
@@ -71,98 +67,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     socket::cleanup_stale_socket(&sock_path);
 
     // ── Config loading ────────────────────────────────────────────────────────
-    let config_paths = [
-        args.config.clone(),
-        Some(PathBuf::from(".agents/mesh-mcp.toml")),
-        Some(PathBuf::from("mesh-mcp.toml")),
-    ];
-    let found_path = config_paths.into_iter().flatten().find(|p| p.exists());
-
-    let (config, base_dir) = if let Some(ref path) = found_path {
-        let cfg = Config::load_from_file(path)?;
-        let base = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        (cfg, base)
-    } else {
-        let default =
-            "[workspace]\nname = \"default-mesh\"\nversion = \"2.9.0\"\nroots = [\".\"]\n";
-        (Config::load_from_str(default)?, PathBuf::from("."))
-    };
-
-    let allowed_roots = match expand_roots(
-        &config.workspace.roots,
-        &base_dir,
-        &config.workspace.workspace_root,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "meshd", "Failed to expand roots: {e}. Falling back to cwd.");
-            vec![dunce::canonicalize(&base_dir).unwrap_or(base_dir.clone())]
-        }
-    };
+    let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
+    let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
 
     // ── AppState (shared, single instance) ───────────────────────────────────
     let audit = Arc::new(AuditLogger::new(None)?);
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
-    let state = Arc::new(AppState::new(
-        config.clone(),
-        allowed_roots.clone(),
-        audit,
-        rescan,
-    ));
+    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
 
-    // ── Initial ingestion ─────────────────────────────────────────────────────
+    // ── Initial ingestion: one parallel scan, one reconcile, one atomic install ─
     tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
-    for (repo_idx, root) in allowed_roots.iter().enumerate() {
-        let repo_id = repo_idx as mesh_core::RepoId;
-        if let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &allowed_roots) {
-            let files = FilesystemCrawler::crawl_scope(
-                &scope,
-                &config.workspace.exclude_patterns,
-                Some(10),
-            );
-            let mut graph = (*state.contract_graph.load().as_ref()).clone();
-            let mut doc_index = (*state.doc_index.load().as_ref()).clone();
-            let mut prop_reg = (*state.property_registry.load().as_ref()).clone();
-
-            for file in files {
-                if let Ok(content) = std::fs::read_to_string(&file) {
-                    let path_str = file.to_string_lossy();
-                    if path_str.ends_with(".md") {
-                        doc_index.index_markdown_file(&file, &content);
-                    } else if path_str.ends_with(".properties") {
-                        prop_reg.ingest_properties_str(&content);
-                    } else if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
-                        let _ = prop_reg.ingest_yaml_str(&content);
-                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
-                    } else {
-                        PolyglotIndexer::index_file(&file, &content, repo_id, &mut graph);
-                    }
-
-                    if let Some(ref contracts_cfg) = state.config.load().engines.contracts {
-                        PolyglotIndexer::apply_custom_patterns(
-                            &file,
-                            &content,
-                            repo_id,
-                            &contracts_cfg.patterns,
-                            &mut graph,
-                        );
-                    }
-                }
-            }
-
-            graph.reconcile_edges();
-            state.contract_graph.store(Arc::new(graph));
-            state.doc_index.store(Arc::new(doc_index));
-            state.property_registry.store(Arc::new(prop_reg));
-        }
-    }
+    let snapshot = {
+        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+        WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs))
+    };
+    state.install_snapshot(snapshot);
     tracing::info!(
         target: "meshd",
         "Ingestion complete: {} contract nodes indexed.",
-        state.contract_graph.load().node_count()
+        state.snapshot().contract_graph.node_count()
     );
 
     // ── Cancellation token + signal handler ───────────────────────────────────

@@ -451,20 +451,23 @@ async fn test_configured_skill_is_recommended_in_tool_output() {
     )
     .expect("write skill");
 
-    let cfg_str = format!(
-        r#"
+    // The skill path stays relative: interpolating an absolute path into a TOML
+    // basic string breaks on Windows, where `C:\Users\...` makes `\U` a unicode
+    // escape. Relative is also how a real config is written — `resolve_skill_paths`
+    // is what turns it into something the server can open from any cwd.
+    let cfg_str = r#"
 [workspace]
 name = "skills-mesh"
 version = "0"
 roots = ["./proto-registry"]
 
 [engines.policy.skills]
-"proto-registry" = "{}/.agents/skills/proto.md"
-"#,
-        base.display()
-    );
+"proto-registry" = ".agents/skills/proto.md"
+"#;
 
-    let config = Config::load_from_str(&cfg_str).expect("config");
+    let mut config = Config::load_from_str(cfg_str).expect("config");
+    config.resolve_skill_paths(&base);
+    let config = config;
     let allowed_roots = expand_roots(
         &config.workspace.roots,
         &base,

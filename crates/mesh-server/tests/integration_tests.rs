@@ -496,3 +496,56 @@ roots = ["./proto-registry"]
     let text = val["content"][0]["text"].as_str().unwrap();
     assert!(!text.contains("Project skill for this area"), "{text}");
 }
+
+#[tokio::test]
+async fn test_docs_engine_aliases_and_stop_words_are_applied() {
+    let temp = tempfile::tempdir().expect("temp");
+    let base = dunce::canonicalize(temp.path()).expect("canon");
+    std::fs::create_dir_all(base.join("docs")).expect("mkdir");
+    std::fs::write(
+        base.join("docs/adr-001.md"),
+        "# Retry policy\n\nFailed messages land in the dead-letter-queue after three attempts.\n",
+    )
+    .expect("write doc");
+
+    let cfg_str = r#"
+[workspace]
+name = "docs-mesh"
+version = "0"
+roots = ["./docs"]
+
+[engines.docs]
+enabled = true
+aliases = { "dlq" = "dead-letter-queue" }
+stop_words = ["the", "what", "is"]
+exact_phrase_boost = 60
+"#;
+
+    let config = Config::load_from_str(cfg_str).expect("config");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &base,
+        &config.workspace.workspace_root,
+    )
+    .expect("roots");
+    let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+    let rescan = Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+
+    let snapshot = mesh_server::WorkspaceIndexer::build_snapshot(
+        &state.config,
+        &state.allowed_roots,
+        None,
+        None,
+    );
+    state.install_snapshot(snapshot);
+
+    // "dlq" only matches because the alias rewrites it, and the stop words keep
+    // "what is the" from diluting the query.
+    let args = json!({ "query": "what is the dlq" });
+    let val = ToolRegistry::call_tool("search_docs", args, state)
+        .await
+        .expect("ok");
+    let text = val["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Retry policy"), "{text}");
+}

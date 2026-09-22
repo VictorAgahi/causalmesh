@@ -141,14 +141,10 @@ directory but leaves `build.rs` and `build_tools/` alone.
 
 ### Running in containers
 
-If your agent sees `/workspace` but your files live elsewhere on the host:
-
-```toml
-[workspace.mount_aliases]
-"/workspace" = "/Users/me/dev/monorepo"
-```
-
-Requests arriving with the container path are translated before the security check.
+> **Not yet wired.** `[workspace.mount_aliases]` parses and the translation logic exists
+> (`ValidatedScope::resolve_with_aliases`), but nothing passes the table to it yet, so container
+> paths are not translated today. Until then, run the server with the same paths the agent uses,
+> or bind-mount at an identical path on both sides.
 
 ---
 
@@ -448,20 +444,26 @@ Every tool call is appended to a SHA-256 hash-chained SQLite log at
 Only these sections exist. The parser rejects unknown keys, so a typo or an invented section
 fails loudly at startup rather than being ignored.
 
-| Section | Purpose |
+Keys marked **wired** change behaviour. Keys marked *accepted* parse without error but are not
+read by anything yet — they are placeholders for planned engines, listed here so you know not to
+rely on them.
+
+| Section / key | Status |
 | :--- | :--- |
-| `[workspace]` | `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` |
-| `[workspace.mount_aliases]` | container path → host path translation |
-| `[engines.docs]` | `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` |
-| `[engines.contracts]` | `enabled` |
-| `[engines.contracts.grpc]` | `proto_dirs`, `controller_annotations`, `canonical_fqcn_projection` |
-| `[engines.contracts.spring]` | `enabled`, `property_files`, `resolve_placeholders`, `auto_redact_secrets` |
-| `[engines.contracts.openapi]` | `enabled`, `spec_files` |
-| `[engines.contracts.asyncapi]` | `enabled`, `spec_files`, `infer_string_topics` |
-| `[[engines.contracts.patterns]]` | `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` |
-| `[engines.policy]` | `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` |
-| `[engines.policy.stop_rules]` | guarded path fragment → refusal message |
-| `[engines.policy.skills]` | tool name or path fragment → skill file |
+| `[workspace]` `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` | **wired** |
+| `[workspace.mount_aliases]` | *accepted* — translation not applied yet |
+| `[engines.docs]` `aliases`, `stop_words`, `exact_phrase_boost`, `sanitize_prompt_injections` | **wired** |
+| `[engines.docs]` `enabled`, `paths`, `fuzzy_fallback` | *accepted* — Markdown is indexed because it sits under `roots`, not because of `paths`; the engine cannot be turned off |
+| `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` | **wired** |
+| `[engines.contracts.grpc]`, `[engines.contracts.spring]`, `[engines.contracts.openapi]`, `[engines.contracts.asyncapi]` | *accepted* — detection is by file extension and content today, so `proto_dirs`, `spec_files`, `property_files`, `controller_annotations` and the `enabled` flags have no effect |
+| `[engines.policy.stop_rules]` | **wired** (via the git pre-commit hook) |
+| `[engines.policy.skills]` | **wired** |
+| `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` | *accepted* — the audit log is always written; hooks install only via `mesh-mcp install-hooks` |
+
+Practical consequence: **secret masking and prompt-injection sanitisation are always on** and
+cannot be disabled by config, which is the safe default. Conversely, listing `spec_files` or
+`proto_dirs` does not narrow or widen what gets scanned — `roots` and `exclude_patterns` are the
+only levers for that.
 
 There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
 a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.

@@ -363,6 +363,7 @@ All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RP
 | [docs/development.md](docs/development.md) | Building, testing, adding a language. |
 | [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, skills, pre-commit enforcement. |
 | [docs/benchmarks.md](docs/benchmarks.md) | How to measure, and what the numbers mean. |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Known gaps and planned work, with file references. |
 | [RFC-001-CAUSAL-MCP.md](RFC-001-CAUSAL-MCP.md) | The specification this implements. |
 
 ---

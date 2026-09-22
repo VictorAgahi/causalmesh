@@ -1,5 +1,6 @@
 use crate::indexer::WorkspaceIndexer;
 use mesh_parsers::GraphRenderer;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct GraphCommand;
@@ -44,8 +45,14 @@ impl GraphCommand {
             eprintln!("✔ Generated HTML topology: {}", temp_html.display());
             Some(temp_html)
         } else {
-            // Print directly to stdout for mermaid or json pipes
-            println!("{rendered}");
+            // Commandment 3 exemption: this is the `graph` CLI subcommand's own output,
+            // not the JSON-RPC stdio stream owned by StdioFramingActor. The `graph`
+            // subcommand never runs the JSON-RPC loop, so writing rendered output
+            // directly to stdout here cannot corrupt a live frame. Written through an
+            // explicit io::stdout() handle (rather than println!) so this exemption is
+            // visible at grep level.
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "{rendered}")?;
             None
         };
 

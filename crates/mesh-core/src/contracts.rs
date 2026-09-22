@@ -415,23 +415,17 @@ impl ContractGraph {
                 }
             }
 
-            if !producers.is_empty() && !consumers.is_empty() {
-                let dispatch_meta = CompactStr::new(format!("stream:{topic_key}"));
-                for &prod_id in producers {
-                    for &cons_id in consumers {
-                        if prod_id != cons_id
-                            && edge_set.insert((prod_id, cons_id, EdgeKind::DispatchesTo))
-                        {
-                            self.edges.push(ContractEdge {
-                                from: prod_id,
-                                to: cons_id,
-                                kind: EdgeKind::DispatchesTo,
-                                metadata: Some(dispatch_meta.clone()),
-                            });
-                        }
-                    }
-                }
-            }
+            // ROADMAP #11: `DispatchesTo` used to materialize one edge per
+            // (producer, consumer) pair here, which is O(producers * consumers)
+            // per topic — a 50x50 hub topic alone produced 2,500 edges, growing
+            // with the square. `EdgeKind::DispatchesTo` is not read by any query
+            // engine or traversal (only referenced defensively in
+            // `mesh-parsers::graph` render match arms); the `Produces` and
+            // `Consumes` edges added above already carry the same information
+            // via a two-hop producer -> topic -> consumer walk. So rather than
+            // capping the pair count, we drop the direct-edge generation
+            // entirely and rely on the two-hop traversal, which is O(producers +
+            // consumers) per topic instead of O(producers * consumers).
         }
 
         // 4. Reconcile gRPC Proto Definitions <-> Service Handlers (Implements)
@@ -843,5 +837,83 @@ mod tests {
         let high_repo_node = dependents.iter().find(|n| n.repo_id == 498);
         assert!(high_repo_node.is_some());
         assert_eq!(high_repo_node.unwrap().name.as_str(), "ServiceHandler498");
+    }
+
+    /// ROADMAP #11: a hub topic with 50 producers and 50 consumers used to
+    /// generate 50*50 = 2,500 `DispatchesTo` edges from `reconcile_edges`
+    /// alone. With direct-edge generation dropped, the same topic must only
+    /// ever produce the `Produces` and `Consumes` edges (50 + 50 = 100, one
+    /// per participant), independent of the quadratic pair count, and zero
+    /// `DispatchesTo` edges.
+    #[test]
+    fn test_hub_topic_edge_growth_is_linear_not_quadratic() {
+        let mut graph = ContractGraph::new();
+
+        const FANOUT: usize = 50;
+        let mut producer_ids = Vec::with_capacity(FANOUT);
+        let mut consumer_ids = Vec::with_capacity(FANOUT);
+
+        for i in 0..FANOUT {
+            let producer = ContractNode {
+                id: 0,
+                name: CompactStr::new(format!("Producer{i}")),
+                kind: NodeKind::ServiceClass,
+                file_path: Path::new(&format!("services/producer_{i}/Handler.go")).into(),
+                line_start: 1,
+                line_end: 10,
+                package: CompactStr::new(format!("producer.{i}")),
+                repo_id: i as RepoId,
+                signature: None,
+                docstring: None,
+            };
+            let pid = graph.add_node(producer);
+            graph.add_producer(pid, "hub-topic");
+            producer_ids.push(pid);
+
+            let consumer = ContractNode {
+                id: 0,
+                name: CompactStr::new(format!("Consumer{i}")),
+                kind: NodeKind::ServiceClass,
+                file_path: Path::new(&format!("services/consumer_{i}/Handler.go")).into(),
+                line_start: 1,
+                line_end: 10,
+                package: CompactStr::new(format!("consumer.{i}")),
+                repo_id: (FANOUT + i) as RepoId,
+                signature: None,
+                docstring: None,
+            };
+            let cid = graph.add_node(consumer);
+            graph.add_consumer(cid, "hub-topic");
+            consumer_ids.push(cid);
+        }
+
+        graph.reconcile_edges();
+
+        let produces_count = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Produces)
+            .count();
+        let consumes_count = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Consumes)
+            .count();
+        let dispatches_count = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DispatchesTo)
+            .count();
+
+        // Bounded: one Produces edge per producer, one Consumes edge per
+        // consumer, and no direct producer->consumer edges at all — never the
+        // 2,500 (50*50) pairs a quadratic pass would have generated.
+        assert_eq!(produces_count, FANOUT);
+        assert_eq!(consumes_count, FANOUT);
+        assert_eq!(dispatches_count, 0);
+
+        let total_topic_edges = produces_count + consumes_count + dispatches_count;
+        assert_eq!(total_topic_edges, FANOUT * 2);
+        assert!(total_topic_edges < FANOUT * FANOUT);
     }
 }

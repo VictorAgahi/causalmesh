@@ -8,8 +8,8 @@
 
 use mesh_core::{
     expand_roots, AppState, BackgroundRescanEngine, Config, ContractGraph, DifferentialVfs,
-    DocIndex, DocSection, FilesystemCrawler, MeshSnapshot, PropertyRegistry, RepoId,
-    ValidatedScope,
+    DocIndex, DocSection, FilesystemCrawler, MeshSnapshot, PropertyRegistry, PropertySourceMatcher,
+    RepoId, ValidatedScope,
 };
 use mesh_parsers::{AstGuard, CompiledPattern, FileIndex, LanguageKind, PolyglotIndexer};
 use rayon::prelude::*;
@@ -26,6 +26,53 @@ struct FileFragment {
     code: FileIndex,
     docs: Vec<DocSection>,
     props: Option<PropertyRegistry>,
+}
+
+/// `[engines.contracts.spring]` settings resolved once per scan, mirroring how
+/// `doc_index_for`/`compiled_patterns` resolve their own engine's config once instead of per
+/// file. Absent `[engines.contracts.spring]` keeps the pre-existing unscoped, redacting,
+/// non-resolving behaviour.
+#[derive(Clone)]
+struct SpringSettings {
+    /// `None` means "no scoping" (match every `.properties`/`.yml`/`.yaml` file), which is both
+    /// the default and the behaviour when `property_files` is left empty.
+    file_matcher: Option<PropertySourceMatcher>,
+    resolve_placeholders: bool,
+    auto_redact_secrets: bool,
+}
+
+impl SpringSettings {
+    fn from_config(config: &Config) -> Self {
+        match config
+            .engines
+            .contracts
+            .as_ref()
+            .and_then(|c| c.spring.as_ref())
+        {
+            Some(spring) => Self {
+                file_matcher: if spring.property_files.is_empty() {
+                    None
+                } else {
+                    Some(PropertySourceMatcher::compile(&spring.property_files))
+                },
+                resolve_placeholders: spring.resolve_placeholders,
+                auto_redact_secrets: spring.auto_redact_secrets,
+            },
+            None => Self {
+                file_matcher: None,
+                resolve_placeholders: true,
+                auto_redact_secrets: true,
+            },
+        }
+    }
+
+    #[inline]
+    fn is_property_source(&self, path: &Path) -> bool {
+        match &self.file_matcher {
+            Some(matcher) => matcher.is_match(path),
+            None => true,
+        }
+    }
 }
 
 pub struct WorkspaceIndexer;
@@ -114,12 +161,13 @@ impl WorkspaceIndexer {
         let files = Self::crawl_all(config, roots);
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
+        let spring = SpringSettings::from_config(config);
 
         let work = || {
             files
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template)
+                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
                 })
                 .collect::<Vec<_>>()
         };
@@ -139,6 +187,9 @@ impl WorkspaceIndexer {
             }
             Self::fold(frag, &mut snapshot);
         }
+        if spring.resolve_placeholders {
+            snapshot.property_registry.resolve_all_placeholders();
+        }
         snapshot.contract_graph.reconcile_edges();
 
         tracing::info!(
@@ -157,11 +208,12 @@ impl WorkspaceIndexer {
         let files = Self::crawl_all(config, roots);
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
+        let spring = SpringSettings::from_config(config);
         let mut graph = ContractGraph::new();
         let fragments: Vec<_> = files
             .par_iter()
             .filter_map(|(repo_id, path)| {
-                Self::process_file(path, *repo_id, &patterns, &doc_template)
+                Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
             })
             .collect();
         for frag in fragments {
@@ -180,6 +232,7 @@ impl WorkspaceIndexer {
         let config = &state.config;
         let files = Self::crawl_all(config, &state.allowed_roots);
         let patterns = Self::compiled_patterns(config);
+        let spring = SpringSettings::from_config(config);
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -212,7 +265,7 @@ impl WorkspaceIndexer {
             candidates
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template)
+                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring)
                 })
                 .collect()
         });
@@ -246,13 +299,18 @@ impl WorkspaceIndexer {
         snapshot.contract_graph.patch_files(stale);
         for f in &changed {
             snapshot.doc_index.remove_file(&f.path);
+            snapshot.property_registry.remove_file(&f.path);
         }
         for p in &deleted {
             snapshot.doc_index.remove_file(p);
+            snapshot.property_registry.remove_file(p);
         }
         let changed_count = changed.len();
         for frag in changed {
             Self::fold(frag, &mut snapshot);
+        }
+        if spring.resolve_placeholders {
+            snapshot.property_registry.resolve_all_placeholders();
         }
         snapshot.contract_graph.reconcile_edges();
         let node_count = snapshot.contract_graph.node_count();
@@ -319,6 +377,7 @@ impl WorkspaceIndexer {
         repo_id: RepoId,
         patterns: &[CompiledPattern],
         doc_template: &DocIndex,
+        spring: &SpringSettings,
     ) -> Option<FileFragment> {
         let metadata = std::fs::metadata(path).ok()?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
@@ -356,14 +415,18 @@ impl WorkspaceIndexer {
         match ext {
             "md" => frag.docs = doc_template.parse_sections(path, content),
             "properties" => {
-                let mut reg = PropertyRegistry::new();
-                reg.ingest_properties_str(content);
-                frag.props = Some(reg);
+                if spring.is_property_source(path) {
+                    let mut reg = PropertyRegistry::with_redaction(spring.auto_redact_secrets);
+                    reg.ingest_properties_str(content);
+                    frag.props = Some(reg);
+                }
             }
             "yml" | "yaml" => {
-                let mut reg = PropertyRegistry::new();
-                let _ = reg.ingest_yaml_str(content);
-                frag.props = Some(reg);
+                if spring.is_property_source(path) {
+                    let mut reg = PropertyRegistry::with_redaction(spring.auto_redact_secrets);
+                    let _ = reg.ingest_yaml_str(content);
+                    frag.props = Some(reg);
+                }
                 frag.code = PolyglotIndexer::extract(path, content, repo_id);
             }
             _ => frag.code = PolyglotIndexer::extract(path, content, repo_id),
@@ -378,13 +441,13 @@ impl WorkspaceIndexer {
     }
 
     fn fold(frag: FileFragment, snapshot: &mut MeshSnapshot) {
-        frag.code.apply(&mut snapshot.contract_graph);
         if !frag.docs.is_empty() {
             snapshot.doc_index.extend_sections(frag.docs);
         }
         if let Some(props) = frag.props {
-            snapshot.property_registry.merge(props);
+            snapshot.property_registry.merge(props, &frag.path);
         }
+        frag.code.apply(&mut snapshot.contract_graph);
     }
 }
 
@@ -454,5 +517,100 @@ mod tests {
         assert_eq!(view.contract_graph.node_count(), 3);
         assert!(view.contract_graph.search_symbols("B", None).is_empty());
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
+    }
+
+    /// Item 10: `PropertyRegistry` provenance. Deleting one of two properties files must remove
+    /// exactly its keys on the next incremental reload, leaving the other file's keys intact —
+    /// previously `merge` only ever added, so deleted keys persisted until a full restart.
+    #[test]
+    fn reload_removes_deleted_properties_files_keys_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(root.join("a.properties"), "app.a.name=a-value\n").expect("write a");
+        std::fs::write(root.join("b.properties"), "app.b.name=b-value\n").expect("write b");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(
+            state.snapshot().property_registry.get("app.a.name"),
+            Some("a-value")
+        );
+        assert_eq!(
+            state.snapshot().property_registry.get("app.b.name"),
+            Some("b-value")
+        );
+
+        std::fs::remove_file(root.join("b.properties")).expect("rm b");
+        WorkspaceIndexer::reload(&state);
+
+        let view = state.snapshot();
+        assert_eq!(view.generation, 2);
+        assert_eq!(view.property_registry.get("app.a.name"), Some("a-value"));
+        assert_eq!(view.property_registry.get("app.b.name"), None);
+    }
+
+    /// Item 1: `[engines.contracts.spring]` `property_files` / `auto_redact_secrets` /
+    /// `resolve_placeholders` must produce observably different behaviour from the (implicit)
+    /// defaults exercised by the other tests in this module.
+    #[test]
+    fn spring_config_keys_change_scan_behaviour() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("application.properties"),
+            "app.secret.token=raw_token_value\napp.greeting=${app.name:World}\n",
+        )
+        .expect("write application.properties");
+        std::fs::write(root.join("other.properties"), "other.key=other-value\n")
+            .expect("write other.properties");
+
+        let cfg = Config::load_from_str(
+            r#"
+[workspace]
+name = "t"
+version = "0"
+roots = ["."]
+
+[engines.contracts.spring]
+property_files = ["application*.properties"]
+auto_redact_secrets = false
+resolve_placeholders = true
+"#,
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+            )
+        };
+        state.install_snapshot(snap);
+        let view = state.snapshot();
+
+        // property_files scoped to application*.properties: other.properties is not ingested.
+        assert_eq!(view.property_registry.get("other.key"), None);
+        // auto_redact_secrets = false: a key that would normally be masked stays raw.
+        assert_eq!(
+            view.property_registry.get("app.secret.token"),
+            Some("raw_token_value")
+        );
+        // resolve_placeholders = true: the ${app.name:World} default is resolved in place.
+        assert_eq!(view.property_registry.get("app.greeting"), Some("World"));
     }
 }

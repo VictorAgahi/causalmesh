@@ -23,7 +23,7 @@ pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
-pub use properties::PropertyRegistry;
+pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
 pub use state::{AppState, MeshSnapshot};

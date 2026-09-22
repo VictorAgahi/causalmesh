@@ -65,8 +65,12 @@ impl McpTool for SmartSearchTool {
     /// contain a hit. The full crawl + parse of the whole scope that used to run
     /// on *every* call is now the opt-in `fuzzy` fallback.
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
-        let validated_scope = ValidatedScope::resolve(args.scope.as_str(), &state.allowed_roots)
-            .map_err(|e| (e.jsonrpc_code(), e.to_string()))?;
+        let validated_scope = ValidatedScope::resolve_with_aliases(
+            args.scope.as_str(),
+            &state.allowed_roots,
+            &state.config.workspace.mount_aliases,
+        )
+        .map_err(|e| (e.jsonrpc_code(), e.to_string()))?;
 
         // Note: smart_search is a read-only discovery tool. Read access to guarded contract
         // scopes (such as proto-registry) is permitted so agents can inspect schemas and signatures.
@@ -188,5 +192,72 @@ impl SmartSearchTool {
             i -= 1;
         }
         i
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_core::{AuditLogger, BackgroundRescanEngine, Config};
+    use std::sync::Arc;
+
+    fn make_state(root: &Path, extra_toml: &str) -> Arc<AppState> {
+        let cfg_str = format!(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\"{}\"]\n{extra_toml}",
+            root.to_string_lossy().replace('\\', "\\\\")
+        );
+        let config = Config::load_from_str(&cfg_str).expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let allowed_roots = vec![root.to_path_buf()];
+        Arc::new(AppState::new(config, allowed_roots, audit, rescan))
+    }
+
+    fn args(scope: &str) -> SmartSearchArgs {
+        SmartSearchArgs {
+            query: "AuthController".into(),
+            scope: scope.into(),
+            include_body: false,
+            fuzzy: Some(true),
+            _meta: None,
+        }
+    }
+
+    /// `[workspace.mount_aliases]` must actually translate a container-style path
+    /// (e.g. a Docker bind mount) to the real filesystem root before the sandbox
+    /// jail check runs — otherwise every aliased scope is rejected outright.
+    #[test]
+    fn mount_alias_translates_container_path_to_real_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(root.join("a.txt"), "hello AuthController world").expect("write");
+
+        let alias_toml = format!(
+            "\n[workspace.mount_aliases]\n\"/workspace\" = \"{}\"\n",
+            root.to_string_lossy().replace('\\', "\\\\")
+        );
+        let state = make_state(&root, &alias_toml);
+
+        let result = SmartSearchTool::run(&args("/workspace"), &state);
+        assert!(
+            result.is_ok(),
+            "expected /workspace alias to resolve to {}: {:?}",
+            root.display(),
+            result.err()
+        );
+    }
+
+    /// Without a matching alias, the same container-style path must still be
+    /// rejected as a sandbox escape attempt (no accidental global allow).
+    #[test]
+    fn without_alias_container_path_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(root.join("a.txt"), "hello AuthController world").expect("write");
+
+        let state = make_state(&root, "");
+
+        let result = SmartSearchTool::run(&args("/workspace"), &state);
+        assert!(result.is_err(), "expected unaliased /workspace to be rejected");
     }
 }

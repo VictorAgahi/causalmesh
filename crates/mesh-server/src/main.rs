@@ -94,7 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InitCommand::run(auto, write_ide_config)?;
         }
         Commands::InstallHooks => {
-            HooksCommand::run()?;
+            let (config, _base) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
+            if HooksCommand::is_enabled(&config) {
+                HooksCommand::run()?;
+            } else {
+                eprintln!(
+                    "✖ Skipped: [engines.policy] enforce_git_hooks = false — hook installation disabled by config."
+                );
+            }
         }
         Commands::Graph {
             format,

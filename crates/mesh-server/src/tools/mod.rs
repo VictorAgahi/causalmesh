@@ -198,18 +198,28 @@ impl ToolRegistry {
             };
 
             // Audit is best-effort and off the executor; the SQLite write never
-            // gates the response but always happens on the same blocking thread.
-            let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
-            if let Err(e) = state.audit.record_entry(
-                "active-session",
-                trace_id.as_deref(),
-                T::NAME,
-                &serde_json::to_string(&args).unwrap_or_default(),
-                status,
-                files,
-                redacted,
-            ) {
-                tracing::warn!(target: "mesh::audit", "Audit write failed for {}: {e}", T::NAME);
+            // gates the response but always happens on the same blocking thread —
+            // unless `[engines.policy] cryptographic_audit_trail = false` turns the
+            // whole audit trail off (absent config defaults to on).
+            let audit_enabled = state
+                .config
+                .engines
+                .policy
+                .as_ref()
+                .is_none_or(|p| p.cryptographic_audit_trail);
+            if audit_enabled {
+                let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
+                if let Err(e) = state.audit.record_entry(
+                    "active-session",
+                    trace_id.as_deref(),
+                    T::NAME,
+                    &serde_json::to_string(&args).unwrap_or_default(),
+                    status,
+                    files,
+                    redacted,
+                ) {
+                    tracing::warn!(target: "mesh::audit", "Audit write failed for {}: {e}", T::NAME);
+                }
             }
 
             result.map(|out| out.text)
@@ -224,6 +234,43 @@ mod tests {
     use super::*;
     use mesh_core::{AuditLogger, BackgroundRescanEngine, Config};
     use serde::Deserialize;
+
+    /// `[engines.policy] cryptographic_audit_trail` must actually gate whether a
+    /// tool call is written to the audit log, instead of the log always being
+    /// written unconditionally.
+    #[tokio::test]
+    async fn cryptographic_audit_trail_flag_gates_audit_writes() {
+        async fn run_with(enabled: bool) -> usize {
+            let cfg_str = format!(
+                "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.policy]\ncryptographic_audit_trail = {enabled}\n"
+            );
+            let config = Config::load_from_str(&cfg_str).expect("config");
+            let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+            let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+            let state = Arc::new(AppState::new(config, vec![], audit.clone(), rescan));
+
+            let _ = ToolRegistry::call_tool(
+                SearchDocsTool::NAME,
+                json!({"query": "anything"}),
+                state,
+            )
+            .await;
+
+            let dest = tempfile::NamedTempFile::new().expect("tmp file");
+            audit.export_to_jsonl(dest.path()).expect("export")
+        }
+
+        assert_eq!(
+            run_with(true).await,
+            1,
+            "cryptographic_audit_trail = true must record the call"
+        );
+        assert_eq!(
+            run_with(false).await,
+            0,
+            "cryptographic_audit_trail = false must skip the audit write"
+        );
+    }
 
     /// Test-only stand-in for a future mutating tool. It carries a fixed
     /// `mutates() -> true` so the governance wiring in `invoke` has something

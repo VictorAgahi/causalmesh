@@ -8,8 +8,8 @@
 
 use mesh_core::{
     expand_roots, AppState, BackgroundRescanEngine, Config, ContractGraph, DifferentialVfs,
-    DocIndex, DocSection, FilesystemCrawler, MeshSnapshot, PropertyRegistry, PropertySourceMatcher,
-    RepoId, ValidatedScope,
+    DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, MeshSnapshot, PropertyRegistry,
+    PropertySourceMatcher, RepoId, ValidatedScope,
 };
 use mesh_parsers::{AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer};
 use rayon::prelude::*;
@@ -73,6 +73,29 @@ impl SpringSettings {
             None => true,
         }
     }
+}
+
+/// Per-scan snapshot of which engines are switched on, plus the compiled
+/// `[engines.docs] paths` allowlist. Built once per scan from `Config` so
+/// `enabled = false` and `paths` actually change what gets indexed instead of
+/// being accepted-but-ignored config keys.
+struct EngineToggles {
+    docs_enabled: bool,
+    contracts_enabled: bool,
+    /// `None` means `[engines.docs] paths` is empty: no restriction, every `.md`
+    /// file under the crawled roots is indexed (the historical behaviour).
+    doc_paths: Option<ExcludeMatcher>,
+}
+
+/// Everything `process_file` needs beyond the file's own path/repo_id/root,
+/// resolved once per scan and bundled to keep the function's argument count
+/// down (clippy::too_many_arguments).
+struct ScanConfig<'a> {
+    patterns: &'a [CompiledPattern],
+    doc_template: &'a DocIndex,
+    spring: &'a SpringSettings,
+    extract_cfg: &'a ExtractConfig,
+    toggles: &'a EngineToggles,
 }
 
 pub struct WorkspaceIndexer;
@@ -163,12 +186,23 @@ impl WorkspaceIndexer {
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
+        let toggles = Self::engine_toggles(config);
+        let scan_cfg = ScanConfig {
+            patterns: &patterns,
+            doc_template: &doc_template,
+            spring: &spring,
+            extract_cfg: &extract_cfg,
+            toggles: &toggles,
+        };
 
         let work = || {
             files
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
+                    let root = roots
+                        .get(*repo_id as usize)
+                        .map_or(path.as_path(), |r| r.as_path());
+                    Self::process_file(path, *repo_id, root, &scan_cfg)
                 })
                 .collect::<Vec<_>>()
         };
@@ -211,11 +245,22 @@ impl WorkspaceIndexer {
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
+        let toggles = Self::engine_toggles(config);
+        let scan_cfg = ScanConfig {
+            patterns: &patterns,
+            doc_template: &doc_template,
+            spring: &spring,
+            extract_cfg: &extract_cfg,
+            toggles: &toggles,
+        };
         let mut graph = ContractGraph::new();
         let fragments: Vec<_> = files
             .par_iter()
             .filter_map(|(repo_id, path)| {
-                Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
+                let root = roots
+                    .get(*repo_id as usize)
+                    .map_or(path.as_path(), |r| r.as_path());
+                Self::process_file(path, *repo_id, root, &scan_cfg)
             })
             .collect();
         for frag in fragments {
@@ -232,10 +277,12 @@ impl WorkspaceIndexer {
     /// Installs one consistent snapshot at the end.
     pub fn reload(state: &AppState) {
         let config = &state.config;
-        let files = Self::crawl_all(config, &state.allowed_roots);
+        let roots = &state.allowed_roots;
+        let files = Self::crawl_all(config, roots);
         let patterns = Self::compiled_patterns(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
+        let toggles = Self::engine_toggles(config);
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -264,11 +311,21 @@ impl WorkspaceIndexer {
         }
 
         let doc_template = state.snapshot().doc_index.clone_settings();
+        let scan_cfg = ScanConfig {
+            patterns: &patterns,
+            doc_template: &doc_template,
+            spring: &spring,
+            extract_cfg: &extract_cfg,
+            toggles: &toggles,
+        };
         let fragments: Vec<FileFragment> = state.rescan.install(|| {
             candidates
                 .par_iter()
                 .filter_map(|(repo_id, path)| {
-                    Self::process_file(path, *repo_id, &patterns, &doc_template, &spring, &extract_cfg)
+                    let root = roots
+                        .get(*repo_id as usize)
+                        .map_or(path.as_path(), |r| r.as_path());
+                    Self::process_file(path, *repo_id, root, &scan_cfg)
                 })
                 .collect()
         });
@@ -338,6 +395,7 @@ impl WorkspaceIndexer {
                 docs.stop_words.clone(),
                 docs.exact_phrase_boost,
                 docs.sanitize_prompt_injections,
+                docs.fuzzy_fallback,
             ),
             None => DocIndex::default(),
         }
@@ -365,12 +423,41 @@ impl WorkspaceIndexer {
             .unwrap_or_default()
     }
 
+    /// Reads `[engines.docs] enabled`, `[engines.contracts] enabled` and
+    /// `[engines.docs] paths` from config. Absent sections default to enabled
+    /// (matching each config struct's own `#[serde(default = "default_true")]`),
+    /// and an empty `paths` list means "no restriction".
+    fn engine_toggles(config: &Config) -> EngineToggles {
+        let docs_enabled = config.engines.docs.as_ref().is_none_or(|d| d.enabled);
+        let contracts_enabled = config
+            .engines
+            .contracts
+            .as_ref()
+            .is_none_or(|c| c.enabled);
+        let doc_paths = config
+            .engines
+            .docs
+            .as_ref()
+            .filter(|d| !d.paths.is_empty())
+            .map(|d| ExcludeMatcher::compile(&d.paths));
+
+        EngineToggles {
+            docs_enabled,
+            contracts_enabled,
+            doc_paths,
+        }
+    }
+
     /// Crawls all roots, tagging each file with the `RepoId` of its root.
     fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
         let mut out = Vec::new();
         for (idx, root) in roots.iter().enumerate() {
             let repo_id = idx as RepoId;
-            match ValidatedScope::resolve(&root.to_string_lossy(), roots) {
+            match ValidatedScope::resolve_with_aliases(
+                &root.to_string_lossy(),
+                roots,
+                &config.workspace.mount_aliases,
+            ) {
                 Ok(scope) => {
                     let files = FilesystemCrawler::crawl_scope(
                         &scope,
@@ -391,11 +478,16 @@ impl WorkspaceIndexer {
     fn process_file(
         path: &Path,
         repo_id: RepoId,
-        patterns: &[CompiledPattern],
-        doc_template: &DocIndex,
-        spring: &SpringSettings,
-        extract_cfg: &ExtractConfig,
+        root: &Path,
+        cfg: &ScanConfig,
     ) -> Option<FileFragment> {
+        let ScanConfig {
+            patterns,
+            doc_template,
+            spring,
+            extract_cfg,
+            toggles,
+        } = *cfg;
         let metadata = std::fs::metadata(path).ok()?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
         // never costs its full read.
@@ -430,7 +522,11 @@ impl WorkspaceIndexer {
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "md" => frag.docs = doc_template.parse_sections(path, content),
+            "md" => {
+                if toggles.docs_enabled && Self::doc_path_allowed(path, root, &toggles.doc_paths) {
+                    frag.docs = doc_template.parse_sections(path, content);
+                }
+            }
             "properties" => {
                 if spring.is_property_source(path) {
                     let mut reg = PropertyRegistry::with_redaction(spring.auto_redact_secrets);
@@ -444,19 +540,37 @@ impl WorkspaceIndexer {
                     let _ = reg.ingest_yaml_str(content);
                     frag.props = Some(reg);
                 }
-                frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+                if toggles.contracts_enabled {
+                    frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+                }
             }
             _ => {
-                frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+                if toggles.contracts_enabled {
+                    frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+                }
             }
         }
-        if !patterns.is_empty() {
+        if toggles.contracts_enabled && !patterns.is_empty() {
             frag.code.merge(PolyglotIndexer::extract_custom_patterns(
                 path, content, repo_id, patterns,
             ));
         }
 
         Some(frag)
+    }
+
+    /// `paths` is empty (default) → no restriction. Otherwise the file's path,
+    /// relative to its own repo root, must match one of the configured globs
+    /// (e.g. `"docs/**"`, `"*.md"`). A file outside `root` (shouldn't happen —
+    /// the crawl is rooted there) is conservatively allowed.
+    fn doc_path_allowed(path: &Path, root: &Path, doc_paths: &Option<ExcludeMatcher>) -> bool {
+        let Some(matcher) = doc_paths else {
+            return true;
+        };
+        match path.strip_prefix(root) {
+            Ok(rel) => matcher.is_excluded(rel),
+            Err(_) => true,
+        }
     }
 
     fn fold(frag: FileFragment, snapshot: &mut MeshSnapshot) {
@@ -631,5 +745,71 @@ resolve_placeholders = true
         );
         // resolve_placeholders = true: the ${app.name:World} default is resolved in place.
         assert_eq!(view.property_registry.get("app.greeting"), Some("World"));
+    }
+
+    /// `[engines.docs] enabled = false` must stop `.md` files from being indexed
+    /// at all, instead of the flag being accepted-but-ignored.
+    #[test]
+    fn docs_engine_disabled_skips_markdown_indexing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(root.join("doc.md"), "# Title\nsome text").expect("write md");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.docs]\nenabled = false\n",
+        )
+        .expect("config");
+        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        assert_eq!(
+            snapshot.doc_index.section_count(),
+            0,
+            "docs engine disabled must index no markdown sections"
+        );
+    }
+
+    /// `[engines.contracts] enabled = false` must stop symbol/contract extraction,
+    /// instead of the flag being accepted-but-ignored.
+    #[test]
+    fn contracts_engine_disabled_skips_extraction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.contracts]\nenabled = false\n",
+        )
+        .expect("config");
+        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        assert_eq!(
+            snapshot.contract_graph.node_count(),
+            0,
+            "contracts engine disabled must extract no contract nodes"
+        );
+    }
+
+    /// `[engines.docs] paths` must scope which markdown files get indexed instead
+    /// of every `.md` file under `roots` being indexed regardless of the setting.
+    #[test]
+    fn docs_paths_scopes_markdown_indexing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir docs");
+        std::fs::write(root.join("docs").join("adr.md"), "# ADR\nsome text").expect("write adr");
+        std::fs::write(root.join("README.md"), "# Readme\nother text").expect("write readme");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.docs]\npaths = [\"docs/**\"]\n",
+        )
+        .expect("config");
+        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        assert_eq!(
+            snapshot.doc_index.section_count(),
+            1,
+            "only docs/** should be indexed when [engines.docs] paths is set"
+        );
     }
 }

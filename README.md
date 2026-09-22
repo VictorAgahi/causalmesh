@@ -12,7 +12,7 @@ that means burnt context, missed callers, and confident answers that are wrong.
 MeshMCP indexes your workspace once, keeps it in memory, and answers four questions your agent
 can't answer alone:
 
-- **Who breaks if I change this?** — reverse dependency graph across languages.
+- **Who breaks if I change this?** — reverse dependency graph.
 - **Where does this RPC actually get implemented?** — `.proto` → generated stubs → handlers.
 - **Who produces and consumes this event?** — Kafka/stream topics across services.
 - **What do our own docs say about this?** — Markdown/ADR/RFC search.
@@ -101,9 +101,9 @@ an agent from flailing.
 | Tool | Answers | Notes |
 | :--- | :--- | :--- |
 | `smart_search` | "Where is `UserAuthRequest` declared?" | Returns signatures with bodies stripped. Searches the in-memory symbol index; pass `fuzzy: true` for a full-text scan of the scope. |
-| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup across repos and languages. |
+| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup. Import edges are currently extracted from **TypeScript/JavaScript only**; for other languages use a custom pattern or `smart_search`. |
 | `analyze_grpc` | "Where is this RPC implemented and called?" | Links `.proto` definitions to handlers and client stubs. |
-| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. |
+| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. Detected natively for Java (`@KafkaListener`) and AsyncAPI channels; for other languages declare a [custom pattern](#layer-5--custom-patterns-teach-it-your-conventions). |
 | `search_docs` | "What did we decide about idempotency?" | Keyword search over your Markdown docs, with alias and stop-word support. |
 | `visualize_mesh` | "Show me the topology." | Mermaid or standalone HTML. |
 
@@ -176,6 +176,9 @@ exact_phrase_boost = 60          # weight of a full-phrase hit in a section titl
 sanitize_prompt_injections = true # neutralise "ignore previous instructions" in indexed docs
 ```
 
+> `paths` and `enabled` are accepted but not yet read: Markdown is indexed because it sits under
+> `roots`. See the [config reference](SETUP.md#config-reference) for which keys are wired.
+
 Aliases are the highest-leverage setting here: without them, an agent asking about "the DLQ"
 finds nothing in a doc that only ever says "dead-letter-queue".
 
@@ -244,8 +247,10 @@ instead. See [docs/governance-rsah.md](docs/governance-rsah.md).
 
 ### Layer 5 — Custom patterns: teach it your conventions
 
-MeshMCP understands gRPC, Spring, OpenAPI and AsyncAPI out of the box. Your in-house event bus,
-outbox table or job queue, it can't guess — describe it with a regex:
+MeshMCP recognises gRPC, Spring, OpenAPI and AsyncAPI shapes by file extension and content —
+the `[engines.contracts.grpc]` / `.spring` / `.openapi` / `.asyncapi` sections are accepted but
+not yet read, so there is nothing to configure there today. Your in-house event bus, outbox
+table or job queue it cannot guess — describe it with a regex:
 
 ```toml
 [[engines.contracts.patterns]]
@@ -358,6 +363,7 @@ All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RP
 | [docs/development.md](docs/development.md) | Building, testing, adding a language. |
 | [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, skills, pre-commit enforcement. |
 | [docs/benchmarks.md](docs/benchmarks.md) | How to measure, and what the numbers mean. |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Known gaps and planned work, with file references. |
 | [RFC-001-CAUSAL-MCP.md](RFC-001-CAUSAL-MCP.md) | The specification this implements. |
 
 ---

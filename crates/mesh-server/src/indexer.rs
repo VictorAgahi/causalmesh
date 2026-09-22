@@ -113,7 +113,7 @@ impl WorkspaceIndexer {
     ) -> MeshSnapshot {
         let files = Self::crawl_all(config, roots);
         let patterns = Self::compiled_patterns(config);
-        let doc_template = DocIndex::default();
+        let doc_template = Self::doc_index_for(config);
 
         let work = || {
             files
@@ -128,7 +128,10 @@ impl WorkspaceIndexer {
             None => work(),
         };
 
-        let mut snapshot = MeshSnapshot::default();
+        let mut snapshot = MeshSnapshot {
+            doc_index: Self::doc_index_for(config),
+            ..MeshSnapshot::default()
+        };
         let mut vfs = vfs;
         for frag in fragments {
             if let Some(vfs) = vfs.as_deref_mut() {
@@ -153,7 +156,7 @@ impl WorkspaceIndexer {
     pub fn build_graph(config: &Config, roots: &[PathBuf]) -> (ContractGraph, usize) {
         let files = Self::crawl_all(config, roots);
         let patterns = Self::compiled_patterns(config);
-        let doc_template = DocIndex::default();
+        let doc_template = Self::doc_index_for(config);
         let mut graph = ContractGraph::new();
         let fragments: Vec<_> = files
             .par_iter()
@@ -263,6 +266,21 @@ impl WorkspaceIndexer {
     }
 
     // ── Internals ───────────────────────────────────────────────────────────
+
+    /// Builds the doc index from `[engines.docs]` so aliases, stop words and the
+    /// phrase boost configured by the user actually apply. A default-constructed
+    /// `DocIndex` silently ignores all of them.
+    fn doc_index_for(config: &Config) -> DocIndex {
+        match config.engines.docs.as_ref() {
+            Some(docs) => DocIndex::new(
+                docs.aliases.clone(),
+                docs.stop_words.clone(),
+                docs.exact_phrase_boost,
+                docs.sanitize_prompt_injections,
+            ),
+            None => DocIndex::default(),
+        }
+    }
 
     fn compiled_patterns(config: &Config) -> Vec<CompiledPattern> {
         config

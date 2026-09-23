@@ -9,8 +9,8 @@ description: >-
 # MeshMCP Parser Engineering Skill
 
 Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today:
-Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, plus Protobuf
-and YAML handled without tree-sitter.
+Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, Ruby, PHP,
+Swift, Scala, plus Protobuf and YAML handled without tree-sitter.
 
 ---
 
@@ -26,7 +26,7 @@ and YAML handled without tree-sitter.
   - `create_bounded_parser()` — the constructor behind it; `verify_all_parsers()`
   - `execute_bounded_query()`, `BoundedMatch<'tree>`, `ParserError`
 - **Language kinds & decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](../../../crates/mesh-parsers/src/decapitate.rs)
-  - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Protobuf, Yaml, Unknown }`
+  - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Yaml, Unknown }`
   - `LanguageKind::TREE_SITTER_COUNT`, `as_str()`, `language()`, `from_path()`, `tree_sitter_slot()`
   - `AstDecapitator::decapitate_auto()`, `::decapitate()`, `BOUNDED_ERROR_STUB`
 - **Extraction dispatch**: [`crates/mesh-parsers/src/languages/mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs)
@@ -40,7 +40,11 @@ and YAML handled without tree-sitter.
   [`rust_lang.rs`](../../../crates/mesh-parsers/src/languages/rust_lang.rs),
   [`cpp.rs`](../../../crates/mesh-parsers/src/languages/cpp.rs),
   [`kotlin.rs`](../../../crates/mesh-parsers/src/languages/kotlin.rs),
-  [`csharp.rs`](../../../crates/mesh-parsers/src/languages/csharp.rs)
+  [`csharp.rs`](../../../crates/mesh-parsers/src/languages/csharp.rs),
+  [`ruby.rs`](../../../crates/mesh-parsers/src/languages/ruby.rs),
+  [`php.rs`](../../../crates/mesh-parsers/src/languages/php.rs),
+  [`swift.rs`](../../../crates/mesh-parsers/src/languages/swift.rs),
+  [`scala.rs`](../../../crates/mesh-parsers/src/languages/scala.rs)
 
 ---
 

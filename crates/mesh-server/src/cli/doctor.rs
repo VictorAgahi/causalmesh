@@ -138,7 +138,7 @@ impl DoctorCommand {
         // 6. Tree-sitter parsers initialization
         if AstGuard::verify_all_parsers() {
             eprintln!(
-                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#)"
+                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala)"
             );
         } else {
             eprintln!("✖ Tree-sitter parsers: Initialization error");

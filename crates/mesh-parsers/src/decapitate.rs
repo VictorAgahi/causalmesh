@@ -10,6 +10,10 @@ pub enum LanguageKind {
     Cpp,
     Kotlin,
     CSharp,
+    Ruby,
+    Php,
+    Swift,
+    Scala,
     Protobuf,
     Yaml,
     Unknown,
@@ -17,8 +21,8 @@ pub enum LanguageKind {
 
 impl LanguageKind {
     /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
-    /// Cpp, Kotlin, CSharp).
-    pub const TREE_SITTER_COUNT: usize = 8;
+    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala).
+    pub const TREE_SITTER_COUNT: usize = 12;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -32,6 +36,10 @@ impl LanguageKind {
             Self::Cpp => "cpp",
             Self::Kotlin => "kotlin",
             Self::CSharp => "csharp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Swift => "swift",
+            Self::Scala => "scala",
             Self::Protobuf => "protobuf",
             Self::Yaml => "yaml",
             Self::Unknown => "unknown",
@@ -50,6 +58,10 @@ impl LanguageKind {
             Self::Cpp => Some(5),
             Self::Kotlin => Some(6),
             Self::CSharp => Some(7),
+            Self::Ruby => Some(8),
+            Self::Php => Some(9),
+            Self::Swift => Some(10),
+            Self::Scala => Some(11),
             Self::Protobuf | Self::Yaml | Self::Unknown => None,
         }
     }
@@ -65,6 +77,10 @@ impl LanguageKind {
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
             Self::CSharp => Some(tree_sitter_c_sharp::language()),
+            Self::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+            Self::Php => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+            Self::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+            Self::Scala => Some(tree_sitter_scala::LANGUAGE.into()),
             Self::Protobuf | Self::Yaml | Self::Unknown => None,
         }
     }
@@ -89,6 +105,14 @@ impl LanguageKind {
             Self::Kotlin
         } else if path_str.ends_with(".cs") {
             Self::CSharp
+        } else if path_str.ends_with(".rb") || path_str.ends_with(".rake") {
+            Self::Ruby
+        } else if path_str.ends_with(".php") || path_str.ends_with(".phtml") {
+            Self::Php
+        } else if path_str.ends_with(".swift") {
+            Self::Swift
+        } else if path_str.ends_with(".scala") || path_str.ends_with(".sc") {
+            Self::Scala
         } else if path_str.ends_with(".cpp")
             || path_str.ends_with(".cc")
             || path_str.ends_with(".cxx")
@@ -332,6 +356,47 @@ impl AstDecapitator {
                         std::borrow::Cow::Borrowed("{ /* stripped */ }")
                     } else {
                         std::borrow::Cow::Borrowed("= /* stripped */")
+                    };
+                    replacements.push((body.start_byte(), body.end_byte(), replacement));
+                    return;
+                }
+            }
+            LanguageKind::Ruby if kind == "method" || kind == "singleton_method" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("\n  # stripped\n"),
+                    ));
+                    return;
+                }
+            }
+            LanguageKind::Php if kind == "method_declaration" || kind == "function_definition" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
+                    return;
+                }
+            }
+            LanguageKind::Swift if kind == "function_declaration" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
+                    return;
+                }
+            }
+            LanguageKind::Scala if kind == "function_definition" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let replacement = if body.kind() == "block" {
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }")
+                    } else {
+                        std::borrow::Cow::Borrowed("/* stripped */")
                     };
                     replacements.push((body.start_byte(), body.end_byte(), replacement));
                     return;
@@ -614,6 +679,102 @@ public class AuthController : ControllerBase
         assert!(!decapitated.contains("authService.Generate"));
         assert_eq!(LanguageKind::from_path("Auth.cs"), LanguageKind::CSharp);
         assert_eq!(LanguageKind::CSharp.as_str(), "csharp");
+    }
+
+    #[test]
+    fn test_ruby_decapitation() {
+        let code = r#"
+class AuthService
+  # Contract docstring to keep
+  def authenticate(token)
+    return false if token.nil?
+    validate(token)
+  end
+end
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_ruby::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Ruby, &mut parser, false);
+        assert!(decapitated.contains("# Contract docstring to keep"));
+        assert!(decapitated.contains("def authenticate(token)"));
+        assert!(decapitated.contains("# stripped"));
+        assert!(!decapitated.contains("validate(token)"));
+        assert_eq!(LanguageKind::from_path("app/models/auth.rb"), LanguageKind::Ruby);
+        assert_eq!(LanguageKind::Ruby.as_str(), "ruby");
+    }
+
+    #[test]
+    fn test_php_decapitation() {
+        let code = r#"<?php
+class AuthController {
+    #[Route('/login')]
+    public function login($req) {
+        $token = $this->authService->generate($req);
+        return $token;
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_php::LANGUAGE_PHP.into();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Php, &mut parser, false);
+        assert!(decapitated.contains("#[Route('/login')]"));
+        assert!(decapitated.contains("public function login($req) { /* stripped */ }"));
+        assert!(!decapitated.contains("authService->generate"));
+        assert_eq!(LanguageKind::from_path("src/Controller/Auth.php"), LanguageKind::Php);
+        assert_eq!(LanguageKind::Php.as_str(), "php");
+    }
+
+    #[test]
+    fn test_swift_decapitation() {
+        let code = r#"
+class AuthService {
+    func authenticate(token: String) -> Bool {
+        if token.isEmpty {
+            return false
+        }
+        return validate(token)
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_swift::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Swift, &mut parser, false);
+        assert!(decapitated.contains("func authenticate(token: String) -> Bool { /* stripped */ }"));
+        assert!(!decapitated.contains("validate(token)"));
+        assert_eq!(LanguageKind::from_path("Sources/App/Auth.swift"), LanguageKind::Swift);
+        assert_eq!(LanguageKind::Swift.as_str(), "swift");
+    }
+
+    #[test]
+    fn test_scala_decapitation() {
+        let code = r#"
+class AuthService {
+  def authenticate(token: String): Boolean = {
+    val valid = token.nonEmpty
+    valid
+  }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_scala::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Scala, &mut parser, false);
+        assert!(decapitated.contains("def authenticate(token: String): Boolean = { /* stripped */ }"));
+        assert!(!decapitated.contains("token.nonEmpty"));
+
+        let concise = "object Foo {\n  def bar(x: Int): Int = x + 1\n}\n";
+        let mut parser2 = Parser::new();
+        parser2.set_language(&lang).unwrap();
+        let decapitated_concise =
+            AstDecapitator::decapitate(concise, LanguageKind::Scala, &mut parser2, false);
+        assert!(decapitated_concise.contains("def bar(x: Int): Int = /* stripped */"));
+        assert!(!decapitated_concise.contains("x + 1"));
+
+        assert_eq!(LanguageKind::from_path("src/main/scala/Auth.scala"), LanguageKind::Scala);
+        assert_eq!(LanguageKind::Scala.as_str(), "scala");
     }
 
     #[test]

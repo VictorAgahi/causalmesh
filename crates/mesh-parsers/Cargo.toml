@@ -28,6 +28,10 @@ tree-sitter-go.workspace = true
 tree-sitter-cpp.workspace = true
 tree-sitter-kotlin-ng.workspace = true
 tree-sitter-c-sharp.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-php.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-scala.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

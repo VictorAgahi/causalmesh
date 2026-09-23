@@ -3,9 +3,13 @@ pub mod csharp;
 pub mod go;
 pub mod java;
 pub mod kotlin;
+pub mod php;
 pub mod proto;
 pub mod python;
+pub mod ruby;
 pub mod rust_lang;
+pub mod scala;
+pub mod swift;
 pub mod ts_config;
 pub mod typescript;
 
@@ -384,6 +388,34 @@ impl PolyglotIndexer {
             LanguageKind::CSharp => {
                 if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
                     csharp::CSharpExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    out.nodes = nodes;
+                }
+            }
+            LanguageKind::Ruby => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    ruby::RubyExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    out.nodes = nodes;
+                }
+            }
+            LanguageKind::Php => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    php::PhpExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    out.nodes = nodes;
+                }
+            }
+            LanguageKind::Swift => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    swift::SwiftExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    out.nodes = nodes;
+                }
+            }
+            LanguageKind::Scala => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    scala::ScalaExtractor::extract(file_path, content, repo_id, parser)
                 }) {
                     out.nodes = nodes;
                 }

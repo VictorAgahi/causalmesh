@@ -78,22 +78,24 @@ cargo fmt --all -- --check
 
 MeshMCP's [`crates/mesh-parsers`](../crates/mesh-parsers) crate uses Tree-sitter grammars to
 decapitate function bodies and extract signatures. Supported languages today: **Java, Go,
-Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#**, plus Protobuf and YAML handled
-without tree-sitter. The full walkthrough — with `cpp.rs` as the worked example — lives in
+Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala**, plus
+Protobuf and YAML handled without tree-sitter. The full walkthrough — with `cpp.rs` as the
+worked example — lives in
 [`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).
-In short, adding a language (e.g. Ruby or Swift) touches these places:
+In short, adding a language touches these places:
 
 ### Step 1: Add the grammar crate
-Root `Cargo.toml` (`[workspace.dependencies]`) and `crates/mesh-parsers/Cargo.toml`:
+Root `Cargo.toml` (`[workspace.dependencies]`) and `crates/mesh-parsers/Cargo.toml` — check the
+grammar's ABI version before picking one (see the "watch out" below):
 ```toml
-tree-sitter-ruby = "0.23"
+tree-sitter-elixir = "0.3"
 ```
 
 ### Step 2: Extend `LanguageKind` in `crates/mesh-parsers/src/decapitate.rs`
 ```rust
 pub enum LanguageKind {
-    Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp,
-    Ruby, // <-- new variant
+    Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala,
+    Elixir, // <-- new variant
     Protobuf, Yaml, Unknown,
 }
 ```
@@ -102,8 +104,8 @@ Bump `TREE_SITTER_COUNT` and add the new variant's slot to `tree_sitter_slot()`,
 thread-local parser array in `guard.rs::with_parser` must be resized to match `TREE_SITTER_COUNT`.
 
 ### Step 3: Write the extractor
-`crates/mesh-parsers/src/languages/ruby.rs`, following the contract in the skill doc (`extract`
-returning `Vec<ContractNode>`), and register `pub mod ruby;` plus the `PolyglotIndexer::extract`
+`crates/mesh-parsers/src/languages/elixir.rs`, following the contract in the skill doc (`extract`
+returning `Vec<ContractNode>`), and register `pub mod elixir;` plus the `PolyglotIndexer::extract`
 dispatch arm in `languages/mod.rs`.
 
 ### Step 4: Add Decapitation Grammar Rules
@@ -111,7 +113,7 @@ In `crates/mesh-parsers/src/decapitate.rs`, update `AstDecapitator::collect_body
 ```rust
 match lang_kind {
     // ... existing match arms ...
-    LanguageKind::Ruby if kind == "method" => {
+    LanguageKind::Elixir if kind == "do_block" => {
         if let Some(body) = node.child_by_field_name("body") {
             replacements.push((body.start_byte(), body.end_byte(), Cow::Borrowed("# stripped")));
             return;
@@ -120,6 +122,12 @@ match lang_kind {
     _ => {}
 }
 ```
+
+**Watch out**: this workspace pins `tree-sitter = "0.24"`, which caps at grammar ABI 14. The
+latest published version of a grammar crate is often ABI 15+ and fails to compile against it
+with a `Language` type mismatch — this cost real time on both the Kotlin and C# additions.
+Check the grammar's ABI (`LANGUAGE_VERSION` in its generated `parser.c`) before committing to a
+Cargo.toml version, or just try a candidate version in a scratch build first.
 
 ### Step 5: Wire the file watcher and `doctor`
 Add the extension(s) to `FileWatcherService::is_relevant_path`

@@ -247,6 +247,10 @@ impl AstGuard {
             && Self::create_bounded_parser(&tree_sitter_cpp::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_kotlin_ng::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_c_sharp::language()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_ruby::LANGUAGE.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_php::LANGUAGE_PHP.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_swift::LANGUAGE.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_scala::LANGUAGE.into()).is_ok()
     }
 
     /// Initializes a bounded tree-sitter parser with a strict 15ms C-FFI timeout
@@ -268,7 +272,11 @@ impl AstGuard {
     pub fn with_parser<R>(lang_kind: LanguageKind, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
         thread_local! {
             static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
-                const { RefCell::new([None, None, None, None, None, None, None, None]) };
+                const {
+                    RefCell::new([
+                        None, None, None, None, None, None, None, None, None, None, None, None,
+                    ])
+                };
         }
 
         let slot = lang_kind.tree_sitter_slot()?;

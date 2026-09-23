@@ -3,6 +3,8 @@ pub mod analyze_impact;
 pub mod find_dependents;
 pub mod search_docs;
 pub mod smart_search;
+#[cfg(feature = "test-util")]
+pub mod test_slow_op;
 pub mod visualize_mesh;
 
 use crate::protocol::RequestMeta;
@@ -17,6 +19,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use smart_search::SmartSearchTool;
 use std::sync::{Arc, LazyLock};
+#[cfg(feature = "test-util")]
+use test_slow_op::TestSlowOpTool;
 use visualize_mesh::VisualizeMeshTool;
 
 /// JSON-RPC error tuple used throughout tool dispatch.
@@ -115,6 +119,8 @@ impl ToolRegistry {
             AnalyzeImpactTool::NAME => Self::invoke::<AnalyzeImpactTool>(arguments, state).await?,
             SearchDocsTool::NAME => Self::invoke::<SearchDocsTool>(arguments, state).await?,
             VisualizeMeshTool::NAME => Self::invoke::<VisualizeMeshTool>(arguments, state).await?,
+            #[cfg(feature = "test-util")]
+            TestSlowOpTool::NAME => Self::invoke::<TestSlowOpTool>(arguments, state).await?,
             unknown => return Err((-32601, format!("Unknown tool: {unknown}"))),
         };
 

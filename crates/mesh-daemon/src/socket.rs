@@ -104,4 +104,55 @@ mod tests {
         // Should not panic on missing file
         cleanup_stale_socket(std::path::Path::new("/tmp/nonexistent-mesh-test.sock"));
     }
+
+    /// Simulates an unclean shutdown: a previous meshd bound this socket and
+    /// was killed (e.g. SIGKILL, OOM) without unlinking the file. Dropping a
+    /// `UnixListener` does NOT remove its backing socket path, so the file
+    /// is left behind with nothing listening on it — exactly the state a
+    /// crashed daemon leaves. `cleanup_stale_socket` must detect that no one
+    /// answers on it and remove it so the next daemon can bind cleanly.
+    #[test]
+    fn test_cleanup_stale_socket_removes_orphaned_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale-meshd.sock");
+
+        {
+            let listener =
+                std::os::unix::net::UnixListener::bind(&path).expect("bind stale listener");
+            drop(listener); // orphaned: file remains, nothing is accepting.
+        }
+        assert!(path.exists(), "socket file should remain after drop");
+
+        cleanup_stale_socket(&path);
+
+        assert!(
+            !path.exists(),
+            "stale socket file must be removed when nothing is listening"
+        );
+
+        // The next daemon must now be able to bind the same path cleanly.
+        let listener = std::os::unix::net::UnixListener::bind(&path);
+        assert!(
+            listener.is_ok(),
+            "bind after stale-socket cleanup should succeed"
+        );
+    }
+
+    /// A live, currently-listening socket must NOT be treated as stale.
+    #[test]
+    fn test_cleanup_stale_socket_preserves_live_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("live-meshd.sock");
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind live listener");
+
+        cleanup_stale_socket(&path);
+
+        assert!(
+            path.exists(),
+            "a live socket's file must not be removed by cleanup_stale_socket"
+        );
+
+        drop(listener);
+    }
 }

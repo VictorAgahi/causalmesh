@@ -139,6 +139,15 @@ exclude_patterns = [
 A pattern without a slash matches a path *component*, so `build` excludes any `build/`
 directory but leaves `build.rs` and `build_tools/` alone.
 
+> **The crawler also always respects `.gitignore`**, independently of `exclude_patterns`. If a
+> file is gitignored — a generated OpenAPI spec emitted by a build step and never committed, for
+> example — it is never scanned, so `[engines.contracts.grpc].proto_dirs`,
+> `[engines.contracts.openapi].spec_files`, and `[engines.docs].paths` can never match it either,
+> no matter how the pattern is written. `mesh-mcp doctor`'s "matched 0 files" warning for one of
+> these fields is often this, not a syntax mistake: check whether the file you expect to be
+> indexed is gitignored before re-writing the pattern. There is currently no config flag to
+> disable this behavior.
+
 ### Running in containers
 
 > **Not yet wired.** `[workspace.mount_aliases]` parses and the translation logic exists
@@ -495,7 +504,15 @@ supported, or your conventions need [custom patterns](#custom-contract-patterns)
 **A specific file is never indexed**
 It probably tripped a guard: over 384 KB (1.5 MB for `.proto` and generated schema stubs), a
 line longer than 1 KB (minified), a null byte, or nesting deeper than 64. Run with
-`RUST_LOG=debug` to see the rejection.
+`RUST_LOG=debug` to see the rejection. If it's a generated file (a build-emitted OpenAPI spec,
+a compiled proto stub), also check whether it's gitignored — the crawler always respects
+`.gitignore`, with no config flag to disable it, so a file that never gets committed never gets
+scanned either.
+
+**`doctor` warns a `proto_dirs`/`spec_files`/`docs.paths` pattern "matched 0 files"**
+Either the pattern is wrong, or the target file is gitignored (see above) — `doctor` can't tell
+these apart, it only knows nothing matched. Check `git check-ignore -v <path>` on the file you
+expected to be indexed before assuming the pattern syntax is at fault.
 
 **`smart_search` returns nothing for a name you can see in the code**
 By design: it searches *declared symbols*, not raw text. For a full-text scan of the scope, pass

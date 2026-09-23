@@ -30,7 +30,8 @@ pub use security::{SecurityError, ValidatedScope};
 pub use state::{AppState, MeshSnapshot};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
-    ContractNode, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState, SymbolName,
+    ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId,
+    RepoState, SymbolName,
 };
 pub use vfs::DifferentialVfs;
 pub use watcher::{FileWatcherService, ReloadFn};

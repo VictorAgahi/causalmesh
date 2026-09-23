@@ -1,6 +1,9 @@
 use crate::types::CompactStr;
-use crate::types::{ContractEdge, ContractNode, EdgeKind, FilePath, NodeId, NodeKind, RepoId};
+use crate::types::{
+    ContractEdge, ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, RepoId,
+};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -11,8 +14,12 @@ use std::path::Path;
 pub struct GrpcTrace<'g> {
     pub target: CompactStr,
     pub proto_definition: Option<&'g ContractNode>,
-    pub client_stubs: Vec<&'g ContractNode>,
-    pub server_handlers: Vec<&'g ContractNode>,
+    /// Each stub paired with the confidence of the match that linked it to
+    /// the proto definition (bare-name scan vs. an exact `CallsRpc` edge).
+    pub client_stubs: Vec<(&'g ContractNode, EdgeConfidence)>,
+    /// Each handler paired with the confidence of the match that linked it
+    /// to the proto definition (bare-name scan vs. an exact `Implements` edge).
+    pub server_handlers: Vec<(&'g ContractNode, EdgeConfidence)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +159,10 @@ impl ContractGraph {
             to: 0, // dynamic link resolved at query time
             kind: EdgeKind::Imports,
             metadata: Some(CompactStr::new(imported_target)),
+            // Placeholder — `reconcile_edges` overwrites this with the real
+            // confidence once `resolve_import_target` runs; `Heuristic` here
+            // is just a conservative default in case reconciliation never runs.
+            confidence: EdgeConfidence::Heuristic,
         });
     }
 
@@ -246,20 +257,78 @@ impl ContractGraph {
         }
     }
 
+    /// Splits a fully-qualified identifier into `(package, bare_name)`.
+    ///
+    /// Covers Java-style dotted FQCNs (`com.acme.billing.Invoice`) and
+    /// Rust-style `::`-separated paths (`crate::billing::Invoice`). `::` is
+    /// checked first since it never appears in a dotted path and a Rust path
+    /// segment can itself legitimately contain a `.` (rare, but this keeps
+    /// the two syntaxes from being conflated).
+    ///
+    /// The Rust-style package is normalized from `::` to `.` before being
+    /// returned, since `ContractNode::package` is always stored dotted
+    /// (`detect_service_package`, proto `package` statements, Java FQCNs).
+    /// Without this normalization a `crate::billing::Invoice` import could
+    /// never match a node whose package is recorded as `crate.billing`.
+    fn split_fully_qualified(target_str: &str) -> Option<(Cow<'_, str>, &str)> {
+        if let Some(idx) = target_str.rfind("::") {
+            let (pkg, name) = (&target_str[..idx], &target_str[idx + 2..]);
+            if !pkg.is_empty() && !name.is_empty() {
+                return Some((Cow::Owned(pkg.replace("::", ".")), name));
+            }
+        }
+        if let Some((pkg, name)) = target_str.rsplit_once('.') {
+            if !pkg.is_empty() && !name.is_empty() {
+                return Some((Cow::Borrowed(pkg), name));
+            }
+        }
+        None
+    }
+
     /// Resolves the target of a placeholder `Imports` edge using the O(1) indices.
-    fn resolve_import_target(&self, importer: NodeId, target_str: &str) -> Option<NodeId> {
-        // 1. Exact symbol name anywhere in the mesh.
-        if let Some(ids) = self.name_to_nodes.get(target_str) {
-            if let Some(&id) = ids.first() {
-                return Some(id);
+    ///
+    /// Returns the resolved node together with the confidence of the
+    /// strategy that found it (see `EdgeConfidence` / ROADMAP Item 6).
+    fn resolve_import_target(
+        &self,
+        importer: NodeId,
+        target_str: &str,
+    ) -> Option<(NodeId, EdgeConfidence)> {
+        let is_relative_or_absolute_path =
+            target_str.starts_with('.') || target_str.starts_with('/');
+
+        // 1. Fully-qualified name (Java `a.b.C`, Rust `a::b::C`, gRPC
+        // `package/Name`): an exact package+name pair is unambiguous, so
+        // this is tried first and is the only strategy tagged `Exact`.
+        if !is_relative_or_absolute_path {
+            if let Some((pkg, name)) = Self::split_fully_qualified(target_str) {
+                if let Some(ids) = self.name_to_nodes.get(name) {
+                    if let Some(&id) = ids.iter().find(|id| {
+                        self.nodes
+                            .get(id)
+                            .is_some_and(|n| n.package.as_str() == pkg.as_ref())
+                    }) {
+                        return Some((id, EdgeConfidence::Exact));
+                    }
+                }
+                let fqcn_key = format!("{pkg}/{name}");
+                if let Some(&id) = self.fqcn_to_node.get(fqcn_key.as_str()) {
+                    return Some((id, EdgeConfidence::Exact));
+                }
             }
         }
 
-        let is_relative_or_absolute_path =
-            target_str.starts_with('.') || target_str.starts_with('/');
+        // 2. Exact symbol name anywhere in the mesh — a bare name, so two
+        // unrelated types sharing it would collide; heuristic.
+        if let Some(ids) = self.name_to_nodes.get(target_str) {
+            if let Some(&id) = ids.first() {
+                return Some((id, EdgeConfidence::Heuristic));
+            }
+        }
+
         let is_qualified = target_str.contains('/') || target_str.contains('.');
 
-        // 2. Relative import: match on file stem, same repo as the importer.
+        // 3. Relative import: match on file stem, same repo as the importer.
         if is_relative_or_absolute_path {
             let target_stem = Path::new(target_str)
                 .file_stem()
@@ -271,28 +340,17 @@ impl ContractGraph {
                     .iter()
                     .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
                 {
-                    return Some(id);
+                    return Some((id, EdgeConfidence::Heuristic));
                 }
             }
         }
 
-        // 3. Qualified package identifier (e.g. '@scope/pkg', 'com.acme.billing').
+        // 4. Qualified package identifier (e.g. '@scope/pkg', 'com.acme.billing')
+        // matched against a whole package, not a specific symbol; heuristic.
         if is_qualified && !is_relative_or_absolute_path {
             if let Some(ids) = self.package_to_nodes.get(target_str) {
                 if let Some(&id) = ids.first() {
-                    return Some(id);
-                }
-            }
-        }
-
-        // 4. `package.Name` — split at the last dot and check the name within that package.
-        if let Some((pkg, name)) = target_str.rsplit_once('.') {
-            if let Some(ids) = self.name_to_nodes.get(name) {
-                if let Some(&id) = ids
-                    .iter()
-                    .find(|id| self.nodes.get(id).is_some_and(|n| n.package == pkg))
-                {
-                    return Some(id);
+                    return Some((id, EdgeConfidence::Heuristic));
                 }
             }
         }
@@ -319,8 +377,9 @@ impl ContractGraph {
                     continue;
                 };
                 // External targets (e.g. '@nestjs/common') drop the placeholder edge.
-                if let Some(to_id) = self.resolve_import_target(edge.from, target) {
+                if let Some((to_id, confidence)) = self.resolve_import_target(edge.from, target) {
                     edge.to = to_id;
+                    edge.confidence = confidence;
                     resolved_edges.push(edge);
                 }
             } else {
@@ -400,6 +459,9 @@ impl ContractGraph {
                         to: topic_id,
                         kind: EdgeKind::Produces,
                         metadata: Some(topic_key.clone()),
+                        // Structural: derived directly from producer registration,
+                        // not a name-matching heuristic.
+                        confidence: EdgeConfidence::Exact,
                     });
                 }
             }
@@ -411,6 +473,8 @@ impl ContractGraph {
                         to: cons_id,
                         kind: EdgeKind::Consumes,
                         metadata: Some(topic_key.clone()),
+                        // Structural: derived directly from consumer registration.
+                        confidence: EdgeConfidence::Exact,
                     });
                 }
             }
@@ -481,18 +545,32 @@ impl ContractGraph {
             ];
 
             for h in &handlers {
-                let matched = h.name == method_fqcn.as_str()
-                    || h.name.eq_ignore_ascii_case(bare)
+                // Only an exact match against the full FQCN is trustworthy;
+                // case-folding, PascalCase normalization, and substring
+                // signature scraping are all bare-name heuristics that can
+                // collide across unrelated same-named symbols.
+                let confidence = if h.name == method_fqcn.as_str() {
+                    Some(EdgeConfidence::Exact)
+                } else if h.name.eq_ignore_ascii_case(bare)
                     || h.pascal_name == bare
                     || h.signature
-                        .is_some_and(|s| needles.iter().any(|n| s.contains(n.as_str())));
+                        .is_some_and(|s| needles.iter().any(|n| s.contains(n.as_str())))
+                {
+                    Some(EdgeConfidence::Heuristic)
+                } else {
+                    None
+                };
 
-                if matched && edge_set.insert((h.id, *proto_id, EdgeKind::Implements)) {
+                let Some(confidence) = confidence else {
+                    continue;
+                };
+                if edge_set.insert((h.id, *proto_id, EdgeKind::Implements)) {
                     new_edges.push(ContractEdge {
                         from: h.id,
                         to: *proto_id,
                         kind: EdgeKind::Implements,
                         metadata: Some(method_fqcn.clone()),
+                        confidence,
                     });
                 }
             }
@@ -516,18 +594,26 @@ impl ContractGraph {
         for (caller_id, target_rpc) in &self.rpc_calls {
             let target_str = target_rpc.as_str();
             let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
+            // A full-name (case-insensitive) match is unambiguous; falling
+            // back to the bare method name is a heuristic that can match
+            // the wrong service's method of the same name.
             let matched_proto = proto_by_name
                 .get(&target_str.to_lowercase())
-                .or_else(|| proto_by_name.get(&target_bare.to_lowercase()))
-                .copied();
+                .map(|&id| (id, EdgeConfidence::Exact))
+                .or_else(|| {
+                    proto_by_name
+                        .get(&target_bare.to_lowercase())
+                        .map(|&id| (id, EdgeConfidence::Heuristic))
+                });
 
-            if let Some(target_id) = matched_proto {
+            if let Some((target_id, confidence)) = matched_proto {
                 if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
                     rpc_edges.push(ContractEdge {
                         from: *caller_id,
                         to: target_id,
                         kind: EdgeKind::CallsRpc,
                         metadata: Some(target_rpc.clone()),
+                        confidence,
                     });
                 }
             }
@@ -574,20 +660,28 @@ impl ContractGraph {
     pub fn analyze_grpc(&self, target: &str) -> GrpcTrace<'_> {
         let norm_target = target.trim();
         let mut proto_definition = None;
-        let mut client_stubs: Vec<&ContractNode> = Vec::new();
-        let mut server_handlers: Vec<&ContractNode> = Vec::new();
+        let mut client_stubs: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
+        let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
         // Search for matching proto methods or services
         for node in self.nodes.values() {
             if !matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod) {
                 continue;
             }
-            let matches_name = node.name.eq_ignore_ascii_case(norm_target);
+            // Case-sensitive exact-name equality is unambiguous; case-folding
+            // or a substring FQCN hit is a name heuristic.
+            let exact_name = node.name.as_str() == norm_target;
+            let matches_name = exact_name || node.name.eq_ignore_ascii_case(norm_target);
             let matches_fqcn = node.package.contains(norm_target)
                 || Self::fqcn_contains(&node.package, &node.name, norm_target);
             if !(matches_name || matches_fqcn) {
                 continue;
             }
+            let confidence = if exact_name {
+                EdgeConfidence::Exact
+            } else {
+                EdgeConfidence::Heuristic
+            };
 
             let path_str = node.file_path.to_string_lossy();
             if Self::is_proto_file(&node.file_path) {
@@ -596,9 +690,9 @@ impl ContractGraph {
                 || path_str.contains("handler")
                 || path_str.contains("service")
             {
-                server_handlers.push(node);
+                server_handlers.push((node, confidence));
             } else {
-                client_stubs.push(node);
+                client_stubs.push((node, confidence));
             }
         }
 
@@ -611,15 +705,15 @@ impl ContractGraph {
                 match edge.kind {
                     EdgeKind::Implements => {
                         if let Some(handler) = self.nodes.get(&edge.from) {
-                            if !server_handlers.iter().any(|h| h.id == handler.id) {
-                                server_handlers.push(handler);
+                            if !server_handlers.iter().any(|(h, _)| h.id == handler.id) {
+                                server_handlers.push((handler, edge.confidence));
                             }
                         }
                     }
                     EdgeKind::CallsRpc => {
                         if let Some(client) = self.nodes.get(&edge.from) {
-                            if !client_stubs.iter().any(|c| c.id == client.id) {
-                                client_stubs.push(client);
+                            if !client_stubs.iter().any(|(c, _)| c.id == client.id) {
+                                client_stubs.push((client, edge.confidence));
                             }
                         }
                     }
@@ -802,6 +896,186 @@ mod tests {
             trace.proto_definition.unwrap().name.as_str(),
             "AuthenticateUser"
         );
+    }
+
+    /// ROADMAP Item 6, short-term step: a bare-name import (ambiguous across
+    /// packages) must not be reported with the same confidence as an exact
+    /// fully-qualified import — and the FQCN match must land on the *right*
+    /// node, not just any node sharing the bare name.
+    #[test]
+    fn test_import_resolution_confidence_distinguishes_fqcn_from_bare_name() {
+        let mut graph = ContractGraph::new();
+
+        // Two unrelated `Invoice` types in different packages — the classic
+        // name-collision the roadmap calls out.
+        let acme_invoice = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("Invoice"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/billing/acme/Invoice.java").into(),
+            line_start: 1,
+            line_end: 10,
+            package: CompactStr::new("com.acme.billing"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        });
+        graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("Invoice"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/billing/other/Invoice.java").into(),
+            line_start: 1,
+            line_end: 10,
+            package: CompactStr::new("com.other.billing"),
+            repo_id: 2,
+            signature: None,
+            docstring: None,
+        });
+
+        let bare_importer = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("BareImporter"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/consumer/BareImporter.java").into(),
+            line_start: 1,
+            line_end: 5,
+            package: CompactStr::new("com.mesh.consumer"),
+            repo_id: 3,
+            signature: None,
+            docstring: None,
+        });
+        let fqcn_importer = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("FqcnImporter"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/consumer/FqcnImporter.java").into(),
+            line_start: 1,
+            line_end: 5,
+            package: CompactStr::new("com.mesh.consumer"),
+            repo_id: 3,
+            signature: None,
+            docstring: None,
+        });
+        let rust_importer = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("RustImporter"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/consumer/rust_importer.rs").into(),
+            line_start: 1,
+            line_end: 5,
+            package: CompactStr::new("com.mesh.consumer"),
+            repo_id: 3,
+            signature: None,
+            docstring: None,
+        });
+
+        // Bare, unqualified import — ambiguous, must resolve as Heuristic.
+        graph.add_dependency(bare_importer, "Invoice");
+        // Fully-qualified Java-style import — unambiguous, must resolve as Exact
+        // and must land specifically on the `com.acme.billing` node.
+        graph.add_dependency(fqcn_importer, "com.acme.billing.Invoice");
+        // Fully-qualified Rust-style path — same requirement, `::`-separated.
+        graph.add_dependency(rust_importer, "com::acme::billing::Invoice");
+
+        graph.reconcile_edges();
+
+        let find_import_edge = |from: NodeId| {
+            graph
+                .all_edges()
+                .iter()
+                .find(|e| e.kind == EdgeKind::Imports && e.from == from)
+                .expect("resolved import edge should exist")
+        };
+
+        let bare_edge = find_import_edge(bare_importer);
+        let fqcn_edge = find_import_edge(fqcn_importer);
+        let rust_edge = find_import_edge(rust_importer);
+
+        assert_eq!(bare_edge.confidence, EdgeConfidence::Heuristic);
+        assert_eq!(fqcn_edge.confidence, EdgeConfidence::Exact);
+        assert_eq!(rust_edge.confidence, EdgeConfidence::Exact);
+
+        // The whole point: the FQCN/`::` matches must resolve to the exact
+        // node their qualifier names, not merely "a" node sharing the bare name.
+        assert_eq!(fqcn_edge.to, acme_invoice);
+        assert_eq!(rust_edge.to, acme_invoice);
+
+        // Bug-in-the-test guard: if every match ends up Exact (or every match
+        // ends up Heuristic), the confidence field is decorative, not signal.
+        assert_ne!(bare_edge.confidence, fqcn_edge.confidence);
+    }
+
+    /// The `Implements` reconciliation likewise must not claim `Exact`
+    /// confidence for a handler that only matches the proto method by a
+    /// case-insensitive / PascalCase heuristic rather than the literal FQCN.
+    #[test]
+    fn test_implements_reconciliation_confidence_distinguishes_heuristic_match() {
+        let mut graph = ContractGraph::new();
+
+        let proto_method = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("auth.v1.AuthenticateUser"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new("proto-registry/auth.proto").into(),
+            line_start: 20,
+            line_end: 25,
+            package: CompactStr::new("auth.v1"),
+            repo_id: 0,
+            signature: Some(CompactStr::new(
+                "rpc AuthenticateUser (AuthRequest) returns (AuthResponse);",
+            )),
+            docstring: None,
+        });
+
+        // Handler whose name is only a case-insensitive match to the bare
+        // method name ("authenticateuser" vs "AuthenticateUser") — heuristic.
+        let heuristic_handler = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("authenticateuser"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new("services/auth/AuthController.java").into(),
+            line_start: 15,
+            line_end: 30,
+            package: CompactStr::new("com.mesh.auth"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        });
+
+        // Handler whose name is the literal FQCN — exact.
+        let exact_handler = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("auth.v1.AuthenticateUser"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new("services/auth/AuthServiceImpl.java").into(),
+            line_start: 15,
+            line_end: 30,
+            package: CompactStr::new("com.mesh.auth"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        });
+        graph.reconcile_edges();
+
+        let implements_edges: Vec<_> = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.to == proto_method)
+            .collect();
+
+        let heuristic_edge = implements_edges
+            .iter()
+            .find(|e| e.from == heuristic_handler)
+            .expect("heuristic handler should still be linked");
+        let exact_edge = implements_edges
+            .iter()
+            .find(|e| e.from == exact_handler)
+            .expect("exact handler should be linked");
+
+        assert_eq!(heuristic_edge.confidence, EdgeConfidence::Heuristic);
+        assert_eq!(exact_edge.confidence, EdgeConfidence::Exact);
+        assert_ne!(heuristic_edge.confidence, exact_edge.confidence);
     }
 
     #[test]

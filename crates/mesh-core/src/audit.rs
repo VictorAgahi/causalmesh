@@ -35,6 +35,9 @@ pub struct AuditEntry {
     pub files_accessed: Vec<String>,
     pub secrets_redacted_count: usize,
     pub entry_hash: String,
+    /// Hash-chain formula version this row was written (and must be verified) under.
+    /// See `AuditLogger::CHAIN_VERSION`.
+    pub chain_version: i64,
 }
 
 /// Robust cryptographic multi-process AuditLogger backed by SQLite in WAL mode per RFC-001 Commandment 7.
@@ -46,6 +49,17 @@ pub struct AuditLogger {
 impl AuditLogger {
     pub const GENESIS_HASH: &'static str =
         "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Hash-chain formula version.
+    ///
+    /// v1 (legacy) hashed only `prev_hash || timestamp || session_id || tool || args_digest`,
+    /// which left `status`, `files_accessed` and `secrets_redacted_count` mutable without
+    /// breaking verification (ROADMAP item 9). v2 folds those three fields into the hash.
+    ///
+    /// Rows carry their own `chain_version` so pre-existing databases keep verifying under
+    /// the formula they were written with (`verify_db` dispatches per row) instead of having
+    /// every historical entry rejected as tampered the moment this binary is upgraded.
+    pub const CHAIN_VERSION: i64 = 2;
 
     pub fn default_db_path() -> PathBuf {
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
@@ -107,13 +121,43 @@ impl AuditLogger {
                  status TEXT NOT NULL,
                  files_accessed TEXT NOT NULL,
                  secrets_redacted_count INTEGER NOT NULL,
-                 entry_hash TEXT NOT NULL
+                 entry_hash TEXT NOT NULL,
+                 chain_version INTEGER NOT NULL DEFAULT 1
              );
              -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
              -- table's B-tree key. The secondary index earlier versions created on it
              -- only doubled every insert's write cost.
              DROP INDEX IF EXISTS idx_audit_seq;",
         )?;
+
+        // Databases created before `chain_version` existed have the table but not the
+        // column; `CREATE TABLE IF NOT EXISTS` above is a no-op for them. Add it here so
+        // their rows are explicitly tagged v1 (the formula they were actually hashed
+        // with) and keep verifying, rather than being silently reinterpreted under v2.
+        let has_chain_version = conn
+            .prepare("PRAGMA table_info(audit_entries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|name| name.ok())
+            .any(|name| name == "chain_version");
+        if !has_chain_version {
+            // Multiple processes/threads can race to open the same on-disk database and
+            // all observe the column as missing before any of them adds it. SQLite has
+            // no `ADD COLUMN IF NOT EXISTS`, so tolerate "duplicate column" specifically
+            // (another opener won the race) and propagate anything else.
+            if let Err(err) = conn.execute(
+                "ALTER TABLE audit_entries ADD COLUMN chain_version INTEGER NOT NULL DEFAULT 1",
+                [],
+            ) {
+                let is_duplicate_column = matches!(
+                    &err,
+                    rusqlite::Error::SqliteFailure(_, Some(msg))
+                        if msg.contains("duplicate column name")
+                );
+                if !is_duplicate_column {
+                    return Err(err.into());
+                }
+            }
+        }
 
         #[cfg(unix)]
         {
@@ -176,18 +220,25 @@ impl AuditLogger {
 
         let timestamp = chrono_fallback_utc_now();
         let args_digest = Self::compute_sha256(args_json.as_bytes());
-
-        // Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || Digest)
-        let hash_input = format!("{prev_hash}{timestamp}{session_id}{tool}{args_digest}");
-        let entry_hash = Self::compute_sha256(hash_input.as_bytes());
-
         let files_json = serde_json::to_string(&files_accessed)?;
+
+        // Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || Digest ||
+        //                 Status || FilesAccessed || SecretsRedactedCount)   [chain v2]
+        //
+        // v1 covered only the first five fields, which let `status`, `files_accessed`
+        // and `secrets_redacted_count` be tampered with in the row without breaking the
+        // chain (ROADMAP item 9). All new writes use v2; see `CHAIN_VERSION`.
+        let hash_input = format!(
+            "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
+        );
+        let entry_hash = Self::compute_sha256(hash_input.as_bytes());
 
         tx.prepare_cached(
             "INSERT INTO audit_entries (
                 entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                args_digest, status, files_accessed, secrets_redacted_count, entry_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                chain_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?
         .execute(params![
             seq,
@@ -201,6 +252,7 @@ impl AuditLogger {
             files_json,
             secrets_redacted_count as i64,
             entry_hash,
+            Self::CHAIN_VERSION,
         ])?;
 
         tx.commit()?;
@@ -217,6 +269,7 @@ impl AuditLogger {
             files_accessed,
             secrets_redacted_count,
             entry_hash,
+            chain_version: Self::CHAIN_VERSION,
         })
     }
 
@@ -229,32 +282,42 @@ impl AuditLogger {
         let conn = Connection::open(path)?;
         let mut stmt = conn.prepare(
             "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version
              FROM audit_entries ORDER BY entry_seq ASC",
         )?;
 
         let mut expected_prev_hash = Self::GENESIS_HASH.to_string();
 
+        // Raw `files_accessed` JSON text is kept alongside the parsed `Vec<String>` so
+        // hashing below re-hashes the exact bytes that were hashed at insert time,
+        // rather than a value re-serialized from the parsed form (which could differ,
+        // e.g. in key/whitespace formatting, without the row being tampered with).
         let rows = stmt.query_map([], |row| {
             let files_str: String = row.get(8)?;
             let files: Vec<String> = serde_json::from_str(&files_str).unwrap_or_default();
-            Ok(AuditEntry {
-                entry_seq: row.get(0)?,
-                prev_hash: row.get(1)?,
-                timestamp: row.get(2)?,
-                session_id: row.get(3)?,
-                trace_id: row.get(4)?,
-                tool: row.get(5)?,
-                args_digest: row.get(6)?,
-                status: row.get(7)?,
-                files_accessed: files,
-                secrets_redacted_count: row.get::<_, i64>(9)? as usize,
-                entry_hash: row.get(10)?,
-            })
+            let chain_version: i64 = row.get(11)?;
+            Ok((
+                AuditEntry {
+                    entry_seq: row.get(0)?,
+                    prev_hash: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    session_id: row.get(3)?,
+                    trace_id: row.get(4)?,
+                    tool: row.get(5)?,
+                    args_digest: row.get(6)?,
+                    status: row.get(7)?,
+                    files_accessed: files,
+                    secrets_redacted_count: row.get::<_, i64>(9)? as usize,
+                    entry_hash: row.get(10)?,
+                    chain_version,
+                },
+                files_str,
+            ))
         })?;
 
         for (idx, entry_res) in rows.enumerate() {
-            let entry = entry_res?;
+            let (entry, files_str) = entry_res?;
             let expected_seq = idx as u64;
             if entry.entry_seq != expected_seq {
                 return Err(AuditError::BrokenChain(
@@ -271,10 +334,31 @@ impl AuditLogger {
                 ));
             }
 
-            let hash_input = format!(
-                "{}{}{}{}{}",
-                entry.prev_hash, entry.timestamp, entry.session_id, entry.tool, entry.args_digest
-            );
+            // Verify each row under the hash formula it was actually written with, so
+            // rows from a database created before `chain_version` existed (tagged v1 by
+            // the migration in `new()`) keep verifying instead of being rejected the
+            // moment this binary upgrades. See `CHAIN_VERSION`.
+            let hash_input = match entry.chain_version {
+                1 => format!(
+                    "{}{}{}{}{}",
+                    entry.prev_hash,
+                    entry.timestamp,
+                    entry.session_id,
+                    entry.tool,
+                    entry.args_digest
+                ),
+                _ => format!(
+                    "{}{}{}{}{}{}{}{}",
+                    entry.prev_hash,
+                    entry.timestamp,
+                    entry.session_id,
+                    entry.tool,
+                    entry.args_digest,
+                    entry.status,
+                    files_str,
+                    entry.secrets_redacted_count
+                ),
+            };
             let calculated_hash = Self::compute_sha256(hash_input.as_bytes());
             if calculated_hash != entry.entry_hash {
                 return Err(AuditError::BrokenChain(
@@ -368,7 +452,8 @@ impl AuditLogger {
 
         let mut stmt = conn.prepare(
             "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version
              FROM audit_entries ORDER BY entry_seq ASC",
         )?;
 
@@ -390,6 +475,7 @@ impl AuditLogger {
                 files_accessed: files,
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
+                chain_version: row.get(11)?,
             })
         })?;
 
@@ -471,6 +557,100 @@ mod tests {
 
         let is_valid = AuditLogger::verify_db(&db_file).expect("verify chain");
         assert!(is_valid);
+    }
+
+    /// ROADMAP item 9: `status`, `files_accessed` and `secrets_redacted_count` are stored
+    /// in the same row as the hash but were not covered by chain v1. This asserts tampering
+    /// with `status` after the fact is now detected as a broken chain.
+    #[test]
+    fn test_tampering_with_status_breaks_chain() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("tamper_status.db");
+
+        let logger = AuditLogger::new(Some(db_file.clone())).expect("failed to init logger");
+        logger
+            .record_entry(
+                "sess-1",
+                Some("trace-abc"),
+                "smart_search",
+                "{\"query\":\"test\"}",
+                "SUCCESS",
+                vec!["src/main.rs".to_string()],
+                0,
+            )
+            .expect("record entry");
+
+        // Sanity check: the untouched chain verifies.
+        assert!(AuditLogger::verify_db(&db_file).expect("verify chain"));
+
+        // Tamper with `status` directly in the database, leaving `entry_hash` untouched.
+        let conn = Connection::open(&db_file).expect("reopen db");
+        conn.execute(
+            "UPDATE audit_entries SET status = 'FAILURE' WHERE entry_seq = 0",
+            [],
+        )
+        .expect("tamper with status");
+        drop(conn);
+
+        let result = AuditLogger::verify_db(&db_file);
+        assert!(
+            matches!(result, Err(AuditError::BrokenChain(_, _, _))),
+            "expected BrokenChain after tampering with status, got {result:?}"
+        );
+    }
+
+    /// Rows written under chain v1 (no `status`/`files_accessed`/`secrets_redacted_count`
+    /// coverage) must keep verifying under their original formula after upgrading to v2 —
+    /// the migration must not silently break existing audit logs.
+    #[test]
+    fn test_legacy_v1_rows_still_verify() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("legacy_v1.db");
+
+        // Build a v1-style row by hand: hash computed over only the first five fields,
+        // with chain_version explicitly 1, simulating a database written before this fix.
+        let conn = Connection::open(&db_file).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                 entry_seq INTEGER PRIMARY KEY,
+                 prev_hash TEXT NOT NULL,
+                 timestamp TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 trace_id TEXT,
+                 tool TEXT NOT NULL,
+                 args_digest TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 files_accessed TEXT NOT NULL,
+                 secrets_redacted_count INTEGER NOT NULL,
+                 entry_hash TEXT NOT NULL,
+                 chain_version INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .expect("create legacy schema");
+
+        let prev_hash = AuditLogger::GENESIS_HASH.to_string();
+        let timestamp = "1700000000.000Z".to_string();
+        let session_id = "sess-legacy".to_string();
+        let tool = "smart_search".to_string();
+        let args_digest = AuditLogger::compute_sha256(b"{}");
+        let hash_input = format!("{prev_hash}{timestamp}{session_id}{tool}{args_digest}");
+        let entry_hash = AuditLogger::compute_sha256(hash_input.as_bytes());
+
+        conn.execute(
+            "INSERT INTO audit_entries (
+                entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
+                args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                chain_version
+            ) VALUES (0, ?1, ?2, ?3, NULL, ?4, ?5, 'SUCCESS', '[]', 0, ?6, 1)",
+            params![prev_hash, timestamp, session_id, tool, args_digest, entry_hash],
+        )
+        .expect("insert legacy row");
+        drop(conn);
+
+        assert!(
+            AuditLogger::verify_db(&db_file).expect("verify legacy chain"),
+            "legacy v1 row must still verify under its original formula"
+        );
     }
 
     #[test]

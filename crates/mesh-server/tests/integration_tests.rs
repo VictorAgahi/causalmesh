@@ -232,6 +232,7 @@ async fn test_analyze_grpc_success() {
         to: proto_node,
         kind: mesh_core::EdgeKind::Implements,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     state.install_snapshot(snapshot);
 
@@ -296,12 +297,14 @@ async fn test_analyze_impact_success() {
         to: topic_node,
         kind: mesh_core::EdgeKind::Produces,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     graph.add_edge(mesh_core::ContractEdge {
         from: consumer_node,
         to: topic_node,
         kind: mesh_core::EdgeKind::Consumes,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     state.install_snapshot(snapshot);
 
@@ -437,6 +440,120 @@ async fn test_smart_search_is_index_first_with_opt_in_fuzzy_fallback() {
         .expect("ok");
     let text = val["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("AuthController.java"), "{text}");
+}
+
+#[tokio::test]
+async fn test_smart_search_ranks_exact_match_over_alphabetically_earlier_substring() {
+    // Regression for ROADMAP item 16: smart_search must rank results by relevance
+    // (exact symbol-name match first) rather than by alphabetical file path order.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let base_path = dunce::canonicalize(temp_dir.path()).expect("canonicalize");
+
+    let order_dir = base_path.join("services").join("order");
+    std::fs::create_dir_all(&order_dir).expect("create order dir");
+
+    // Sorts BEFORE the exact-match file alphabetically, and only contains an
+    // incidental substring match ("MyOrderServiceUtil" contains "OrderService").
+    let earlier_path = order_dir.join("AAA_Helper.java");
+    let mut earlier_file = File::create(&earlier_path).expect("create earlier file");
+    writeln!(
+        earlier_file,
+        r#"package com.mesh.order;
+
+public class MyOrderServiceUtil {{
+    public void helper() {{
+    }}
+}}
+"#
+    )
+    .expect("write earlier file");
+
+    // Sorts AFTER the substring-match file alphabetically, but declares the exact
+    // symbol being searched for.
+    let later_path = order_dir.join("ZZZ_Exact.java");
+    let mut later_file = File::create(&later_path).expect("create later file");
+    writeln!(
+        later_file,
+        r#"package com.mesh.order;
+
+public class OrderService {{
+    public void place() {{
+    }}
+}}
+"#
+    )
+    .expect("write later file");
+
+    let cfg_str = r#"
+[workspace]
+name = "test-mesh-rank"
+version = "2.9.0"
+roots = ["./services/order"]
+"#;
+
+    let config = Config::load_from_str(cfg_str).expect("parse config");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &base_path,
+        &config.workspace.workspace_root,
+    )
+    .expect("expand roots");
+
+    let log_file = base_path.join("audit.log");
+    let audit = Arc::new(AuditLogger::new(Some(log_file)).expect("audit logger"));
+    let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan engine"));
+
+    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+
+    let mut snapshot = state.snapshot_clone();
+    let graph = &mut snapshot.contract_graph;
+    graph.add_node(ContractNode {
+        id: 0,
+        name: "MyOrderServiceUtil".into(),
+        kind: NodeKind::ServiceClass,
+        file_path: earlier_path.clone().into(),
+        line_start: 3,
+        line_end: 5,
+        package: "com.mesh.order".into(),
+        repo_id: 1,
+        signature: Some("public class MyOrderServiceUtil".into()),
+        docstring: None,
+    });
+    graph.add_node(ContractNode {
+        id: 1,
+        name: "OrderService".into(),
+        kind: NodeKind::ServiceClass,
+        file_path: later_path.clone().into(),
+        line_start: 3,
+        line_end: 5,
+        package: "com.mesh.order".into(),
+        repo_id: 1,
+        signature: Some("public class OrderService".into()),
+        docstring: None,
+    });
+    state.install_snapshot(snapshot);
+
+    let args = json!({
+        "query": "OrderService",
+        "scope": order_dir.to_string_lossy(),
+    });
+
+    let val = ToolRegistry::call_tool("smart_search", args, state)
+        .await
+        .expect("ok");
+    let text = val["content"][0]["text"].as_str().unwrap();
+
+    let exact_pos = text
+        .find("ZZZ_Exact.java")
+        .expect("exact match file present");
+    let substring_pos = text
+        .find("AAA_Helper.java")
+        .expect("substring match file present");
+    assert!(
+        exact_pos < substring_pos,
+        "exact match (ZZZ_Exact.java, sorts late alphabetically) must be ranked before the \
+         incidental substring match (AAA_Helper.java, sorts early alphabetically):\n{text}"
+    );
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::languages::FileIndex;
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
@@ -12,16 +13,31 @@ impl CppExtractor {
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
+        Self::extract_file_index(file_path, content, repo_id, parser).nodes
+    }
+
+    /// Same extraction as [`Self::extract`], plus quoted `#include` dependencies
+    /// (Item 2: `find_dependents` for C++). Angle-bracket includes (`<vector>`) are
+    /// system headers and are never treated as dependencies.
+    pub fn extract_file_index(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        parser: &mut Parser,
+    ) -> FileIndex {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let tree = match parser.parse(content, None) {
             Some(t) => t,
-            None => return nodes,
+            None => return FileIndex::default(),
         };
 
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = mesh_core::detect_service_package(&file_path, None);
+
+        let mut grpc_services = Vec::new();
+        Self::collect_grpc_service_names(root, source_bytes, &mut grpc_services);
 
         Self::visit_node(
             root,
@@ -29,9 +45,67 @@ impl CppExtractor {
             &file_path,
             repo_id,
             &mut package_name,
+            &grpc_services,
             &mut nodes,
         );
-        nodes
+
+        let mut dependencies = Vec::new();
+        let includes = Self::quoted_local_includes(root, source_bytes);
+        if !includes.is_empty() {
+            let content_lines: Vec<&str> = content.lines().collect();
+            for (i, node) in nodes.iter().enumerate() {
+                let body = content_lines
+                    .get(node.line_start.saturating_sub(1)..node.line_end)
+                    .unwrap_or(&[]);
+                for target in &includes {
+                    // Reuse the "is it actually used in this node's line range?"
+                    // heuristic (see languages/mod.rs TS import handling) so a
+                    // file-level include does not attach to every symbol.
+                    let is_used = body.iter().any(|l| l.contains(target.as_str()));
+                    if is_used {
+                        dependencies.push((i, target.clone()));
+                    }
+                }
+            }
+        }
+
+        FileIndex {
+            nodes,
+            dependencies,
+            ..Default::default()
+        }
+    }
+
+    /// Collects the file-stem of every quoted `#include "..."` in the tree.
+    /// Angle-bracket includes (`#include <vector>`, `system_lib_string`) are
+    /// system headers and are deliberately excluded.
+    fn quoted_local_includes(root: Node, source: &[u8]) -> Vec<CompactStr> {
+        let mut out = Vec::new();
+        Self::collect_includes(root, source, &mut out);
+        out
+    }
+
+    fn collect_includes(node: Node, source: &[u8], out: &mut Vec<CompactStr>) {
+        if node.kind() == "preproc_include" {
+            if let Some(path_node) = node.child_by_field_name("path") {
+                if path_node.kind() == "string_literal" {
+                    if let Ok(text) = path_node.utf8_text(source) {
+                        let trimmed = text.trim_matches('"');
+                        let stem = Path::new(trimmed)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(trimmed);
+                        out.push(CompactStr::new(stem));
+                    }
+                }
+                // `system_lib_string` (`<vector>`) is a system header — excluded.
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_includes(child, source, out);
+        }
     }
 
     fn visit_node(
@@ -40,6 +114,7 @@ impl CppExtractor {
         file_path: &FilePath,
         repo_id: RepoId,
         package_name: &mut CompactStr,
+        grpc_services: &[CompactStr],
         nodes: &mut Vec<ContractNode>,
     ) {
         match node.kind() {
@@ -60,7 +135,9 @@ impl CppExtractor {
                         .and_then(|n| n.utf8_text(source).ok())
                     {
                         let first_line = Self::first_line(node, source, name);
-                        let kind = if Self::is_pure_interface(node, source) {
+                        let kind = if Self::has_grpc_service_base(node, source) {
+                            NodeKind::GrpcService
+                        } else if Self::is_pure_interface(node, source) {
                             NodeKind::Interface
                         } else {
                             NodeKind::ServiceClass
@@ -87,7 +164,14 @@ impl CppExtractor {
                 {
                     let first_line = Self::first_line(node, source, func_name);
 
-                    let kind = if func_name.starts_with("Handle")
+                    // Out-of-line methods on a `::grpc::Service` subclass (`Foo::SayHello`,
+                    // where `Foo` derives from `::grpc::Service`) are RPC handlers.
+                    let is_grpc_method = Self::declarator_qualifier(node, source)
+                        .is_some_and(|q| grpc_services.iter().any(|s| s.as_str() == q));
+
+                    let kind = if is_grpc_method {
+                        NodeKind::GrpcMethod
+                    } else if func_name.starts_with("Handle")
                         || func_name.starts_with("handle")
                         || func_name.ends_with("Handler")
                     {
@@ -115,7 +199,74 @@ impl CppExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, file_path, repo_id, package_name, nodes);
+            Self::visit_node(
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                grpc_services,
+                nodes,
+            );
+        }
+    }
+
+    /// True if `node` (a `class_specifier`/`struct_specifier`) directly extends
+    /// `::grpc::Service` (or the generated `Service` base), per Item 5.
+    fn has_grpc_service_base(node: Node, source: &[u8]) -> bool {
+        let mut cursor = node.walk();
+        let found = node.children(&mut cursor).any(|child| {
+            child.kind() == "base_class_clause"
+                && child
+                    .utf8_text(source)
+                    .is_ok_and(|text| text.contains("grpc::Service"))
+        });
+        found
+    }
+
+    /// Collects the names of every class/struct in the tree that derives from
+    /// `::grpc::Service`, so out-of-line method definitions (`Foo::Method`) can be
+    /// attributed back to their owning gRPC service.
+    fn collect_grpc_service_names(node: Node, source: &[u8], out: &mut Vec<CompactStr>) {
+        if matches!(node.kind(), "class_specifier" | "struct_specifier")
+            && node.child_by_field_name("body").is_some()
+            && Self::has_grpc_service_base(node, source)
+        {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
+                out.push(CompactStr::new(name));
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_grpc_service_names(child, source, out);
+        }
+    }
+
+    /// The scope of a `Foo::Method` qualified declarator (`Foo`), if any.
+    fn declarator_qualifier<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+        let mut current = node.child_by_field_name("declarator")?;
+        loop {
+            match current.kind() {
+                "qualified_identifier" => {
+                    return current.child_by_field_name("scope")?.utf8_text(source).ok();
+                }
+                "function_declarator"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator" => {
+                    current = current.child_by_field_name("declarator").or_else(|| {
+                        current.named_child(0)
+                    })?;
+                }
+                "template_function" => {
+                    current = current.child_by_field_name("name")?;
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -261,5 +412,110 @@ void HandleLogin(int fd) {}
         let mut p = parser();
         let nodes = CppExtractor::extract(Path::new("fwd.hpp"), code, 0, &mut p);
         assert!(nodes.is_empty());
+    }
+
+    // --- Item 5: gRPC extractor parity -------------------------------------------------
+
+    #[test]
+    fn test_cpp_extractor_grpc_service_and_method() {
+        let code = r#"
+class GreeterService final : public ::grpc::Service {
+public:
+    grpc::Status SayHello(grpc::ServerContext* context) override;
+};
+
+grpc::Status GreeterService::SayHello(grpc::ServerContext* context) {
+    return grpc::Status::OK;
+}
+
+class PlainWidget {
+public:
+    void Render() {}
+};
+"#;
+        let mut p = parser();
+        let nodes = CppExtractor::extract(Path::new("greeter.cpp"), code, 1, &mut p);
+        let find = |name: &str| nodes.iter().find(|n| n.name == name);
+
+        assert_eq!(
+            find("GreeterService").expect("grpc service").kind,
+            NodeKind::GrpcService
+        );
+        assert_eq!(
+            find("SayHello").expect("grpc method").kind,
+            NodeKind::GrpcMethod
+        );
+        // A plain class unrelated to ::grpc::Service is unaffected.
+        assert_eq!(find("PlainWidget").unwrap().kind, NodeKind::ServiceClass);
+        assert_eq!(find("Render").unwrap().kind, NodeKind::ServiceClass);
+    }
+
+    // --- Item 2: quoted #include dependencies -------------------------------------------
+
+    #[test]
+    fn test_cpp_extractor_excludes_angle_bracket_system_includes() {
+        let code = r#"
+#include <vector>
+#include "Shape.hpp"
+
+class Circle : public Shape {
+public:
+    double Area() const { return 3.14; }
+};
+"#;
+        let mut p = parser();
+        let index = CppExtractor::extract_file_index(Path::new("circle.cpp"), code, 0, &mut p);
+
+        // "vector" (system, angle-bracket) must never appear as a dependency target.
+        assert!(
+            index.dependencies.iter().all(|(_, t)| t.as_str() != "vector"),
+            "angle-bracket system include must not be treated as a dependency"
+        );
+        // "Shape" (quoted, local) is used by `Circle` and must be attached.
+        assert!(
+            index.dependencies.iter().any(|(_, t)| t.as_str() == "Shape"),
+            "quoted local include used by a node must be a dependency"
+        );
+    }
+
+    #[test]
+    fn test_cpp_include_dependency_resolves_via_find_dependents() {
+        // File 1: declares `Shape`.
+        let header_code = r#"
+class Shape {
+public:
+    virtual ~Shape() = default;
+    virtual double Area() const = 0;
+};
+"#;
+        // File 2: includes the local header and uses `Shape` as a base class.
+        let consumer_code = r#"
+#include "Shape.hpp"
+#include <vector>
+
+class Circle : public Shape {
+public:
+    double Area() const override { return 3.14; }
+};
+"#;
+        let mut p = parser();
+        let header_index =
+            CppExtractor::extract_file_index(Path::new("Shape.hpp"), header_code, 0, &mut p);
+        let mut p2 = parser();
+        let consumer_index =
+            CppExtractor::extract_file_index(Path::new("circle.cpp"), consumer_code, 0, &mut p2);
+
+        let mut merged = FileIndex::default();
+        merged.merge(header_index);
+        merged.merge(consumer_index);
+
+        let mut graph = mesh_core::ContractGraph::new();
+        merged.apply(&mut graph);
+
+        let dependents = graph.find_dependents("Shape");
+        assert!(
+            dependents.iter().any(|n| n.name == "Circle"),
+            "Circle should be a dependent of Shape via the quoted #include"
+        );
     }
 }

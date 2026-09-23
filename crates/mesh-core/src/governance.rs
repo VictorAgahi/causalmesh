@@ -100,7 +100,7 @@ impl GovernanceEngine {
                     step_4: "DO NOT modify 'api-gateway' or 'services/*' until the published packages are available.".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: "J'ai détecté un accès au contrat Protobuf dans 'proto-registry'. Conformément à la gouvernance d'architecture, je m'arrête ici : vous devez soumettre la PR du contrat pour que la CI génère les stubs avant d'adapter les microservices.".to_string(),
+                message_to_user: "I detected a mutation targeting the Protobuf contract in 'proto-registry'. Per active architecture governance, I'm stopping here: you must submit the contract PR and let CI generate the stubs before adapting the microservices.".to_string(),
             },
             "k8s-infrastructure" => RsahResponse {
                 status: "GOVERNANCE_BLOCKED".to_string(),
@@ -113,7 +113,7 @@ impl GovernanceEngine {
                     step_4: "Await ArgoCD / Flux deployment sync".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: "Modification des manifests K8s sous revue DevOps obligatoire. Veuillez valider les manifests avec l'équipe Infrastructure avant déploiement.".to_string(),
+                message_to_user: "Modifying K8s manifests requires mandatory DevOps review. Please validate the manifests with the Infrastructure team before deployment.".to_string(),
             },
             _ => RsahResponse {
                 status: "GOVERNANCE_BLOCKED".to_string(),
@@ -126,7 +126,7 @@ impl GovernanceEngine {
                     step_4: "Verify downstream dependencies".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: format!("Cette action nécessite une validation humaine conformément à la règle: {rule_description}"),
+                message_to_user: format!("This action requires human validation per the active rule: {rule_description}"),
             },
         }
     }

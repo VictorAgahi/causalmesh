@@ -48,6 +48,7 @@ pub struct DocIndex {
     stop_words: Vec<String>,
     exact_phrase_boost: u32,
     sanitize_injections: bool,
+    fuzzy_fallback: bool,
 }
 
 impl Default for DocIndex {
@@ -58,6 +59,7 @@ impl Default for DocIndex {
             stop_words: Vec::new(),
             exact_phrase_boost: 10,
             sanitize_injections: true,
+            fuzzy_fallback: true,
         }
     }
 }
@@ -68,6 +70,7 @@ impl DocIndex {
         stop_words: Vec<String>,
         exact_phrase_boost: u32,
         sanitize_injections: bool,
+        fuzzy_fallback: bool,
     ) -> Self {
         Self {
             sections: Vec::new(),
@@ -75,6 +78,7 @@ impl DocIndex {
             stop_words,
             exact_phrase_boost,
             sanitize_injections,
+            fuzzy_fallback,
         }
     }
 
@@ -87,6 +91,7 @@ impl DocIndex {
             stop_words: self.stop_words.clone(),
             exact_phrase_boost: self.exact_phrase_boost,
             sanitize_injections: self.sanitize_injections,
+            fuzzy_fallback: self.fuzzy_fallback,
         }
     }
 
@@ -239,12 +244,96 @@ impl DocIndex {
             })
             .collect();
 
+        // The exact/keyword pass above found nothing: with `fuzzy_fallback` enabled
+        // (the default), retry with edit-distance-tolerant token matching so a typo
+        // like "kubernets" still surfaces the "Kubernetes" section.
+        if scored.is_empty() && self.fuzzy_fallback {
+            scored = self
+                .sections
+                .iter()
+                .filter_map(|section| {
+                    let score = Self::fuzzy_score(section, &words);
+                    (score > 0).then_some((score, section))
+                })
+                .collect();
+        }
+
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         scored
             .into_iter()
             .take(max_sections)
             .map(|(_, s)| s)
             .collect()
+    }
+
+    /// Scores a section by fuzzy (edit-distance-tolerant) token matching, used only
+    /// as the `fuzzy_fallback` retry when exact/substring scoring found nothing.
+    fn fuzzy_score(section: &DocSection, words: &[&str]) -> u32 {
+        let is_word_char = |c: char| !c.is_alphanumeric();
+        let title_tokens: Vec<&str> = section
+            .title_lower
+            .split(is_word_char)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let content_tokens: Vec<&str> = section
+            .content_lower
+            .split(is_word_char)
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let mut score = 0u32;
+        for word in words {
+            // Very short words are too likely to fuzzy-match noise; require exact
+            // containment for those (already covered by the primary pass).
+            if word.len() < 3 {
+                continue;
+            }
+            if title_tokens.iter().any(|t| Self::is_fuzzy_match(t, word)) {
+                score += 8;
+            }
+            if content_tokens.iter().any(|t| Self::is_fuzzy_match(t, word)) {
+                score += 3;
+            }
+        }
+        score
+    }
+
+    fn is_fuzzy_match(token: &str, query_word: &str) -> bool {
+        if token == query_word {
+            return true;
+        }
+        let max_distance = if query_word.len() <= 4 { 1 } else { 2 };
+        Self::levenshtein(token, query_word) <= max_distance
+    }
+
+    /// Classic O(n*m) edit distance, bounded by short section/query words so the
+    /// cost per comparison stays negligible.
+    fn levenshtein(a: &str, b: &str) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let (n, m) = (a.len(), b.len());
+        if n == 0 {
+            return m;
+        }
+        if m == 0 {
+            return n;
+        }
+
+        let mut prev_row: Vec<usize> = (0..=m).collect();
+        let mut cur_row = vec![0usize; m + 1];
+
+        for i in 1..=n {
+            cur_row[0] = i;
+            for j in 1..=m {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                cur_row[j] = (prev_row[j] + 1)
+                    .min(cur_row[j - 1] + 1)
+                    .min(prev_row[j - 1] + cost);
+            }
+            prev_row.copy_from_slice(&cur_row);
+        }
+
+        prev_row[m]
     }
 
     fn normalize_query(&self, raw: &str) -> String {
@@ -301,6 +390,7 @@ mod tests {
             vec!["the".to_string(), "in".to_string()],
             60,
             true,
+            true,
         );
 
         let markdown = r#"# Architecture Overview
@@ -317,6 +407,38 @@ We deploy microservices onto kubernetes using Helm and ArgoCD.
         let results = index.search("k8s deployment", 3);
         assert!(!results.is_empty());
         assert_eq!(results[0].title.as_str(), "Kubernetes Deployment (C4)");
+    }
+
+    #[test]
+    fn fuzzy_fallback_true_finds_typo_query() {
+        let mut index = DocIndex::new(HashMap::new(), Vec::new(), 60, true, true);
+        index.index_markdown_file(
+            Path::new("docs/architecture.md"),
+            "# Kubernetes Deployment\n\nWe deploy onto kubernetes using Helm.\n",
+        );
+
+        // "kubernets" (missing the final "e") has no exact substring hit, but is
+        // within edit distance 1 of "kubernetes".
+        let results = index.search("kubernets", 3);
+        assert!(
+            !results.is_empty(),
+            "fuzzy_fallback = true should recover a near-miss typo"
+        );
+    }
+
+    #[test]
+    fn fuzzy_fallback_false_leaves_typo_query_empty() {
+        let mut index = DocIndex::new(HashMap::new(), Vec::new(), 60, true, false);
+        index.index_markdown_file(
+            Path::new("docs/architecture.md"),
+            "# Kubernetes Deployment\n\nWe deploy onto kubernetes using Helm.\n",
+        );
+
+        let results = index.search("kubernets", 3);
+        assert!(
+            results.is_empty(),
+            "fuzzy_fallback = false must not fall back to fuzzy matching"
+        );
     }
 
     #[test]

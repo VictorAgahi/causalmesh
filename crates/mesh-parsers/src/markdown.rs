@@ -172,12 +172,13 @@ impl MarkdownFormatter {
             "### 2. Client Stubs ({} found)\n",
             trace.client_stubs.len()
         ));
-        for stub in &trace.client_stubs {
+        for (stub, confidence) in &trace.client_stubs {
             out.push_str(&format!(
-                "- `{}` in `{}:{}`\n",
+                "- `{}` in `{}:{}` _(match: {})_\n",
                 stub.name,
                 stub.file_path.display(),
-                stub.line_start
+                stub.line_start,
+                confidence.label()
             ));
         }
         out.push('\n');
@@ -186,12 +187,13 @@ impl MarkdownFormatter {
             "### 3. Server Handlers / Controllers ({} found)\n",
             trace.server_handlers.len()
         ));
-        for handler in &trace.server_handlers {
+        for (handler, confidence) in &trace.server_handlers {
             out.push_str(&format!(
-                "- `{}` in `{}:{}`\n",
+                "- `{}` in `{}:{}` _(match: {})_\n",
                 handler.name,
                 handler.file_path.display(),
-                handler.line_start
+                handler.line_start,
+                confidence.label()
             ));
         }
 

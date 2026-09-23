@@ -29,6 +29,18 @@ impl McpTool for FindDependentsTool {
         args._meta.as_ref()
     }
 
+    fn truncation_hint(args: &Self::Args, state: &AppState) -> Option<String> {
+        let snapshot = state.snapshot();
+        let dependents = snapshot
+            .contract_graph
+            .find_dependents(args.target.as_str());
+        Some(format!(
+            "Target '{}' has {} dependent consumer(s). Consider searching for specific caller sub-packages or narrowing your query.",
+            args.target,
+            dependents.len()
+        ))
+    }
+
     fn subject(args: &Self::Args) -> Option<&str> {
         Some(args.target.as_str())
     }

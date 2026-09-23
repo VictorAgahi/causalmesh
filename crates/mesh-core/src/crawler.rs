@@ -39,14 +39,7 @@ impl ExcludeMatcher {
             hits.push(Arc::new(AtomicUsize::new(0)));
 
             // Normalize and expand `${workspace_root}` / `${WORKSPACE_ROOT}` references
-            let clean = if pat.contains("${workspace_root}") || pat.contains("${WORKSPACE_ROOT}") {
-                pat.replace("${workspace_root}/", "")
-                    .replace("${workspace_root}", "")
-                    .replace("${WORKSPACE_ROOT}/", "")
-                    .replace("${WORKSPACE_ROOT}", "")
-            } else {
-                pat.to_string()
-            };
+            let clean = crate::config::strip_workspace_root_prefix(pat);
 
             // Normalize to a path-anchored form so `foo/**` and `**/foo/**` both prune `foo/`
             // and everything under it, and `*.pem` matches at any depth.

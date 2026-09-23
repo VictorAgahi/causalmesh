@@ -32,6 +32,19 @@ pub enum ConfigError {
     NoValidRootsConfigured,
 }
 
+/// Helper function to strip `${workspace_root}/` or `${WORKSPACE_ROOT}/` prefixes from path/glob patterns.
+pub fn strip_workspace_root_prefix(pattern: &str) -> String {
+    let pat = pattern.trim();
+    if pat.contains("${workspace_root}") || pat.contains("${WORKSPACE_ROOT}") {
+        pat.replace("${workspace_root}/", "")
+            .replace("${workspace_root}", "")
+            .replace("${WORKSPACE_ROOT}/", "")
+            .replace("${WORKSPACE_ROOT}", "")
+    } else {
+        pat.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {

@@ -494,22 +494,125 @@ roots = ["."]
         }
         let doc_text = std::fs::read_to_string(path).expect("read mcp-tools.md");
 
-        // Verify that obsolete/invented field names never appear in docs/mcp-tools.md
-        let forbidden_fields = ["service_name", "method_name", "changed_file"];
-        for forbidden in forbidden_fields {
-            assert!(
-                !doc_text.contains(&format!("\"{forbidden}\"")),
-                "docs/mcp-tools.md must NOT contain obsolete field {forbidden:?}"
-            );
-        }
+        // Parse tool sections starting with `### Tool `
+        let sections: Vec<&str> = doc_text.split("### Tool ").skip(1).collect();
+        assert!(
+            !sections.is_empty(),
+            "docs/mcp-tools.md must contain tool sections"
+        );
 
-        // Verify real required fields appear in docs/mcp-tools.md
-        let required_fields = ["target", "query", "scope"];
-        for req in required_fields {
+        for section in sections {
+            // Find the `#### JSON Schema` heading
+            let Some(schema_idx) = section.find("#### JSON Schema") else {
+                continue;
+            };
+            let schema_part = &section[schema_idx..];
+
+            // Extract the first ```json ... ``` code block under `#### JSON Schema`
+            let Some(code_open) = schema_part.find("```json") else {
+                continue;
+            };
+            let code_start = code_open + 7;
+            let Some(code_close) = schema_part[code_start..].find("```") else {
+                continue;
+            };
+            let json_str = schema_part[code_start..code_start + code_close].trim();
+
+            let schema_val: serde_json::Value =
+                serde_json::from_str(json_str).expect("parse JSON Schema from docs/mcp-tools.md");
+            let props = schema_val
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .expect("JSON schema in docs/mcp-tools.md must have properties object");
+
+            let prop_keys: Vec<&String> = props.keys().collect();
+
+            // Verify that no obsolete field names exist in any tool schema block
             assert!(
-                doc_text.contains(&format!("\"{req}\"")),
-                "docs/mcp-tools.md must contain real schema field {req:?}"
+                !prop_keys.contains(&&"service_name".to_string()),
+                "Schema block must not contain obsolete field 'service_name'"
             );
+            assert!(
+                !prop_keys.contains(&&"method_name".to_string()),
+                "Schema block must not contain obsolete field 'method_name'"
+            );
+            assert!(
+                !prop_keys.contains(&&"changed_file".to_string()),
+                "Schema block must not contain obsolete field 'changed_file'"
+            );
+
+            // Verify that required fields match real tool structs
+            if section.contains("`find_dependents`")
+                || section.contains("`analyze_grpc`")
+                || section.contains("`analyze_impact`")
+            {
+                assert!(
+                    prop_keys.contains(&&"target".to_string()),
+                    "Schema block for target tools must contain 'target'"
+                );
+            }
+            if section.contains("`smart_search`") {
+                assert!(
+                    prop_keys.contains(&&"query".to_string())
+                        && prop_keys.contains(&&"scope".to_string()),
+                    "Schema block for smart_search must contain 'query' and 'scope'"
+                );
+            }
+            if section.contains("`search_docs`") {
+                assert!(
+                    prop_keys.contains(&&"query".to_string()),
+                    "Schema block for search_docs must contain 'query'"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn test_truncation_hints_contain_arguments() {
+        let config = Config::load_from_str(
+            "[workspace]\nname = \"test\"\nversion = \"1.0.0\"\nroots = [\".\"]",
+        )
+        .expect("config");
+        let allowed_roots = vec![std::path::PathBuf::from(".")];
+        let audit = Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+
+        let find_deps_args = super::find_dependents::FindDependentsArgs {
+            target: mesh_core::CompactStr::new("UserAuthRequest"),
+            _meta: None,
+        };
+        let hint_deps = FindDependentsTool::truncation_hint(&find_deps_args, &state).unwrap();
+        assert!(
+            hint_deps.contains("UserAuthRequest"),
+            "FindDependents truncation hint must contain target argument"
+        );
+
+        let search_args = super::smart_search::SmartSearchArgs {
+            query: mesh_core::CompactStr::new("signUp"),
+            scope: mesh_core::CompactStr::new("ms-user"),
+            include_body: false,
+            fuzzy: None,
+            _meta: None,
+        };
+        let hint_search = SmartSearchTool::truncation_hint(&search_args, &state).unwrap();
+        assert!(
+            hint_search.contains("signUp"),
+            "SmartSearch truncation hint must contain query argument"
+        );
+        assert!(
+            hint_search.contains("ms-user"),
+            "SmartSearch truncation hint must contain scope argument"
+        );
+
+        let impact_args = super::analyze_impact::AnalyzeImpactArgs {
+            target: mesh_core::CompactStr::new("EVENT_CREATED"),
+            _meta: None,
+        };
+        let hint_impact = AnalyzeImpactTool::truncation_hint(&impact_args, &state).unwrap();
+        assert!(
+            hint_impact.contains("EVENT_CREATED"),
+            "AnalyzeImpact truncation hint must contain target argument"
+        );
     }
 }

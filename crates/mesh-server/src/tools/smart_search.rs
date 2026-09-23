@@ -56,6 +56,13 @@ impl McpTool for SmartSearchTool {
         args._meta.as_ref()
     }
 
+    fn truncation_hint(args: &Self::Args, _state: &AppState) -> Option<String> {
+        Some(format!(
+            "Query '{}' in scope '{}' returned max payload. Refine query or specify a narrower subdirectory scope.",
+            args.query, args.scope
+        ))
+    }
+
     fn subject(args: &Self::Args) -> Option<&str> {
         Some(args.scope.as_str())
     }

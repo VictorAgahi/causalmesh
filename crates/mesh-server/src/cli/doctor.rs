@@ -147,10 +147,15 @@ impl DoctorCommand {
                                     &roots,
                                     &cfg.workspace.mount_aliases,
                                 ) {
-                                    let files = mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(5));
+                                    let files = mesh_core::FilesystemCrawler::crawl_scope(
+                                        &scope,
+                                        &[],
+                                        Some(5),
+                                    );
                                     for f in files {
                                         if let Ok(rel) = f.strip_prefix(root) {
-                                            let _ = docs_matcher.is_excluded_with_root(rel, Some(root));
+                                            let _ =
+                                                docs_matcher.is_excluded_with_root(rel, Some(root));
                                         }
                                     }
                                 }
@@ -166,6 +171,95 @@ impl DoctorCommand {
                                     eprintln!(
                                         "⚠ Path pattern '{dead}' in [engines.docs.paths] matched 0 files — likely dead config"
                                     );
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(contracts) = &cfg.engines.contracts {
+                        if let Some(grpc) = &contracts.grpc {
+                            if !grpc.proto_dirs.is_empty() {
+                                let mut matched_dirs = std::collections::HashSet::new();
+                                for root in &roots {
+                                    if let Ok(scope) =
+                                        mesh_core::ValidatedScope::resolve_with_aliases(
+                                            &root.to_string_lossy(),
+                                            &roots,
+                                            &cfg.workspace.mount_aliases,
+                                        )
+                                    {
+                                        let files = mesh_core::FilesystemCrawler::crawl_scope(
+                                            &scope,
+                                            &[],
+                                            Some(5),
+                                        );
+                                        for f in files {
+                                            if f.extension().is_some_and(|ext| ext == "proto") {
+                                                let p_str = f.to_string_lossy();
+                                                for dir in &grpc.proto_dirs {
+                                                    let clean =
+                                                        mesh_core::strip_workspace_root_prefix(dir);
+                                                    let needle =
+                                                        clean.trim_matches('/').replace('\\', "/");
+                                                    if !needle.is_empty()
+                                                        && p_str
+                                                            .replace('\\', "/")
+                                                            .contains(&needle)
+                                                    {
+                                                        matched_dirs.insert(dir.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for dir in &grpc.proto_dirs {
+                                    if !matched_dirs.contains(dir) {
+                                        eprintln!(
+                                            "⚠ Proto directory '{dir}' in [engines.contracts.grpc.proto_dirs] matched 0 files — likely dead config"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(openapi) = &contracts.openapi {
+                            if !openapi.spec_files.is_empty() {
+                                let extract_cfg =
+                                    mesh_parsers::ExtractConfig::from_contracts(contracts);
+                                for spec in &openapi.spec_files {
+                                    let mut matched = false;
+                                    for root in &roots {
+                                        if let Ok(scope) =
+                                            mesh_core::ValidatedScope::resolve_with_aliases(
+                                                &root.to_string_lossy(),
+                                                &roots,
+                                                &cfg.workspace.mount_aliases,
+                                            )
+                                        {
+                                            let files = mesh_core::FilesystemCrawler::crawl_scope(
+                                                &scope,
+                                                &[],
+                                                Some(5),
+                                            );
+                                            for f in files {
+                                                if extract_cfg
+                                                    .allows_openapi_spec(&f.to_string_lossy())
+                                                {
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if matched {
+                                            break;
+                                        }
+                                    }
+                                    if !matched {
+                                        eprintln!(
+                                            "⚠ Spec file '{spec}' in [engines.contracts.openapi.spec_files] matched 0 files — likely dead config"
+                                        );
+                                    }
                                 }
                             }
                         }

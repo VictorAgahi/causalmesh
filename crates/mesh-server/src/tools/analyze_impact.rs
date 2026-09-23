@@ -29,6 +29,13 @@ impl McpTool for AnalyzeImpactTool {
         args._meta.as_ref()
     }
 
+    fn truncation_hint(args: &Self::Args, _state: &AppState) -> Option<String> {
+        Some(format!(
+            "Impact flow for target '{}' exceeds payload budget. Consider querying a specific downstream service or event name.",
+            args.target
+        ))
+    }
+
     fn subject(args: &Self::Args) -> Option<&str> {
         Some(args.target.as_str())
     }

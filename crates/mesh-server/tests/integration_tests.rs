@@ -722,6 +722,54 @@ async fn test_volontariapp_fixture_end_to_end_indexing() {
     assert!(!docs.is_empty(), "Docs in fixture should be indexed");
 }
 
+/// Functional integration test verifying that `proto_dirs` configured with `${workspace_root}`
+/// actually extracts `.proto` definitions at runtime rather than being parsed and ignored (Écart 1 fix).
+#[test]
+fn test_proto_dirs_workspace_root_expansion_functional_wiring() {
+    let temp = tempfile::tempdir().expect("temp");
+    let base = dunce::canonicalize(temp.path()).expect("canon");
+    let proto_dir = base.join("proto-registry/proto");
+    std::fs::create_dir_all(&proto_dir).expect("mkdir");
+    std::fs::write(
+        proto_dir.join("billing.proto"),
+        "syntax = \"proto3\"; package billing.v1; service BillingService { rpc Invoice (InvoiceReq) returns (InvoiceResp); }",
+    )
+    .expect("write proto");
+
+    let cfg_str = r#"
+[workspace]
+name = "proto-mesh"
+version = "0"
+roots = ["."]
+
+[engines.contracts]
+enabled = true
+
+[engines.contracts.grpc]
+proto_dirs = ["${workspace_root}/proto-registry/proto"]
+"#;
+
+    let config = Config::load_from_str(cfg_str).expect("config");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &base,
+        &config.workspace.workspace_root,
+    )
+    .expect("roots");
+
+    let snapshot =
+        mesh_server::WorkspaceIndexer::build_snapshot(&config, &allowed_roots, None, None);
+
+    let trace = snapshot.contract_graph.analyze_grpc("Invoice");
+    assert!(
+        trace.proto_definition.is_some(),
+        "proto_dirs configured with ${{workspace_root}}/proto-registry/proto MUST extract proto definition at runtime"
+    );
+}
+
+/// Text alignment test for SETUP.md.
+/// NOTE: This test ONLY validates that the Markdown text in SETUP.md matches the expected table status.
+/// Runtime functional wiring is separately verified by real functional tests (such as `test_proto_dirs_workspace_root_expansion_functional_wiring` above).
 #[test]
 fn test_setup_md_config_reference_status_sync() {
     let setup_md_path = std::path::Path::new("SETUP.md");

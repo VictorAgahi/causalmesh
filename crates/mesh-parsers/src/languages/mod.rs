@@ -112,22 +112,35 @@ impl ExtractConfig {
 
     /// Whether `path` falls under one of `proto_dirs` (or `proto_dirs` is
     /// empty, i.e. unrestricted).
-    fn allows_proto_path(&self, path_str: &str) -> bool {
+    pub fn allows_proto_path(&self, path_str: &str) -> bool {
         if self.proto_dirs.is_empty() {
             return true;
         }
         let normalized = path_str.replace('\\', "/");
         self.proto_dirs.iter().any(|d| {
-            let needle = d.trim_matches('/').replace('\\', "/");
+            let clean = mesh_core::strip_workspace_root_prefix(d);
+            let needle = clean.trim_matches('/').replace('\\', "/");
             !needle.is_empty() && normalized.contains(needle.as_str())
         })
+    }
+
+    /// Whether `path` matches one of `openapi_spec_files`.
+    pub fn allows_openapi_spec(&self, path_str: &str) -> bool {
+        if self.openapi_spec_files.is_empty() {
+            return false;
+        }
+        let lower = path_str.to_lowercase().replace('\\', "/");
+        self.openapi_spec_files
+            .iter()
+            .any(|spec| spec_file_matches(&lower, spec))
     }
 }
 
 /// Matches `path_str` (already lowercased) against a configured spec-file
 /// pattern by suffix or substring, mirroring `CompiledPattern::matches_path`.
 fn spec_file_matches(path_str: &str, pattern: &str) -> bool {
-    let needle = pattern
+    let clean = mesh_core::strip_workspace_root_prefix(pattern);
+    let needle = clean
         .trim_start_matches("./")
         .trim_start_matches('*')
         .to_lowercase();

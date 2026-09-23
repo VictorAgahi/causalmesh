@@ -275,22 +275,29 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Java => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    java::JavaExtractor::extract(file_path, content, repo_id, parser)
-                }) {
+                if let Some((nodes, dependencies, producers)) =
+                    AstGuard::with_parser(lang_kind, |parser| {
+                        java::JavaExtractor::extract_relations(file_path, content, repo_id, parser)
+                    })
+                {
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
                         }
                     }
                     out.nodes = nodes;
+                    out.dependencies = dependencies;
+                    out.producers = producers;
                 }
             }
             LanguageKind::Go => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    go::GoExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    go::GoExtractor::extract_with_relations(file_path, content, repo_id, parser)
                 }) {
                     out.nodes = nodes;
+                    out.dependencies = relations.dependencies;
+                    out.producers = relations.producers;
+                    out.consumers = relations.consumers;
                 }
             }
             LanguageKind::Python => {
@@ -343,17 +350,17 @@ impl PolyglotIndexer {
                 out.nodes = nodes;
             }
             LanguageKind::Rust => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    rust_lang::RustExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(index) = AstGuard::with_parser(lang_kind, |parser| {
+                    rust_lang::RustExtractor::extract_index(file_path, content, repo_id, parser)
                 }) {
-                    out.nodes = nodes;
+                    out.merge(index);
                 }
             }
             LanguageKind::Cpp => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    cpp::CppExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(index) = AstGuard::with_parser(lang_kind, |parser| {
+                    cpp::CppExtractor::extract_file_index(file_path, content, repo_id, parser)
                 }) {
-                    out.nodes = nodes;
+                    out.merge(index);
                 }
             }
             LanguageKind::Yaml => {
@@ -613,6 +620,111 @@ mod tests {
         assert!(graph
             .all_nodes()
             .any(|n| n.name == "HandleCharge" && n.kind == NodeKind::HttpEndpoint));
+    }
+
+    /// Wiring check for items 2/3/5: the per-language extractors gained
+    /// relations-aware entry points (`extract_relations`/`extract_with_relations`/
+    /// `extract_index`/`extract_file_index`), but `PolyglotIndexer::extract`'s
+    /// dispatch is what the real indexing pipeline (`WorkspaceIndexer`) actually
+    /// calls. These tests go through `index_file` (which calls the real dispatch),
+    /// not the per-language extractor directly, so a regression here means the
+    /// feature is unreachable in production even if the language's own unit tests
+    /// pass.
+    #[test]
+    fn test_polyglot_indexer_wires_java_import_dependency() {
+        let mut graph = ContractGraph::new();
+        PolyglotIndexer::index_file(
+            Path::new("services/billing/Widget.java"),
+            "package billing;\npublic class Widget {}\n",
+            0,
+            &mut graph,
+        );
+        PolyglotIndexer::index_file(
+            Path::new("services/orders/Consumer.java"),
+            "package orders;\nimport billing.Widget;\npublic class Consumer {\n    void use(Widget w) {}\n}\n",
+            0,
+            &mut graph,
+        );
+        assert!(
+            !graph.find_dependents("Widget").is_empty(),
+            "Java import dependency must reach find_dependents through the real PolyglotIndexer dispatch"
+        );
+    }
+
+    #[test]
+    fn test_polyglot_indexer_wires_go_import_dependency() {
+        // Go dependencies are keyed by the raw import path string (Go imports a
+        // whole package, not a specific symbol) — mirrors go.rs's own
+        // `find_dependents_links_consumer_via_go_import` test.
+        let mut graph = ContractGraph::new();
+        PolyglotIndexer::index_file(
+            Path::new("utils/helper.go"),
+            "package utils\n\nfunc Helper() string {\n    return \"ok\"\n}\n",
+            0,
+            &mut graph,
+        );
+        PolyglotIndexer::index_file(
+            Path::new("main.go"),
+            "package main\n\nimport (\n    \"myapp/utils\"\n)\n\nfunc Run() {\n    utils.Helper()\n}\n",
+            0,
+            &mut graph,
+        );
+        assert!(
+            graph
+                .find_dependents("myapp/utils")
+                .iter()
+                .any(|n| n.name == "Run"),
+            "Go import dependency must reach find_dependents through the real PolyglotIndexer dispatch"
+        );
+    }
+
+    #[test]
+    fn test_polyglot_indexer_wires_rust_use_dependency() {
+        let mut graph = ContractGraph::new();
+        PolyglotIndexer::index_file(
+            Path::new("services/billing/widget.rs"),
+            "pub struct Widget;\n",
+            0,
+            &mut graph,
+        );
+        PolyglotIndexer::index_file(
+            Path::new("services/orders/consumer.rs"),
+            "use billing::Widget;\n\nfn use_it(_w: Widget) {}\n",
+            0,
+            &mut graph,
+        );
+        assert!(
+            !graph.find_dependents("Widget").is_empty(),
+            "Rust use dependency must reach find_dependents through the real PolyglotIndexer dispatch"
+        );
+    }
+
+    #[test]
+    fn test_polyglot_indexer_wires_cpp_include_dependency() {
+        // C++ dependencies are keyed by the #include's file stem, matched against
+        // literal usage in the consumer's body — mirrors cpp.rs's own
+        // `test_cpp_include_dependency_resolves_via_find_dependents` test, so the
+        // header's stem ("Shape") must match the symbol name used in the body.
+        let mut graph = ContractGraph::new();
+        PolyglotIndexer::index_file(
+            Path::new("Shape.hpp"),
+            "class Shape {\npublic:\n    virtual ~Shape() = default;\n    virtual double Area() const = 0;\n};\n",
+            0,
+            &mut graph,
+        );
+        PolyglotIndexer::index_file(
+            Path::new("circle.cpp"),
+            "#include \"Shape.hpp\"\n#include <vector>\n\nclass Circle : public Shape {\npublic:\n    double Area() const override { return 3.14; }\n};\n",
+            0,
+            &mut graph,
+        );
+        assert!(
+            graph
+                .find_dependents("Shape")
+                .iter()
+                .any(|n| n.name == "Circle"),
+            "C++ #include dependency must reach find_dependents through the real PolyglotIndexer dispatch"
+        );
     }
 
     #[test]

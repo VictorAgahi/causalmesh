@@ -576,7 +576,7 @@ impl WorkspaceIndexer {
             return true;
         };
         match path.strip_prefix(root) {
-            Ok(rel) => matcher.is_excluded(rel),
+            Ok(rel) => matcher.is_excluded_with_root(rel, Some(root)),
             Err(_) => true,
         }
     }
@@ -821,6 +821,29 @@ resolve_placeholders = true
             snapshot.doc_index.section_count(),
             1,
             "only docs/** should be indexed when [engines.docs] paths is set"
+        );
+    }
+
+    /// `[engines.docs] paths` containing `${workspace_root}/docs/**` must be expanded
+    /// properly so markdown files in `docs/` are indexed.
+    #[test]
+    fn docs_paths_workspace_root_expansion_scopes_indexing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir docs");
+        std::fs::write(root.join("docs").join("adr.md"), "# ADR\nsome text").expect("write adr");
+        std::fs::write(root.join("README.md"), "# Readme\nother text").expect("write readme");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.docs]\npaths = [\"${workspace_root}/docs/**\"]\n",
+        )
+        .expect("config");
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        assert_eq!(
+            snapshot.doc_index.section_count(),
+            1,
+            "docs/** expanded from ${{workspace_root}}/docs/** should be indexed"
         );
     }
 }

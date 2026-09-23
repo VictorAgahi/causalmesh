@@ -118,7 +118,7 @@ func (h *BillingHandler) ProcessPayment(ctx context.Context, req *pb.PaymentRequ
 #### Description
 Reverse dependency search across repository and microservice boundaries. Identifies all upstream callers, client classes, and consumer services that depend on a given contract, class, or gRPC method.
 
-**Negative Constraints**: Do NOT pass generic or short strings (e.g., `'id'`, `'error'`). Provide fully qualified names or unambiguous identifiers.
+**Negative Constraints**: DO NOT USE to search freeform text or method signatures (use smart_search).
 
 #### JSON Schema
 ```json
@@ -128,11 +128,7 @@ Reverse dependency search across repository and microservice boundaries. Identif
   "properties": {
     "target": {
       "type": "string",
-      "description": "Fully qualified contract name, gRPC method, or class identifier (e.g. 'com.corp.proto.v1.UserService', 'OrderEvent')"
-    },
-    "scope": {
-      "type": "string",
-      "description": "Optional sub-scope to restrict caller lookup"
+      "description": "Target contract name (ex: 'UserAuthRequest') or package identifier (ex: '@volontariapp/domain-user') to trace reverse dependencies for."
     }
   },
   "additionalProperties": false
@@ -141,7 +137,7 @@ Reverse dependency search across repository and microservice boundaries. Identif
 
 #### Sample Response
 ```markdown
-## Reverse Dependencies for `com.corp.proto.v1.PaymentService`
+## Reverse Dependencies for `UserAuthRequest`
 *Found 3 direct downstream consumer(s) across 2 repositories*
 
 - **Service**: `api-gateway`
@@ -159,21 +155,17 @@ Reverse dependency search across repository and microservice boundaries. Identif
 #### Description
 Comprehensive end-to-end tracing for gRPC service architectures. Correlates Protobuf definitions, Java/Go/Rust server implementations, and client stubs across all repositories.
 
-**Negative Constraints**: Do NOT use this tool for asynchronous message queues (Kafka, RabbitMQ). Use `analyze_impact` for event-driven flows.
+**Negative Constraints**: DO NOT USE for message brokers or asynchronous event streams (use analyze_impact).
 
 #### JSON Schema
 ```json
 {
   "type": "object",
-  "required": ["service_name"],
+  "required": ["target"],
   "properties": {
-    "service_name": {
+    "target": {
       "type": "string",
-      "description": "Name of the gRPC service defined in Protobuf (e.g. 'UserService', 'AuthService')"
-    },
-    "method_name": {
-      "type": "string",
-      "description": "Optional specific RPC method name (e.g. 'GetUser', 'VerifyToken')"
+      "description": "Name of the gRPC service (ex: 'UserService'), RPC method (ex: 'SignUp', 'AuthenticateUser'), or package."
     }
   },
   "additionalProperties": false
@@ -205,19 +197,19 @@ Comprehensive end-to-end tracing for gRPC service architectures. Correlates Prot
 ### Tool 4: `analyze_impact`
 
 #### Description
-Causal impact and blast radius analysis. Computes synchronous call chains and asynchronous event distribution flows (Kafka topics, AsyncAPI channels, SQS queues) affected by a proposed file modification.
+Maps asynchronous events, Kafka topics, queues, post-processors, and sagas.
 
-**Negative Constraints**: Do NOT use for general keyword searches. Pass a specific file path that is being created, modified, or deleted.
+**Negative Constraints**: DO NOT USE for synchronous direct HTTP/gRPC RPC calls (use analyze_grpc).
 
 #### JSON Schema
 ```json
 {
   "type": "object",
-  "required": ["changed_file"],
+  "required": ["target"],
   "properties": {
-    "changed_file": {
+    "target": {
       "type": "string",
-      "description": "Workspace-relative path to the file scheduled for modification (e.g. 'proto-registry/payment/v1/payment.proto', 'services/user/model.py')"
+      "description": "Name of event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga to analyze."
     }
   },
   "additionalProperties": false
@@ -226,7 +218,7 @@ Causal impact and blast radius analysis. Computes synchronous call chains and as
 
 #### Sample Response
 ```markdown
-## Causal Blast Radius Report for `proto-registry/payment/v1/payment.proto`
+## Causal Blast Radius Report for `EVENT_CREATED`
 
 ⚠️ **Impact Severity**: HIGH (Cross-Service Contract Mutation)
 
@@ -248,7 +240,7 @@ Causal impact and blast radius analysis. Computes synchronous call chains and as
 #### Description
 Search architecture decision records (ADRs), RFCs, and markdown documentation with integrated prompt-injection sanitization.
 
-**Negative Constraints**: Do NOT use to search source code. Use `smart_search` for code.
+**Negative Constraints**: DO NOT USE to search application source code (use smart_search).
 
 #### JSON Schema
 ```json
@@ -258,11 +250,11 @@ Search architecture decision records (ADRs), RFCs, and markdown documentation wi
   "properties": {
     "query": {
       "type": "string",
-      "description": "Keywords or topics to search for within markdown documentation (e.g. 'Kafka idempotency', 'JWT expiration')"
+      "description": "Architectural concept, ADR, or RFC term to search for (ex: 'Scatter-Gather', 'Transactional Outbox', 'Neo4j')"
     },
-    "scope": {
-      "type": "string",
-      "description": "Optional documentation sub-directory (e.g. 'docs/adr', 'architecture')"
+    "max_sections": {
+      "type": "integer",
+      "description": "Maximum number of conceptual sections to return (default: 3)."
     }
   },
   "additionalProperties": false

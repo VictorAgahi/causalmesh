@@ -86,6 +86,58 @@ impl DoctorCommand {
             }
         }
 
+        // 1c. Source repository version drift check (Issue 5)
+        let cargo_path = PathBuf::from("Cargo.toml");
+        if cargo_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&cargo_path) {
+                if let Ok(val) = content.parse::<toml::Value>() {
+                    let local_version = val
+                        .get("workspace")
+                        .and_then(|w| w.get("package"))
+                        .and_then(|p| p.get("version"))
+                        .or_else(|| val.get("package").and_then(|p| p.get("version")))
+                        .and_then(|v| v.as_str());
+                    if let Some(version) = local_version {
+                        let running_version = env!("CARGO_PKG_VERSION");
+                        if version != running_version {
+                            eprintln!(
+                                "⚠ Binary version drift warning: Running binary is v{running_version}, but local workspace Cargo.toml is v{version} — consider running 'cargo build --release' or updating."
+                            );
+                        } else {
+                            eprintln!("✔ Binary version match: Running binary matches local workspace Cargo.toml (v{running_version})");
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1d. Exclude pattern inspection (Issue 2)
+        if let Some(p) = cfg_path {
+            if let Ok(cfg) = Config::load_from_file(p) {
+                let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
+                if let Ok(roots) = expand_roots(
+                    &cfg.workspace.roots,
+                    base_dir,
+                    &cfg.workspace.workspace_root,
+                ) {
+                    let root_names: Vec<String> = roots
+                        .iter()
+                        .filter_map(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .collect();
+                    for pat in &cfg.workspace.exclude_patterns {
+                        for root_name in &root_names {
+                            if pat.starts_with(root_name) || pat.contains(&format!("/{root_name}/"))
+                            {
+                                eprintln!(
+                                    "ℹ Exclude pattern note: Pattern '{pat}' includes root name '{root_name}'. MeshMCP automatically resolves root-prefixed patterns."
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Symlink invariants
         eprintln!("✔ Symlink invariants: follow_links=false verified across all engines");
 

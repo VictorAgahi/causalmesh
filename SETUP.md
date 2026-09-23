@@ -451,19 +451,19 @@ rely on them.
 | Section / key | Status |
 | :--- | :--- |
 | `[workspace]` `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` | **wired** |
-| `[workspace.mount_aliases]` | *accepted* — translation not applied yet |
-| `[engines.docs]` `aliases`, `stop_words`, `exact_phrase_boost`, `sanitize_prompt_injections` | **wired** |
-| `[engines.docs]` `enabled`, `paths`, `fuzzy_fallback` | *accepted* — Markdown is indexed because it sits under `roots`, not because of `paths`; the engine cannot be turned off |
+| `[workspace.mount_aliases]` | **wired** — translates container bind-mount paths (e.g. `/workspace`) to local host roots |
+| `[engines.docs]` `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` | **wired** — `enabled` toggles doc indexing, `paths` restricts doc scope (`"docs/**"` or `"${workspace_root}/docs/**"`), `fuzzy_fallback` controls full-text fallback |
 | `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` | **wired** |
-| `[engines.contracts.grpc]`, `[engines.contracts.spring]`, `[engines.contracts.openapi]`, `[engines.contracts.asyncapi]` | *accepted* — detection is by file extension and content today, so `proto_dirs`, `spec_files`, `property_files`, `controller_annotations` and the `enabled` flags have no effect |
-| `[engines.policy.stop_rules]` | **wired** (via the git pre-commit hook) |
+| `[engines.contracts.grpc]` `proto_dirs`, `controller_annotations`, `canonical_fqcn_projection` | **wired** — scopes `.proto` dirs, configures controller annotations (e.g. `@GrpcMethod`), and controls canonical FQCN projection |
+| `[engines.contracts.spring]` `enabled`, `property_files`, `resolve_placeholders`, `auto_redact_secrets` | **wired** — scopes property files, resolves `${...}` placeholders, and masks sensitive secrets |
+| `[engines.contracts.openapi]` `enabled`, `spec_files` | **wired** — scopes OpenAPI spec detection |
+| `[engines.contracts.asyncapi]` `enabled`, `spec_files`, `infer_string_topics` | **wired** — scopes AsyncAPI spec detection and topic string inference |
+| `[engines.contracts.cpp]` `include_paths` | **wired** — resolves C++ `<header.h>` angle-bracket include targets |
+| `[engines.policy.stop_rules]` | **wired** (evaluated in tool dispatch and git pre-commit hook) |
 | `[engines.policy.skills]` | **wired** |
-| `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` | *accepted* — the audit log is always written; hooks install only via `mesh-mcp install-hooks` |
+| `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` | **wired** — `enabled=false` turns off stop rules/skills; `enforce_git_hooks` gates hook installation; `cryptographic_audit_trail` gates audit logging |
 
-Practical consequence: **secret masking and prompt-injection sanitisation are always on** and
-cannot be disabled by config, which is the safe default. Conversely, listing `spec_files` or
-`proto_dirs` does not narrow or widen what gets scanned — `roots` and `exclude_patterns` are the
-only levers for that.
+Practical consequence: **all configuration sections actively control their respective indexing and governance behavior**. Secret masking and prompt-injection sanitisation are enabled by default and can be configured per section.
 
 There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
 a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.

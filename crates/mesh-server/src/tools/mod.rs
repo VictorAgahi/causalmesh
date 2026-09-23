@@ -408,4 +408,59 @@ roots = ["."]
         assert!(names.contains(&"search_docs"));
         assert!(names.contains(&"visualize_mesh"));
     }
+
+    /// Regression test for Issue 3: assert generated JSON schemas match real tool structs
+    #[test]
+    fn test_tool_schemas_match_expectations() {
+        use schemars::schema_for;
+
+        let find_deps = schema_for!(super::find_dependents::FindDependentsArgs);
+        let find_deps_props: Vec<String> = find_deps
+            .schema
+            .object
+            .unwrap()
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        assert!(find_deps_props.contains(&"target".to_string()));
+        assert!(!find_deps_props.contains(&"scope".to_string()));
+
+        let analyze_grpc = schema_for!(super::analyze_grpc::AnalyzeGrpcArgs);
+        let grpc_props: Vec<String> = analyze_grpc
+            .schema
+            .object
+            .unwrap()
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        assert!(grpc_props.contains(&"target".to_string()));
+        assert!(!grpc_props.contains(&"service_name".to_string()));
+
+        let analyze_impact = schema_for!(super::analyze_impact::AnalyzeImpactArgs);
+        let impact_props: Vec<String> = analyze_impact
+            .schema
+            .object
+            .unwrap()
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        assert!(impact_props.contains(&"target".to_string()));
+        assert!(!impact_props.contains(&"changed_file".to_string()));
+
+        let search_docs = schema_for!(super::search_docs::SearchDocsArgs);
+        let docs_props: Vec<String> = search_docs
+            .schema
+            .object
+            .unwrap()
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        assert!(docs_props.contains(&"query".to_string()));
+        assert!(docs_props.contains(&"max_sections".to_string()));
+        assert!(!docs_props.contains(&"scope".to_string()));
+    }
 }

@@ -13,27 +13,49 @@ pub struct FilesystemCrawler;
 /// matched by a pattern are pruned from the walk entirely instead of being filtered file by file.
 pub struct ExcludeMatcher {
     set: GlobSet,
+    pub raw_patterns: Vec<String>,
 }
 
 impl ExcludeMatcher {
     pub fn compile(exclude_patterns: &[String]) -> Self {
         let mut builder = GlobSetBuilder::new();
+        let mut raw_patterns = Vec::new();
         for raw in exclude_patterns {
             let pat = raw.trim();
             if pat.is_empty() {
                 continue;
             }
+            raw_patterns.push(pat.to_string());
+
+            // Normalize and expand `${workspace_root}` / `${WORKSPACE_ROOT}` references
+            let clean = if pat.contains("${workspace_root}") || pat.contains("${WORKSPACE_ROOT}") {
+                pat.replace("${workspace_root}/", "")
+                    .replace("${workspace_root}", "")
+                    .replace("${WORKSPACE_ROOT}/", "")
+                    .replace("${WORKSPACE_ROOT}", "")
+            } else {
+                pat.to_string()
+            };
+
             // Normalize to a path-anchored form so `foo/**` and `**/foo/**` both prune `foo/`
             // and everything under it, and `*.pem` matches at any depth.
-            let mut expanded: Vec<String> = Vec::with_capacity(3);
-            let core = pat.trim_end_matches("/**").trim_end_matches('/');
-            let anchored = if core.starts_with("**/") || core.starts_with('/') {
-                core.to_string()
-            } else {
-                format!("**/{core}")
-            };
-            expanded.push(anchored.clone());
-            expanded.push(format!("{anchored}/**"));
+            let mut expanded: Vec<String> = Vec::with_capacity(4);
+            let core = clean.trim_end_matches("/**").trim_end_matches('/');
+            if !core.is_empty() {
+                let anchored = if core.starts_with("**/") || core.starts_with('/') {
+                    core.to_string()
+                } else {
+                    format!("**/{core}")
+                };
+                expanded.push(anchored.clone());
+                expanded.push(format!("{anchored}/**"));
+
+                if core.starts_with('/') {
+                    let unslash = core.trim_start_matches('/');
+                    expanded.push(unslash.to_string());
+                    expanded.push(format!("{unslash}/**"));
+                }
+            }
 
             for e in expanded {
                 match Glob::new(&e) {
@@ -53,18 +75,34 @@ impl ExcludeMatcher {
             tracing::error!(target: "mesh::crawler", "Exclude set failed to compile: {err}");
             GlobSet::empty()
         });
-        Self { set }
+        Self { set, raw_patterns }
     }
 
     /// `rel` must be the path relative to the crawl root (never absolute) so that user
     /// patterns can't accidentally match the workspace's own parent directories.
     #[inline]
     pub fn is_excluded(&self, rel: &Path) -> bool {
+        self.is_excluded_with_root(rel, None)
+    }
+
+    /// Checks if `rel` (optionally prepended with `root`'s folder name) matches an exclude pattern.
+    pub fn is_excluded_with_root(&self, rel: &Path, root: Option<&Path>) -> bool {
         // `.git` is always off-limits regardless of configuration.
         if rel.components().any(|c| c.as_os_str() == ".git") {
             return true;
         }
-        self.set.is_match(rel)
+        if self.set.is_match(rel) {
+            return true;
+        }
+        if let Some(r) = root {
+            if let Some(root_name) = r.file_name() {
+                let rel_with_root = Path::new(root_name).join(rel);
+                if self.set.is_match(&rel_with_root) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -95,7 +133,10 @@ impl FilesystemCrawler {
 
         // Prune excluded directories at the walker level so `node_modules/` is never descended.
         let root_for_filter = root.to_path_buf();
-        let filter_set = matcher.set.clone();
+        let matcher_clone = ExcludeMatcher {
+            set: matcher.set.clone(),
+            raw_patterns: matcher.raw_patterns.clone(),
+        };
         builder.filter_entry(move |entry| {
             let rel = match entry.path().strip_prefix(&root_for_filter) {
                 Ok(r) => r,
@@ -104,10 +145,7 @@ impl FilesystemCrawler {
             if rel.as_os_str().is_empty() {
                 return true;
             }
-            if rel.components().any(|c| c.as_os_str() == ".git") {
-                return false;
-            }
-            !filter_set.is_match(rel)
+            !matcher_clone.is_excluded_with_root(rel, Some(&root_for_filter))
         });
 
         let mut files = Vec::new();
@@ -315,5 +353,20 @@ mod tests {
             !files.iter().any(|p| p.to_string_lossy().contains("/etc/")),
             "External symlink escaping workspace must be discarded"
         );
+    }
+
+    #[test]
+    fn test_exclude_matcher_root_prefixed_pattern() {
+        let matcher = ExcludeMatcher::compile(&["**/deploy/submodules/**".to_string()]);
+        let root = Path::new("/workspace/deploy");
+        let rel = Path::new("submodules/config.yml");
+        assert!(matcher.is_excluded_with_root(rel, Some(root)));
+    }
+
+    #[test]
+    fn test_exclude_matcher_workspace_root_pattern() {
+        let matcher = ExcludeMatcher::compile(&["${workspace_root}/docs/**".to_string()]);
+        let rel = Path::new("docs/readme.md");
+        assert!(matcher.is_excluded(rel));
     }
 }

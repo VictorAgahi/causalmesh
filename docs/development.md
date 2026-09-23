@@ -50,14 +50,15 @@ MeshMCP adheres to a zero-warning, zero-compromise quality standard.
 ```bash
 cargo test --workspace
 ```
-Expected output:
+Expected output (counts grow as languages and roadmap items are added — treat these as a
+floor, not an exact match):
 ```
-test result: ok. 22 passed (mesh-core)
-test result: ok. 8 passed (mesh-daemon)
-test result: ok. 24 passed (mesh-parsers)
-test result: ok. 4 passed (mesh-server unit)
-test result: ok. 9 passed (mesh-server integration)
-Total: 67 passed; 0 failed
+test result: ok. 42 passed (mesh-core)
+test result: ok. 13 passed (mesh-daemon)
+test result: ok. 85 passed (mesh-parsers)
+test result: ok. 20 passed (mesh-server unit)
+test result: ok. 13 passed (mesh-server integration)
+Total: 173 passed; 0 failed
 ```
 
 ### Run Strict Clippy

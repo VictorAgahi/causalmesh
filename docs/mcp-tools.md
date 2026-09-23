@@ -1,6 +1,6 @@
 # MeshMCP MCP Tools Specification & Reference Guide
 
-This document specifies the five core Model Context Protocol (MCP) tools exposed by MeshMCP (RFC-001 Rev. 2.9.0). All tools adhere to strict JSON schemas, negative prompting constraints (Miller's Law), and affordance-driven output bounding.
+This document specifies the six core Model Context Protocol (MCP) tools exposed by MeshMCP (RFC-001 Rev. 2.9.0). All tools adhere to strict JSON schemas, negative prompting constraints (Miller's Law), and affordance-driven output bounding.
 
 ---
 
@@ -33,6 +33,7 @@ graph LR
     T -->|analyze_grpc| TG[Synchronous gRPC Tracing]
     T -->|analyze_impact| TI[Causal Event & Async Blast Radius]
     T -->|search_docs| TDO[Sanitized Architecture Docs]
+    T -->|visualize_mesh| TV[Mermaid / HTML Topology]
 ```
 
 ---
@@ -278,6 +279,43 @@ User-generated markdown documentation can contain prompt injections designed to 
 
 ---
 
+### Tool 6: `visualize_mesh`
+
+#### Description
+Renders the whole indexed topology — services, contracts, gRPC endpoints, Kafka topics — as a
+diagram, either as Mermaid Markdown (pastable into a doc or PR description) or as a standalone
+interactive HTML page.
+
+**Negative Constraints**: Do NOT use for a targeted question about one symbol or dependency —
+this renders the *entire* mesh, which is the wrong tool for "what depends on X" (use
+`find_dependents`) or "where is X implemented" (use `analyze_grpc`).
+
+#### JSON Schema
+```json
+{
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "string",
+      "description": "Desired output format: 'mermaid' (returns GitHub-compatible Mermaid Markdown) or 'html' (returns standalone interactive HTML). Defaults to 'mermaid'."
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+#### Sample Response
+```markdown
+​```mermaid
+graph LR
+  ProtoRegistry["proto-registry"] -->|implements| BillingService
+  BillingService -->|produces| PaymentSettled[("payment.settled.v1")]
+  CheckoutWorker -->|consumes| PaymentSettled
+​```
+```
+
+---
+
 ## 3. Error Codes & Diagnostic Handling
 
 MeshMCP maps all internal failure modes into standard JSON-RPC 2.0 error responses:
@@ -287,4 +325,4 @@ MeshMCP maps all internal failure modes into standard JSON-RPC 2.0 error respons
 | **`-32602`** | `InvalidParams` | Scope path escaped sandbox jail (`ValidatedScope`), or unknown parameters sent | Verify path exists within declared `roots` in `mesh-mcp.toml`. |
 | **`-32601`** | `MethodNotFound`| Unrecognized tool requested | Use one of the 6 registered tools (`smart_search`, etc.). |
 | **`-32603`** | `InternalError` | Tree-sitter timeout (15ms exceeded) or file > 384 KB | Reduce query scope or check file size. |
-| **`200 OK`** | `RSAH Governance Block` | Attempted write to guarded repo (e.g. `proto-registry`) | Follow structured action handoff to human engineer. |
+| **`-32001`** | `GOVERNANCE_BLOCKED` | The call targets a subject matched by `[engines.policy.stop_rules]`, on a tool that declares itself capable of mutating that target (`McpTool::mutates()`). Returns a structured RSAH payload (see [governance-rsah.md](governance-rsah.md)). | Follow the returned `required_workflow`/`message_to_user` and report to the human. In practice this never fires today — every shipped tool is read-only, so `mutates()` is `false` everywhere; it activates automatically the day a mutating tool is added. |

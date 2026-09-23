@@ -226,6 +226,11 @@ MeshMCP schedules Tier-2 background rescans on a dedicated Rayon thread pool con
 
 - **macOS (Darwin)**: Sets thread priority using `libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_BACKGROUND, 0)`. macOS kernel delegates these threads to high-efficiency cores (E-cores) and deprioritizes disk I/O.
 - **Linux**: Calls `libc::setpriority(libc::PRIO_PROCESS, 0, 10)` to yield CPU cycles to IDE and language server processes.
+- **Windows**: Calls `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)` followed by `SetThreadPriority(.., THREAD_MODE_BACKGROUND_BEGIN)` — the latter alone does not change what `GetThreadPriority` reports, so the former is set first to guarantee the thread genuinely runs below normal CPU priority, with I/O and memory priority also dropped.
+
+The daemon transport itself is also platform-specific: a Unix domain socket on macOS/Linux, a
+named pipe (`\\.\pipe\mesh-mcp-<user>`) on Windows, so `meshd` sharing across IDE windows works
+on every supported OS, not only Unix.
 
 ---
 
@@ -233,11 +238,18 @@ MeshMCP schedules Tier-2 background rescans on a dedicated Rayon thread pool con
 
 For compliance under SOC2 Type II and EU AI Act Article 14 (human-in-the-loop oversight for automated systems), MeshMCP generates an append-only cryptographic audit trail:
 
-- **Location**: `~/.cache/mesh-mcp/audit.log` (or workspace-configured audit path).
+- **Location**: `~/.cache/mesh-mcp/audit.db` (SQLite, WAL mode; the `.log` naming in older docs is
+  historical — `default_log_path()` is an alias for `default_db_path()`).
 - **Permissions**: Mode `0600` (readable/writable exclusively by user).
-- **Chaining Function**:
+- **Chaining Function** (chain v2 — every row also carries the `chain_version` it was written
+  under, so upgrading the binary does not invalidate a database written before this formula
+  existed; v1 rows keep verifying under the original 5-field formula):
   ```text
-  Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || PayloadDigest)
+  Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || ArgsDigest
+                   || Status || FilesAccessed || SecretsRedactedCount)
   ```
+  The v1 formula omitted `Status`, `FilesAccessed` and `SecretsRedactedCount`, which are stored
+  in the same row — meaning those three fields could be altered without breaking chain
+  verification. v2 closes that.
 
-An auditor or CI verification script can replay the log from genesis (`0000000000000000000000000000000000000000000000000000000000000000`). Any modified, inserted, or removed record breaks all subsequent SHA-256 signatures.
+An auditor or CI verification script can replay the log from genesis (`0000000000000000000000000000000000000000000000000000000000000000`). Any modified, inserted, or removed record breaks all subsequent SHA-256 signatures. `mesh-mcp stats` reads this same database read-only for local usage reporting — it never writes to it and nothing it computes leaves the machine.

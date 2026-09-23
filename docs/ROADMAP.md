@@ -9,12 +9,18 @@ against *Definition of done*. Items are independent unless *Depends on* says oth
 
 Effort scale: **S** ≈ half a day · **M** ≈ 1–3 days · **L** ≈ a week or more.
 
+**Status as of 2026-09-23**: 15 of 16 items resolved and merged. Item 7 is partial — Kotlin and
+C# extractors are done; Ruby, PHP, Swift and Scala are not started. Each item below carries a
+**Status** line; the *Problem*/*Evidence* text below it is left as the historical record of what
+was true at `27520b4`, not updated to describe the fix — read the linked source for current
+behaviour.
+
 | Priority | Theme | Items |
 | :--- | :--- | :--- |
-| P0 | The product promises things it does not do | [1](#1-config-surface-is-largely-decorative) [2](#2-find_dependents-only-works-for-typescript) [3](#3-analyze_impact-natively-covers-java-and-asyncapi-only) [4](#4-rsah-governance-has-no-production-caller) |
-| P1 | Extraction quality | [5](#5-language-extractors-are-uneven) [6](#6-no-type-resolution--the-graph-is-name-matching) [7](#7-missing-languages) |
-| P2 | Robustness and correctness | [8](#8-mesh-daemon-is-under-tested) [9](#9-audit-hash-chain-does-not-cover-all-stored-fields) [10](#10-propertyregistry-has-no-per-file-provenance) [11](#11-dispatchesto-generation-is-quadratic-per-topic) [12](#12-println-in-cligraphrs-contradicts-commandment-3) |
-| P3 | Ecosystem and polish | [13](#13-windows-is-a-second-class-target) [14](#14-rfc-001-has-drifted-from-the-implementation) [15](#15-no-local-telemetry-despite-having-the-data) [16](#16-smart_search-results-are-unranked) |
+| P0 | The product promises things it does not do | [1](#1-config-surface-is-largely-decorative) ✅ [2](#2-find_dependents-only-works-for-typescript) ✅ [3](#3-analyze_impact-natively-covers-java-and-asyncapi-only) ✅ [4](#4-rsah-governance-has-no-production-caller) ✅ |
+| P1 | Extraction quality | [5](#5-language-extractors-are-uneven) ✅ [6](#6-no-type-resolution--the-graph-is-name-matching) ✅ [7](#7-missing-languages) ⚠️ partial |
+| P2 | Robustness and correctness | [8](#8-mesh-daemon-is-under-tested) ✅ [9](#9-audit-hash-chain-does-not-cover-all-stored-fields) ✅ [10](#10-propertyregistry-has-no-per-file-provenance) ✅ [11](#11-dispatchesto-generation-is-quadratic-per-topic) ✅ [12](#12-println-in-cligraphrs-contradicts-commandment-3) ✅ |
+| P3 | Ecosystem and polish | [13](#13-windows-is-a-second-class-target) ✅ [14](#14-rfc-001-has-drifted-from-the-implementation) ✅ [15](#15-no-local-telemetry-despite-having-the-data) ✅ [16](#16-smart_search-results-are-unranked) ✅ |
 
 ---
 
@@ -24,6 +30,13 @@ These are the items where a user follows the documentation, sees no error, and g
 That is worse than an unimplemented feature, because it costs trust in everything else.
 
 ### 1. Config surface is largely decorative
+
+**Status: ✅ Resolved.** All keys listed below are now wired: `enabled` flags gate their engine
+in `WorkspaceIndexer::process_file`; `mount_aliases` threads through every production
+`ValidatedScope::resolve_with_aliases` call site; the grpc/spring/openapi/asyncapi knobs feed
+`ExtractConfig`/`SpringSettings`; `enforce_git_hooks`/`cryptographic_audit_trail` gate hook
+install and audit writes; `docs.paths`/`fuzzy_fallback` scope indexing and add edit-distance
+fallback search. No config key remains unread.
 
 **Problem.** Around 18 of ~25 configuration keys parse successfully and are then read by nothing.
 `#[serde(deny_unknown_fields)]` means a typo fails loudly, which trains users to believe that a
@@ -68,6 +81,11 @@ Consider one release that warns (`#[serde(default)]` + a `doctor` note) before o
 
 ### 2. `find_dependents` only works for TypeScript
 
+**Status: ✅ Resolved.** Java, Go, Python, Rust and C++ import extractors now populate
+`FileIndex.dependencies`, verified through the real `PolyglotIndexer::extract` dispatch (not
+just each extractor's own unit tests — see `test_polyglot_indexer_wires_*_dependency` in
+`crates/mesh-parsers/src/languages/mod.rs`).
+
 **Problem.** One of the four questions the README leads with is "who breaks if I change this?".
 For a Java, Go, Python, Rust or C++ workspace, `find_dependents` returns empty — always.
 
@@ -105,6 +123,11 @@ paths may need an extra resolution strategy there; add it in one place rather th
 
 ### 3. `analyze_impact` natively covers Java and AsyncAPI only
 
+**Status: ✅ Resolved.** Native producer/consumer detection added for Go (kafka-go, sarama,
+confluent-kafka-go), Python (confluent_kafka, aiokafka, Celery), Rust (rdkafka), TypeScript
+(kafkajs, `@nestjs/microservices`, BullMQ), plus Java `KafkaTemplate.send` on the producer
+side. Non-literal topic names emit the variable/expression text rather than being dropped.
+
 **Problem.** Event tracing across services — the flagship feature for event-driven architectures —
 has native detection for Java `@KafkaListener` and AsyncAPI `channels`. Everything else requires
 the user to hand-write regex patterns in `[[engines.contracts.patterns]]`.
@@ -139,6 +162,13 @@ so the agent can at least see that a topic is used there.
 
 ### 4. RSAH governance has no production caller
 
+**Status: ✅ Resolved — option (a), wired.** `McpTool::mutates()` (default `false`) gates a
+call to `evaluate_guard` inside `ToolRegistry::invoke`, returning `GOVERNANCE_BLOCKED_CODE`
+(`-32001`) on a hit. Every shipped tool is read-only, so this never fires in practice today —
+see [docs/governance-rsah.md](governance-rsah.md) for the honest scope. The French
+`message_to_user` strings were also translated to English since they are now reachable
+through a production path.
+
 **Problem.** `GovernanceEngine::evaluate_guard` (`mesh-core/src/governance.rs:75`) builds complete
 RSAH refusal envelopes — status, policy, four-step required workflow, user-facing message — and is
 reachable only from tests. Actual enforcement is the git pre-commit hook
@@ -172,6 +202,11 @@ or `evaluate_guard` and `RsahResponse` removed with the hook documented as the s
 
 ### 5. Language extractors are uneven
 
+**Status: ✅ Resolved for the languages listed.** Rust gained tonic (`GrpcService`/
+`GrpcMethod`), axum/actix-web (`HttpEndpoint`), and trait→`Interface` — previously
+`ServiceClass` only. Go gained gRPC server-registration detection and chi/gin/echo route
+recognition. C++ gained `::grpc::Service` subclass detection.
+
 **Problem.** Extractor coverage varies wildly, so graph richness depends on which language a
 service happens to be written in.
 
@@ -203,6 +238,11 @@ language extractor recognises, backed by a test per row.
 
 ### 6. No type resolution — the graph is name matching
 
+**Status: ✅ Resolved for the short-term step.** `ContractEdge` carries `EdgeConfidence`
+(`Exact` for an FQCN/`::`-path match or a structural edge, `Heuristic` for bare-name/
+case-insensitive/substring matches), surfaced by `MarkdownFormatter` and `GraphRenderer`.
+Medium/long-term (real qualified-name resolver, compiler/LSP output) remain open.
+
 **Problem.** The entire graph is built from string matching: symbol names, package names, regex
 captures. Two `UserService` types in different repositories are indistinguishable; a mechanical
 rename silently splits the graph; an interface and its implementation link only when their names
@@ -233,6 +273,14 @@ noise.
 
 ### 7. Missing languages
 
+**Status: ⚠️ Partial.** Kotlin and C# are fully done (extractor, full wiring, tests, docs) —
+see `crates/mesh-parsers/src/languages/kotlin.rs` / `csharp.rs`. Ruby, PHP, Swift and Scala
+are not started. The main cost on Kotlin/C# was grammar ABI compatibility: this workspace
+pins `tree-sitter = "0.24"` (grammar ABI ≤ 14), and the obvious latest crate version for both
+languages turned out to be ABI 15+ and failed to link — `tree-sitter-kotlin-ng = "1.1"` and
+`tree-sitter-c-sharp = "0.21"` (not 0.23+) are the versions that actually work. Whoever picks
+up the remaining four should check ABI compatibility before committing to a crate version.
+
 **Problem.** No extractor for C#, Kotlin, Ruby, PHP, Swift or Scala. Kotlin is the sharpest gap:
 a Spring Boot shop that migrated to Kotlin gets nothing from the Java extractor.
 
@@ -255,6 +303,11 @@ updated.
 
 ### 8. `mesh-daemon` is under-tested
 
+**Status: ✅ Resolved.** `mesh-daemon` went from 8 to 13 tests, including the exact DoD test
+(`test_slow_tool_call_does_not_block_other_client_ping`), a racing-bind test, an
+idle-cancellation-mid-request test, and stale-socket-recovery tests. "Multiple concurrent
+clients" was already covered by a pre-existing test.
+
 **Problem.** The daemon is the default runtime path — `mesh-mcp run` proxies to it — and has 8
 tests, versus 26 in `mesh-core` and 30 in `mesh-parsers`.
 
@@ -275,6 +328,11 @@ and a `ping` on the other, and asserts the `ping` completes well before the slow
 ---
 
 ### 9. Audit hash chain does not cover all stored fields
+
+**Status: ✅ Resolved — versioned (option a).** `hash_input` and `verify_db` now cover all
+eight fields. A `chain_version` column tags each row with the formula it was written under,
+so pre-existing v1 databases keep verifying under the original five-field formula instead of
+every historical entry being rejected the moment the binary upgrades.
 
 **Problem.** The chain attests `prev_hash`, `timestamp`, `session_id`, `tool` and `args_digest`.
 It does **not** cover `status`, `files_accessed` or `secrets_redacted_count`, which are stored in

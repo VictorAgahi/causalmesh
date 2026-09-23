@@ -14,8 +14,8 @@ Four separate mechanisms, often confused with each other:
 | --- | --- | --- |
 | `ValidatedScope` sandbox | every tool taking a path | enforced at runtime |
 | Secret redaction | `PropertyRegistry` at index time | enforced at runtime |
-| Audit chain | `ToolRegistry::invoke` after every call | enforced at runtime |
-| RSAH governance refusal (`evaluate_guard`) | git pre-commit hook only | **not** called by any MCP tool |
+| Audit chain (v2, 8-field) | `ToolRegistry::invoke` after every call, gated by `[engines.policy] cryptographic_audit_trail` | enforced at runtime |
+| RSAH governance refusal (`evaluate_guard`) | git pre-commit hook, **and** `ToolRegistry::invoke` before `run` — but only when `McpTool::mutates(&args)` is `true` | wired in both places; the in-server check is a no-op today because every shipped tool is read-only (`mutates()` defaults to `false` and no tool overrides it) |
 | `[engines.policy.skills]` hint (`recommend_skill`) | `ToolRegistry::invoke` | wired, see section 4 |
 
 ---
@@ -41,8 +41,11 @@ Four separate mechanisms, often confused with each other:
   - `RsahResponse { status, policy, violation, required_workflow, agent_next_action, message_to_user }`, `RsahWorkflow`
 - **Audit chain**: [`crates/mesh-core/src/audit.rs`](../../../crates/mesh-core/src/audit.rs)
   - `AuditLogger::new(Option<PathBuf>)`, `::new_in_memory()`, `::default_db_path()`, `::log_path()`
-  - `::record_entry()`, `::verify_db()`, `::verify_log_file()` (alias), `::export_to_jsonl()`
-  - `::compute_sha256()`, `GENESIS_HASH`, `AuditEntry`
+  - `::record_entry()`, `::verify_db()`, `::verify_log_file()` (alias), `::export_to_jsonl()`,
+    `::read_entries(path, since_epoch_secs)` (read-only, backs `mesh-mcp stats`)
+  - `::compute_sha256()`, `GENESIS_HASH`, `CHAIN_VERSION`, `AuditEntry { .., chain_version }`
+- **Governance gate in tool dispatch**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
+  - `McpTool::mutates()`, `GOVERNANCE_BLOCKED_CODE = -32001`, the check inside `ToolRegistry::invoke`
 - **Git hook**: [`crates/mesh-server/src/cli/hooks.rs`](../../../crates/mesh-server/src/cli/hooks.rs) (`HooksCommand::run`)
 - **Doctor**: [`crates/mesh-server/src/cli/doctor.rs`](../../../crates/mesh-server/src/cli/doctor.rs)
 - **Prompt-injection sanitising of docs**: [`crates/mesh-core/src/docs.rs`](../../../crates/mesh-core/src/docs.rs) (`DocIndex::sanitize_prompt_injections`)
@@ -131,18 +134,33 @@ into `flat_properties` directly bypasses redaction entirely.
 
 ## 4. Governance: what actually runs
 
-### 4.1 RSAH refusals are not enforced by the MCP tools
+### 4.1 RSAH is wired into `ToolRegistry::invoke`, gated on `mutates()`
 
 `GovernanceEngine::evaluate_guard(target_or_scope)` lowercases its input, tests it against
 each `[engines.policy.stop_rules]` key by substring, and returns a fully-formed
 `RsahResponse` (status `GOVERNANCE_BLOCKED`, a four-step `required_workflow`,
-`agent_next_action: "STOP_AND_REPORT_TO_USER"`, and a user-facing message). It has
-special-cased envelopes for `proto-registry` (policy `CONTRACT_FIRST_CASCADE_CI`) and
+`agent_next_action: "STOP_AND_REPORT_TO_USER"`, and a user-facing message, now in English).
+It has special-cased envelopes for `proto-registry` (policy `CONTRACT_FIRST_CASCADE_CI`) and
 `k8s-infrastructure` (`INFRASTRUCTURE_AS_CODE_REVIEW`), plus a generic fallback.
 
-**No MCP tool calls it.** The only non-test caller in the tree is none; the integration
-test `test_governance_rsah_trigger_on_mutation` calls it directly on `state.governance`.
-This is deliberate and documented in `smart_search`:
+`McpTool` carries a `mutates(&Self::Args) -> bool` method, defaulting to `false`. Right after
+parsing args and before `spawn_blocking`, `ToolRegistry::invoke` does:
+
+```rust
+if T::mutates(&args) {
+    if let Some(subject) = T::subject(&args) {
+        if let Some(rsah) = state.governance.evaluate_guard(subject) {
+            return Err((GOVERNANCE_BLOCKED_CODE, serde_json::to_string(&rsah)...));
+        }
+    }
+}
+```
+
+`GOVERNANCE_BLOCKED_CODE` is `-32001` (an implementation-defined JSON-RPC server error, distinct
+from `-32602`/`-32601`). This is a real call path with its own integration test
+(`test_invoke_blocks_mutating_call_on_guarded_subject`, `crates/mesh-server/src/tools/mod.rs`) —
+but **every shipped tool leaves `mutates()` at its default `false`**, so in practice this check
+never fires today. It is deliberate and documented in `smart_search`:
 
 ```rust
 // Note: smart_search is a read-only discovery tool. Read access to guarded contract
@@ -150,14 +168,15 @@ This is deliberate and documented in `smart_search`:
 // Active governance (RSAH) is reserved for mutations and commit verification.
 ```
 
-The enforcement that actually bites is the OS-level git hook installed by
-`mesh-mcp install-hooks` (`HooksCommand::run`): a `.git/hooks/pre-commit` script, mode
-`0755`, that fails the commit when staged files touch both `proto-registry/` or `proto/`
-and `services/` or `api-gateway/`. MeshMCP's tools are read-only; the commit boundary is
-where a mutation can be stopped.
+The enforcement that actually bites *today* is the OS-level git hook installed by
+`mesh-mcp install-hooks` (`HooksCommand::run`, gated by `[engines.policy] enforce_git_hooks`): a
+`.git/hooks/pre-commit` script, mode `0755`, that fails the commit when staged files touch both
+`proto-registry/` or `proto/` and `services/` or `api-gateway/`. MeshMCP's shipped tools are all
+read-only; the commit boundary is where a mutation can currently be stopped.
 
-If you wire `evaluate_guard` into a tool, say so in that tool's `DESCRIPTION` and update
-this section — a refusal an agent cannot predict is worse than none.
+If you add a tool that mutates something, override `mutates()` to `true` for the args that do,
+say so in that tool's `DESCRIPTION`, and add an integration test proving the refusal fires
+through the real `invoke` path — a refusal an agent cannot predict is worse than none.
 
 ### 4.2 Skill hints: key = tool name, or path fragment
 
@@ -205,17 +224,31 @@ alias for `verify_db()`.
   `audit_entries`, keyed by `entry_seq INTEGER PRIMARY KEY` (the rowid).
 - `record_entry` opens a `TransactionBehavior::Immediate` transaction so concurrent
   processes serialise, reads the committed tail from SQLite rather than from RAM (another
-  process may share the DB), and chains:
+  process may share the DB), and chains (chain v2 — see below for why a version exists):
 
   ```rust
-  // Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || Digest)
-  let hash_input = format!("{prev_hash}{timestamp}{session_id}{tool}{args_digest}");
+  // Hash_n = SHA256(Hash_{n-1} || Timestamp || SessionId || Tool || Digest
+  //                 || Status || FilesAccessed || SecretsRedactedCount)
+  let hash_input = format!(
+      "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
+  );
   let entry_hash = Self::compute_sha256(hash_input.as_bytes());
   ```
 
   `args_digest` is `SHA256(args_json)`, so the arguments are committed to without being
   stored verbatim. The first entry uses `GENESIS_HASH` (64 zeros) and `seq = 0`.
-- `verify_db` replays the chain; `export_to_jsonl` dumps entries for compliance tooling.
+- Every row carries a `chain_version` column. The original (v1) formula covered only the first
+  five fields, which let `status`, `files_accessed` and `secrets_redacted_count` be tampered
+  with in the row without breaking the chain — v2 folds those three in. `verify_db` dispatches
+  the hash formula **per row** based on its own `chain_version`, so a database written before
+  v2 existed keeps verifying under the original five-field formula instead of every historical
+  entry being rejected the moment the binary upgrades. New writes always use v2
+  (`AuditLogger::CHAIN_VERSION`). If you add another stored field that should be tamper-evident,
+  bump `CHAIN_VERSION` again and add a new match arm in `verify_db` — never change what an
+  existing version number means.
+- `verify_db` replays the chain; `export_to_jsonl` dumps entries for compliance tooling;
+  `read_entries` (read-only, `SQLITE_OPEN_READ_ONLY`) backs `mesh-mcp stats` and never mutates
+  the file or its `0600` permissions.
 
 Because the whole args struct is serialised into `args_json` before digesting, never put a
 secret or a file body in a tool argument.

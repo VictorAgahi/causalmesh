@@ -31,8 +31,11 @@ newline corrupts the JSON-RPC stream for the whole session.
   - `MarkdownFormatter::format_search_results` / `format_dependents` / `format_grpc_trace` /
     `format_impact_flow` / `format_doc_sections`; `SearchResult`
 - **Daemon proxy**: [`crates/mesh-server/src/main.rs`](../../../crates/mesh-server/src/main.rs)
-  (`resolve_socket_path`, `ensure_daemon_running`, `run_proxy_mode`, `run_standalone`) and
-  [`crates/mesh-daemon/src/`](../../../crates/mesh-daemon/src/)
+  (`resolve_socket_path`/`resolve_pipe_name`, `ensure_daemon_running[_windows]`,
+  `run_proxy_mode[_windows]`, `run_standalone`) and
+  [`crates/mesh-daemon/src/server.rs`](../../../crates/mesh-daemon/src/server.rs)
+  (shared `dispatch`/`handle_client`, `unix_impl::run_uds_server`,
+  `windows_impl::run_named_pipe_server`)
 
 ---
 
@@ -152,11 +155,16 @@ and name the next call.
 
 ## 6. Daemon proxy mode
 
-`mesh-mcp run` defaults to proxy mode on Unix: `resolve_socket_path` (honouring
+`mesh-mcp run` defaults to proxy mode: on Unix, `resolve_socket_path` (honouring
 `MESH_SOCKET_PATH`, then `XDG_RUNTIME_DIR`, then `~/.cache/mesh/meshd.sock`),
 `ensure_daemon_running` (auto-spawns `meshd` next to the current exe and polls the socket),
-then `run_proxy_mode`, which is a bidirectional `tokio::io::copy` between stdin/stdout and
-the UDS. `--standalone` skips detection, and any failure to reach `meshd` falls back to
+then `run_proxy_mode`, a bidirectional `tokio::io::copy` between stdin/stdout and the UDS. On
+Windows the same shape runs over a named pipe instead (`resolve_pipe_name`,
+`ensure_daemon_running_windows`, `run_proxy_mode_windows`, spawning `meshd.exe`) —
+`crates/mesh-daemon/src/server.rs` shares one `dispatch`/`handle_client<S: AsyncRead +
+AsyncWrite>` between `unix_impl::run_uds_server` and `windows_impl::run_named_pipe_server`, so
+the JSON-RPC handling itself is transport-agnostic; only the accept loop differs. `--standalone`
+skips detection on either platform, and any failure to reach `meshd` falls back to
 `run_standalone` with a warning.
 
 In proxy mode the framing rules apply to `meshd`, not to the proxy: the proxy copies bytes

@@ -66,8 +66,9 @@ sample, computed by the harness, not an estimate.
 
 Reduction depends entirely on code style: a file of one-line delegating methods barely shrinks,
 a file of long business-logic bodies shrinks a lot. The 54–69% range above reflects the three
-samples in the harness (TypeScript, Rust, Go). To know your own figure, run the suite — do not
-assume a single headline percentage applies to your codebase.
+samples currently in the harness (TypeScript, Rust, Go); decapitation itself now also covers
+Java, Python, C++, Kotlin and C#, just without a dedicated bench sample yet. To know your own
+figure, run the suite — do not assume a single headline percentage applies to your codebase.
 
 Signatures, parameter types, return types, annotations (`@Service`, `@GrpcMethod`, …) and
 docstrings are always preserved. An agent that genuinely needs an implementation asks for it

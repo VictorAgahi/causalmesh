@@ -29,8 +29,10 @@ graph TD
     
     subgraph Barrier 1: Cognitive RSAH
         Action --> Server[MeshMCP JSON-RPC Server]
-        Server --> GovCheck{Target in stop_rules?}
-        GovCheck -->|Yes| RSAH[Return RSAH Refusal Payload]
+        Server --> MutCheck{Tool declares mutates == true?}
+        MutCheck -->|No -- every shipped tool| Allowed2[Call proceeds, read-only]
+        MutCheck -->|Yes| GovCheck{Target in stop_rules?}
+        GovCheck -->|Yes| RSAH[Return RSAH Refusal Payload, code -32001]
         RSAH --> ChannelCoT[Channel Agent Chain-of-Thought]
         ChannelCoT --> Human[Handoff to Human Engineer]
     end
@@ -59,20 +61,34 @@ RSAH eliminates this loop by providing:
 3. **Sequential Action Plan**: Details what must happen next (e.g., commit schema $\to$ wait for CI build $\to$ resume service updates).
 
 ### 3.2 Concrete RSAH Payload
+
+`ToolRegistry::invoke` checks `evaluate_guard` **before** running the tool, for any call where
+`McpTool::mutates(&args)` returns `true`. On a hit it short-circuits with a JSON-RPC error
+(code `-32001`, an implementation-defined server error) instead of a normal result envelope —
+the agent's tool call fails outright rather than succeeding with a refusal buried in the text:
+
 ```json
 {
   "jsonrpc": "2.0",
   "id": 42,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "🛑 [MeshMCP GOVERNANCE BLOCKED: CONTRACT_FIRST_CASCADE_CI]\nModification targeting guarded repository 'proto-registry' is restricted.\n\n👉 Reason: Central Protobuf contracts must be reviewed, committed, and published to artifact repositories before downstream microservices can be updated.\n\nRecommended User Message:\n'I have drafted the necessary contract changes in proto-registry. To maintain CI stability, please review and commit the schema changes independently before I update services/billing-service.'"
-      }
-    ]
+  "error": {
+    "code": -32001,
+    "message": "{\"status\":\"GOVERNANCE_BLOCKED\",\"policy\":\"CONTRACT_FIRST_CASCADE_CI\",\"required_workflow\":{\"step_1\":\"...\",\"step_2\":\"...\",\"step_3\":\"...\",\"step_4\":\"DO NOT modify 'api-gateway' or 'services/*' until the published packages are available.\"},\"agent_next_action\":\"STOP_AND_REPORT_TO_USER\",\"message_to_user\":\"I detected a mutation targeting the Protobuf contract in 'proto-registry'. Per active architecture governance, I'm stopping here: you must submit the contract PR and let CI generate the stubs before adapting the microservices.\"}"
   }
 }
 ```
+
+`message` is the serialized `RsahResponse` (the same struct the `evaluate_guard` unit tests use)
+as a string, since a JSON-RPC error's `message` field is a string, not a nested object.
+
+> **Honest scope**: this check is gated on `McpTool::mutates()`, which every shipped tool
+> (`smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`,
+> `visualize_mesh`) leaves at its default of `false` — they are all read-only. So while the
+> wiring above is real and covered by an integration test
+> (`test_invoke_blocks_mutating_call_on_guarded_subject` in
+> `crates/mesh-server/src/tools/mod.rs`), it does not fire against any tool call you can make
+> today. It activates automatically for a future tool that overrides `mutates()` to `true`. The
+> enforcement point that *is* active against every commit today is Barrier 2 below.
 
 ---
 

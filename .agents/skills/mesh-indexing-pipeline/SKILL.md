@@ -26,7 +26,10 @@ the wrong place.
   - `WorkspaceIndexer::reload()`: differential reload driven by the VFS, handles deletions
   - `WorkspaceIndexer::repo_names()`: display names indexed by `RepoId`
   - `SCAN_DEPTH`: crawl depth used by every full scan
-  - private: `crawl_all`, `process_file`, `fold`, `compiled_patterns`, `FileFragment`
+  - private: `crawl_all`, `process_file`, `fold`, `compiled_patterns`, `extract_config`,
+    `engine_toggles`, `FileFragment`, `ScanConfig` (bundles `patterns`/`doc_template`/
+    `spring`/`extract_cfg`/`toggles` into one `&ScanConfig` param so `process_file` stays
+    under `clippy::too_many_arguments` — resolved once per scan, not per file)
 - **Crawl**: [`crates/mesh-core/src/crawler.rs`](../../../crates/mesh-core/src/crawler.rs)
   - `FilesystemCrawler::crawl_scope()`: `follow_links(false)`, depth cap, `git_ignore(true)`, `hidden(false)`
   - `ExcludeMatcher::compile()` / `is_excluded()`: globset compiled once, wired into `WalkBuilder::filter_entry` so excluded directories are pruned instead of filtered file by file; `.git` is always excluded
@@ -34,10 +37,14 @@ the wrong place.
   - `AstGuard::within_size_budget(path, metadata)`: stat-only, runs *before* the read
   - `AstGuard::looks_binary(bytes)`, `AstGuard::should_parse_path(path, metadata, bytes)`
 - **Extraction**: [`crates/mesh-parsers/src/languages/mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs)
-  - `PolyglotIndexer::extract(path, content, repo_id) -> FileIndex` (thread-safe, no graph)
+  - `PolyglotIndexer::extract(path, content, repo_id) -> FileIndex` (thread-safe, no graph;
+    default `ExtractConfig`) and `::extract_with_config(.., &ExtractConfig)` (the one the real
+    pipeline calls)
   - `PolyglotIndexer::extract_custom_patterns(path, content, repo_id, &[CompiledPattern])`
   - `FileIndex::merge()`, `FileIndex::apply(&mut ContractGraph)`
   - `CompiledPattern::compile_all(&[CustomPatternConfig])`
+  - `ExtractConfig::from_contracts(&ContractsConfig)` — `proto_dirs`, `controller_annotations`,
+    `canonical_fqcn_projection`, `openapi_spec_files`, `asyncapi_spec_files`, `infer_string_topics`
 - **State**: [`crates/mesh-core/src/state.rs`](../../../crates/mesh-core/src/state.rs)
   - `MeshSnapshot { contract_graph, doc_index, property_registry, generation }`
   - `AppState::snapshot()`, `AppState::snapshot_clone()`, `AppState::install_snapshot()`
@@ -150,21 +157,47 @@ Do not add your own queue on top of it.
 
 ## 4. Adding a file type to the pipeline
 
-`process_file` dispatches on the extension:
+`process_file` dispatches on the extension, now gated by per-engine config (`[engines.docs]
+enabled`/`paths`, `[engines.contracts] enabled`, `[engines.contracts.spring]
+property_files`/`auto_redact_secrets`, resolved once per scan into `ScanConfig`):
 
 ```rust
 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 match ext {
-    "md" => frag.docs = doc_template.parse_sections(path, content),
-    "properties" => { /* PropertyRegistry::ingest_properties_str */ }
-    "yml" | "yaml" => { /* properties + PolyglotIndexer::extract */ }
-    _ => frag.code = PolyglotIndexer::extract(path, content, repo_id),
+    "md" => {
+        if toggles.docs_enabled && Self::doc_path_allowed(path, root, &toggles.doc_paths) {
+            frag.docs = doc_template.parse_sections(path, content);
+        }
+    }
+    "properties" => { /* gated by spring.is_property_source(path) */ }
+    "yml" | "yaml" => { /* properties (same gate) + extract_with_config, gated by toggles.contracts_enabled */ }
+    _ => {
+        if toggles.contracts_enabled {
+            frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+        }
+    }
 }
 ```
 
+`PolyglotIndexer::extract_with_config` threads `[engines.contracts.grpc/.openapi/.asyncapi]`
+knobs (`proto_dirs`, `controller_annotations`, `canonical_fqcn_projection`, `spec_files`,
+`infer_string_topics`) into extraction; `extract(path, content, repo_id)` is a thin wrapper
+using `ExtractConfig::default()` for callers (mostly tests) that don't need config-driven
+behaviour.
+
 To add a **new source language**, do not touch this `match`: the `_` arm already routes
-to `PolyglotIndexer::extract`. Register the extension in `LanguageKind::from_path` and
-follow [`mesh-parser-engineering`](../mesh-parser-engineering/SKILL.md).
+to `PolyglotIndexer::extract_with_config`. Register the extension in `LanguageKind::from_path`
+and follow [`mesh-parser-engineering`](../mesh-parser-engineering/SKILL.md) — and make sure
+your language's dispatch arm in `PolyglotIndexer::extract_with_config` (in `languages/mod.rs`)
+actually populates `out.dependencies`/`.producers`/`.consumers` from your extractor's relations,
+not just `out.nodes`. Every one of items 2/3 (imports, native event detection) for Java, Go,
+Rust and C++ was implemented correctly in its own extractor module but initially left
+unreachable in production because this exact dispatch wiring was skipped — the extractor's own
+unit tests passed by calling the relations-aware function directly, while the real pipeline
+kept calling the old node-only `extract()`. A test that goes through
+`PolyglotIndexer::index_file` (not the extractor directly) is what catches this — see
+`test_polyglot_indexer_wires_java_import_dependency` and its siblings in `languages/mod.rs`
+for the pattern.
 
 To add a **new non-code artefact** (a lockfile, a manifest, an IDL that is not
 tree-sitter-parsed):

@@ -100,11 +100,11 @@ an agent from flailing.
 
 | Tool | Answers | Notes |
 | :--- | :--- | :--- |
-| `smart_search` | "Where is `UserAuthRequest` declared?" | Returns signatures with bodies stripped. Searches the in-memory symbol index; pass `fuzzy: true` for a full-text scan of the scope. |
-| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup. Import edges are currently extracted from **TypeScript/JavaScript only**; for other languages use a custom pattern or `smart_search`. |
+| `smart_search` | "Where is `UserAuthRequest` declared?" | Returns signatures with bodies stripped, ranked by relevance (exact name match first, then prefix, then substring; ties broken by node kind). Searches the in-memory symbol index; pass `fuzzy: true` for a full-text scan of the scope. |
+| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup. Import edges are extracted natively for Java, Go, Python, Rust, C++ and TypeScript/JavaScript; for anything else use a custom pattern. Edges carry a confidence (`Exact` for an FQCN/fully-qualified match, `Heuristic` for a bare-name match), surfaced in the output. |
 | `analyze_grpc` | "Where is this RPC implemented and called?" | Links `.proto` definitions to handlers and client stubs. |
-| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. Detected natively for Java (`@KafkaListener`) and AsyncAPI channels; for other languages declare a [custom pattern](#layer-5--custom-patterns-teach-it-your-conventions). |
-| `search_docs` | "What did we decide about idempotency?" | Keyword search over your Markdown docs, with alias and stop-word support. |
+| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. Detected natively for Java (`@KafkaListener`/`KafkaTemplate`), Go (kafka-go/sarama/confluent-kafka-go), Python (confluent_kafka/aiokafka/Celery), Rust (rdkafka), TypeScript (kafkajs/NestJS microservices/BullMQ) and AsyncAPI channels; for anything else declare a [custom pattern](#layer-5--custom-patterns-teach-it-your-conventions). |
+| `search_docs` | "What did we decide about idempotency?" | Keyword search over your Markdown docs, with alias, stop-word and optional fuzzy (edit-distance) fallback support. |
 | `visualize_mesh` | "Show me the topology." | Mermaid or standalone HTML. |
 
 Two things every tool does:
@@ -159,6 +159,17 @@ exclude_patterns = [
 
 Excluded directories are pruned from the walk, so a large `node_modules/` costs nothing.
 
+Running inside a container where the agent sees a different path than the one on disk (a
+Docker bind mount, a devcontainer)? Map the container path to the real one:
+
+```toml
+[workspace.mount_aliases]
+"/workspace" = "${workspace_root}"
+```
+
+A scope argument starting with `/workspace` is translated before the jail check runs, instead
+of being rejected as a sandbox escape.
+
 ### Layer 2 — Docs: make `search_docs` speak your vocabulary
 
 ```toml
@@ -176,8 +187,10 @@ exact_phrase_boost = 60          # weight of a full-phrase hit in a section titl
 sanitize_prompt_injections = true # neutralise "ignore previous instructions" in indexed docs
 ```
 
-> `paths` and `enabled` are accepted but not yet read: Markdown is indexed because it sits under
-> `roots`. See the [config reference](SETUP.md#config-reference) for which keys are wired.
+`enabled = false` skips markdown indexing entirely; `paths` scopes indexing to a glob allowlist
+instead of every `.md` file under `roots`. Add `fuzzy_fallback = true` (the default) to retry a
+query that found nothing with edit-distance-tolerant token matching, so a typo like "kubernets"
+still surfaces a section titled "Kubernetes".
 
 Aliases are the highest-leverage setting here: without them, an agent asking about "the DLQ"
 finds nothing in a doc that only ever says "dead-letter-queue".
@@ -233,9 +246,9 @@ Where a skill is advice, a stop rule is a refusal. Used by the git pre-commit ho
 
 ```toml
 [engines.policy]
-enabled = true
-enforce_git_hooks = true
-cryptographic_audit_trail = true
+enabled = true                    # false disables stop rules and skill hints entirely
+enforce_git_hooks = true          # false makes `install-hooks` a no-op
+cryptographic_audit_trail = true  # false skips the audit write on every tool call
 
 [engines.policy.stop_rules]
 "proto-registry" = "STOP: proto-registry generates the TS/Go/Java stubs. Land the contract PR first."
@@ -243,14 +256,37 @@ cryptographic_audit_trail = true
 ```
 
 A commit touching a guarded path is rejected with a structured explanation of what to do
-instead. See [docs/governance-rsah.md](docs/governance-rsah.md).
+instead. The same stop rules are also checked inside the MCP server itself, for any tool that
+declares it can mutate its target — read [docs/governance-rsah.md](docs/governance-rsah.md) for
+the honest scope of that (no shipped tool mutates anything today, so this is enforcement
+infrastructure the git hook alone doesn't need yet, not something you'll see fire in practice).
 
 ### Layer 5 — Custom patterns: teach it your conventions
 
-MeshMCP recognises gRPC, Spring, OpenAPI and AsyncAPI shapes by file extension and content —
-the `[engines.contracts.grpc]` / `.spring` / `.openapi` / `.asyncapi` sections are accepted but
-not yet read, so there is nothing to configure there today. Your in-house event bus, outbox
-table or job queue it cannot guess — describe it with a regex:
+MeshMCP recognises gRPC, Spring, OpenAPI and AsyncAPI shapes by file extension and content by
+default, and each of those is configurable:
+
+```toml
+[engines.contracts.grpc]
+proto_dirs = ["proto-registry"]              # scope .proto extraction; empty = unrestricted
+controller_annotations = ["@GrpcMethod"]     # TS decorators that mark a gRPC handler
+canonical_fqcn_projection = true             # false projects the bare method name
+
+[engines.contracts.spring]
+property_files = ["application*.properties"] # scope which files are Spring property sources
+resolve_placeholders = true                   # resolve ${key:default} in place
+auto_redact_secrets = true                    # false stops masking matched secret keys
+
+[engines.contracts.openapi]
+spec_files = ["**/openapi.yaml"]             # scope OpenAPI detection instead of sniffing
+
+[engines.contracts.asyncapi]
+spec_files = ["**/asyncapi.yaml"]
+infer_string_topics = true                   # also pick up a non-standard top-level `topics:` list
+```
+
+Your in-house event bus, outbox table or job queue it still cannot guess — describe it with a
+regex:
 
 ```toml
 [[engines.contracts.patterns]]
@@ -305,12 +341,12 @@ Details: [docs/architecture.md](docs/architecture.md).
 
 ### Two ways to run
 
-**Daemon (default)** — `mesh-mcp run` is a thin proxy over a Unix socket to a shared `meshd`
-process that holds the index. Five IDE windows share one index instead of building five.
-`meshd` is auto-spawned and shuts down when idle.
+**Daemon (default)** — `mesh-mcp run` is a thin proxy to a shared `meshd` process that holds the
+index: a Unix domain socket on macOS/Linux, a named pipe on Windows. Five IDE windows share one
+index instead of building five. `meshd` is auto-spawned and shuts down when idle.
 
 **Standalone** — `mesh-mcp run --standalone` keeps everything in one process. Use it in
-containers, in CI, or when a Unix socket isn't available.
+containers, in CI, or when the daemon transport isn't available.
 
 ---
 
@@ -348,6 +384,7 @@ files): 20.5 MiB. Index size scales with your workspace — measure on yours.
 | `mesh-mcp doctor` | Validate config, roots, skill files, parsers, secret masking. |
 | `mesh-mcp graph [--format html\|mermaid\|json] [--open]` | Render the topology. |
 | `mesh-mcp install-hooks` | Install the git pre-commit hook enforcing stop rules. |
+| `mesh-mcp stats [--since 7d\|24h\|all]` | Local-only summary of the audit log: calls per tool, error rate, most-queried scopes/targets. Nothing leaves the machine. |
 
 All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RPC only.
 

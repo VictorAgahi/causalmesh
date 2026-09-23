@@ -27,6 +27,12 @@ by every MCP tool.
   - `NodeKind`: `GrpcService`, `GrpcMethod`, `HttpEndpoint`, `KafkaTopic`, `EventStream`,
     `Queue`, `ProtoMessage`, `PostProcessor`, `Saga`, `ServiceClass`, `Interface`
   - `EdgeKind`: `Produces`, `Consumes`, `CallsRpc`, `Implements`, `Imports`, `DispatchesTo`
+    (variant kept for `mesh-parsers::graph`'s render match arms; `reconcile_edges` no longer
+    constructs it — see section 4)
+  - `EdgeConfidence`: `Exact` (FQCN/fully-qualified match, or a structural edge derived from
+    node identity) vs. `Heuristic` (bare-name, case-insensitive or substring match).
+    `ContractEdge.confidence` carries it; `MarkdownFormatter` and `GraphRenderer` surface it
+    so an agent can weigh a result instead of treating every edge as fact.
   - `CanonicalMethodId::new(package, service, method)` → `package.Service/Method`,
     `to_pascal_case()`, `detect_service_package()`
 - **Graph engine**: [`crates/mesh-core/src/contracts.rs`](../../../crates/mesh-core/src/contracts.rs)
@@ -119,12 +125,22 @@ order, per its doc comment:
 1. Resolve or drop placeholder import edges. `add_dependency` pushes an `Imports` edge
    with `to: 0` and the import string in `metadata`; reconcile resolves it via
    `resolve_import_target(from, target)` and **drops** it when unresolvable — that is how
-   external packages like `@nestjs/common` disappear instead of pointing at node 0.
-2. & 3. Topic hubs and causal dispatch: for each key in `topic_producers ∪ topic_consumers`,
-   find or synthesise the hub node, then wire `Produces` / `Consumes` and, when a topic has
-   both, `DispatchesTo` from each producer to each consumer.
-4. `Implements`: service handlers to their protobuf RPC declarations.
-5. `CallsRpc`: client call sites to proto methods.
+   external packages like `@nestjs/common` disappear instead of pointing at node 0. The
+   resolved edge's `confidence` comes from which strategy matched (see below).
+2. & 3. Topic hubs and dispatch: for each key in `topic_producers ∪ topic_consumers`, find or
+   synthesise the hub node, then wire `Produces` (`producer -> topic`) / `Consumes`
+   (`topic -> consumer`), both tagged `Exact` (they derive from producer/consumer
+   registration, not name matching). **`DispatchesTo` is no longer generated here** — it used
+   to materialize one direct edge per `(producer, consumer)` pair, which is
+   `O(producers * consumers)` per topic (a 50×50 hub topic alone produced 2,500 edges,
+   growing with the square — see ROADMAP item 11). The same information is available via the
+   two-hop `producer -> topic -> consumer` walk through `Produces`/`Consumes`, which is what
+   `analyze_impact` already reads directly from `topic_producers`/`topic_consumers`, not from
+   edges. Do not resurrect direct dispatch edges without a cap; if you need them, bound the
+   pair count per topic and document the behaviour at the limit.
+4. `Implements`: service handlers to their protobuf RPC declarations, tagged `Exact` for an
+   FQCN match, `Heuristic` for a case-insensitive/PascalCase/substring match.
+5. `CallsRpc`: client call sites to proto methods, same confidence split as above.
 
 De-duplication is a set, seeded once from the existing edges:
 
@@ -133,10 +149,14 @@ let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> =
     self.edges.iter().map(|e| (e.from, e.to, e.kind)).collect();
 ```
 
-`resolve_import_target` tries, in order: an exact name hit in `name_to_nodes`; for a
-relative or absolute path, the file stem restricted to the importer's own `repo_id`; then
-the qualified package identifier via `package_to_nodes`. Every lookup is an index hit —
-`nodes.values().find(...)` in this function is a regression.
+`resolve_import_target` tries, in order: (1) a fully-qualified name — Java `a.b.C`, Rust
+`a::b::C`, or `package/Name` — split via `split_fully_qualified` and matched against an
+package+name pair or `fqcn_to_node`, tagged `Exact`; (2) an exact bare name hit in
+`name_to_nodes`, tagged `Heuristic` (two unrelated types sharing a bare name would collide);
+(3) for a relative or absolute path, the file stem restricted to the importer's own
+`repo_id`, `Heuristic`; (4) the qualified package identifier via `package_to_nodes`,
+`Heuristic`. Every lookup is an index hit — `nodes.values().find(...)` in this function is a
+regression.
 
 The synthesised topic hub is worth reading before you touch it:
 

@@ -17,11 +17,12 @@ Six tools are exposed over MCP: `smart_search`, `find_dependents`, `analyze_grpc
 ## 1. Quick Navigation & Codebase References
 
 - **Trait and registry**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
-  - `McpTool { NAME, DESCRIPTION, Args, meta(), subject(), run() }`
+  - `McpTool { NAME, DESCRIPTION, Args, meta(), subject(), mutates(), run() }`
   - `ToolOutput { text, files_accessed, secrets_redacted }`, `ToolOutput::text()`
-  - `ToolError = (i32, String)`
+  - `ToolError = (i32, String)`, `GOVERNANCE_BLOCKED_CODE = -32001`
   - `ToolRegistry::list_tools()` (built once in a `LazyLock`), `::describe::<T>()`
-  - `ToolRegistry::call_tool()` (dispatch by name), `::invoke::<T>()` (parse, `spawn_blocking`, audit, skill hint)
+  - `ToolRegistry::call_tool()` (dispatch by name), `::invoke::<T>()` (parse, governance gate,
+    `spawn_blocking`, audit, skill hint)
 - **Reference implementations**: [`smart_search.rs`](../../../crates/mesh-server/src/tools/smart_search.rs)
   (scope validation, index-first lookup, snippet budget), [`find_dependents.rs`](../../../crates/mesh-server/src/tools/find_dependents.rs)
   (the minimal shape), [`search_docs.rs`](../../../crates/mesh-server/src/tools/search_docs.rs),
@@ -48,6 +49,9 @@ pub trait McpTool {
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta>;
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError>;
+
+    fn subject(_args: &Self::Args) -> Option<&str> { None }
+    fn mutates(_args: &Self::Args) -> bool { false }
 }
 ```
 
@@ -64,6 +68,14 @@ fn subject(args: &Self::Args) -> Option<&str> {
     Some(args.scope.as_str())   // smart_search
 }
 ```
+
+`mutates` defaults to `false`. Every shipped tool is read-only and leaves it there. If your
+tool actually changes something on disk or in a downstream system, override it — `true`
+routes the call through the RSAH governance check (`state.governance.evaluate_guard(subject)`)
+before `run` executes, and a hit short-circuits with `GOVERNANCE_BLOCKED_CODE` (`-32001`)
+instead of running the tool. Read-only tools must never override this to `true`: it would
+make inspecting a guarded scope (e.g. reading `proto-registry`) fail for no reason — see the
+comment in `smart_search.rs` explaining why it stays read-only-permitted.
 
 ---
 
@@ -188,6 +200,9 @@ slicing a multi-byte line at a fixed byte index panics.
 You get these for free; do not reimplement them in the tool:
 
 - **Argument parsing** into `T::Args`, with `-32602` and the tool name on failure.
+- **Governance gate**: if `T::mutates(&args)` is `true` and `T::subject(&args)` matches a
+  configured stop rule, the call is refused with `GOVERNANCE_BLOCKED_CODE` (`-32001`) before
+  `run` is ever called. Skipped entirely for the default `mutates() -> false`.
 - **`spawn_blocking`**, so `run` may block.
 - **Skill hint**: on `Ok`, `state.governance.recommend_skill(T::NAME, T::subject(&args))`
   is consulted and, when it matches, a `Project skill for this area` footer naming the

@@ -448,8 +448,16 @@ impl WorkspaceIndexer {
 
     /// Crawls all roots, tagging each file with the `RepoId` of its root.
     fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
+        if roots.len() > RepoId::MAX as usize {
+            tracing::error!(
+                target: "mesh::indexer",
+                "Root count ({}) exceeds maximum supported RepoId limit ({})",
+                roots.len(),
+                RepoId::MAX
+            );
+        }
         let mut out = Vec::new();
-        for (idx, root) in roots.iter().enumerate() {
+        for (idx, root) in roots.iter().enumerate().take(RepoId::MAX as usize) {
             let repo_id = idx as RepoId;
             match ValidatedScope::resolve_with_aliases(
                 &root.to_string_lossy(),

@@ -163,7 +163,7 @@ pub fn detect_service_package(
     let mut current = file_path.parent();
     while let Some(dir) = current {
         if let Some(parent) = dir.parent() {
-            if let Some(pname) = parent.file_name().and_then(|s| s.to_str()) {
+            if let Some(pname) = parent.file_name() {
                 if pname == "services" || pname == "apps" || pname == "packages" {
                     if let Some(svc_name) = dir.file_name().and_then(|s| s.to_str()) {
                         return CompactStr::new(svc_name);
@@ -192,7 +192,7 @@ pub fn detect_service_package(
     // 3. Fallback directory inspection
     current = file_path.parent();
     while let Some(dir) = current {
-        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+        if let Some(name) = dir.file_name() {
             if name != "src"
                 && name != "lib"
                 && name != "cmd"
@@ -201,7 +201,9 @@ pub fn detect_service_package(
                 && name != "services"
                 && name != "proto"
             {
-                return CompactStr::new(name);
+                if let Some(name_str) = name.to_str() {
+                    return CompactStr::new(name_str);
+                }
             }
         }
         current = dir.parent();

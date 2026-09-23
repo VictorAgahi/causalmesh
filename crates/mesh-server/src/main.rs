@@ -30,8 +30,6 @@ enum Commands {
     /// By default, connects to the shared meshd daemon via UDS for zero-overhead operation.
     /// Falls back to --standalone mode if daemon is unavailable.
     Run {
-        /// Force standalone mode: skip daemon detection and run a full in-process server.
-        /// Use this in containerised environments or when UDS is not available.
         #[arg(long, default_value = "false")]
         standalone: bool,
     },
@@ -131,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(unix)]
             if !standalone {
                 // ── UDS Proxy Mode ────────────────────────────────────────────
-                let sock_path = resolve_socket_path();
+                let sock_path = mesh_core::socket_path();
                 match ensure_daemon_running(&sock_path).await {
                     Ok(()) => {
                         tracing::info!(
@@ -154,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(windows)]
             if !standalone {
                 // ── Named Pipe Proxy Mode ──────────────────────────────────────
-                let pipe_name = resolve_pipe_name();
+                let pipe_name = mesh_core::pipe_name();
                 match ensure_daemon_running_windows(&pipe_name).await {
                     Ok(()) => {
                         tracing::info!(
@@ -186,25 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
-
-/// Resolves the socket path — mirrors meshd/src/socket.rs logic.
-#[cfg(unix)]
-fn resolve_socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("MESH_SOCKET_PATH") {
-        return PathBuf::from(p);
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("mesh").join("meshd.sock");
-    }
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("mesh")
-            .join("meshd.sock");
-    }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/mesh-{uid}.sock"))
-}
 
 /// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
 #[cfg(unix)]
@@ -286,16 +265,6 @@ async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Erro
 // meshd has no Unix Domain Socket on Windows, so `mesh-mcp run` shares the
 // daemon over a named pipe instead (ROADMAP Item 13), mirroring the UDS proxy
 // helpers above.
-
-/// Resolves the named pipe address — mirrors meshd/src/socket.rs's `pipe_name()`.
-#[cfg(windows)]
-fn resolve_pipe_name() -> String {
-    if let Ok(p) = std::env::var("MESH_PIPE_NAME") {
-        return p;
-    }
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
-    format!(r"\\.\pipe\mesh-mcp-{user}")
-}
 
 /// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
 #[cfg(windows)]

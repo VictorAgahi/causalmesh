@@ -76,7 +76,7 @@ Claude Code must strictly enforce these invariants on every edit:
 7. **OS Politeness & Cryptographic Audit**:
    - Rayon rescan thread pool runs with `QOS_CLASS_BACKGROUND` (macOS) / `nice(10)` (Linux).
    - Propagate W3C `traceparent` headers.
-   - Append to `audit.log` (mode `0600`) with chained SHA-256 signatures.
+   - Append-only SQLite audit DB (`~/.cache/mesh-mcp/audit.db`, mode `0600`) with chained SHA-256 signatures.
 
 ---
 

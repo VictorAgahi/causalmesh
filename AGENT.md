@@ -61,7 +61,7 @@ Before executing any file write, code refactor, or architectural change, you mus
 [7] OS POLITENESS, W3C TRACING & CRYPTOGRAPHIC AUDIT
     - Rayon rescan pool throttled via QOS_CLASS_BACKGROUND (macOS) / nice(10) (Linux)
     - W3C Trace Context (traceparent) parsed and propagated
-    - Append-only audit log (~/.cache/mesh-mcp/audit.log) with chained SHA-256 (0600)
+    - Append-only SQLite audit DB (~/.cache/mesh-mcp/audit.db) with chained SHA-256 (0600)
 ```
 
 ---

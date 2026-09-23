@@ -430,7 +430,7 @@ impl AuditLogger {
                 // "{unix_secs}.{millis:03}Z" — strip the trailing 'Z' and parse
                 // the epoch-seconds float directly rather than pulling in a
                 // date/time parser for this one call site.
-                let entry_secs: f64 = entry.timestamp.trim_end_matches('Z').parse().unwrap_or(0.0);
+                let entry_secs = parse_timestamp_to_epoch_secs(&entry.timestamp);
                 if entry_secs < cutoff {
                     continue;
                 }
@@ -506,11 +506,68 @@ fn chrono_fallback_utc_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now();
     let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = duration.as_secs();
+    let total_secs = duration.as_secs();
     let millis = duration.subsec_millis();
 
-    // ISO 8601 format
-    format!("{secs}.{millis:03}Z")
+    let secs_per_day = 86400;
+    let days = (total_secs / secs_per_day) as i64;
+    let rem_secs = (total_secs % secs_per_day) as u32;
+
+    let hours = rem_secs / 3600;
+    let minutes = (rem_secs % 3600) / 60;
+    let seconds = rem_secs % 60;
+
+    // Civil day calculation (Howard Hinnant algorithm)
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
+}
+
+fn parse_timestamp_to_epoch_secs(ts: &str) -> f64 {
+    let trimmed = ts.trim_end_matches('Z');
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return v;
+    }
+    // Parse ISO 8601 format: YYYY-MM-DDTHH:MM:SS.sss
+    if let Some((date_part, time_part)) = trimmed.split_once('T') {
+        let date_parts: Vec<&str> = date_part.split('-').collect();
+        let time_subparts: Vec<&str> = time_part.split('.').collect();
+        if date_parts.len() == 3 && !time_subparts.is_empty() {
+            let hms: Vec<&str> = time_subparts[0].split(':').collect();
+            if hms.len() == 3 {
+                let y: i64 = date_parts[0].parse().unwrap_or(1970);
+                let m: u32 = date_parts[1].parse().unwrap_or(1);
+                let d: u32 = date_parts[2].parse().unwrap_or(1);
+                let h: u64 = hms[0].parse().unwrap_or(0);
+                let min: u64 = hms[1].parse().unwrap_or(0);
+                let s: u64 = hms[2].parse().unwrap_or(0);
+                let millis: f64 = time_subparts
+                    .get(1)
+                    .and_then(|ms| ms.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    / 1000.0;
+
+                let y = if m <= 2 { y - 1 } else { y };
+                let era = (if y >= 0 { y } else { y - 399 }) / 400;
+                let yoe = (y - era * 400) as u32;
+                let m_idx = if m > 2 { m - 3 } else { m + 9 };
+                let doy = (153 * m_idx + 2) / 5 + d - 1;
+                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                let days = era * 146097 + (doe as i64) - 719468;
+                return (days as f64) * 86400.0 + (h * 3600 + min * 60 + s) as f64 + millis;
+            }
+        }
+    }
+    0.0
 }
 
 #[cfg(test)]

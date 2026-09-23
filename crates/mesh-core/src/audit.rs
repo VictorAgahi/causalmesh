@@ -398,7 +398,8 @@ impl AuditLogger {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut stmt = conn.prepare(
             "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version
              FROM audit_entries ORDER BY entry_seq ASC",
         )?;
 
@@ -417,6 +418,7 @@ impl AuditLogger {
                 files_accessed: files,
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
+                chain_version: row.get(11)?,
             })
         })?;
 

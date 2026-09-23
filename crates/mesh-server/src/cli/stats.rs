@@ -187,6 +187,7 @@ mod tests {
                 files_accessed: vec!["src/main.rs".to_string()],
                 secrets_redacted_count: 0,
                 entry_hash: "h0".to_string(),
+                chain_version: 2,
             },
             AuditEntry {
                 entry_seq: 1,
@@ -200,6 +201,7 @@ mod tests {
                 files_accessed: vec![],
                 secrets_redacted_count: 0,
                 entry_hash: "h1".to_string(),
+                chain_version: 2,
             },
             AuditEntry {
                 entry_seq: 2,
@@ -213,6 +215,7 @@ mod tests {
                 files_accessed: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
                 secrets_redacted_count: 0,
                 entry_hash: "h2".to_string(),
+                chain_version: 2,
             },
         ];
 

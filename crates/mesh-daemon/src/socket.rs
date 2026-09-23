@@ -30,15 +30,32 @@ pub fn socket_path() -> PathBuf {
         return p;
     }
 
+    let identifier = user_session_identifier();
     #[cfg(unix)]
-    let uid = unsafe { libc::getuid() };
+    return PathBuf::from(format!("/tmp/mesh-{identifier}.sock"));
     #[cfg(not(unix))]
-    let uid = unsafe { libc::getpid() as u32 };
+    return std::env::temp_dir().join(format!("mesh-{identifier}.sock"));
+}
+
+fn user_session_identifier() -> String {
+    if let Ok(user) = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .or_else(|_| std::env::var("USERNAME"))
+    {
+        if !user.trim().is_empty() {
+            return user.trim().to_string();
+        }
+    }
 
     #[cfg(unix)]
-    return PathBuf::from(format!("/tmp/mesh-{uid}.sock"));
+    {
+        let uid = unsafe { libc::getuid() };
+        uid.to_string()
+    }
     #[cfg(not(unix))]
-    return std::env::temp_dir().join(format!("mesh-{uid}.sock"));
+    {
+        "default".to_string()
+    }
 }
 
 pub fn cleanup_stale_socket(path: &std::path::Path) {

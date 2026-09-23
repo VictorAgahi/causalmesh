@@ -175,7 +175,12 @@ impl AstDecapitator {
 
         let mut result = content.to_string();
         for (start_byte, end_byte, replacement) in replacements {
-            if start_byte < result.len() && end_byte <= result.len() && start_byte <= end_byte {
+            if start_byte < result.len()
+                && end_byte <= result.len()
+                && start_byte <= end_byte
+                && result.is_char_boundary(start_byte)
+                && result.is_char_boundary(end_byte)
+            {
                 result.replace_range(start_byte..end_byte, &replacement);
             }
         }

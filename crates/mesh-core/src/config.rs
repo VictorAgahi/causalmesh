@@ -215,6 +215,15 @@ pub struct AsyncApiConfig {
     pub infer_string_topics: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadGovernanceMode {
+    #[default]
+    AllowAll,
+    AuditWarn,
+    EnforceRefusal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
@@ -224,6 +233,8 @@ pub struct PolicyConfig {
     pub enforce_git_hooks: bool,
     #[serde(default = "default_true")]
     pub cryptographic_audit_trail: bool,
+    #[serde(default)]
+    pub read_governance_mode: ReadGovernanceMode,
     #[serde(default)]
     pub stop_rules: HashMap<CompactStr, String>,
     #[serde(default)]
@@ -236,6 +247,7 @@ impl Default for PolicyConfig {
             enabled: true,
             enforce_git_hooks: true,
             cryptographic_audit_trail: true,
+            read_governance_mode: ReadGovernanceMode::AllowAll,
             stop_rules: HashMap::new(),
             skills: HashMap::new(),
         }

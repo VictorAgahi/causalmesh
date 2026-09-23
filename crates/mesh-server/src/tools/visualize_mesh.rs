@@ -59,6 +59,22 @@ impl McpTool for VisualizeMeshTool {
             }
         };
 
-        Ok(ToolOutput::text(output))
+        const MAX_OUTPUT: usize = 48 * 1024 - 1024;
+        let final_output = if output.len() > MAX_OUTPUT {
+            let mut cut_off = MAX_OUTPUT;
+            while !output.is_char_boundary(cut_off) {
+                cut_off -= 1;
+            }
+            format!(
+                "{}\n\n> [!NOTE]\n> Graph output truncated to fit within maximum MCP output payload (48 KB). Total nodes: {}, total edges: {}.\n",
+                &output[..cut_off],
+                graph.node_count(),
+                graph.edge_count()
+            )
+        } else {
+            output
+        };
+
+        Ok(ToolOutput::text(final_output))
     }
 }

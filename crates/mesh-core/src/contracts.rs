@@ -320,8 +320,15 @@ impl ContractGraph {
 
         // 2. Exact symbol name anywhere in the mesh — a bare name, so two
         // unrelated types sharing it would collide; heuristic.
+        // Prioritize a symbol in the same repository as the importer to avoid cross-repo false links.
         if let Some(ids) = self.name_to_nodes.get(target_str) {
-            if let Some(&id) = ids.first() {
+            let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
+            let chosen_id = ids
+                .iter()
+                .copied()
+                .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                .or_else(|| ids.first().copied());
+            if let Some(id) = chosen_id {
                 return Some((id, EdgeConfidence::Heuristic));
             }
         }
@@ -347,9 +354,16 @@ impl ContractGraph {
 
         // 4. Qualified package identifier (e.g. '@scope/pkg', 'com.acme.billing')
         // matched against a whole package, not a specific symbol; heuristic.
+        // Prioritize package nodes in the importer's repository if available.
         if is_qualified && !is_relative_or_absolute_path {
             if let Some(ids) = self.package_to_nodes.get(target_str) {
-                if let Some(&id) = ids.first() {
+                let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
+                let chosen_id = ids
+                    .iter()
+                    .copied()
+                    .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                    .or_else(|| ids.first().copied());
+                if let Some(id) = chosen_id {
                     return Some((id, EdgeConfidence::Heuristic));
                 }
             }

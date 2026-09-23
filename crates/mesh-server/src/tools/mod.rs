@@ -173,16 +173,32 @@ impl ToolRegistry {
         let args: T::Args = serde_json::from_value(arguments)
             .map_err(|e| (-32602, format!("Invalid arguments for {}: {e}", T::NAME)))?;
 
-        // Active governance (RSAH): only mutating calls are subject to a stop
-        // rule. Read-only tools (search, analyze_impact, find_dependents, ...)
-        // never call `evaluate_guard`, so inspecting a guarded scope stays allowed.
-        if T::mutates(&args) {
+        // Active governance (RSAH): mutating calls are subject to a stop rule.
+        // For read-only tools, behavior depends on `read_governance_mode`:
+        // - AllowAll (default): read queries proceed without refusal or warning.
+        // - AuditWarn: read queries proceed, but log a warning trace if a stop rule matched.
+        // - EnforceRefusal: read queries on guarded subjects are blocked with RSAH refusal.
+        let is_mutating = T::mutates(&args);
+        let mode = state.governance.read_governance_mode();
+        let should_check_guard = is_mutating || mode != mesh_core::ReadGovernanceMode::AllowAll;
+
+        if should_check_guard {
             if let Some(subject) = T::subject(&args) {
                 if let Some(rsah) = state.governance.evaluate_guard(subject) {
-                    let payload = serde_json::to_string(&rsah).unwrap_or_else(|_| {
-                        "RSAH governance refusal (payload serialization failed)".to_string()
-                    });
-                    return Err((GOVERNANCE_BLOCKED_CODE, payload));
+                    if is_mutating || mode == mesh_core::ReadGovernanceMode::EnforceRefusal {
+                        let payload = serde_json::to_string(&rsah).unwrap_or_else(|_| {
+                            "RSAH governance refusal (payload serialization failed)".to_string()
+                        });
+                        return Err((GOVERNANCE_BLOCKED_CODE, payload));
+                    } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
+                        tracing::warn!(
+                            target: "mesh::security",
+                            tool = T::NAME,
+                            subject = subject,
+                            "Read access to RSAH guarded scope '{}' detected under AuditWarn policy",
+                            subject
+                        );
+                    }
                 }
             }
         }

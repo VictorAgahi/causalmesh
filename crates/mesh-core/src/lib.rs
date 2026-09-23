@@ -18,7 +18,7 @@ pub mod watcher;
 pub use audit::{AuditEntry, AuditError, AuditLogger};
 pub use config::{
     expand_roots, AsyncApiConfig, Config, ConfigError, ContractsConfig, CustomPatternConfig,
-    GrpcConfig, OpenApiConfig, PatternKind, WorkspaceConfig,
+    GrpcConfig, OpenApiConfig, PatternKind, ReadGovernanceMode, WorkspaceConfig,
 };
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler};

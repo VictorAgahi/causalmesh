@@ -1,3 +1,4 @@
+use crate::config::ReadGovernanceMode;
 use crate::types::CompactStr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,14 +25,25 @@ pub struct RsahResponse {
 pub struct GovernanceEngine {
     stop_rules: HashMap<CompactStr, String>,
     skills: HashMap<CompactStr, String>,
+    read_governance_mode: ReadGovernanceMode,
 }
 
 impl GovernanceEngine {
     pub fn new(
         stop_rules: HashMap<CompactStr, String>,
         skills: HashMap<CompactStr, String>,
+        read_governance_mode: ReadGovernanceMode,
     ) -> Self {
-        Self { stop_rules, skills }
+        Self {
+            stop_rules,
+            skills,
+            read_governance_mode,
+        }
+    }
+
+    #[inline]
+    pub fn read_governance_mode(&self) -> ReadGovernanceMode {
+        self.read_governance_mode
     }
 
     #[inline]
@@ -144,7 +156,7 @@ mod tests {
             "Ne touche pas aux microservices avant CI".to_string(),
         );
 
-        let engine = GovernanceEngine::new(rules, HashMap::new());
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
         let result = engine.evaluate_guard("services/proto-registry/auth.proto");
         assert!(result.is_some());
 
@@ -165,7 +177,7 @@ mod tests {
             CompactStr::new("proto-registry"),
             ".agents/skills/proto.md".to_string(),
         );
-        let engine = GovernanceEngine::new(HashMap::new(), skills);
+        let engine = GovernanceEngine::new(HashMap::new(), skills, ReadGovernanceMode::AllowAll);
 
         // Exact tool-name key wins over any subject match.
         assert_eq!(
@@ -192,7 +204,7 @@ mod tests {
             "Stop Cascade CI".to_string(),
         );
 
-        let engine = GovernanceEngine::new(rules, HashMap::new());
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
         let result = engine.evaluate_guard("services/billing/BillingController.java");
         assert!(result.is_none());
     }

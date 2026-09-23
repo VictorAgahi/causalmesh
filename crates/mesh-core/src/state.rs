@@ -53,18 +53,28 @@ impl AppState {
     ) -> Self {
         // `[engines.policy] enabled = false` switches the whole policy engine off:
         // no stop rules, no skill recommendations.
-        let (stop_rules, skills) = config
+        let (stop_rules, skills, read_governance_mode) = config
             .engines
             .policy
             .as_ref()
             .filter(|p| p.enabled)
-            .map(|p| (p.stop_rules.clone(), p.skills.clone()))
+            .map(|p| {
+                (
+                    p.stop_rules.clone(),
+                    p.skills.clone(),
+                    p.read_governance_mode,
+                )
+            })
             .unwrap_or_default();
 
         Self {
             config: Arc::new(config),
             allowed_roots: allowed_roots.into(),
-            governance: Arc::new(GovernanceEngine::new(stop_rules, skills)),
+            governance: Arc::new(GovernanceEngine::new(
+                stop_rules,
+                skills,
+                read_governance_mode,
+            )),
             snapshot: ArcSwap::from_pointee(MeshSnapshot::default()),
             audit,
             rescan,

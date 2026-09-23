@@ -69,15 +69,6 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Resolves the named pipe address for meshd's Windows daemon transport.
-///
-/// `meshd` has no Unix Domain Socket on Windows, so IDE clients (`mesh-mcp
-/// run`) and the daemon instead share a single named pipe per user session,
-/// mirroring the UDS-based sharing on macOS/Linux (ROADMAP Item 13).
-///
-/// Precedence mirrors `socket_path()`:
-///   1. `$MESH_PIPE_NAME` (env override, full `\\.\pipe\...` address)
-///   2. `\\.\pipe\mesh-mcp-<username>` (per-user default)
 #[cfg(windows)]
 pub fn pipe_name() -> String {
     if let Ok(p) = std::env::var("MESH_PIPE_NAME") {
@@ -105,13 +96,8 @@ mod tests {
         cleanup_stale_socket(std::path::Path::new("/tmp/nonexistent-mesh-test.sock"));
     }
 
-    /// Simulates an unclean shutdown: a previous meshd bound this socket and
-    /// was killed (e.g. SIGKILL, OOM) without unlinking the file. Dropping a
-    /// `UnixListener` does NOT remove its backing socket path, so the file
-    /// is left behind with nothing listening on it — exactly the state a
-    /// crashed daemon leaves. `cleanup_stale_socket` must detect that no one
-    /// answers on it and remove it so the next daemon can bind cleanly.
     #[test]
+    #[cfg(unix)]
     fn test_cleanup_stale_socket_removes_orphaned_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("stale-meshd.sock");
@@ -140,6 +126,7 @@ mod tests {
 
     /// A live, currently-listening socket must NOT be treated as stale.
     #[test]
+    #[cfg(unix)]
     fn test_cleanup_stale_socket_preserves_live_listener() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("live-meshd.sock");

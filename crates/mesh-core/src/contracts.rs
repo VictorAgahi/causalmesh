@@ -570,6 +570,7 @@ impl ContractGraph {
                     Some(EdgeConfidence::Exact)
                 } else if h.name.eq_ignore_ascii_case(bare)
                     || h.pascal_name == bare
+                    || Self::bare_names_match(h.name, bare)
                     || h.signature
                         .is_some_and(|s| Self::signature_contains_bare(s, bare))
                 {
@@ -688,7 +689,9 @@ impl ContractGraph {
             // Case-sensitive exact-name equality is unambiguous; case-folding
             // or a substring FQCN hit is a name heuristic.
             let exact_name = node.name.as_str() == norm_target;
-            let matches_name = exact_name || node.name.eq_ignore_ascii_case(norm_target);
+            let matches_name = exact_name
+                || node.name.eq_ignore_ascii_case(norm_target)
+                || Self::bare_names_match(&node.name, norm_target);
             let matches_fqcn = node.package.contains(norm_target)
                 || Self::fqcn_contains(&node.package, &node.name, norm_target);
             if !(matches_name || matches_fqcn) {
@@ -840,7 +843,9 @@ impl ContractGraph {
                 continue;
             }
             if let Some(node) = self.nodes.get(id) {
-                if contains_ignore_ascii_case(node.name.as_str(), query) {
+                if contains_ignore_ascii_case(node.name.as_str(), query)
+                    || Self::bare_names_match(node.name.as_str(), query)
+                {
                     seen.insert(node.id);
                     matches.push(node);
                 }
@@ -861,6 +866,21 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 }
 
 impl ContractGraph {
+    /// Compares two bare names with normalization (case-insensitive and ignoring `_` underscores).
+    /// e.g. "USER_SERVICE_NAME.SIGN_UP" or "SIGN_UP" vs "SignUp" -> true.
+    pub fn bare_names_match(a: &str, b: &str) -> bool {
+        let a_bare = a.split('.').next_back().unwrap_or(a);
+        let b_bare = b.split('.').next_back().unwrap_or(b);
+
+        if a_bare.eq_ignore_ascii_case(b_bare) {
+            return true;
+        }
+
+        let a_norm: String = a_bare.chars().filter(|c| *c != '_').collect();
+        let b_norm: String = b_bare.chars().filter(|c| *c != '_').collect();
+        !a_norm.is_empty() && a_norm.eq_ignore_ascii_case(&b_norm)
+    }
+
     /// Allocation-free check whether `sig` contains `bare` prefixed by `@`, `'`, `"`, `fn `, `func `, or `def `.
     fn signature_contains_bare(sig: &str, bare: &str) -> bool {
         if bare.is_empty() {
@@ -871,7 +891,15 @@ impl ContractGraph {
             let mut offset = 0;
             while let Some(pos) = sig[offset..].find(prefix) {
                 let start = offset + pos + prefix.len();
-                if sig[start..].starts_with(bare) {
+                let rest = &sig[start..];
+                if rest.starts_with(bare) {
+                    return true;
+                }
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() && Self::bare_names_match(&ident, bare) {
                     return true;
                 }
                 offset += pos + prefix.len();
@@ -1227,5 +1255,75 @@ mod tests {
         let total_topic_edges = produces_count + consumes_count + dispatches_count;
         assert_eq!(total_topic_edges, FANOUT * 2);
         assert!(total_topic_edges < FANOUT * FANOUT);
+    }
+
+    #[test]
+    fn test_grpc_enum_decorator_end_to_end_reconciliation() {
+        let mut graph = ContractGraph::new();
+
+        // 1. Proto RPC declaration node
+        let proto_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("volontariapp.user.v1.UserService.SignUp"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new("proto/user.proto").into(),
+            line_start: 10,
+            line_end: 15,
+            package: CompactStr::new("volontariapp.user.v1"),
+            repo_id: 1,
+            signature: Some(CompactStr::new(
+                "rpc SignUp(SignUpRequest) returns (SignUpResponse)",
+            )),
+            docstring: None,
+        };
+        graph.add_node(proto_node);
+
+        // 2. TS Controller Handler node extracted from @GrpcMethod(USER_SERVICE_NAME, UserCommandMethod.SIGN_UP)
+        let ts_handler = ContractNode {
+            id: 0,
+            name: CompactStr::new("USER_SERVICE_NAME.SIGN_UP"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new(
+                "ms-user/src/modules/user/controllers/command/user.command.controller.ts",
+            )
+            .into(),
+            line_start: 47,
+            line_end: 50,
+            package: CompactStr::new("ms-user"),
+            repo_id: 1,
+            signature: Some(CompactStr::new(
+                "@GrpcMethod(USER_SERVICE_NAME, UserCommandMethod.SIGN_UP) async signUp(data: SignUpCommandDTO)",
+            )),
+            docstring: None,
+        };
+        graph.add_node(ts_handler);
+
+        // Reconcile graph edges
+        graph.reconcile_edges();
+
+        // Query analyze_grpc("SignUp")
+        let trace = graph.analyze_grpc("SignUp");
+        assert!(
+            trace.proto_definition.is_some(),
+            "Proto definition for SignUp should be found"
+        );
+        assert!(
+            !trace.server_handlers.is_empty(),
+            "Server handlers for SignUp must not be empty"
+        );
+        assert_eq!(
+            trace.server_handlers[0].0.name.as_str(),
+            "USER_SERVICE_NAME.SIGN_UP"
+        );
+
+        // Query analyze_grpc("UserService")
+        let trace_svc = graph.analyze_grpc("UserService");
+        assert!(!trace_svc.server_handlers.is_empty());
+
+        // Query search_symbols("signUp")
+        let symbols = graph.search_symbols("signUp", None);
+        assert!(symbols
+            .iter()
+            .any(|n| n.name.as_str() == "USER_SERVICE_NAME.SIGN_UP"));
     }
 }

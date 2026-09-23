@@ -318,7 +318,23 @@ impl TypeScriptExtractor {
                     let args = &rest[paren_open + 1..paren_open + 1 + paren_close];
                     let parts: Vec<&str> = args
                         .split(',')
-                        .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+                        .map(|s| {
+                            let trimmed = s.trim();
+                            if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+                                || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                                || (trimmed.starts_with('`') && trimmed.ends_with('`'))
+                            {
+                                trimmed
+                                    .trim_matches('\'')
+                                    .trim_matches('"')
+                                    .trim_matches('`')
+                            } else if let Some(last_dot) = trimmed.rfind('.') {
+                                &trimmed[last_dot + 1..]
+                            } else {
+                                trimmed
+                            }
+                        })
+                        .filter(|s| !s.is_empty())
                         .collect();
                     if parts.len() == 2 {
                         return Some(format!("{}.{}", parts[0], parts[1]));
@@ -516,6 +532,32 @@ export class AuthController {
         assert!(configured_nodes
             .iter()
             .any(|n| n.name == "AuthService.AuthenticateUser" && n.kind == NodeKind::GrpcMethod));
+    }
+
+    #[test]
+    fn test_ts_extractor_grpc_method_enum_identifiers() {
+        let code = r#"
+@Controller('user')
+export class UserCommandController {
+    @GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.SIGN_UP)
+    async signUp(data: SignUpCommandDTO): Promise<SignUpResponseDTO> {
+        return null;
+    }
+
+    @GrpcMethod(GRPC_SERVICES.EVENT_COMMAND_SERVICE, UserCommandMethod.CREATE_EVENT)
+    async createEvent(data: any): Promise<any> {
+        return null;
+    }
+}
+"#;
+        let (nodes, _) = parse(code);
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "USER_SERVICE_NAME.SIGN_UP" && n.kind == NodeKind::GrpcMethod));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "EVENT_COMMAND_SERVICE.CREATE_EVENT"
+                && n.kind == NodeKind::GrpcMethod));
     }
 
     #[test]

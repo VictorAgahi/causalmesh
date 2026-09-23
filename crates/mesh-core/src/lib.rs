@@ -17,19 +17,21 @@ pub mod watcher;
 // Re-export common types
 pub use audit::{AuditEntry, AuditError, AuditLogger};
 pub use config::{
-    expand_roots, Config, ConfigError, CustomPatternConfig, PatternKind, WorkspaceConfig,
+    expand_roots, AsyncApiConfig, Config, ConfigError, ContractsConfig, CustomPatternConfig,
+    GrpcConfig, OpenApiConfig, PatternKind, WorkspaceConfig,
 };
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
-pub use properties::PropertyRegistry;
+pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
 pub use state::{AppState, MeshSnapshot};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
-    ContractNode, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState, SymbolName,
+    ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId,
+    RepoState, SymbolName,
 };
 pub use vfs::DifferentialVfs;
 pub use watcher::{FileWatcherService, ReloadFn};

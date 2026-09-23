@@ -51,10 +51,13 @@ impl AppState {
         audit: Arc<AuditLogger>,
         rescan: Arc<BackgroundRescanEngine>,
     ) -> Self {
+        // `[engines.policy] enabled = false` switches the whole policy engine off:
+        // no stop rules, no skill recommendations.
         let (stop_rules, skills) = config
             .engines
             .policy
             .as_ref()
+            .filter(|p| p.enabled)
             .map(|p| (p.stop_rules.clone(), p.skills.clone()))
             .unwrap_or_default();
 
@@ -104,6 +107,67 @@ mod tests {
         let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
         let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
         AppState::new(config, vec![], audit, rescan)
+    }
+
+    #[test]
+    fn policy_enabled_false_disables_stop_rules_and_skills() {
+        let config = Config::load_from_str(
+            r#"
+[workspace]
+name = "t"
+version = "0"
+roots = ["."]
+
+[engines.policy]
+enabled = false
+
+[engines.policy.stop_rules]
+"proto-registry" = "STOP"
+
+[engines.policy.skills]
+"proto-registry" = "skills/proto.md"
+"#,
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let st = AppState::new(config, vec![], audit, rescan);
+
+        // With the engine disabled, neither the stop rule nor the skill hint fires,
+        // even though both were configured.
+        assert!(st.governance.evaluate_guard("proto-registry").is_none());
+        assert!(st
+            .governance
+            .recommend_skill("smart_search", Some("proto-registry"))
+            .is_none());
+    }
+
+    #[test]
+    fn policy_enabled_true_keeps_stop_rules_and_skills() {
+        let config = Config::load_from_str(
+            r#"
+[workspace]
+name = "t"
+version = "0"
+roots = ["."]
+
+[engines.policy.stop_rules]
+"proto-registry" = "STOP"
+
+[engines.policy.skills]
+"proto-registry" = "skills/proto.md"
+"#,
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let st = AppState::new(config, vec![], audit, rescan);
+
+        assert!(st.governance.evaluate_guard("proto-registry").is_some());
+        assert!(st
+            .governance
+            .recommend_skill("smart_search", Some("proto-registry"))
+            .is_some());
     }
 
     #[test]

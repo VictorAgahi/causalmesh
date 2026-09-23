@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "real_benchmarks"
 harness = false
 
+[features]
+# Test-only instrumentation (e.g. a deliberately slow MCP tool used by
+# mesh-daemon's concurrency tests). Never enabled for the release binary.
+test-util = []
+
 [dependencies]
 mesh-core.workspace = true
 mesh-parsers.workspace = true

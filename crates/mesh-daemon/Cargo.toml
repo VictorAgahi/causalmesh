@@ -33,6 +33,11 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enables mesh-server's test-only "test_slow_op" tool for daemon concurrency
+# tests. Cargo's per-target feature resolution (resolver = "2") keeps this
+# off for the `meshd` release binary, which only pulls in the [dependencies]
+# entry above.
+mesh-server = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-use mesh_core::{ContractGraph, EdgeKind, NodeKind};
+use mesh_core::{ContractGraph, EdgeConfidence, EdgeKind, NodeKind};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -26,6 +26,10 @@ pub struct WebEdge {
     pub to: u32,
     pub kind: String,
     pub metadata: Option<String>,
+    /// "exact" or "heuristic" — see `mesh_core::EdgeConfidence`. Surfaced so
+    /// consumers of the graph export don't silently treat a bare-name
+    /// heuristic match as fact (ROADMAP Item 6).
+    pub confidence: String,
 }
 
 /// Combined graph payload.
@@ -84,6 +88,7 @@ impl GraphRenderer {
                 to: e.to,
                 kind: format!("{:?}", e.kind),
                 metadata: e.metadata.as_ref().map(|m| m.to_string()),
+                confidence: e.confidence.label().to_string(),
             })
             .collect();
 
@@ -184,13 +189,33 @@ impl GraphRenderer {
 
             // Only link valid destination nodes
             if graph.get_node(edge.to).is_some() {
+                let label = match edge.kind {
+                    EdgeKind::Produces => "Produces",
+                    EdgeKind::Consumes => "Consumes",
+                    EdgeKind::CallsRpc => "CallsRpc",
+                    EdgeKind::Implements => "Implements",
+                    EdgeKind::Imports => "Imports",
+                    EdgeKind::DispatchesTo => "Dispatches",
+                };
+                // Only flag `Heuristic` edges — marking every edge (including
+                // the structural `Exact` majority) would make the tag
+                // decorative noise instead of a real signal.
+                let label = match edge.confidence {
+                    EdgeConfidence::Heuristic => format!("{label} (heuristic)"),
+                    EdgeConfidence::Exact => label.to_string(),
+                };
                 let arrow = match edge.kind {
-                    EdgeKind::Produces => "== Produces ==> ",
-                    EdgeKind::Consumes => "-. Consumes .-> ",
-                    EdgeKind::CallsRpc => "-- CallsRpc --> ",
-                    EdgeKind::Implements => "-- Implements --> ",
-                    EdgeKind::Imports => "--> ",
-                    EdgeKind::DispatchesTo => "== Dispatches ==> ",
+                    EdgeKind::Produces => format!("== {label} ==> "),
+                    EdgeKind::Consumes => format!("-. {label} .-> "),
+                    EdgeKind::CallsRpc | EdgeKind::Implements => format!("-- {label} --> "),
+                    EdgeKind::Imports => {
+                        if label == "Imports" {
+                            "--> ".to_string()
+                        } else {
+                            format!("-- {label} --> ")
+                        }
+                    }
+                    EdgeKind::DispatchesTo => format!("== {label} ==> "),
                 };
                 out.push_str(&format!("  {from_id} {arrow} {to_id}\n"));
             }
@@ -1207,7 +1232,7 @@ impl GraphRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_core::{ContractEdge, ContractNode, EdgeKind, NodeKind};
+    use mesh_core::{ContractEdge, ContractNode, EdgeConfidence, EdgeKind, NodeKind};
     use std::path::PathBuf;
 
     #[test]
@@ -1244,6 +1269,7 @@ mod tests {
             to: id1,
             kind: EdgeKind::Produces,
             metadata: Some("orders.created".into()),
+            confidence: EdgeConfidence::Exact,
         });
 
         // Node repo_ids in this test are 1, so index 0 is an unused placeholder.

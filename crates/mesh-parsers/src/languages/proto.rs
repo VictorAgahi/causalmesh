@@ -5,7 +5,21 @@ use std::sync::Arc;
 pub struct ProtoExtractor;
 
 impl ProtoExtractor {
+    /// Extracts with the legacy/default projection: RPC nodes are named
+    /// `Service.Method` (canonical).
     pub fn extract(file_path: &Path, content: &str, repo_id: RepoId) -> Vec<ContractNode> {
+        Self::extract_with_config(file_path, content, repo_id, true)
+    }
+
+    /// Same as [`Self::extract`], but `canonical_fqcn_projection` controls how
+    /// the RPC method node is named: `true` projects the canonical
+    /// `Service.Method` form; `false` projects the bare method name only.
+    pub fn extract_with_config(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        canonical_fqcn_projection: bool,
+    ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut current_package = CompactStr::default();
@@ -86,7 +100,11 @@ impl ProtoExtractor {
                         .as_ref()
                         .map(|s| s.as_str())
                         .unwrap_or("UnknownService");
-                    let fqcn_name = format!("{full_service}.{rpc_name}");
+                    let fqcn_name = if canonical_fqcn_projection {
+                        format!("{full_service}.{rpc_name}")
+                    } else {
+                        rpc_name.to_string()
+                    };
 
                     nodes.push(ContractNode {
                         id: 0,
@@ -167,5 +185,25 @@ message AuthRequest {
             .iter()
             .any(|n| n.name == "AuthService.AuthenticateUser"));
         assert!(nodes.iter().any(|n| n.name == "AuthRequest"));
+    }
+
+    #[test]
+    fn test_proto_extraction_non_canonical_fqcn_projection() {
+        let proto = r#"
+syntax = "proto3";
+package auth.v1;
+
+service AuthService {
+    rpc AuthenticateUser (AuthRequest) returns (AuthResponse);
+}
+"#;
+        // `canonical_fqcn_projection = false` must produce an observably
+        // different node name than the (default) canonical projection.
+        let nodes =
+            ProtoExtractor::extract_with_config(Path::new("proto/auth.proto"), proto, 0, false);
+        assert!(nodes.iter().any(|n| n.name == "AuthenticateUser"));
+        assert!(!nodes
+            .iter()
+            .any(|n| n.name == "AuthService.AuthenticateUser"));
     }
 }

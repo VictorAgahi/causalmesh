@@ -5,13 +5,48 @@ use tree_sitter::{Node, Parser};
 
 pub struct TypeScriptExtractor;
 
+/// Historical hardcoded gRPC decorator, used when `controller_annotations`
+/// is not configured.
+const DEFAULT_GRPC_ANNOTATION: &str = "@GrpcMethod";
+
+/// Per-file invariants threaded through the recursive `visit_node` walk,
+/// bundled to keep its argument count down.
+struct VisitCtx<'a> {
+    file_path: &'a FilePath,
+    repo_id: RepoId,
+    package_name: &'a CompactStr,
+    grpc_annotations: &'a [String],
+}
+
 impl TypeScriptExtractor {
+    /// Extracts using the legacy hardcoded `@GrpcMethod` decorator.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+    ) -> Vec<ContractNode> {
+        Self::extract_with_config(
+            file_path,
+            content,
+            repo_id,
+            parser,
+            imports,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        )
+    }
+
+    /// Same as [`Self::extract`], but `grpc_annotations` (from
+    /// `[engines.contracts.grpc] controller_annotations`) replaces the
+    /// hardcoded `@GrpcMethod` decorator list used to recognise gRPC handlers.
+    pub fn extract_with_config(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        parser: &mut Parser,
+        imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+        grpc_annotations: &[String],
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
@@ -23,28 +58,28 @@ impl TypeScriptExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
-
-        Self::visit_node(
-            root,
-            source_bytes,
-            &file_path,
+        let ctx = VisitCtx {
+            file_path: &file_path,
             repo_id,
-            &package_name,
-            &mut nodes,
-            imports,
-        );
+            package_name: &package_name,
+            grpc_annotations,
+        };
+
+        Self::visit_node(root, source_bytes, &ctx, &mut nodes, imports);
         nodes
     }
 
     fn visit_node(
         node: Node,
         source: &[u8],
-        file_path: &FilePath,
-        repo_id: RepoId,
-        package_name: &CompactStr,
+        ctx: &VisitCtx,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<(String, String)>,
     ) {
+        let file_path = ctx.file_path;
+        let repo_id = ctx.repo_id;
+        let package_name = ctx.package_name;
+        let grpc_annotations = ctx.grpc_annotations;
         match node.kind() {
             "import_statement" => {
                 if let Ok(text) = node.utf8_text(source) {
@@ -125,14 +160,26 @@ impl TypeScriptExtractor {
                     full_text.push_str(t);
                 }
 
-                if full_text.contains("@GrpcMethod") {
+                let matched_annotation = grpc_annotations
+                    .iter()
+                    .find(|a| full_text.contains(a.as_str()));
+                if let Some(annotation) = matched_annotation {
                     kind = NodeKind::GrpcMethod;
-                    grpc_target = Self::extract_grpc_method(&full_text);
+                    grpc_target = Self::extract_grpc_method(&full_text, annotation);
                 } else if full_text.contains("@Get")
                     || full_text.contains("@Post")
                     || full_text.contains("@Put")
                 {
                     kind = NodeKind::HttpEndpoint;
+                } else if full_text.contains("@EventPattern") {
+                    // @nestjs/microservices event handler: a message-bus consumer.
+                    kind = NodeKind::KafkaTopic;
+                    grpc_target = Self::extract_decorator_single_arg(&full_text, "@EventPattern");
+                } else if full_text.contains("@MessagePattern") {
+                    // @nestjs/microservices RPC-style handler: also a consumer side.
+                    kind = NodeKind::KafkaTopic;
+                    grpc_target =
+                        Self::extract_decorator_single_arg(&full_text, "@MessagePattern");
                 }
 
                 let first_line = node
@@ -160,20 +207,74 @@ impl TypeScriptExtractor {
                     docstring: None,
                 });
             }
+            // kafkajs: `consumer.subscribe({ topic: 'x' })` / `producer.send({ topic: 'x' })`.
+            "call_expression" => {
+                if let Some(callee) = node.child_by_field_name("function") {
+                    if callee.kind() == "member_expression" {
+                        if let Some(prop) = callee.child_by_field_name("property") {
+                            if let Ok(prop_name) = prop.utf8_text(source) {
+                                let signature = match prop_name {
+                                    "subscribe" => Some("kafkajs consumer.subscribe"),
+                                    "send" => Some("kafkajs producer.send"),
+                                    _ => None,
+                                };
+                                if let Some(signature) = signature {
+                                    if let Some(args) = node.child_by_field_name("arguments") {
+                                        if let Some(topic) =
+                                            Self::extract_object_value(args, source, "topic")
+                                        {
+                                            nodes.push(ContractNode {
+                                                id: 0,
+                                                name: CompactStr::new(topic),
+                                                kind: NodeKind::KafkaTopic,
+                                                file_path: file_path.clone(),
+                                                line_start: node.start_position().row + 1,
+                                                line_end: node.end_position().row + 1,
+                                                package: package_name.clone(),
+                                                repo_id,
+                                                signature: Some(CompactStr::new(signature)),
+                                                docstring: None,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // BullMQ: `new Queue('name')` is a producer-side topic/queue declaration.
+            "new_expression" => {
+                if let Some(ctor) = node.child_by_field_name("constructor") {
+                    if ctor.kind() == "identifier" {
+                        if let Ok("Queue") = ctor.utf8_text(source) {
+                            if let Some(args) = node.child_by_field_name("arguments") {
+                                if let Some(queue_name) = Self::extract_first_arg_value(args, source)
+                                {
+                                    nodes.push(ContractNode {
+                                        id: 0,
+                                        name: CompactStr::new(queue_name),
+                                        kind: NodeKind::Queue,
+                                        file_path: file_path.clone(),
+                                        line_start: node.start_position().row + 1,
+                                        line_end: node.end_position().row + 1,
+                                        package: package_name.clone(),
+                                        repo_id,
+                                        signature: Some(CompactStr::new("bullmq new Queue()")),
+                                        docstring: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(
-                child,
-                source,
-                file_path,
-                repo_id,
-                package_name,
-                nodes,
-                imports,
-            );
+            Self::visit_node(child, source, ctx, nodes, imports);
         }
     }
 
@@ -209,9 +310,9 @@ impl TypeScriptExtractor {
         specifiers
     }
 
-    fn extract_grpc_method(text: &str) -> Option<String> {
-        if let Some(idx) = text.find("@GrpcMethod") {
-            let rest = &text[idx + 11..];
+    fn extract_grpc_method(text: &str, annotation: &str) -> Option<String> {
+        if let Some(idx) = text.find(annotation) {
+            let rest = &text[idx + annotation.len()..];
             if let Some(paren_open) = rest.find('(') {
                 if let Some(paren_close) = rest[paren_open + 1..].find(')') {
                     let args = &rest[paren_open + 1..paren_open + 1 + paren_close];
@@ -229,11 +330,111 @@ impl TypeScriptExtractor {
         }
         None
     }
+
+    /// Extracts a single-argument decorator's value, e.g. `@EventPattern('order.created')`
+    /// or `@MessagePattern(ORDER_CMD)`. Quoted literals are unquoted; anything else
+    /// (a variable, enum member, or config lookup) is kept verbatim rather than
+    /// dropped, so callers still see that *some* topic/pattern was referenced there.
+    fn extract_decorator_single_arg(text: &str, decorator: &str) -> Option<String> {
+        let idx = text.find(decorator)?;
+        let rest = &text[idx + decorator.len()..];
+        let paren_open = rest.find('(')?;
+        let paren_close = rest[paren_open + 1..].find(')')?;
+        let arg = rest[paren_open + 1..paren_open + 1 + paren_close].trim();
+        let first = arg.split(',').next().unwrap_or(arg).trim();
+        if first.is_empty() {
+            return None;
+        }
+        Some(
+            first
+                .trim_matches('\'')
+                .trim_matches('"')
+                .trim_matches('`')
+                .to_string(),
+        )
+    }
+
+    /// Looks for an object literal among `args` (a call's `arguments` node) and
+    /// returns the value of its `key` property, e.g. `topic` in
+    /// `{ topic: 'orders' }`. Falls through non-object arguments untouched.
+    fn extract_object_value(args: Node, source: &[u8], key: &str) -> Option<String> {
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if arg.kind() != "object" {
+                continue;
+            }
+            let mut pair_cursor = arg.walk();
+            for pair in arg.children(&mut pair_cursor) {
+                if pair.kind() != "pair" {
+                    continue;
+                }
+                let Some(key_node) = pair.child_by_field_name("key") else {
+                    continue;
+                };
+                let Ok(key_text) = key_node.utf8_text(source) else {
+                    continue;
+                };
+                if key_text.trim_matches('\'').trim_matches('"') != key {
+                    continue;
+                }
+                if let Some(value_node) = pair.child_by_field_name("value") {
+                    return Self::extract_value_text(value_node, source);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the first named argument of a call's `arguments` node, e.g. the
+    /// `'email-queue'` in `new Queue('email-queue')`.
+    fn extract_first_arg_value(args: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if arg.is_named() {
+                return Self::extract_value_text(arg, source);
+            }
+        }
+        None
+    }
+
+    /// Unquotes a string-literal node's text; for anything else (identifier,
+    /// member expression, ...) returns the raw expression text — this is the
+    /// "not a literal" escape hatch so a variable/config-lookup topic name is
+    /// still surfaced instead of silently dropped.
+    fn extract_value_text(value_node: Node, source: &[u8]) -> Option<String> {
+        let text = value_node.utf8_text(source).ok()?;
+        if value_node.kind() == "string" {
+            Some(
+                text.trim_matches('\'')
+                    .trim_matches('"')
+                    .trim_matches('`')
+                    .to_string(),
+            )
+        } else {
+            Some(text.trim().to_string())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mesh_core::{ContractGraph, EdgeKind};
+
+    fn parse(code: &str) -> (Vec<ContractNode>, Vec<(String, String)>) {
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let nodes = TypeScriptExtractor::extract(
+            Path::new("events.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+        );
+        (nodes, imports)
+    }
 
     #[test]
     fn test_ts_extractor() {
@@ -272,5 +473,202 @@ export class AuthController {
         assert!(nodes
             .iter()
             .any(|n| n.name == "AuthService.AuthenticateUser" && n.kind == NodeKind::GrpcMethod));
+    }
+
+    #[test]
+    fn test_ts_extractor_configurable_controller_annotations() {
+        let code = r#"
+@Controller('auth')
+export class AuthController {
+    @RpcHandler('AuthService', 'AuthenticateUser')
+    async authenticateUser(data: any): Promise<any> {
+        return null;
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+
+        // Default decorator list (`@GrpcMethod`) does not recognise `@RpcHandler`.
+        let default_nodes = TypeScriptExtractor::extract(
+            Path::new("auth.controller.ts"),
+            code,
+            4,
+            &mut parser,
+            &mut imports,
+        );
+        assert!(!default_nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::GrpcMethod));
+
+        // A configured `controller_annotations` list must produce an
+        // observably different result: the method is now recognised as a
+        // gRPC handler and projected via the same `Service.Method` parsing.
+        let mut imports2 = Vec::new();
+        let configured_nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("auth.controller.ts"),
+            code,
+            4,
+            &mut parser,
+            &mut imports2,
+            &["@RpcHandler".to_string()],
+        );
+        assert!(configured_nodes
+            .iter()
+            .any(|n| n.name == "AuthService.AuthenticateUser" && n.kind == NodeKind::GrpcMethod));
+    }
+
+    #[test]
+    fn test_kafkajs_consumer_and_producer_literal_topic() {
+        let code = r#"
+async function run() {
+    await consumer.subscribe({ topic: 'orders', fromBeginning: true });
+    await producer.send({ topic: 'orders', messages: [] });
+}
+"#;
+        let (nodes, _) = parse(code);
+
+        assert!(nodes.iter().any(|n| {
+            n.name == "orders"
+                && n.kind == NodeKind::KafkaTopic
+                && n.signature.as_deref() == Some("kafkajs consumer.subscribe")
+        }));
+        assert!(nodes.iter().any(|n| {
+            n.name == "orders"
+                && n.kind == NodeKind::KafkaTopic
+                && n.signature.as_deref() == Some("kafkajs producer.send")
+        }));
+    }
+
+    #[test]
+    fn test_kafkajs_non_literal_topic_emits_variable_name() {
+        let code = r#"
+async function run() {
+    await consumer.subscribe({ topic: TOPIC_NAME });
+}
+"#;
+        let (nodes, _) = parse(code);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "TOPIC_NAME" && n.kind == NodeKind::KafkaTopic));
+    }
+
+    #[test]
+    fn test_nestjs_event_and_message_pattern_decorators() {
+        let code = r#"
+@Controller()
+export class OrdersController {
+    @EventPattern('order.created')
+    handleOrderCreated(data: any) {}
+
+    @MessagePattern('order.get')
+    handleGetOrder(data: any) {}
+}
+"#;
+        let (nodes, _) = parse(code);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "order.created" && n.kind == NodeKind::KafkaTopic));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "order.get" && n.kind == NodeKind::KafkaTopic));
+    }
+
+    #[test]
+    fn test_bullmq_new_queue_declaration() {
+        let code = r#"
+const emailQueue = new Queue('email-queue');
+"#;
+        let (nodes, _) = parse(code);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "email-queue" && n.kind == NodeKind::Queue));
+    }
+
+    #[test]
+    fn test_bullmq_new_queue_non_literal_name() {
+        let code = r#"
+const emailQueue = new Queue(QUEUE_NAME);
+"#;
+        let (nodes, _) = parse(code);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "QUEUE_NAME" && n.kind == NodeKind::Queue));
+    }
+
+    /// Definition-of-done test: a kafkajs producer and consumer for the same
+    /// topic, detected with zero custom `[[engines.contracts.patterns]]`
+    /// configuration, are linked by `ContractGraph::analyze_impact` — the
+    /// producer feeds a `Produces` edge and the consumer a `Consumes` edge
+    /// into the same topic hub, and reconciliation derives a direct
+    /// `DispatchesTo` causal edge between them.
+    #[test]
+    fn test_kafkajs_producer_consumer_linked_via_analyze_impact() {
+        let code = r#"
+async function run() {
+    await consumer.subscribe({ topic: 'orders' });
+    await producer.send({ topic: 'orders' });
+}
+"#;
+        let (nodes, _) = parse(code);
+
+        let consumer_node = nodes
+            .iter()
+            .find(|n| n.signature.as_deref() == Some("kafkajs consumer.subscribe"))
+            .expect("kafkajs consumer.subscribe node not detected")
+            .clone();
+        let producer_node = nodes
+            .iter()
+            .find(|n| n.signature.as_deref() == Some("kafkajs producer.send"))
+            .expect("kafkajs producer.send node not detected")
+            .clone();
+
+        // Mirrors how `PolyglotIndexer` wires a language extractor's tagged
+        // nodes into `FileIndex.producers`/`.consumers` (see
+        // `languages/mod.rs`'s Java branch) — done inline here since this
+        // extractor's own scope doesn't include that dispatch wiring.
+        let mut graph = ContractGraph::new();
+        let consumer_topic = consumer_node.name.clone();
+        let producer_topic = producer_node.name.clone();
+        let consumer_id = graph.add_node(consumer_node);
+        let producer_id = graph.add_node(producer_node);
+        graph.add_consumer(consumer_id, &consumer_topic);
+        graph.add_producer(producer_id, &producer_topic);
+        graph.reconcile_edges();
+
+        let impact = graph.analyze_impact("orders");
+        assert!(
+            !impact.upstream_producers.is_empty(),
+            "expected the kafkajs producer to be linked as an upstream producer"
+        );
+        assert!(
+            !impact.downstream_consumers.is_empty(),
+            "expected the kafkajs consumer to be linked as a downstream consumer"
+        );
+        // ROADMAP #11 dropped direct producer->consumer `DispatchesTo` edges (they
+        // were O(producers * consumers) per topic); the same information is now
+        // carried by the two-hop `Produces`/`Consumes` walk through the topic,
+        // which `analyze_impact` already reads directly from the topic registry
+        // above — not by materializing a direct edge here.
+        assert!(
+            graph
+                .all_edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Produces && e.from == producer_id),
+            "expected a Produces edge from the kafkajs producer to the topic"
+        );
+        assert!(
+            graph
+                .all_edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Consumes && e.to == consumer_id),
+            "expected a Consumes edge from the topic to the kafkajs consumer"
+        );
     }
 }

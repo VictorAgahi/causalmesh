@@ -179,6 +179,13 @@ impl DoctorCommand {
                     if let Some(contracts) = &cfg.engines.contracts {
                         if let Some(grpc) = &contracts.grpc {
                             if !grpc.proto_dirs.is_empty() {
+                                // Reuse the real runtime matcher (ExtractConfig::allows_proto_path)
+                                // instead of reimplementing the substring/prefix logic here, so
+                                // this check can never drift from what extraction actually does.
+                                // Test one dir at a time (via a single-entry ExtractConfig clone)
+                                // to keep per-directory reporting.
+                                let base_extract_cfg =
+                                    mesh_parsers::ExtractConfig::from_contracts(contracts);
                                 let mut matched_dirs = std::collections::HashSet::new();
                                 for root in &roots {
                                     if let Ok(scope) =
@@ -197,15 +204,10 @@ impl DoctorCommand {
                                             if f.extension().is_some_and(|ext| ext == "proto") {
                                                 let p_str = f.to_string_lossy();
                                                 for dir in &grpc.proto_dirs {
-                                                    let clean =
-                                                        mesh_core::strip_workspace_root_prefix(dir);
-                                                    let needle =
-                                                        clean.trim_matches('/').replace('\\', "/");
-                                                    if !needle.is_empty()
-                                                        && p_str
-                                                            .replace('\\', "/")
-                                                            .contains(&needle)
-                                                    {
+                                                    let mut single_dir_cfg =
+                                                        base_extract_cfg.clone();
+                                                    single_dir_cfg.proto_dirs = vec![dir.clone()];
+                                                    if single_dir_cfg.allows_proto_path(&p_str) {
                                                         matched_dirs.insert(dir.clone());
                                                     }
                                                 }

@@ -232,6 +232,7 @@ async fn test_analyze_grpc_success() {
         to: proto_node,
         kind: mesh_core::EdgeKind::Implements,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     state.install_snapshot(snapshot);
 
@@ -296,12 +297,14 @@ async fn test_analyze_impact_success() {
         to: topic_node,
         kind: mesh_core::EdgeKind::Produces,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     graph.add_edge(mesh_core::ContractEdge {
         from: consumer_node,
         to: topic_node,
         kind: mesh_core::EdgeKind::Consumes,
         metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
     });
     state.install_snapshot(snapshot);
 

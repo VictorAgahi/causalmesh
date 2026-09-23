@@ -141,7 +141,16 @@ pub struct ContractsConfig {
     #[serde(default)]
     pub asyncapi: Option<AsyncApiConfig>,
     #[serde(default)]
+    pub cpp: Option<CppConfig>,
+    #[serde(default)]
     pub patterns: Vec<CustomPatternConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CppConfig {
+    #[serde(default)]
+    pub include_paths: Vec<String>,
 }
 
 fn default_group_1() -> usize {

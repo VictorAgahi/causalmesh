@@ -41,7 +41,7 @@ pub struct ContractGraph {
     name_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
     package_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
     file_to_nodes: HashMap<FilePath, Vec<NodeId>>,
-    fqcn_to_node: HashMap<CompactStr, NodeId>,
+    fqcn_to_node: HashMap<CompactStr, Vec<NodeId>>,
     reverse_deps: HashMap<CompactStr, Vec<NodeId>>,
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
     topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
@@ -108,9 +108,12 @@ impl ContractGraph {
             .or_default()
             .push(id);
 
-        if node.kind == NodeKind::GrpcMethod || node.kind == NodeKind::GrpcService {
-            let fqcn = format!("{}/{}", node.package, node.name);
-            self.fqcn_to_node.insert(CompactStr::new(&fqcn), id);
+        if node.kind == NodeKind::GrpcMethod
+            || node.kind == NodeKind::GrpcService
+            || !node.package.is_empty()
+        {
+            let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
+            self.fqcn_to_node.entry(fqcn).or_default().push(id);
         }
 
         if node.kind == NodeKind::KafkaTopic
@@ -220,11 +223,12 @@ impl ContractGraph {
             if !node.package.is_empty() {
                 Self::remove_from_index(&mut self.package_to_nodes, &node.package, *id);
             }
-            if node.kind == NodeKind::GrpcMethod || node.kind == NodeKind::GrpcService {
+            if node.kind == NodeKind::GrpcMethod
+                || node.kind == NodeKind::GrpcService
+                || !node.package.is_empty()
+            {
                 let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
-                if self.fqcn_to_node.get(&fqcn) == Some(id) {
-                    self.fqcn_to_node.remove(&fqcn);
-                }
+                Self::remove_from_index(&mut self.fqcn_to_node, &fqcn, *id);
             }
         }
 
@@ -312,8 +316,16 @@ impl ContractGraph {
                     }
                 }
                 let fqcn_key = format!("{pkg}/{name}");
-                if let Some(&id) = self.fqcn_to_node.get(fqcn_key.as_str()) {
-                    return Some((id, EdgeConfidence::Exact));
+                if let Some(ids) = self.fqcn_to_node.get(fqcn_key.as_str()) {
+                    let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
+                    let chosen_id = ids
+                        .iter()
+                        .copied()
+                        .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                        .or_else(|| ids.first().copied());
+                    if let Some(id) = chosen_id {
+                        return Some((id, EdgeConfidence::Exact));
+                    }
                 }
             }
         }
@@ -548,15 +560,6 @@ impl ContractGraph {
                 .split('.')
                 .next_back()
                 .unwrap_or(method_fqcn.as_str());
-            // Six needles allocated once per proto method (was six per candidate node).
-            let needles = [
-                format!("@{bare}"),
-                format!("'{bare}'"),
-                format!("\"{bare}\""),
-                format!("fn {bare}"),
-                format!("func {bare}"),
-                format!("def {bare}"),
-            ];
 
             for h in &handlers {
                 // Only an exact match against the full FQCN is trustworthy;
@@ -568,7 +571,7 @@ impl ContractGraph {
                 } else if h.name.eq_ignore_ascii_case(bare)
                     || h.pascal_name == bare
                     || h.signature
-                        .is_some_and(|s| needles.iter().any(|n| s.contains(n.as_str())))
+                        .is_some_and(|s| Self::signature_contains_bare(s, bare))
                 {
                     Some(EdgeConfidence::Heuristic)
                 } else {
@@ -855,6 +858,27 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     }
     let (h, n) = (haystack.as_bytes(), needle.as_bytes());
     h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+impl ContractGraph {
+    /// Allocation-free check whether `sig` contains `bare` prefixed by `@`, `'`, `"`, `fn `, `func `, or `def `.
+    fn signature_contains_bare(sig: &str, bare: &str) -> bool {
+        if bare.is_empty() {
+            return false;
+        }
+        let prefixes = ["@", "'", "\"", "fn ", "func ", "def "];
+        for prefix in prefixes {
+            let mut offset = 0;
+            while let Some(pos) = sig[offset..].find(prefix) {
+                let start = offset + pos + prefix.len();
+                if sig[start..].starts_with(bare) {
+                    return true;
+                }
+                offset += pos + prefix.len();
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]

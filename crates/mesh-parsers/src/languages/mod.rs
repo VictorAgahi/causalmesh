@@ -6,7 +6,10 @@ pub mod kotlin;
 pub mod proto;
 pub mod python;
 pub mod rust_lang;
+pub mod ts_config;
 pub mod typescript;
+
+pub use ts_config::TsConfigResolver;
 
 use crate::decapitate::LanguageKind;
 use crate::guard::AstGuard;
@@ -955,6 +958,7 @@ topics:
                 spec_files: vec!["asyncapi.yaml".to_string()],
                 infer_string_topics: false,
             }),
+            cpp: None,
             patterns: Vec::new(),
         };
 

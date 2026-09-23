@@ -296,10 +296,10 @@ impl WorkspaceIndexer {
             .map(Path::to_path_buf)
             .collect();
 
-        // Candidates: new or stat-changed. The metadata call is the only I/O for
-        // unchanged files — they are never read.
+        // Candidates: new or stat-changed. The metadata call is parallelized over
+        // Rayon threads to maximize OS kernel page-cache stat speed.
         let candidates: Vec<(RepoId, &PathBuf)> = files
-            .iter()
+            .par_iter()
             .filter(|(_, p)| match std::fs::metadata(p) {
                 Ok(m) => !vfs.is_unchanged_fast(p, &m),
                 Err(_) => false,

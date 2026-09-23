@@ -28,9 +28,9 @@ pub use governance::{GovernanceEngine, RsahResponse};
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
-pub use socket::{cleanup_stale_socket, socket_path};
 #[cfg(windows)]
 pub use socket::pipe_name;
+pub use socket::{cleanup_stale_socket, socket_path};
 pub use state::{AppState, MeshSnapshot};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,

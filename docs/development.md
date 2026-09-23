@@ -75,59 +75,63 @@ cargo fmt --all -- --check
 
 ## 4. How to Add a New Tree-Sitter Language Parser
 
-MeshMCP's [`crates/mesh-parsers`](../crates/mesh-parsers) crate uses Tree-sitter grammars to decapitate function bodies and extract signatures. Adding a new language (e.g. C# or Kotlin) follows a 5-step pattern:
+MeshMCP's [`crates/mesh-parsers`](../crates/mesh-parsers) crate uses Tree-sitter grammars to
+decapitate function bodies and extract signatures. Supported languages today: **Java, Go,
+Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#**, plus Protobuf and YAML handled
+without tree-sitter. The full walkthrough — with `cpp.rs` as the worked example — lives in
+[`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).
+In short, adding a language (e.g. Ruby or Swift) touches these places:
 
-### Step 1: Add Dependency in `crates/mesh-parsers/Cargo.toml`
+### Step 1: Add the grammar crate
+Root `Cargo.toml` (`[workspace.dependencies]`) and `crates/mesh-parsers/Cargo.toml`:
 ```toml
-[dependencies]
-tree-sitter-kotlin = "0.3"
+tree-sitter-ruby = "0.23"
 ```
 
-### Step 2: Extend `LanguageKind` Enum in `crates/mesh-parsers/src/guard.rs`
+### Step 2: Extend `LanguageKind` in `crates/mesh-parsers/src/decapitate.rs`
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageKind {
-    Java,
-    Go,
-    Python,
-    TypeScript,
-    Rust,
-    Proto,
-    Yaml,
-    Kotlin, // <-- Add new language
+    Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp,
+    Ruby, // <-- new variant
+    Protobuf, Yaml, Unknown,
 }
 ```
+Bump `TREE_SITTER_COUNT` and add the new variant's slot to `tree_sitter_slot()`, its grammar to
+`language()`, and its extensions to `from_path()` — all four must move together, and the
+thread-local parser array in `guard.rs::with_parser` must be resized to match `TREE_SITTER_COUNT`.
 
-### Step 3: Register Tree-Sitter Language Pointer
-In `crates/mesh-parsers/src/guard.rs`, update `get_tree_sitter_language()`:
-```rust
-LanguageKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
-```
+### Step 3: Write the extractor
+`crates/mesh-parsers/src/languages/ruby.rs`, following the contract in the skill doc (`extract`
+returning `Vec<ContractNode>`), and register `pub mod ruby;` plus the `PolyglotIndexer::extract`
+dispatch arm in `languages/mod.rs`.
 
 ### Step 4: Add Decapitation Grammar Rules
 In `crates/mesh-parsers/src/decapitate.rs`, update `AstDecapitator::collect_body_replacements`:
 ```rust
 match lang_kind {
     // ... existing match arms ...
-    LanguageKind::Kotlin if kind == "function_body" => {
-        replacements.push((node.start_byte(), node.end_byte(), "{ /* stripped */ }"));
-        return;
+    LanguageKind::Ruby if kind == "method" => {
+        if let Some(body) = node.child_by_field_name("body") {
+            replacements.push((body.start_byte(), body.end_byte(), Cow::Borrowed("# stripped")));
+            return;
+        }
     }
     _ => {}
 }
 ```
 
-### Step 5: Add Unit Test
-Add a test in `crates/mesh-parsers/src/decapitate.rs` verifying that method bodies are stripped while preserving the declaration:
-```rust
-#[test]
-fn test_kotlin_decapitation() {
-    let source = "fun calculateTotal(order: Order): Double {\n    return order.items.sumOf { it.price }\n}";
-    let decap = AstDecapitator::decapitate(source, LanguageKind::Kotlin);
-    assert!(decap.contains("fun calculateTotal(order: Order): Double { /* stripped */ }"));
-    assert!(!decap.contains("sumOf"));
-}
-```
+### Step 5: Wire the file watcher and `doctor`
+Add the extension(s) to `FileWatcherService::is_relevant_path`
+(`crates/mesh-core/src/watcher.rs`) — a language missing from this list parses correctly at boot
+but never hot-reloads on edit — and to `AstGuard::verify_all_parsers`, which backs the
+`mesh-mcp doctor` parser-initialization line.
+
+### Step 6: Add tests
+A unit test in the new extractor module asserting the expected `NodeKind`s, and a decapitation
+test in `crates/mesh-parsers/src/decapitate.rs` verifying that method bodies are stripped while
+the signature, annotations/attributes and docstrings survive. See `test_kotlin_decapitation` and
+`test_csharp_decapitation` for worked examples of both a fields-less grammar (Kotlin) and a
+grammar with named fields (C#).
 
 ---
 

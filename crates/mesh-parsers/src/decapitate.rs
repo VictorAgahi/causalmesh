@@ -8,14 +8,17 @@ pub enum LanguageKind {
     TypeScript,
     Rust,
     Cpp,
+    Kotlin,
+    CSharp,
     Protobuf,
     Yaml,
     Unknown,
 }
 
 impl LanguageKind {
-    /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust, Cpp).
-    pub const TREE_SITTER_COUNT: usize = 6;
+    /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
+    /// Cpp, Kotlin, CSharp).
+    pub const TREE_SITTER_COUNT: usize = 8;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -27,6 +30,8 @@ impl LanguageKind {
             Self::TypeScript => "typescript",
             Self::Rust => "rust",
             Self::Cpp => "cpp",
+            Self::Kotlin => "kotlin",
+            Self::CSharp => "csharp",
             Self::Protobuf => "protobuf",
             Self::Yaml => "yaml",
             Self::Unknown => "unknown",
@@ -43,6 +48,8 @@ impl LanguageKind {
             Self::TypeScript => Some(3),
             Self::Rust => Some(4),
             Self::Cpp => Some(5),
+            Self::Kotlin => Some(6),
+            Self::CSharp => Some(7),
             Self::Protobuf | Self::Yaml | Self::Unknown => None,
         }
     }
@@ -56,6 +63,8 @@ impl LanguageKind {
             Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+            Self::CSharp => Some(tree_sitter_c_sharp::language()),
             Self::Protobuf | Self::Yaml | Self::Unknown => None,
         }
     }
@@ -76,6 +85,10 @@ impl LanguageKind {
             Self::TypeScript
         } else if path_str.ends_with(".rs") {
             Self::Rust
+        } else if path_str.ends_with(".kt") || path_str.ends_with(".kts") {
+            Self::Kotlin
+        } else if path_str.ends_with(".cs") {
+            Self::CSharp
         } else if path_str.ends_with(".cpp")
             || path_str.ends_with(".cc")
             || path_str.ends_with(".cxx")
@@ -277,6 +290,44 @@ impl AstDecapitator {
                         body.end_byte(),
                         std::borrow::Cow::Borrowed(" ..."),
                     ));
+                    return;
+                }
+            }
+            LanguageKind::CSharp if kind == "method_declaration" || kind == "constructor_declaration" =>
+            {
+                if let Some(body) = node.child_by_field_name("body") {
+                    replacements.push((
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }"),
+                    ));
+                    return;
+                }
+            }
+            LanguageKind::Kotlin if kind == "function_declaration" => {
+                let mut cursor = node.walk();
+                let mut body = None;
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "function_body" {
+                        body = Some(child);
+                        break;
+                    }
+                }
+                if let Some(body) = body {
+                    // `function_body`'s span includes the leading `=` for expression
+                    // bodies (`fun f() = expr`); block bodies (`{ ... }`) keep their
+                    // braces, expression bodies keep the `=` but drop the expression,
+                    // mirroring the TypeScript concise-arrow-function rule.
+                    let is_block = source
+                        .as_bytes()
+                        .get(body.start_byte())
+                        .is_some_and(|b| *b == b'{');
+                    let replacement = if is_block {
+                        std::borrow::Cow::Borrowed("{ /* stripped */ }")
+                    } else {
+                        std::borrow::Cow::Borrowed("= /* stripped */")
+                    };
+                    replacements.push((body.start_byte(), body.end_byte(), replacement));
                     return;
                 }
             }
@@ -495,6 +546,61 @@ class AuthService:
         assert!(decapitated.contains("def login(self, username: str, secret: str) -> dict:"));
         assert!(decapitated.contains("..."));
         assert!(!decapitated.contains("generate_jwt"));
+    }
+
+    #[test]
+    fn test_kotlin_decapitation() {
+        let code = r#"
+@RestController
+class AuthController {
+    @PostMapping("/login")
+    fun login(req: LoginRequest): TokenResponse {
+        val token = authService.generate(req)
+        return TokenResponse(token)
+    }
+
+    fun shortcut(): Int = 42
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_kotlin_ng::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Kotlin, &mut parser, false);
+        assert!(decapitated.contains("@RestController"));
+        assert!(decapitated.contains("@PostMapping(\"/login\")"));
+        assert!(decapitated.contains("fun login(req: LoginRequest): TokenResponse { /* stripped */ }"));
+        assert!(!decapitated.contains("authService.generate"));
+        assert!(decapitated.contains("fun shortcut(): Int = /* stripped */"));
+        assert_eq!(LanguageKind::from_path("Foo.kt"), LanguageKind::Kotlin);
+        assert_eq!(LanguageKind::from_path("build.gradle.kts"), LanguageKind::Kotlin);
+        assert_eq!(LanguageKind::Kotlin.as_str(), "kotlin");
+    }
+
+    #[test]
+    fn test_csharp_decapitation() {
+        let code = r#"
+[ApiController]
+public class AuthController : ControllerBase
+{
+    [HttpPost("/login")]
+    public TokenResponse Login(LoginRequest req)
+    {
+        var token = authService.Generate(req);
+        return new TokenResponse(token);
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_c_sharp::language();
+        parser.set_language(&lang).unwrap();
+        let decapitated = AstDecapitator::decapitate(code, LanguageKind::CSharp, &mut parser, false);
+        assert!(decapitated.contains("[ApiController]"));
+        assert!(decapitated.contains("[HttpPost(\"/login\")]"));
+        assert!(decapitated.contains("public TokenResponse Login(LoginRequest req)"));
+        assert!(decapitated.contains("{ /* stripped */ }"));
+        assert!(!decapitated.contains("authService.Generate"));
+        assert_eq!(LanguageKind::from_path("Auth.cs"), LanguageKind::CSharp);
+        assert_eq!(LanguageKind::CSharp.as_str(), "csharp");
     }
 
     #[test]

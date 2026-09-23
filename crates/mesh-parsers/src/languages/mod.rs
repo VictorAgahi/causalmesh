@@ -1,6 +1,8 @@
 pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod java;
+pub mod kotlin;
 pub mod proto;
 pub mod python;
 pub mod rust_lang;
@@ -361,6 +363,25 @@ impl PolyglotIndexer {
                     cpp::CppExtractor::extract_file_index(file_path, content, repo_id, parser)
                 }) {
                     out.merge(index);
+                }
+            }
+            LanguageKind::Kotlin => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    kotlin::KotlinExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    for (i, node) in nodes.iter().enumerate() {
+                        if node.kind == NodeKind::KafkaTopic {
+                            out.consumers.push((i, node.name.clone()));
+                        }
+                    }
+                    out.nodes = nodes;
+                }
+            }
+            LanguageKind::CSharp => {
+                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    csharp::CSharpExtractor::extract(file_path, content, repo_id, parser)
+                }) {
+                    out.nodes = nodes;
                 }
             }
             LanguageKind::Yaml => {

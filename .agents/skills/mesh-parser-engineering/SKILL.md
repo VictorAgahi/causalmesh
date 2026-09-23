@@ -9,8 +9,8 @@ description: >-
 # MeshMCP Parser Engineering Skill
 
 Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today:
-Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, plus Protobuf and YAML
-handled without tree-sitter.
+Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, plus Protobuf
+and YAML handled without tree-sitter.
 
 ---
 
@@ -26,7 +26,7 @@ handled without tree-sitter.
   - `create_bounded_parser()` — the constructor behind it; `verify_all_parsers()`
   - `execute_bounded_query()`, `BoundedMatch<'tree>`, `ParserError`
 - **Language kinds & decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](../../../crates/mesh-parsers/src/decapitate.rs)
-  - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Protobuf, Yaml, Unknown }`
+  - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Protobuf, Yaml, Unknown }`
   - `LanguageKind::TREE_SITTER_COUNT`, `as_str()`, `language()`, `from_path()`, `tree_sitter_slot()`
   - `AstDecapitator::decapitate_auto()`, `::decapitate()`, `BOUNDED_ERROR_STUB`
 - **Extraction dispatch**: [`crates/mesh-parsers/src/languages/mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs)
@@ -38,7 +38,9 @@ handled without tree-sitter.
   [`python.rs`](../../../crates/mesh-parsers/src/languages/python.rs),
   [`typescript.rs`](../../../crates/mesh-parsers/src/languages/typescript.rs),
   [`rust_lang.rs`](../../../crates/mesh-parsers/src/languages/rust_lang.rs),
-  [`cpp.rs`](../../../crates/mesh-parsers/src/languages/cpp.rs)
+  [`cpp.rs`](../../../crates/mesh-parsers/src/languages/cpp.rs),
+  [`kotlin.rs`](../../../crates/mesh-parsers/src/languages/kotlin.rs),
+  [`csharp.rs`](../../../crates/mesh-parsers/src/languages/csharp.rs)
 
 ---
 
@@ -87,7 +89,7 @@ This is what allows extraction to run in parallel — see
 pub fn with_parser<R>(lang_kind: LanguageKind, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
     thread_local! {
         static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
-            const { RefCell::new([None, None, None, None, None, None]) };
+            const { RefCell::new([None, None, None, None, None, None, None, None]) };
     }
     ...
 }

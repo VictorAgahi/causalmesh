@@ -20,7 +20,7 @@ can't answer alone:
 It's a single Rust binary, runs locally, reads only the directories you list, and never talks
 to the network.
 
-**Languages indexed**: Java · Go · Python · TypeScript/JavaScript · Rust · C++ · Protobuf · OpenAPI/AsyncAPI YAML · Markdown
+**Languages indexed**: Java · Go · Python · TypeScript/JavaScript · Rust · C++ · Kotlin · C# · Protobuf · OpenAPI/AsyncAPI YAML · Markdown
 
 ---
 

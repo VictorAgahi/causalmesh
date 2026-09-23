@@ -1,8 +1,20 @@
+use mesh_core::Config;
 use std::fs;
 
 pub struct HooksCommand;
 
 impl HooksCommand {
+    /// Whether `[engines.policy] enforce_git_hooks` permits installing the OS-level
+    /// pre-commit hook. No `[engines.policy]` section at all defaults to on, matching
+    /// `PolicyConfig`'s own `#[serde(default = "default_true")]`.
+    pub fn is_enabled(config: &Config) -> bool {
+        config
+            .engines
+            .policy
+            .as_ref()
+            .is_none_or(|p| p.enforce_git_hooks)
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let cur_dir = std::env::current_dir()?;
         let git_hooks_dir = cur_dir.join(".git").join("hooks");
@@ -50,5 +62,27 @@ exit 0
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforce_git_hooks_false_disables_install() {
+        let config = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.policy]\nenforce_git_hooks = false\n",
+        )
+        .expect("config");
+        assert!(!HooksCommand::is_enabled(&config));
+    }
+
+    #[test]
+    fn enforce_git_hooks_true_by_default() {
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        assert!(HooksCommand::is_enabled(&config));
     }
 }

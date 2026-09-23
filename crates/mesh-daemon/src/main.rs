@@ -41,7 +41,7 @@ struct Args {
     #[arg(long, default_value = "30")]
     idle_timeout_minutes: u64,
 
-    /// Override the UDS socket path
+    /// Override the UDS socket path (Unix) or named pipe address (Windows)
     #[arg(long)]
     socket: Option<PathBuf>,
 }
@@ -57,14 +57,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // ── Socket path ───────────────────────────────────────────────────────────
-    let sock_path = match args.socket {
+    // ── Socket path (Unix) / named pipe address (Windows) ───────────────────────
+    // `meshd` has no UDS on Windows, so IDE clients share the daemon over a
+    // named pipe instead (ROADMAP Item 13). `--socket` overrides either form.
+    #[cfg(unix)]
+    let sock_path = match args.socket.clone() {
         Some(p) => p,
         None => socket::socket_path(),
     };
 
     // Clean up any stale socket from a previous crashed daemon
+    #[cfg(unix)]
     socket::cleanup_stale_socket(&sock_path);
+
+    #[cfg(windows)]
+    let pipe_name = match args.socket.clone() {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => socket::pipe_name(),
+    };
 
     // ── Config loading ────────────────────────────────────────────────────────
     let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
@@ -118,13 +128,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ── UDS server (blocking until cancelled) ─────────────────────────────────
+    // ── IPC server (blocking until cancelled) ─────────────────────────────────
+    #[cfg(unix)]
     server::run_uds_server(&sock_path, state, cancel_token, counter)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Clean up socket on exit
-    let _ = std::fs::remove_file(&sock_path);
+    #[cfg(windows)]
+    server::run_named_pipe_server(&pipe_name, state, cancel_token, counter)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Clean up socket on exit (Unix only — named pipes are released by the OS
+    // once the last handle closes, there is no file to remove on Windows).
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(&sock_path);
+    }
     tracing::info!(target: "meshd", "meshd stopped. Socket removed.");
 
     Ok(())

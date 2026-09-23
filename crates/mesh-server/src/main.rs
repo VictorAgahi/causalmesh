@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
-use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand};
+use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand, StatsCommand};
 use mesh_server::{run_server, WorkspaceIndexer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +56,15 @@ enum Commands {
     /// Install OS-level Git pre-commit hooks for active governance
     InstallHooks,
 
+    /// Summarize local audit-log usage: calls per tool, error rate, and
+    /// most-queried scopes/targets. Reads `audit.db` read-only; nothing leaves
+    /// the machine.
+    Stats {
+        /// Time window to include: `<N>s`, `<N>m`, `<N>h`, `<N>d`, or `all`.
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
+
     /// Generate and view an interactive architecture graph of services, contracts, and topics
     Graph {
         /// Format of the output: html, mermaid, or json
@@ -94,7 +103,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InitCommand::run(auto, write_ide_config)?;
         }
         Commands::InstallHooks => {
-            HooksCommand::run()?;
+            let (config, _base) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
+            if HooksCommand::is_enabled(&config) {
+                HooksCommand::run()?;
+            } else {
+                eprintln!(
+                    "✖ Skipped: [engines.policy] enforce_git_hooks = false — hook installation disabled by config."
+                );
+            }
+        }
+        Commands::Stats { since } => {
+            StatsCommand::run(None, Some(&since))?;
         }
         Commands::Graph {
             format,
@@ -132,7 +151,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            if !standalone {
+                // ── Named Pipe Proxy Mode ──────────────────────────────────────
+                let pipe_name = resolve_pipe_name();
+                match ensure_daemon_running_windows(&pipe_name).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "mesh::proxy",
+                            "Connecting to meshd at {}",
+                            pipe_name
+                        );
+                        return run_proxy_mode_windows(&pipe_name).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mesh::proxy",
+                            "Could not connect to meshd ({}). Falling back to standalone mode.",
+                            e
+                        );
+                    }
+                }
+            }
+
+            #[cfg(not(any(unix, windows)))]
             let _ = standalone;
 
             // ── Standalone Mode (in-process fallback) ─────────────────────────
@@ -210,6 +252,100 @@ async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Erro
 
     let stream = tokio::net::UnixStream::connect(sock_path).await?;
     let (daemon_reader, mut daemon_writer) = stream.into_split();
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let stdin_to_daemon = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stdin, &mut daemon_writer).await;
+        let _ = daemon_writer.shutdown().await;
+    });
+
+    let daemon_to_stdout = tokio::spawn(async move {
+        let mut daemon_reader = daemon_reader;
+        let _ = tokio::io::copy(&mut daemon_reader, &mut stdout).await;
+        let _ = stdout.flush().await;
+    });
+
+    tokio::pin!(daemon_to_stdout);
+
+    // If daemon disconnects, terminate immediately.
+    // If stdin closes (e.g. echo pipe in CI), wait for daemon to drain response.
+    tokio::select! {
+        _ = stdin_to_daemon => {
+            let _ = (&mut daemon_to_stdout).await;
+        }
+        _ = &mut daemon_to_stdout => {}
+    }
+
+    Ok(())
+}
+
+// ── Windows named pipe proxy helpers ─────────────────────────────────────────
+//
+// meshd has no Unix Domain Socket on Windows, so `mesh-mcp run` shares the
+// daemon over a named pipe instead (ROADMAP Item 13), mirroring the UDS proxy
+// helpers above.
+
+/// Resolves the named pipe address — mirrors meshd/src/socket.rs's `pipe_name()`.
+#[cfg(windows)]
+fn resolve_pipe_name() -> String {
+    if let Ok(p) = std::env::var("MESH_PIPE_NAME") {
+        return p;
+    }
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+    format!(r"\\.\pipe\mesh-mcp-{user}")
+}
+
+/// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
+#[cfg(windows)]
+async fn ensure_daemon_running_windows(
+    pipe_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    if ClientOptions::new().open(pipe_name).is_ok() {
+        return Ok(());
+    }
+
+    tracing::info!(target: "mesh::proxy", "meshd not found. Attempting auto-spawn…");
+
+    let meshd_path = std::env::current_exe()?
+        .parent()
+        .ok_or("Cannot determine exe dir")?
+        .join("meshd.exe");
+
+    if !meshd_path.exists() {
+        return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
+    }
+
+    std::process::Command::new(&meshd_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
+
+    // Poll up to 500ms for the pipe to appear
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if ClientOptions::new().open(pipe_name).is_ok() {
+            tracing::info!(target: "mesh::proxy", "meshd started successfully.");
+            return Ok(());
+        }
+    }
+
+    Err("meshd did not bind its named pipe within 500ms".into())
+}
+
+/// Ultra-lightweight proxy: bridges stdin/stdout ↔ named pipe.
+#[cfg(windows)]
+async fn run_proxy_mode_windows(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let client = ClientOptions::new().open(pipe_name)?;
+    let (daemon_reader, mut daemon_writer) = tokio::io::split(client);
 
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();

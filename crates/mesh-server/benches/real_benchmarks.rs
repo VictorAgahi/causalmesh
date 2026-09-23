@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use mesh_core::{
-    AuditLogger, CompactStr, ContractEdge, ContractGraph, ContractNode, EdgeKind, NodeKind,
+    AuditLogger, CompactStr, ContractEdge, ContractGraph, ContractNode, EdgeConfidence, EdgeKind,
+    NodeKind,
 };
 use mesh_parsers::{AstDecapitator, AstGuard, LanguageKind, MarkdownFormatter, SearchResult};
 use std::time::Instant;
@@ -349,6 +350,7 @@ fn main() {
                 to: node_id - 1,
                 kind: EdgeKind::Implements,
                 metadata: None,
+                confidence: EdgeConfidence::Exact,
             });
         }
     }

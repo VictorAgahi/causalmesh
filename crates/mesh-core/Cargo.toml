@@ -37,6 +37,9 @@ unicode-normalization.workspace = true
 once_cell.workspace = true
 regex.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

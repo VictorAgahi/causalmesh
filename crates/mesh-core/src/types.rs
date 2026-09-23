@@ -106,12 +106,44 @@ pub enum EdgeKind {
     DispatchesTo,
 }
 
+/// Confidence of a `ContractEdge`'s resolution. The graph is built mostly from
+/// string matching (symbol names, packages, substrings — see ROADMAP Item 6),
+/// so an edge is only as trustworthy as the strategy that produced it. This
+/// lets callers weigh a result instead of treating every edge as fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeConfidence {
+    /// Resolved via a fully-qualified name (FQCN, `a.b.C`, `a::b::C`) or a
+    /// structural link the graph derived directly from node identity
+    /// (e.g. topic producer/consumer wiring), not from a name heuristic.
+    #[default]
+    Exact,
+    /// Resolved via a bare symbol name, case-insensitive match, PascalCase
+    /// normalization, or substring search — i.e. a heuristic that can
+    /// collide across unrelated symbols that merely share a name.
+    Heuristic,
+}
+
+impl EdgeConfidence {
+    /// Short, human-readable label for markdown/graph surfacing.
+    #[inline]
+    pub fn label(&self) -> &'static str {
+        match self {
+            EdgeConfidence::Exact => "exact",
+            EdgeConfidence::Heuristic => "heuristic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractEdge {
     pub from: NodeId,
     pub to: NodeId,
     pub kind: EdgeKind,
     pub metadata: Option<CompactStr>,
+    /// How the edge's `to` target was resolved. See `EdgeConfidence`.
+    #[serde(default)]
+    pub confidence: EdgeConfidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

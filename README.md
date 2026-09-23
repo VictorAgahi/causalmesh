@@ -3,7 +3,7 @@
 **An MCP server that gives your AI coding agent a map of your polyglot codebase.**
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
-[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE-APACHE)
 
 Your agent reads code the way a newcomer does: one file at a time, guessing what calls what.
 On a monorepo with a proto registry, a TypeScript gateway, three Go workers and a Java saga,
@@ -400,7 +400,6 @@ All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RP
 | [docs/development.md](docs/development.md) | Building, testing, adding a language. |
 | [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, skills, pre-commit enforcement. |
 | [docs/benchmarks.md](docs/benchmarks.md) | How to measure, and what the numbers mean. |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Known gaps and planned work, with file references. |
 | [RFC-001-CAUSAL-MCP.md](RFC-001-CAUSAL-MCP.md) | The specification this implements. |
 
 ---
@@ -437,4 +436,8 @@ and [CLAUDE.md](CLAUDE.md) for the architectural invariants a change must preser
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either of:
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
+
+at your option.

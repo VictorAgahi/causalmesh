@@ -5,6 +5,20 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [3.0.2] - 2026-09-23
+
+### Fixed
+- Dual-license claim (`Apache-2.0 OR MIT`, advertised in `Cargo.toml` and the README badge) had
+  no corresponding `LICENSE-MIT` file — only Apache-2.0 text existed under `LICENSE`. Renamed
+  `LICENSE` to `LICENSE-APACHE` and added `LICENSE-MIT`, following the standard Rust dual-license
+  layout. Updated the README badge link and License section accordingly.
+- Removed `docs/ROADMAP.md`. It was a closed, all-16-resolved audit trail rather than an open
+  backlog, but README's Documentation table described it as "known gaps and planned work" and
+  the file itself read as a live list of problems unless you noticed the status banner several
+  paragraphs in — misleading for anyone landing on a specific item via a direct link. A finished
+  audit belongs in CHANGELOG.md, not a document whose own title is "the product promises things
+  it does not do". Removed the corresponding README table row.
+
 ## [3.0.1] - 2026-09-23
 
 ### Fixed

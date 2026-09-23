@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
-use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand};
+use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand, StatsCommand};
 use mesh_server::{run_server, WorkspaceIndexer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +56,15 @@ enum Commands {
     /// Install OS-level Git pre-commit hooks for active governance
     InstallHooks,
 
+    /// Summarize local audit-log usage: calls per tool, error rate, and
+    /// most-queried scopes/targets. Reads `audit.db` read-only; nothing leaves
+    /// the machine.
+    Stats {
+        /// Time window to include: `<N>s`, `<N>m`, `<N>h`, `<N>d`, or `all`.
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
+
     /// Generate and view an interactive architecture graph of services, contracts, and topics
     Graph {
         /// Format of the output: html, mermaid, or json
@@ -95,6 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::InstallHooks => {
             HooksCommand::run()?;
+        }
+        Commands::Stats { since } => {
+            StatsCommand::run(None, Some(&since))?;
         }
         Commands::Graph {
             format,

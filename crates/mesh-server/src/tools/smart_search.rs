@@ -1,10 +1,10 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
-use mesh_core::{AppState, CompactStr, FilesystemCrawler, ValidatedScope};
+use mesh_core::{AppState, CompactStr, ContractNode, FilesystemCrawler, NodeKind, ValidatedScope};
 use mesh_parsers::{AstDecapitator, AstGuard, LanguageKind, MarkdownFormatter, SearchResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,13 +79,33 @@ impl McpTool for SmartSearchTool {
         let query = args.query.as_str();
         let snapshot = state.snapshot();
 
-        // 1. In-memory symbol index → distinct files, in stable order.
-        let indexed_files: BTreeSet<&Path> = snapshot
+        // 1. In-memory symbol index → distinct files, ranked by relevance rather than
+        // alphabetical path order. Each file's rank is the best (lowest) rank among the
+        // symbol nodes it declares: exact name match first, then prefix match, then
+        // substring match; ties broken by node kind (a declared GrpcService outranks an
+        // incidental ServiceClass), then by path. Without this, the 48 KB output cap could
+        // truncate away an exact match that happens to sort late alphabetically while an
+        // incidental substring match from an earlier path survives.
+        let mut best_rank: HashMap<&Path, (u8, u8)> = HashMap::new();
+        for node in snapshot
             .contract_graph
             .search_symbols(query, Some(validated_scope.as_path()))
-            .into_iter()
-            .map(|n| &*n.file_path)
-            .collect();
+        {
+            let rank = Self::symbol_rank(node, query);
+            best_rank
+                .entry(&*node.file_path)
+                .and_modify(|r| {
+                    if rank < *r {
+                        *r = rank;
+                    }
+                })
+                .or_insert(rank);
+        }
+        let mut ranked_files: Vec<(&Path, (u8, u8))> = best_rank.into_iter().collect();
+        ranked_files.sort_by(|(path_a, rank_a), (path_b, rank_b)| {
+            rank_a.cmp(rank_b).then_with(|| path_a.cmp(path_b))
+        });
+        let indexed_files: Vec<&Path> = ranked_files.into_iter().map(|(path, _)| path).collect();
 
         let candidate_files: Vec<PathBuf> = if !indexed_files.is_empty() {
             indexed_files.into_iter().map(Path::to_path_buf).collect()
@@ -123,6 +143,34 @@ impl McpTool for SmartSearchTool {
 }
 
 impl SmartSearchTool {
+    /// Ranks a symbol match for relevance ordering: (match_rank, kind_rank), both
+    /// ascending (lower is better). `match_rank` distinguishes an exact symbol-name
+    /// match from a prefix match from a plain substring match; `kind_rank` breaks
+    /// ties in favor of protocol declarations (gRPC/HTTP/proto) over incidental
+    /// structural kinds like a bare `ServiceClass`.
+    fn symbol_rank(node: &ContractNode, query: &str) -> (u8, u8) {
+        let name = node.name.as_str();
+        let match_rank: u8 = if name.eq_ignore_ascii_case(query) {
+            0
+        } else if name.len() >= query.len()
+            && name.as_bytes()[..query.len()].eq_ignore_ascii_case(query.as_bytes())
+        {
+            1
+        } else {
+            2
+        };
+
+        let kind_rank: u8 = match node.kind {
+            NodeKind::GrpcService | NodeKind::GrpcMethod | NodeKind::HttpEndpoint => 0,
+            NodeKind::ProtoMessage | NodeKind::Interface => 1,
+            NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue | NodeKind::Saga => 2,
+            NodeKind::PostProcessor => 3,
+            NodeKind::ServiceClass => 4,
+        };
+
+        (match_rank, kind_rank)
+    }
+
     /// Reads one file under the AstGuard budget and extracts the snippet around the
     /// first line mentioning `query` in its decapitated form.
     fn search_file(file_path: &Path, query: &str, include_body: bool) -> Option<SearchResult> {

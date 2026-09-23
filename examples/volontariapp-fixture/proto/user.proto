@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package volontariapp.user.v1;
+
+service UserService {
+  rpc SignUp (SignUpRequest) returns (SignUpResponse);
+}
+
+message SignUpRequest {
+  string email = 1;
+}
+
+message SignUpResponse {
+  string user_id = 1;
+}

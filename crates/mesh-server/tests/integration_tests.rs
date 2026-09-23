@@ -669,3 +669,87 @@ exact_phrase_boost = 60
     let text = val["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Retry policy"), "{text}");
 }
+
+#[tokio::test]
+async fn test_volontariapp_fixture_end_to_end_indexing() {
+    let fixture_dir = std::path::Path::new("examples/volontariapp-fixture");
+    if !fixture_dir.exists() {
+        return;
+    }
+    let canonical_dir = dunce::canonicalize(fixture_dir).expect("canonicalize fixture path");
+    let cfg_path = canonical_dir.join("mesh-mcp.toml");
+    let config = Config::load_from_file(&cfg_path).expect("load fixture config");
+    let allowed_roots = expand_roots(
+        &config.workspace.roots,
+        &canonical_dir,
+        &config.workspace.workspace_root,
+    )
+    .expect("expand fixture roots");
+
+    let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+    let rescan = Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+
+    let snapshot = mesh_server::WorkspaceIndexer::build_snapshot(
+        &state.config,
+        &state.allowed_roots,
+        None,
+        None,
+    );
+    state.install_snapshot(snapshot);
+
+    // 1. Verify analyze_grpc("SignUp") finds the TS handler with enum args
+    let snap = state.snapshot();
+    let trace = snap.contract_graph.analyze_grpc("SignUp");
+    assert!(
+        trace.proto_definition.is_some(),
+        "Proto definition for SignUp should be indexed"
+    );
+    assert!(
+        !trace.server_handlers.is_empty(),
+        "Server handler for SignUp must not be empty in fixture"
+    );
+
+    // 2. Verify analyze_impact("USER_CREATED_EVENT") finds outbox producer and post-processor consumer
+    let impact = snap.contract_graph.analyze_impact("USER_CREATED_EVENT");
+    assert!(
+        !impact.topics.is_empty() || !impact.downstream_consumers.is_empty(),
+        "Custom pattern event USER_CREATED_EVENT should be tracked"
+    );
+
+    // 3. Verify search_docs finds architectural documentation
+    let docs = snap.doc_index.search("Volontariapp Architecture", 3);
+    assert!(!docs.is_empty(), "Docs in fixture should be indexed");
+}
+
+#[test]
+fn test_setup_md_config_reference_status_sync() {
+    let setup_md_path = std::path::Path::new("SETUP.md");
+    if !setup_md_path.exists() {
+        return;
+    }
+    let content = std::fs::read_to_string(setup_md_path).expect("read SETUP.md");
+
+    // Active wired sections must be documented as "Wired", never "Accepted-only"
+    let wired_sections = [
+        "`[engines.contracts.grpc]`",
+        "`[engines.contracts.openapi]`",
+        "`[engines.docs]`",
+        "`[engines.policy]`",
+    ];
+
+    for section in wired_sections {
+        let line = content
+            .lines()
+            .find(|l| l.contains(section))
+            .expect("SETUP.md status table must list section");
+        assert!(
+            line.contains("Wired"),
+            "SETUP.md section {section} must be documented as Wired & Active (got line: {line})"
+        );
+        assert!(
+            !line.contains("Accepted-only"),
+            "SETUP.md section {section} must NOT be documented as Accepted-only (got line: {line})"
+        );
+    }
+}

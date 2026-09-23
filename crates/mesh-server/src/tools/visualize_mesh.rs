@@ -35,6 +35,16 @@ impl McpTool for VisualizeMeshTool {
         args._meta.as_ref()
     }
 
+    fn truncation_hint(_args: &Self::Args, state: &AppState) -> Option<String> {
+        let snapshot = state.snapshot();
+        let graph = &snapshot.contract_graph;
+        Some(format!(
+            "Total graph nodes: {}, total edges: {}.",
+            graph.node_count(),
+            graph.edge_count()
+        ))
+    }
+
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let format_choice = args
             .format
@@ -59,22 +69,6 @@ impl McpTool for VisualizeMeshTool {
             }
         };
 
-        const MAX_OUTPUT: usize = 48 * 1024 - 1024;
-        let final_output = if output.len() > MAX_OUTPUT {
-            let mut cut_off = MAX_OUTPUT;
-            while !output.is_char_boundary(cut_off) {
-                cut_off -= 1;
-            }
-            format!(
-                "{}\n\n> [!NOTE]\n> Graph output truncated to fit within maximum MCP output payload (48 KB). Total nodes: {}, total edges: {}.\n",
-                &output[..cut_off],
-                graph.node_count(),
-                graph.edge_count()
-            )
-        } else {
-            output
-        };
-
-        Ok(ToolOutput::text(final_output))
+        Ok(ToolOutput::text(output))
     }
 }

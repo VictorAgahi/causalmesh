@@ -8,8 +8,9 @@ pub struct DoctorCommand;
 impl DoctorCommand {
     pub fn run(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
-            "🔍 Running MeshMCP Diagnostic Healthcheck (v{})...\n",
-            env!("CARGO_PKG_VERSION")
+            "🔍 Running MeshMCP Diagnostic Healthcheck (v{}, commit: {})...\n",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("GIT_HASH").unwrap_or("dev")
         );
 
         // 1. Config syntax
@@ -111,7 +112,7 @@ impl DoctorCommand {
             }
         }
 
-        // 1d. Exclude pattern inspection (Issue 2)
+        // 1d. Dead configuration pattern inspection on positive selection fields (Feedback Item 1)
         if let Some(p) = cfg_path {
             if let Ok(cfg) = Config::load_from_file(p) {
                 let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
@@ -120,6 +121,7 @@ impl DoctorCommand {
                     base_dir,
                     &cfg.workspace.workspace_root,
                 ) {
+                    // Check exclude_patterns for root-name prefix pitfalls
                     let root_names: Vec<String> = roots
                         .iter()
                         .filter_map(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
@@ -131,6 +133,40 @@ impl DoctorCommand {
                                 eprintln!(
                                     "ℹ Exclude pattern note: Pattern '{pat}' includes root name '{root_name}'. MeshMCP automatically resolves root-prefixed patterns."
                                 );
+                            }
+                        }
+                    }
+
+                    // Check positive selection fields (docs.paths, proto_dirs, spec_files) for 0 matches
+                    if let Some(docs) = &cfg.engines.docs {
+                        if !docs.paths.is_empty() {
+                            let docs_matcher = mesh_core::ExcludeMatcher::compile(&docs.paths);
+                            for root in &roots {
+                                if let Ok(scope) = mesh_core::ValidatedScope::resolve_with_aliases(
+                                    &root.to_string_lossy(),
+                                    &roots,
+                                    &cfg.workspace.mount_aliases,
+                                ) {
+                                    let files = mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(5));
+                                    for f in files {
+                                        if let Ok(rel) = f.strip_prefix(root) {
+                                            let _ = docs_matcher.is_excluded_with_root(rel, Some(root));
+                                        }
+                                    }
+                                }
+                            }
+                            let dead_docs = docs_matcher.unmatched_patterns();
+                            if dead_docs.is_empty() {
+                                eprintln!(
+                                    "✔ Docs path patterns: {} configured, all patterns matched scanned files",
+                                    docs.paths.len()
+                                );
+                            } else {
+                                for dead in dead_docs {
+                                    eprintln!(
+                                        "⚠ Path pattern '{dead}' in [engines.docs.paths] matched 0 files — likely dead config"
+                                    );
+                                }
                             }
                         }
                     }

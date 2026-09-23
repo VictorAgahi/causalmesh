@@ -59,6 +59,12 @@ pub trait McpTool {
     fn meta(args: &Self::Args) -> Option<&RequestMeta>;
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError>;
 
+    /// Optional tool-specific narrowing hint added when output payload exceeds 48 KB.
+    /// Default returns None (falling back to standard narrowing recommendation).
+    fn truncation_hint(_args: &Self::Args, _state: &AppState) -> Option<String> {
+        None
+    }
+
     /// The scope or target this call is about, used to match
     /// `[engines.policy.skills]` keys the same way stop rules are matched.
     /// `None` means only an exact tool-name key can recommend a skill.
@@ -211,6 +217,22 @@ impl ToolRegistry {
             if let Ok(out) = &mut result {
                 if let Some(skill) = state.governance.recommend_skill(T::NAME, T::subject(&args)) {
                     out.text.push_str(&Self::render_skill_hint(skill));
+                }
+
+                // Centralized 48 KB Payload Budget Capping (Feedback Item 2)
+                const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
+                if out.text.len() > MAX_TOOL_OUTPUT_BYTES {
+                    let mut cut_off = MAX_TOOL_OUTPUT_BYTES - 384;
+                    while !out.text.is_char_boundary(cut_off) {
+                        cut_off -= 1;
+                    }
+                    out.text.truncate(cut_off);
+                    let hint = T::truncation_hint(&args, &state).unwrap_or_else(|| {
+                        "Refine scope or pass specific search targets to narrow output.".to_string()
+                    });
+                    out.text.push_str(&format!(
+                        "\n\n> [!NOTE]\n> Output payload truncated to fit within maximum MCP output payload cap (48 KB). {hint}\n",
+                    ));
                 }
             }
 
@@ -462,5 +484,32 @@ roots = ["."]
         assert!(docs_props.contains(&"query".to_string()));
         assert!(docs_props.contains(&"max_sections".to_string()));
         assert!(!docs_props.contains(&"scope".to_string()));
+    }
+
+    #[test]
+    fn test_mcp_tools_md_schema_drift_check() {
+        let path = std::path::Path::new("docs/mcp-tools.md");
+        if !path.exists() {
+            return;
+        }
+        let doc_text = std::fs::read_to_string(path).expect("read mcp-tools.md");
+
+        // Verify that obsolete/invented field names never appear in docs/mcp-tools.md
+        let forbidden_fields = ["service_name", "method_name", "changed_file"];
+        for forbidden in forbidden_fields {
+            assert!(
+                !doc_text.contains(&format!("\"{forbidden}\"")),
+                "docs/mcp-tools.md must NOT contain obsolete field {forbidden:?}"
+            );
+        }
+
+        // Verify real required fields appear in docs/mcp-tools.md
+        let required_fields = ["target", "query", "scope"];
+        for req in required_fields {
+            assert!(
+                doc_text.contains(&format!("\"{req}\"")),
+                "docs/mcp-tools.md must contain real schema field {req:?}"
+            );
+        }
     }
 }

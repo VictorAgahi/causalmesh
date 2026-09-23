@@ -3,6 +3,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 pub struct FilesystemCrawler;
 
 /// Compiled exclusion matcher built once per crawl from the workspace `exclude_patterns`.
@@ -11,21 +14,29 @@ pub struct FilesystemCrawler;
 /// without a slash is matched against the basename of every path component, so `build`
 /// excludes a `build/` directory anywhere but not `build.rs` or `build_tools/`. Directories
 /// matched by a pattern are pruned from the walk entirely instead of being filtered file by file.
+#[derive(Clone)]
 pub struct ExcludeMatcher {
     set: GlobSet,
     pub raw_patterns: Vec<String>,
+    pattern_indices: Vec<usize>,
+    hits: Vec<Arc<AtomicUsize>>,
 }
 
 impl ExcludeMatcher {
     pub fn compile(exclude_patterns: &[String]) -> Self {
         let mut builder = GlobSetBuilder::new();
         let mut raw_patterns = Vec::new();
+        let mut pattern_indices = Vec::new();
+        let mut hits = Vec::new();
+
         for raw in exclude_patterns {
             let pat = raw.trim();
             if pat.is_empty() {
                 continue;
             }
             raw_patterns.push(pat.to_string());
+            let current_raw_idx = hits.len();
+            hits.push(Arc::new(AtomicUsize::new(0)));
 
             // Normalize and expand `${workspace_root}` / `${WORKSPACE_ROOT}` references
             let clean = if pat.contains("${workspace_root}") || pat.contains("${WORKSPACE_ROOT}") {
@@ -61,6 +72,7 @@ impl ExcludeMatcher {
                 match Glob::new(&e) {
                     Ok(g) => {
                         builder.add(g);
+                        pattern_indices.push(current_raw_idx);
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -75,7 +87,12 @@ impl ExcludeMatcher {
             tracing::error!(target: "mesh::crawler", "Exclude set failed to compile: {err}");
             GlobSet::empty()
         });
-        Self { set, raw_patterns }
+        Self {
+            set,
+            raw_patterns,
+            pattern_indices,
+            hits,
+        }
     }
 
     /// `rel` must be the path relative to the crawl root (never absolute) so that user
@@ -91,18 +108,47 @@ impl ExcludeMatcher {
         if rel.components().any(|c| c.as_os_str() == ".git") {
             return true;
         }
-        if self.set.is_match(rel) {
+        let matches = self.set.matches(rel);
+        if !matches.is_empty() {
+            for m in matches {
+                if let Some(&raw_idx) = self.pattern_indices.get(m) {
+                    if let Some(h) = self.hits.get(raw_idx) {
+                        h.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             return true;
         }
         if let Some(r) = root {
             if let Some(root_name) = r.file_name() {
                 let rel_with_root = Path::new(root_name).join(rel);
-                if self.set.is_match(&rel_with_root) {
+                let matches_root = self.set.matches(&rel_with_root);
+                if !matches_root.is_empty() {
+                    for m in matches_root {
+                        if let Some(&raw_idx) = self.pattern_indices.get(m) {
+                            if let Some(h) = self.hits.get(raw_idx) {
+                                h.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Returns the raw patterns that matched zero files during scans.
+    pub fn unmatched_patterns(&self) -> Vec<&str> {
+        let mut unmatched = Vec::new();
+        for (idx, raw) in self.raw_patterns.iter().enumerate() {
+            if let Some(h) = self.hits.get(idx) {
+                if h.load(Ordering::Relaxed) == 0 {
+                    unmatched.push(raw.as_str());
+                }
+            }
+        }
+        unmatched
     }
 }
 
@@ -117,7 +163,7 @@ impl FilesystemCrawler {
         Self::crawl_scope_with(scope, &matcher, max_depth)
     }
 
-    fn crawl_scope_with(
+    pub fn crawl_scope_with(
         scope: &ValidatedScope,
         matcher: &ExcludeMatcher,
         max_depth: Option<usize>,
@@ -133,10 +179,7 @@ impl FilesystemCrawler {
 
         // Prune excluded directories at the walker level so `node_modules/` is never descended.
         let root_for_filter = root.to_path_buf();
-        let matcher_clone = ExcludeMatcher {
-            set: matcher.set.clone(),
-            raw_patterns: matcher.raw_patterns.clone(),
-        };
+        let matcher_clone = matcher.clone();
         builder.filter_entry(move |entry| {
             let rel = match entry.path().strip_prefix(&root_for_filter) {
                 Ok(r) => r,

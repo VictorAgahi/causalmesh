@@ -1,0 +1,34 @@
+[workspace]
+name = "volontariapp-fixture"
+version = "1.0.0"
+roots = ["."]
+
+exclude_patterns = [
+  "**/node_modules/**"
+]
+
+[engines.docs]
+enabled = true
+paths = ["docs"]
+
+[engines.contracts]
+enabled = true
+
+[engines.contracts.grpc]
+proto_dirs = ["proto"]
+controller_annotations = ["@GrpcMethod"]
+
+[[engines.contracts.patterns]]
+name = "transactional-outbox"
+kind = "topic_producer"
+file_pattern = "*.ts"
+regex = 'createEvent<([^>]+)>'
+target_group = 1
+
+[[engines.contracts.patterns]]
+name = "event-post-processor"
+kind = "topic_consumer"
+file_pattern = "*.ts"
+regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
+target_group = 2
+consumer_group = 1

@@ -22,7 +22,7 @@ pub struct AnalyzeGrpcTool;
 
 impl McpTool for AnalyzeGrpcTool {
     const NAME: &'static str = "analyze_grpc";
-    const DESCRIPTION: &'static str = "Traces end-to-end gRPC RPC definitions from .proto to polyglot generated stubs and controllers. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact).";
+    const DESCRIPTION: &'static str = "Traces end-to-end gRPC RPC definitions from .proto to polyglot generated stubs and controllers. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). Note: Client-side gRPC stub call detection is supported for Java/Go/Rust; TypeScript NestJS ClientGrpc client stub resolution is currently in development.";
     type Args = AnalyzeGrpcArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {

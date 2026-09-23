@@ -1,5 +1,5 @@
 use ring::digest::{Context, SHA256};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
@@ -379,6 +379,72 @@ impl AuditLogger {
         Self::verify_db(path)
     }
 
+    /// Reads audit entries for local, read-only reporting (`mesh-mcp stats`).
+    ///
+    /// Opens the database `SQLITE_OPEN_READ_ONLY` so this never contends with the
+    /// write lock `record_entry` takes, and never mutates the file (mode stays
+    /// whatever it was, normally `0600`). `since_epoch_secs`, when set, drops any
+    /// entry older than that many seconds since the Unix epoch; `None` returns the
+    /// full history. This performs no network I/O — the data never leaves the
+    /// machine.
+    pub fn read_entries(
+        path: &Path,
+        since_epoch_secs: Option<f64>,
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut stmt = conn.prepare(
+            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version
+             FROM audit_entries ORDER BY entry_seq ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let files_str: String = row.get(8)?;
+            let files: Vec<String> = serde_json::from_str(&files_str).unwrap_or_default();
+            Ok(AuditEntry {
+                entry_seq: row.get(0)?,
+                prev_hash: row.get(1)?,
+                timestamp: row.get(2)?,
+                session_id: row.get(3)?,
+                trace_id: row.get(4)?,
+                tool: row.get(5)?,
+                args_digest: row.get(6)?,
+                status: row.get(7)?,
+                files_accessed: files,
+                secrets_redacted_count: row.get::<_, i64>(9)? as usize,
+                entry_hash: row.get(10)?,
+                chain_version: row.get(11)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for entry_res in rows {
+            let entry = entry_res?;
+            if let Some(cutoff) = since_epoch_secs {
+                // Timestamps are written by `chrono_fallback_utc_now` as
+                // "{unix_secs}.{millis:03}Z" — strip the trailing 'Z' and parse
+                // the epoch-seconds float directly rather than pulling in a
+                // date/time parser for this one call site.
+                let entry_secs: f64 = entry
+                    .timestamp
+                    .trim_end_matches('Z')
+                    .parse()
+                    .unwrap_or(0.0);
+                if entry_secs < cutoff {
+                    continue;
+                }
+            }
+            out.push(entry);
+        }
+
+        Ok(out)
+    }
+
     /// Exports all audit entries to a JSON Lines (JSONL) flat file for compliance tooling
     pub fn export_to_jsonl(&self, dest: &Path) -> Result<usize, AuditError> {
         let conn = self
@@ -637,5 +703,64 @@ mod tests {
             .export_to_jsonl(&jsonl_file)
             .expect("export to jsonl");
         assert_eq!(exported_count, 120);
+    }
+
+    #[test]
+    fn test_read_entries_all_and_since_filter() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("read_entries.db");
+
+        let logger = AuditLogger::new(Some(db_file.clone())).expect("init logger");
+        logger
+            .record_entry(
+                "sess-1",
+                None,
+                "smart_search",
+                "{}",
+                "SUCCESS",
+                vec!["a.rs".to_string()],
+                0,
+            )
+            .expect("entry 0");
+        logger
+            .record_entry(
+                "sess-1",
+                None,
+                "find_dependents",
+                "{}",
+                "ERROR",
+                vec![],
+                0,
+            )
+            .expect("entry 1");
+
+        // No filter: both entries come back.
+        let all = AuditLogger::read_entries(&db_file, None).expect("read all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].tool, "smart_search");
+        assert_eq!(all[1].tool, "find_dependents");
+
+        // A cutoff far in the future excludes everything.
+        let future_cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            + 3600.0;
+        let none = AuditLogger::read_entries(&db_file, Some(future_cutoff)).expect("read none");
+        assert!(none.is_empty());
+
+        // A cutoff far in the past keeps everything.
+        let past_cutoff = 0.0;
+        let all_again =
+            AuditLogger::read_entries(&db_file, Some(past_cutoff)).expect("read all again");
+        assert_eq!(all_again.len(), 2);
+    }
+
+    #[test]
+    fn test_read_entries_missing_db_returns_empty() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing = temp_dir.path().join("does-not-exist.db");
+        let entries = AuditLogger::read_entries(&missing, None).expect("read missing db");
+        assert!(entries.is_empty());
     }
 }

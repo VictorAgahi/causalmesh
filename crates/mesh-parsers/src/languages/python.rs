@@ -167,8 +167,7 @@ impl PythonExtractor {
                                 kind = NodeKind::Queue;
                                 celery_task_name = Self::celery_task_name_override(dec_text)
                                     .or_else(|| Some(func_name.to_string()));
-                            } else if dec_text.contains("@app.") || dec_text.contains("@router.")
-                            {
+                            } else if dec_text.contains("@app.") || dec_text.contains("@router.") {
                                 kind = NodeKind::HttpEndpoint;
                             }
                         }
@@ -324,8 +323,8 @@ impl PythonExtractor {
                 if imp.target.is_empty() {
                     continue;
                 }
-                let is_used = imp.module_like
-                    || body.iter().any(|l| l.contains(imp.search_text.as_str()));
+                let is_used =
+                    imp.module_like || body.iter().any(|l| l.contains(imp.search_text.as_str()));
                 if is_used && seen.insert((i, imp.target.clone())) {
                     deps.push((i, CompactStr::new(imp.target.as_str())));
                 }
@@ -602,7 +601,10 @@ def process():
         assert!(
             dependents.iter().any(|n| n.name == "process"),
             "expected `process` (consumer of greet_user) in find_dependents, got: {:?}",
-            dependents.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+            dependents
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

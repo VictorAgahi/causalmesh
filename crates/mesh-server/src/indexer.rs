@@ -11,7 +11,9 @@ use mesh_core::{
     DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, MeshSnapshot, PropertyRegistry,
     PropertySourceMatcher, RepoId, ValidatedScope,
 };
-use mesh_parsers::{AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer};
+use mesh_parsers::{
+    AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
+};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -429,11 +431,7 @@ impl WorkspaceIndexer {
     /// and an empty `paths` list means "no restriction".
     fn engine_toggles(config: &Config) -> EngineToggles {
         let docs_enabled = config.engines.docs.as_ref().is_none_or(|d| d.enabled);
-        let contracts_enabled = config
-            .engines
-            .contracts
-            .as_ref()
-            .is_none_or(|c| c.enabled);
+        let contracts_enabled = config.engines.contracts.as_ref().is_none_or(|c| c.enabled);
         let doc_paths = config
             .engines
             .docs
@@ -541,12 +539,14 @@ impl WorkspaceIndexer {
                     frag.props = Some(reg);
                 }
                 if toggles.contracts_enabled {
-                    frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+                    frag.code =
+                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
                 }
             }
             _ => {
                 if toggles.contracts_enabled {
-                    frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+                    frag.code =
+                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
                 }
             }
         }
@@ -759,7 +759,8 @@ resolve_placeholders = true
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.docs]\nenabled = false\n",
         )
         .expect("config");
-        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             0,
@@ -783,7 +784,8 @@ resolve_placeholders = true
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.contracts]\nenabled = false\n",
         )
         .expect("config");
-        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
         assert_eq!(
             snapshot.contract_graph.node_count(),
             0,
@@ -805,7 +807,8 @@ resolve_placeholders = true
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\n[engines.docs]\npaths = [\"docs/**\"]\n",
         )
         .expect("config");
-        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             1,

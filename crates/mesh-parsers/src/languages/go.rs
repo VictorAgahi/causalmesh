@@ -723,7 +723,10 @@ func Run() {
         // Wire it into a graph exactly as `FileIndex::apply` would (mod.rs),
         // then confirm `find_dependents` resolves the consumer.
         let mut graph = ContractGraph::new();
-        let ids: Vec<_> = consumer_nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        let ids: Vec<_> = consumer_nodes
+            .into_iter()
+            .map(|n| graph.add_node(n))
+            .collect();
         for (i, target) in relations.dependencies {
             graph.add_dependency(ids[i], target.as_str());
         }
@@ -782,22 +785,36 @@ func Consume() {
 }
 "#;
         let mut p1 = parser();
-        let (producer_nodes, producer_relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), producer_code, 1, &mut p1);
+        let (producer_nodes, producer_relations) = GoExtractor::extract_with_relations(
+            Path::new("producer.go"),
+            producer_code,
+            1,
+            &mut p1,
+        );
         assert!(!producer_relations.producers.is_empty());
 
         let mut p2 = parser();
-        let (consumer_nodes, consumer_relations) =
-            GoExtractor::extract_with_relations(Path::new("consumer.go"), consumer_code, 1, &mut p2);
+        let (consumer_nodes, consumer_relations) = GoExtractor::extract_with_relations(
+            Path::new("consumer.go"),
+            consumer_code,
+            1,
+            &mut p2,
+        );
         assert!(!consumer_relations.consumers.is_empty());
 
         // No custom regex pattern configured anywhere — purely native detection.
         let mut graph = ContractGraph::new();
-        let producer_ids: Vec<_> = producer_nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        let producer_ids: Vec<_> = producer_nodes
+            .into_iter()
+            .map(|n| graph.add_node(n))
+            .collect();
         for (i, topic) in producer_relations.producers {
             graph.add_producer(producer_ids[i], topic.as_str());
         }
-        let consumer_ids: Vec<_> = consumer_nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        let consumer_ids: Vec<_> = consumer_nodes
+            .into_iter()
+            .map(|n| graph.add_node(n))
+            .collect();
         for (i, topic) in consumer_relations.consumers {
             graph.add_consumer(consumer_ids[i], topic.as_str());
         }
@@ -871,8 +888,14 @@ func Consume() {
         let mut p = parser();
         let (_, relations) =
             GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &mut p);
-        assert!(relations.consumers.iter().any(|(_, t)| t.as_str() == "orders"));
-        assert!(relations.consumers.iter().any(|(_, t)| t.as_str() == "payments"));
+        assert!(relations
+            .consumers
+            .iter()
+            .any(|(_, t)| t.as_str() == "orders"));
+        assert!(relations
+            .consumers
+            .iter()
+            .any(|(_, t)| t.as_str() == "payments"));
     }
 
     // -- Item 5: gRPC registration + router parity ---------------------------

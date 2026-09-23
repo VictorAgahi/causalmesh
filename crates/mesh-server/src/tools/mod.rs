@@ -255,12 +255,9 @@ mod tests {
             let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
             let state = Arc::new(AppState::new(config, vec![], audit.clone(), rescan));
 
-            let _ = ToolRegistry::call_tool(
-                SearchDocsTool::NAME,
-                json!({"query": "anything"}),
-                state,
-            )
-            .await;
+            let _ =
+                ToolRegistry::call_tool(SearchDocsTool::NAME, json!({"query": "anything"}), state)
+                    .await;
 
             let dest = tempfile::NamedTempFile::new().expect("tmp file");
             audit.export_to_jsonl(dest.path()).expect("export")

@@ -222,8 +222,7 @@ impl PropertyRegistry {
             Cow::Borrowed(val.as_str())
         } else if let Some(def) = default_val {
             let lower_key = key.to_lowercase();
-            if self.redact_secrets && Self::SECRET_PATTERNS.iter().any(|&p| lower_key.contains(p))
-            {
+            if self.redact_secrets && Self::SECRET_PATTERNS.iter().any(|&p| lower_key.contains(p)) {
                 Cow::Borrowed(Self::REDACTED_PLACEHOLDER)
             } else {
                 Cow::Borrowed(def)

@@ -51,7 +51,9 @@ impl CSharpExtractor {
                     *package_name = mesh_core::detect_service_package(file_path, Some(name));
                 }
             }
-            "class_declaration" | "interface_declaration" | "struct_declaration"
+            "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
             | "record_declaration" => {
                 if let Some(name) = node
                     .child_by_field_name("name")

@@ -306,6 +306,9 @@ mod tests {
         let state = make_state(&root, "");
 
         let result = SmartSearchTool::run(&args("/workspace"), &state);
-        assert!(result.is_err(), "expected unaliased /workspace to be rejected");
+        assert!(
+            result.is_err(),
+            "expected unaliased /workspace to be rejected"
+        );
     }
 }

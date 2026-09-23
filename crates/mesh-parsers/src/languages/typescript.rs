@@ -178,8 +178,7 @@ impl TypeScriptExtractor {
                 } else if full_text.contains("@MessagePattern") {
                     // @nestjs/microservices RPC-style handler: also a consumer side.
                     kind = NodeKind::KafkaTopic;
-                    grpc_target =
-                        Self::extract_decorator_single_arg(&full_text, "@MessagePattern");
+                    grpc_target = Self::extract_decorator_single_arg(&full_text, "@MessagePattern");
                 }
 
                 let first_line = node
@@ -249,7 +248,8 @@ impl TypeScriptExtractor {
                     if ctor.kind() == "identifier" {
                         if let Ok("Queue") = ctor.utf8_text(source) {
                             if let Some(args) = node.child_by_field_name("arguments") {
-                                if let Some(queue_name) = Self::extract_first_arg_value(args, source)
+                                if let Some(queue_name) =
+                                    Self::extract_first_arg_value(args, source)
                                 {
                                     nodes.push(ContractNode {
                                         id: 0,
@@ -499,9 +499,7 @@ export class AuthController {
             &mut parser,
             &mut imports,
         );
-        assert!(!default_nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::GrpcMethod));
+        assert!(!default_nodes.iter().any(|n| n.kind == NodeKind::GrpcMethod));
 
         // A configured `controller_annotations` list must produce an
         // observably different result: the method is now recognised as a

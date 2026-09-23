@@ -430,11 +430,7 @@ impl AuditLogger {
                 // "{unix_secs}.{millis:03}Z" — strip the trailing 'Z' and parse
                 // the epoch-seconds float directly rather than pulling in a
                 // date/time parser for this one call site.
-                let entry_secs: f64 = entry
-                    .timestamp
-                    .trim_end_matches('Z')
-                    .parse()
-                    .unwrap_or(0.0);
+                let entry_secs: f64 = entry.timestamp.trim_end_matches('Z').parse().unwrap_or(0.0);
                 if entry_secs < cutoff {
                     continue;
                 }
@@ -644,7 +640,14 @@ mod tests {
                 args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
                 chain_version
             ) VALUES (0, ?1, ?2, ?3, NULL, ?4, ?5, 'SUCCESS', '[]', 0, ?6, 1)",
-            params![prev_hash, timestamp, session_id, tool, args_digest, entry_hash],
+            params![
+                prev_hash,
+                timestamp,
+                session_id,
+                tool,
+                args_digest,
+                entry_hash
+            ],
         )
         .expect("insert legacy row");
         drop(conn);
@@ -723,15 +726,7 @@ mod tests {
             )
             .expect("entry 0");
         logger
-            .record_entry(
-                "sess-1",
-                None,
-                "find_dependents",
-                "{}",
-                "ERROR",
-                vec![],
-                0,
-            )
+            .record_entry("sess-1", None, "find_dependents", "{}", "ERROR", vec![], 0)
             .expect("entry 1");
 
         // No filter: both entries come back.

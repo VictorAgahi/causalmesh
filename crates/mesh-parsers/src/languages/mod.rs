@@ -63,26 +63,26 @@ impl ExtractConfig {
     /// sub-tables (`grpc`/`openapi`/`asyncapi`) fall back to their defaults.
     pub fn from_contracts(contracts: &ContractsConfig) -> Self {
         let default = Self::default();
-        let (proto_dirs, controller_annotations, canonical_fqcn_projection) =
-            match &contracts.grpc {
-                Some(g) => {
-                    let annotations = if g.controller_annotations.is_empty() {
-                        default.controller_annotations.clone()
-                    } else {
-                        g.controller_annotations.clone()
-                    };
-                    (
-                        g.proto_dirs.clone(),
-                        annotations,
-                        g.canonical_fqcn_projection,
-                    )
-                }
-                None => (
-                    default.proto_dirs.clone(),
-                    default.controller_annotations.clone(),
-                    default.canonical_fqcn_projection,
-                ),
-            };
+        let (proto_dirs, controller_annotations, canonical_fqcn_projection) = match &contracts.grpc
+        {
+            Some(g) => {
+                let annotations = if g.controller_annotations.is_empty() {
+                    default.controller_annotations.clone()
+                } else {
+                    g.controller_annotations.clone()
+                };
+                (
+                    g.proto_dirs.clone(),
+                    annotations,
+                    g.canonical_fqcn_projection,
+                )
+            }
+            None => (
+                default.proto_dirs.clone(),
+                default.controller_annotations.clone(),
+                default.canonical_fqcn_projection,
+            ),
+        };
         let openapi_spec_files = contracts
             .openapi
             .as_ref()
@@ -124,7 +124,8 @@ fn spec_file_matches(path_str: &str, pattern: &str) -> bool {
         .trim_start_matches("./")
         .trim_start_matches('*')
         .to_lowercase();
-    !needle.is_empty() && (path_str.ends_with(needle.as_str()) || path_str.contains(needle.as_str()))
+    !needle.is_empty()
+        && (path_str.ends_with(needle.as_str()) || path_str.contains(needle.as_str()))
 }
 
 /// Everything extracted from one file, expressed against *local* node indices.
@@ -583,7 +584,9 @@ impl PolyglotIndexer {
         // Check for OpenAPI spec. `spec_files`, when configured, scopes detection
         // to those files exactly instead of the filename/content sniff.
         let is_openapi = if cfg.openapi_spec_files.is_empty() {
-            path_str.contains("openapi") || content.contains("openapi:") || content.contains("swagger:")
+            path_str.contains("openapi")
+                || content.contains("openapi:")
+                || content.contains("swagger:")
         } else {
             cfg.openapi_spec_files
                 .iter()
@@ -957,10 +960,7 @@ topics:
 
         let cfg = ExtractConfig::from_contracts(&contracts);
         assert_eq!(cfg.proto_dirs, vec!["proto-registry".to_string()]);
-        assert_eq!(
-            cfg.controller_annotations,
-            vec!["@RpcHandler".to_string()]
-        );
+        assert_eq!(cfg.controller_annotations, vec!["@RpcHandler".to_string()]);
         assert!(!cfg.canonical_fqcn_projection);
         assert_eq!(cfg.openapi_spec_files, vec!["openapi.yaml".to_string()]);
         assert_eq!(cfg.asyncapi_spec_files, vec!["asyncapi.yaml".to_string()]);

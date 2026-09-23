@@ -269,8 +269,15 @@ impl RustExtractor {
                 }
             }
             "impl_item" => {
-                let is_grpc =
-                    Self::handle_impl(node, source, file_path, repo_id, package_name, nodes, pending_attr);
+                let is_grpc = Self::handle_impl(
+                    node,
+                    source,
+                    file_path,
+                    repo_id,
+                    package_name,
+                    nodes,
+                    pending_attr,
+                );
                 // The impl's methods live one level down, inside its
                 // `declaration_list` body — recurse into *that* with the
                 // gRPC flag, not into the `impl_item` itself (whose direct
@@ -432,7 +439,10 @@ impl RustExtractor {
         for (rel, _) in text.match_indices(NEEDLE) {
             let after = &text[rel + NEEDLE.len()..];
             let end = after.find(')').unwrap_or(after.len());
-            if let Some(topic) = Self::extract_quoted_strings(&after[..end]).into_iter().next() {
+            if let Some(topic) = Self::extract_quoted_strings(&after[..end])
+                .into_iter()
+                .next()
+            {
                 producers.push((idx, CompactStr::new(topic)));
             }
         }
@@ -547,7 +557,11 @@ impl RustExtractor {
             if full.is_empty() {
                 continue;
             }
-            let last = full.rsplit("::").next().unwrap_or(full.as_str()).to_string();
+            let last = full
+                .rsplit("::")
+                .next()
+                .unwrap_or(full.as_str())
+                .to_string();
             imports.push((String::new(), full.clone()));
             if last != full {
                 imports.push((String::new(), last));
@@ -722,11 +736,7 @@ fn uses_both() {
 }
 "#;
         let idx = RustExtractor::extract_index(Path::new("src/lib.rs"), code, 1, &mut parser);
-        let dep_targets: Vec<&str> = idx
-            .dependencies
-            .iter()
-            .map(|(_, t)| t.as_str())
-            .collect();
+        let dep_targets: Vec<&str> = idx.dependencies.iter().map(|(_, t)| t.as_str()).collect();
         assert!(dep_targets.contains(&"a::b"));
         assert!(dep_targets.contains(&"a::c::D"));
         assert!(dep_targets.contains(&"b"));

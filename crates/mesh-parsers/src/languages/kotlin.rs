@@ -132,10 +132,8 @@ impl KotlinExtractor {
 
                     if modifiers_text.contains("@KafkaListener") {
                         kind = NodeKind::KafkaTopic;
-                        topic_target = Some(Self::extract_annotation_param(
-                            modifiers_text,
-                            "topics",
-                        ));
+                        topic_target =
+                            Some(Self::extract_annotation_param(modifiers_text, "topics"));
                     } else if modifiers_text.contains("@GetMapping")
                         || modifiers_text.contains("@PostMapping")
                         || modifiers_text.contains("@PutMapping")
@@ -227,8 +225,7 @@ interface BillingGateway {
 }
 "#;
         let mut p = parser();
-        let nodes =
-            KotlinExtractor::extract(Path::new("BillingController.kt"), code, 1, &mut p);
+        let nodes = KotlinExtractor::extract(Path::new("BillingController.kt"), code, 1, &mut p);
 
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
 
@@ -263,7 +260,10 @@ object Constants {
 "#;
         let mut p = parser();
         let nodes = KotlinExtractor::extract(Path::new("Constants.kt"), code, 0, &mut p);
-        let constants = nodes.iter().find(|n| n.name == "Constants").expect("object");
+        let constants = nodes
+            .iter()
+            .find(|n| n.name == "Constants")
+            .expect("object");
         assert_eq!(constants.kind, NodeKind::ServiceClass);
     }
 }

@@ -5,7 +5,11 @@ use tree_sitter::{Node, Parser};
 
 /// `(nodes, dependencies, producers)`, the latter two keyed by local node index
 /// in the same shape `languages::FileIndex.dependencies` / `.producers` expect.
-type ExtractedRelations = (Vec<ContractNode>, Vec<(usize, CompactStr)>, Vec<(usize, CompactStr)>);
+type ExtractedRelations = (
+    Vec<ContractNode>,
+    Vec<(usize, CompactStr)>,
+    Vec<(usize, CompactStr)>,
+);
 
 pub struct JavaExtractor;
 
@@ -277,7 +281,13 @@ impl JavaExtractor {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             Self::visit_node(
-                child, source, file_path, repo_id, package_name, nodes, producers,
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                nodes,
+                producers,
             );
         }
     }
@@ -354,8 +364,12 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) =
-            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &mut parser);
+        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
+            Path::new("OrderController.java"),
+            code,
+            1,
+            &mut parser,
+        );
 
         let class_idx = nodes
             .iter()
@@ -381,8 +395,12 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) =
-            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &mut parser);
+        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
+            Path::new("OrderController.java"),
+            code,
+            1,
+            &mut parser,
+        );
 
         let class_idx = nodes
             .iter()
@@ -414,16 +432,20 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) =
-            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &mut parser);
+        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
+            Path::new("OrderController.java"),
+            code,
+            1,
+            &mut parser,
+        );
 
         let method_idx = nodes
             .iter()
             .position(|n| n.name == "ping")
             .expect("method node present");
-        assert!(!dependencies
-            .iter()
-            .any(|(i, target)| { *i == method_idx && target.as_str() == "com.mesh.billing.BillingService" }));
+        assert!(!dependencies.iter().any(|(i, target)| {
+            *i == method_idx && target.as_str() == "com.mesh.billing.BillingService"
+        }));
     }
 
     #[test]

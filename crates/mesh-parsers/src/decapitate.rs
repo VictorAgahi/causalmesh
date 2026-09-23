@@ -293,7 +293,8 @@ impl AstDecapitator {
                     return;
                 }
             }
-            LanguageKind::CSharp if kind == "method_declaration" || kind == "constructor_declaration" =>
+            LanguageKind::CSharp
+                if kind == "method_declaration" || kind == "constructor_declaration" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {
                     replacements.push((
@@ -565,14 +566,20 @@ class AuthController {
         let mut parser = Parser::new();
         let lang = tree_sitter_kotlin_ng::LANGUAGE.into();
         parser.set_language(&lang).unwrap();
-        let decapitated = AstDecapitator::decapitate(code, LanguageKind::Kotlin, &mut parser, false);
+        let decapitated =
+            AstDecapitator::decapitate(code, LanguageKind::Kotlin, &mut parser, false);
         assert!(decapitated.contains("@RestController"));
         assert!(decapitated.contains("@PostMapping(\"/login\")"));
-        assert!(decapitated.contains("fun login(req: LoginRequest): TokenResponse { /* stripped */ }"));
+        assert!(
+            decapitated.contains("fun login(req: LoginRequest): TokenResponse { /* stripped */ }")
+        );
         assert!(!decapitated.contains("authService.generate"));
         assert!(decapitated.contains("fun shortcut(): Int = /* stripped */"));
         assert_eq!(LanguageKind::from_path("Foo.kt"), LanguageKind::Kotlin);
-        assert_eq!(LanguageKind::from_path("build.gradle.kts"), LanguageKind::Kotlin);
+        assert_eq!(
+            LanguageKind::from_path("build.gradle.kts"),
+            LanguageKind::Kotlin
+        );
         assert_eq!(LanguageKind::Kotlin.as_str(), "kotlin");
     }
 
@@ -593,7 +600,8 @@ public class AuthController : ControllerBase
         let mut parser = Parser::new();
         let lang = tree_sitter_c_sharp::language();
         parser.set_language(&lang).unwrap();
-        let decapitated = AstDecapitator::decapitate(code, LanguageKind::CSharp, &mut parser, false);
+        let decapitated =
+            AstDecapitator::decapitate(code, LanguageKind::CSharp, &mut parser, false);
         assert!(decapitated.contains("[ApiController]"));
         assert!(decapitated.contains("[HttpPost(\"/login\")]"));
         assert!(decapitated.contains("public TokenResponse Login(LoginRequest req)"));

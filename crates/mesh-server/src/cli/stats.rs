@@ -111,7 +111,10 @@ impl StatsCommand {
         }
 
         eprintln!();
-        eprintln!("Most-queried scopes/targets (top {}, by files_accessed):", summary.top_targets.len());
+        eprintln!(
+            "Most-queried scopes/targets (top {}, by files_accessed):",
+            summary.top_targets.len()
+        );
         if summary.top_targets.is_empty() {
             eprintln!("  (no files_accessed recorded in this window)");
         } else {
@@ -270,15 +273,7 @@ mod tests {
                 .expect("seed smart_search entry");
         }
         logger
-            .record_entry(
-                "sess-1",
-                None,
-                "find_dependents",
-                "{}",
-                "ERROR",
-                vec![],
-                0,
-            )
+            .record_entry("sess-1", None, "find_dependents", "{}", "ERROR", vec![], 0)
             .expect("seed find_dependents entry");
 
         let entries = AuditLogger::read_entries(&db_file, None).expect("read seeded entries");
@@ -310,9 +305,15 @@ mod tests {
 
     #[test]
     fn test_parse_since_variants() {
-        assert!(StatsCommand::parse_since("all").expect("all parses").is_none());
-        assert!(StatsCommand::parse_since("7d").expect("7d parses").is_some());
-        assert!(StatsCommand::parse_since("24h").expect("24h parses").is_some());
+        assert!(StatsCommand::parse_since("all")
+            .expect("all parses")
+            .is_none());
+        assert!(StatsCommand::parse_since("7d")
+            .expect("7d parses")
+            .is_some());
+        assert!(StatsCommand::parse_since("24h")
+            .expect("24h parses")
+            .is_some());
         assert!(StatsCommand::parse_since("bogus").is_err());
         assert!(StatsCommand::parse_since("").is_err());
     }

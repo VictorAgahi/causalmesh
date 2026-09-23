@@ -239,10 +239,7 @@ mod windows_impl {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio_util::sync::CancellationToken;
 
-    fn create_instance(
-        pipe_name: &str,
-        first: bool,
-    ) -> std::io::Result<NamedPipeServer> {
+    fn create_instance(pipe_name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
         ServerOptions::new()
             .first_pipe_instance(first)
             .create(pipe_name)
@@ -551,12 +548,14 @@ mod unix_tests {
         let token_a2 = token_a.clone();
         let token_b2 = token_b.clone();
 
-        let handle_a = tokio::spawn(async move {
-            run_uds_server(&path_a, state_a, token_a2, counter_a).await
-        });
-        let handle_b = tokio::spawn(async move {
-            run_uds_server(&path_b, state_b, token_b2, counter_b).await
-        });
+        let handle_a =
+            tokio::spawn(
+                async move { run_uds_server(&path_a, state_a, token_a2, counter_a).await },
+            );
+        let handle_b =
+            tokio::spawn(
+                async move { run_uds_server(&path_b, state_b, token_b2, counter_b).await },
+            );
 
         let (res_a, res_b) = tokio::join!(
             tokio::time::timeout(std::time::Duration::from_millis(400), handle_a),
@@ -636,7 +635,6 @@ mod unix_tests {
             "in-flight request must still complete and be returned to the client, got: {resp}"
         );
     }
-
 }
 
 #[cfg(all(test, windows))]

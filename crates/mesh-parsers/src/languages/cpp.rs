@@ -258,9 +258,9 @@ impl CppExtractor {
                 | "pointer_declarator"
                 | "reference_declarator"
                 | "parenthesized_declarator" => {
-                    current = current.child_by_field_name("declarator").or_else(|| {
-                        current.named_child(0)
-                    })?;
+                    current = current
+                        .child_by_field_name("declarator")
+                        .or_else(|| current.named_child(0))?;
                 }
                 "template_function" => {
                     current = current.child_by_field_name("name")?;
@@ -468,12 +468,18 @@ public:
 
         // "vector" (system, angle-bracket) must never appear as a dependency target.
         assert!(
-            index.dependencies.iter().all(|(_, t)| t.as_str() != "vector"),
+            index
+                .dependencies
+                .iter()
+                .all(|(_, t)| t.as_str() != "vector"),
             "angle-bracket system include must not be treated as a dependency"
         );
         // "Shape" (quoted, local) is used by `Circle` and must be attached.
         assert!(
-            index.dependencies.iter().any(|(_, t)| t.as_str() == "Shape"),
+            index
+                .dependencies
+                .iter()
+                .any(|(_, t)| t.as_str() == "Shape"),
             "quoted local include used by a node must be a dependency"
         );
     }

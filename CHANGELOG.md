@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [3.0.1] - 2026-09-23
+
+### Fixed
+- `mesh-mcp graph --format html`: the interactive topology's legend hardcoded "Kafka Topic" for
+  the shared yellow node color, even though that same color (and, previously, node size) covers
+  `NodeKind::EventStream` and `NodeKind::Queue` too — the transport-agnostic kinds introduced
+  specifically so Redis Streams/BullMQ/SQS custom-pattern nodes wouldn't be mislabeled as Kafka
+  (see `ContractGraph`'s own comment on this in `contracts.rs`). A project with zero real Kafka
+  usage had every async event/queue node visually reading as "Kafka Topic" in the legend.
+  Relabeled to "Topic / Queue / Stream" and aligned node radius so `EventStream`/`Queue` render
+  identically to `KafkaTopic` instead of smaller.
+
 ## [3.0.0] - 2026-09-23
 
 This release closes out an audit driven by real consumer usage (a 15-root, ~4000-file polyglot

@@ -584,7 +584,7 @@ impl GraphRenderer {
       <div class="legend-item"><div class="legend-color" style="background: #10b981;"></div>CallsRpc</div>
       <div class="legend-item"><div class="legend-color" style="background: #f59e0b;"></div>Implements</div>
       <div class="legend-item"><div class="legend-color" style="background: #ec4899;"></div>DispatchesTo</div>
-      <div class="legend-item"><div class="legend-color" style="background: #fbbf24;"></div>Kafka Topic</div>
+      <div class="legend-item"><div class="legend-color" style="background: #fbbf24;"></div>Topic / Queue / Stream</div>
       <div class="legend-item"><div class="legend-color" style="background: #34d399;"></div>Protobuf</div>
     </div>
 
@@ -801,7 +801,7 @@ impl GraphRenderer {
           }});
 
           p.pkgNodes.forEach((n, i) => {{
-            const nodeRadius = n.kind === 'GrpcService' || n.kind === 'KafkaTopic' ? 14 : 10;
+            const nodeRadius = n.kind === 'GrpcService' || n.kind === 'KafkaTopic' || n.kind === 'EventStream' || n.kind === 'Queue' ? 14 : 10;
             const offset = ringPosition(i, p.pkgNodes.length, p.radius - nodeRadius - 6, nodeRadius * 2 + 10);
             const nodeObj = {{
               ...n,

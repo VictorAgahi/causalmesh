@@ -415,6 +415,12 @@ cargo fmt --all                                          # before committing
 cargo bench -p mesh-server                               # benchmark suite
 ```
 
+Once per clone, wire up the pre-commit hook (`.githooks/pre-commit`) so fmt/clippy/tests run
+automatically before every commit instead of being caught later in CI:
+```bash
+git config core.hooksPath .githooks
+```
+
 Workspace layout:
 
 | Crate | Responsibility |

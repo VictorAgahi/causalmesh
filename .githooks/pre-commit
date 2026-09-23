@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — fast local regression guard.
+#
+# Runs the same checks that have been done by hand before every fix this project has shipped:
+# formatting, strict clippy, and the full test suite. Deliberately skips the release build and
+# smoke test in scripts/ci.sh — those are slow and belong in CI / pre-push, not on every commit.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+echo "==> pre-commit: cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "==> pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "==> pre-commit: cargo test --workspace"
+cargo test --workspace
+
+echo "✔ pre-commit checks passed."

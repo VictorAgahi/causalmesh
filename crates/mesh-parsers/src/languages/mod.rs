@@ -294,10 +294,15 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Python => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    python::PythonExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    python::PythonExtractor::extract_with_relations(
+                        file_path, content, repo_id, parser,
+                    )
                 }) {
                     out.nodes = nodes;
+                    out.dependencies = relations.dependencies;
+                    out.producers = relations.producers;
+                    out.consumers = relations.consumers;
                 }
             }
             LanguageKind::TypeScript => {

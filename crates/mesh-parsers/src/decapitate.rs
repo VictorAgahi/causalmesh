@@ -700,7 +700,10 @@ end
         assert!(decapitated.contains("def authenticate(token)"));
         assert!(decapitated.contains("# stripped"));
         assert!(!decapitated.contains("validate(token)"));
-        assert_eq!(LanguageKind::from_path("app/models/auth.rb"), LanguageKind::Ruby);
+        assert_eq!(
+            LanguageKind::from_path("app/models/auth.rb"),
+            LanguageKind::Ruby
+        );
         assert_eq!(LanguageKind::Ruby.as_str(), "ruby");
     }
 
@@ -722,7 +725,10 @@ class AuthController {
         assert!(decapitated.contains("#[Route('/login')]"));
         assert!(decapitated.contains("public function login($req) { /* stripped */ }"));
         assert!(!decapitated.contains("authService->generate"));
-        assert_eq!(LanguageKind::from_path("src/Controller/Auth.php"), LanguageKind::Php);
+        assert_eq!(
+            LanguageKind::from_path("src/Controller/Auth.php"),
+            LanguageKind::Php
+        );
         assert_eq!(LanguageKind::Php.as_str(), "php");
     }
 
@@ -744,7 +750,10 @@ class AuthService {
         let decapitated = AstDecapitator::decapitate(code, LanguageKind::Swift, &mut parser, false);
         assert!(decapitated.contains("func authenticate(token: String) -> Bool { /* stripped */ }"));
         assert!(!decapitated.contains("validate(token)"));
-        assert_eq!(LanguageKind::from_path("Sources/App/Auth.swift"), LanguageKind::Swift);
+        assert_eq!(
+            LanguageKind::from_path("Sources/App/Auth.swift"),
+            LanguageKind::Swift
+        );
         assert_eq!(LanguageKind::Swift.as_str(), "swift");
     }
 
@@ -762,7 +771,9 @@ class AuthService {
         let lang = tree_sitter_scala::LANGUAGE.into();
         parser.set_language(&lang).unwrap();
         let decapitated = AstDecapitator::decapitate(code, LanguageKind::Scala, &mut parser, false);
-        assert!(decapitated.contains("def authenticate(token: String): Boolean = { /* stripped */ }"));
+        assert!(
+            decapitated.contains("def authenticate(token: String): Boolean = { /* stripped */ }")
+        );
         assert!(!decapitated.contains("token.nonEmpty"));
 
         let concise = "object Foo {\n  def bar(x: Int): Int = x + 1\n}\n";
@@ -773,7 +784,10 @@ class AuthService {
         assert!(decapitated_concise.contains("def bar(x: Int): Int = /* stripped */"));
         assert!(!decapitated_concise.contains("x + 1"));
 
-        assert_eq!(LanguageKind::from_path("src/main/scala/Auth.scala"), LanguageKind::Scala);
+        assert_eq!(
+            LanguageKind::from_path("src/main/scala/Auth.scala"),
+            LanguageKind::Scala
+        );
         assert_eq!(LanguageKind::Scala.as_str(), "scala");
     }
 

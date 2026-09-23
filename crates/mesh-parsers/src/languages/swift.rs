@@ -27,7 +27,14 @@ impl SwiftExtractor {
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
 
-        Self::visit_node(root, source_bytes, &file_path, repo_id, &package_name, &mut nodes);
+        Self::visit_node(
+            root,
+            source_bytes,
+            &file_path,
+            repo_id,
+            &package_name,
+            &mut nodes,
+        );
         nodes
     }
 
@@ -91,7 +98,8 @@ impl SwiftExtractor {
                 });
             }
             "call_expression" => {
-                if let Some(node_out) = Self::vapor_route_node(node, source, package_name, repo_id) {
+                if let Some(node_out) = Self::vapor_route_node(node, source, package_name, repo_id)
+                {
                     nodes.push(ContractNode {
                         id: 0,
                         file_path: file_path.clone(),
@@ -195,7 +203,12 @@ struct Invoice {
 }
 "#;
         let mut p = parser();
-        let nodes = SwiftExtractor::extract(Path::new("Sources/App/PaymentService.swift"), code, 4, &mut p);
+        let nodes = SwiftExtractor::extract(
+            Path::new("Sources/App/PaymentService.swift"),
+            code,
+            4,
+            &mut p,
+        );
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
         assert_eq!(find("Payable").unwrap().kind, NodeKind::Interface);
         assert_eq!(find("PaymentService").unwrap().kind, NodeKind::ServiceClass);

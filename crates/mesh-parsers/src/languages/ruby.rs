@@ -129,8 +129,7 @@ impl RubyExtractor {
                 return;
             }
             "call" if is_routes_file => {
-                if let Some(node_out) = Self::route_call_node(node, source, package_name, repo_id)
-                {
+                if let Some(node_out) = Self::route_call_node(node, source, package_name, repo_id) {
                     nodes.push(ContractNode {
                         id: 0,
                         file_path: file_path.clone(),
@@ -265,7 +264,10 @@ end
         );
 
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
-        assert_eq!(find("UsersController").unwrap().kind, NodeKind::ServiceClass);
+        assert_eq!(
+            find("UsersController").unwrap().kind,
+            NodeKind::ServiceClass
+        );
         assert_eq!(find("index").unwrap().kind, NodeKind::HttpEndpoint);
         assert_eq!(find("show").unwrap().kind, NodeKind::HttpEndpoint);
         assert_eq!(find("initialize").unwrap().kind, NodeKind::ServiceClass);
@@ -276,9 +278,14 @@ end
     fn test_ruby_extractor_module_is_interface() {
         let code = "module Authenticatable\n  def authenticate\n  end\nend\n";
         let mut p = parser();
-        let nodes = RubyExtractor::extract(Path::new("app/models/concerns/auth.rb"), code, 0, &mut p);
+        let nodes =
+            RubyExtractor::extract(Path::new("app/models/concerns/auth.rb"), code, 0, &mut p);
         assert_eq!(
-            nodes.iter().find(|n| n.name == "Authenticatable").unwrap().kind,
+            nodes
+                .iter()
+                .find(|n| n.name == "Authenticatable")
+                .unwrap()
+                .kind,
             NodeKind::Interface
         );
     }

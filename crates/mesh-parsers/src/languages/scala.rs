@@ -26,7 +26,14 @@ impl ScalaExtractor {
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
 
-        Self::visit_node(root, source_bytes, &file_path, repo_id, &package_name, &mut nodes);
+        Self::visit_node(
+            root,
+            source_bytes,
+            &file_path,
+            repo_id,
+            &package_name,
+            &mut nodes,
+        );
         nodes
     }
 
@@ -209,7 +216,12 @@ object PaymentApp {
 }
 "#;
         let mut p = parser();
-        let nodes = ScalaExtractor::extract(Path::new("src/main/scala/PaymentService.scala"), code, 5, &mut p);
+        let nodes = ScalaExtractor::extract(
+            Path::new("src/main/scala/PaymentService.scala"),
+            code,
+            5,
+            &mut p,
+        );
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
         assert_eq!(find("Payable").unwrap().kind, NodeKind::Interface);
         assert_eq!(find("PaymentService").unwrap().kind, NodeKind::ServiceClass);
@@ -229,7 +241,8 @@ object Routes {
 }
 "#;
         let mut p = parser();
-        let nodes = ScalaExtractor::extract(Path::new("src/main/scala/Routes.scala"), code, 0, &mut p);
+        let nodes =
+            ScalaExtractor::extract(Path::new("src/main/scala/Routes.scala"), code, 0, &mut p);
         assert!(nodes
             .iter()
             .any(|n| n.name == "GET users" && n.kind == NodeKind::HttpEndpoint));

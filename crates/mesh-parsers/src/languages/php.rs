@@ -85,13 +85,12 @@ impl PhpExtractor {
 
                 let route_from_attribute = Self::route_attribute(node, source);
 
-                let kind = if route_from_attribute.is_some()
-                    || (in_controller && name != "__construct")
-                {
-                    NodeKind::HttpEndpoint
-                } else {
-                    NodeKind::ServiceClass
-                };
+                let kind =
+                    if route_from_attribute.is_some() || (in_controller && name != "__construct") {
+                        NodeKind::HttpEndpoint
+                    } else {
+                        NodeKind::ServiceClass
+                    };
 
                 let final_name = route_from_attribute.unwrap_or_else(|| name.to_string());
 
@@ -110,7 +109,9 @@ impl PhpExtractor {
                 return;
             }
             "expression_statement" => {
-                if let Some(node_out) = Self::laravel_route_node(node, source, package_name, repo_id) {
+                if let Some(node_out) =
+                    Self::laravel_route_node(node, source, package_name, repo_id)
+                {
                     nodes.push(ContractNode {
                         id: 0,
                         file_path: file_path.clone(),
@@ -171,7 +172,9 @@ impl PhpExtractor {
         package_name: &CompactStr,
         repo_id: RepoId,
     ) -> Option<ContractNode> {
-        let call = node.named_child(0).filter(|c| c.kind() == "scoped_call_expression")?;
+        let call = node
+            .named_child(0)
+            .filter(|c| c.kind() == "scoped_call_expression")?;
         let scope = call
             .child_by_field_name("scope")
             .and_then(|n| n.utf8_text(source).ok())?;
@@ -238,7 +241,12 @@ class UserController extends AbstractController {
 }
 "#;
         let mut p = parser();
-        let nodes = PhpExtractor::extract(Path::new("src/Controller/UserController.php"), code, 1, &mut p);
+        let nodes = PhpExtractor::extract(
+            Path::new("src/Controller/UserController.php"),
+            code,
+            1,
+            &mut p,
+        );
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
         assert_eq!(find("UserController").unwrap().kind, NodeKind::ServiceClass);
         assert_eq!(find("index").unwrap().kind, NodeKind::HttpEndpoint);
@@ -250,7 +258,10 @@ class UserController extends AbstractController {
         let code = "<?php\ninterface Foo { public function bar($x); }\n";
         let mut p = parser();
         let nodes = PhpExtractor::extract(Path::new("Foo.php"), code, 0, &mut p);
-        assert_eq!(nodes.iter().find(|n| n.name == "Foo").unwrap().kind, NodeKind::Interface);
+        assert_eq!(
+            nodes.iter().find(|n| n.name == "Foo").unwrap().kind,
+            NodeKind::Interface
+        );
     }
 
     #[test]

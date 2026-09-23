@@ -69,6 +69,25 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Resolves the named pipe address for meshd's Windows daemon transport.
+///
+/// `meshd` has no Unix Domain Socket on Windows, so IDE clients (`mesh-mcp
+/// run`) and the daemon instead share a single named pipe per user session,
+/// mirroring the UDS-based sharing on macOS/Linux (ROADMAP Item 13).
+///
+/// Precedence mirrors `socket_path()`:
+///   1. `$MESH_PIPE_NAME` (env override, full `\\.\pipe\...` address)
+///   2. `\\.\pipe\mesh-mcp-<username>` (per-user default)
+#[cfg(windows)]
+pub fn pipe_name() -> String {
+    if let Ok(p) = std::env::var("MESH_PIPE_NAME") {
+        return p;
+    }
+
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+    format!(r"\\.\pipe\mesh-mcp-{user}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

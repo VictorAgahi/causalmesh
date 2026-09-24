@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 pub struct TypeScriptExtractor;
 
@@ -31,7 +31,11 @@ struct VisitCtx<'a> {
 }
 
 impl TypeScriptExtractor {
-    /// Extracts using the legacy hardcoded `@GrpcMethod` decorator.
+    /// Test/ad-hoc entry point using the legacy hardcoded `@GrpcMethod` decorator;
+    /// parses `content` itself. Production indexing goes through
+    /// [`Self::extract_with_config`] via `PolyglotIndexer`, which parses once with
+    /// `AstGuard::parse_with` so a parse failure is visible instead of silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
@@ -39,12 +43,15 @@ impl TypeScriptExtractor {
         parser: &mut Parser,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
     ) -> Vec<ContractNode> {
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
         let mut rpc_calls = Vec::new();
         Self::extract_with_config(
             file_path,
             content,
             repo_id,
-            parser,
+            &tree,
             imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -63,18 +70,13 @@ impl TypeScriptExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
         rpc_calls: &mut Vec<(usize, CompactStr)>,
         grpc_annotations: &[String],
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return nodes,
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
@@ -674,11 +676,12 @@ export class AuthController {
         // gRPC handler and projected via the same `Service.Method` parsing.
         let mut imports2 = Vec::new();
         let mut rpc_calls2 = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let configured_nodes = TypeScriptExtractor::extract_with_config(
             Path::new("auth.controller.ts"),
             code,
             4,
-            &mut parser,
+            &tree,
             &mut imports2,
             &mut rpc_calls2,
             &["@RpcHandler".to_string()],
@@ -888,11 +891,12 @@ export class CheckoutGateway implements OnModuleInit {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("gateways/rpc/Checkout.gateway.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -928,11 +932,12 @@ export class CheckoutGateway {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("gateways/rpc/Checkout.gateway.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -961,11 +966,12 @@ export class CheckoutGateway {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("gateways/rpc/Checkout.gateway.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -993,11 +999,12 @@ export class CheckoutGateway {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("gateways/rpc/Checkout.gateway.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -1025,11 +1032,12 @@ export class CheckoutGateway {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("gateways/rpc/Checkout.gateway.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
@@ -1054,11 +1062,12 @@ import { escapeFromHtml } from './security';
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let _ = TypeScriptExtractor::extract_with_config(
             Path::new("app.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[],
@@ -1091,11 +1100,12 @@ export class UserController {
         parser.set_language(&lang).unwrap();
         let mut imports = Vec::new();
         let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
         let nodes = TypeScriptExtractor::extract_with_config(
             Path::new("user.controller.ts"),
             code,
             1,
-            &mut parser,
+            &tree,
             &mut imports,
             &mut rpc_calls,
             &[],

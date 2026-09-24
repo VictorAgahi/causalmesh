@@ -126,8 +126,10 @@ The design decisions behind the numbers, in rough order of impact:
   tree-sitter parsers are cached per thread instead of being rebuilt per file.
 - **Interned paths and compact strings.** `Arc<Path>` gives one path buffer per file rather than
   one per symbol; `CompactString` keeps names up to 24 bytes on the stack.
-- **Bounded work.** 15 ms parse timeout, 384 KB file budget (1.5 MB for schemas), 1 KB max line
-  length, 48 KB output cap. Worst-case cost per file is bounded by construction.
+- **Bounded work.** A 2s indexing parse timeout (a hang guard, not a target — see
+  `docs/architecture.md` §5.2 for why it isn't 15ms anymore), 384 KB file budget (1.5 MB for
+  schemas), 1 KB max line length, 48 KB output cap. Worst-case cost per file is bounded by
+  construction.
 - **Background priority.** Rescans run on a Rayon pool with `QOS_CLASS_BACKGROUND` (macOS) or
   `nice(10)` (Linux) so re-indexing does not compete with your editor. The boot scan
   deliberately uses the normal-priority pool — you are waiting for it.

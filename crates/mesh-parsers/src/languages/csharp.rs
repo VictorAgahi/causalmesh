@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Default)]
 pub struct CSharpRelations {
@@ -20,29 +20,32 @@ struct RawKafkaCall {
 pub struct CSharpExtractor;
 
 impl CSharpExtractor {
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_with_relations`] via `PolyglotIndexer`, which parses
+    /// once with `AstGuard::parse_with` so a parse failure is visible instead of
+    /// silently producing an empty result indistinguishable from a legitimately
+    /// empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_with_relations(file_path, content, repo_id, parser).0
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_with_relations(file_path, content, repo_id, &tree).0
     }
 
     pub fn extract_with_relations(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> (Vec<ContractNode>, CSharpRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut relations = CSharpRelations::default();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (nodes, relations),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = mesh_core::detect_service_package(&file_path, None);
@@ -429,11 +432,12 @@ public class OrderEventService
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (nodes, relations) = CSharpExtractor::extract_with_relations(
             Path::new("OrderEventService.cs"),
             code,
             0,
-            &mut p,
+            &tree,
         );
 
         assert_eq!(nodes.len(), 3); // Class + 2 methods

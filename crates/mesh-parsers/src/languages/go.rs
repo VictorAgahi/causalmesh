@@ -2,7 +2,7 @@ use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 pub struct GoExtractor;
 
@@ -54,14 +54,21 @@ struct RawRpcCall {
 }
 
 impl GoExtractor {
-    /// Extracts declaration nodes only.
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_with_relations`] via `PolyglotIndexer`, which parses
+    /// once with `AstGuard::parse_with` so a parse failure is visible instead of
+    /// silently producing an empty result indistinguishable from a legitimately
+    /// empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_with_relations(file_path, content, repo_id, parser).0
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_with_relations(file_path, content, repo_id, &tree).0
     }
 
     /// Same extraction as `extract`, plus import/event relations for items 2 and 3.
@@ -69,16 +76,11 @@ impl GoExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> (Vec<ContractNode>, GoRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut relations = GoRelations::default();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (nodes, relations),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
@@ -908,8 +910,13 @@ func Run() {
 }
 "#;
         let mut p2 = parser();
-        let (consumer_nodes, relations) =
-            GoExtractor::extract_with_relations(Path::new("main.go"), consumer_code, 1, &mut p2);
+        let consumer_tree = p2.parse(consumer_code, None).expect("parse");
+        let (consumer_nodes, relations) = GoExtractor::extract_with_relations(
+            Path::new("main.go"),
+            consumer_code,
+            1,
+            &consumer_tree,
+        );
         assert!(consumer_nodes.iter().any(|n| n.name == "Run"));
         assert!(relations
             .dependencies
@@ -946,8 +953,9 @@ import (
 func Init() {}
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("main.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("main.go"), code, 1, &tree);
         assert!(relations
             .dependencies
             .iter()
@@ -980,20 +988,22 @@ func Consume() {
 }
 "#;
         let mut p1 = parser();
+        let producer_tree = p1.parse(producer_code, None).expect("parse");
         let (producer_nodes, producer_relations) = GoExtractor::extract_with_relations(
             Path::new("producer.go"),
             producer_code,
             1,
-            &mut p1,
+            &producer_tree,
         );
         assert!(!producer_relations.producers.is_empty());
 
         let mut p2 = parser();
+        let consumer_tree = p2.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, consumer_relations) = GoExtractor::extract_with_relations(
             Path::new("consumer.go"),
             consumer_code,
             1,
-            &mut p2,
+            &consumer_tree,
         );
         assert!(!consumer_relations.consumers.is_empty());
 
@@ -1038,8 +1048,9 @@ func Emit() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(relations
             .producers
             .iter()
@@ -1064,8 +1075,9 @@ func Emit() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
             relations
                 .producers
@@ -1090,8 +1102,9 @@ func Emit() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
             relations
                 .producers
@@ -1115,8 +1128,9 @@ func Emit() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
             relations
                 .producers
@@ -1154,8 +1168,9 @@ func Emit() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
             relations
                 .producers
@@ -1180,8 +1195,9 @@ func Consume() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &tree);
         assert!(
             relations
                 .consumers
@@ -1202,8 +1218,9 @@ func Consume() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &tree);
         assert!(relations
             .consumers
             .iter()
@@ -1260,8 +1277,9 @@ func (fe *frontendServer) placeOrder(w http.ResponseWriter, r *http.Request) {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (nodes, relations) =
-            GoExtractor::extract_with_relations(Path::new("handlers.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("handlers.go"), code, 1, &tree);
 
         let caller_idx = nodes
             .iter()
@@ -1376,8 +1394,9 @@ func Setup() {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (_, relations) =
-            GoExtractor::extract_with_relations(Path::new("main.go"), code, 1, &mut p);
+            GoExtractor::extract_with_relations(Path::new("main.go"), code, 1, &tree);
         assert!(
             relations.rpc_calls.is_empty(),
             "redis.NewClient must not be treated as a gRPC RPC call: {:?}",

@@ -27,6 +27,19 @@ Plan 1 (P0): make every answer reproducible and honest. This first step only
 - **`scripts/determinism.sh`** and a CI job running it: indexes each workspace 5 times
   sequentially and 8 times concurrently and requires a single fingerprint.
 
+### Added (P0 step 1.3)
+- **`IndexHealth`** (`mesh-core::health`): counts of what happened to every file since the last
+  full rebuild — scanned, indexed, rejected (oversized / lexical guard / unreadable), and
+  genuinely parse-failed. Carried on `MeshSnapshot::health`, merged onto the snapshot by every
+  incremental reload. `mesh-mcp doctor` and tool output can now say a scan wasn't fully healthy
+  instead of a failed file being indistinguishable from a legitimately empty one (idempotence
+  invariant I6).
+- `FileIndex::parse_failed`: set by `PolyglotIndexer::extract_with_config` when a language's
+  tree-sitter parse itself failed, as opposed to `nodes` legitimately being empty.
+- `AstGuard::parse_with` / `ParseOutcome`: the indexing-time parse primitive, with its own
+  timeout budget and thread-local parser cache, independent of `AstGuard::with_parser` (still
+  used, unchanged, for on-demand decapitation).
+
 ### Fixed
 - **Overlapping configured roots no longer double-index files** (P0 step 1.2). A workspace
   configured as `roots = [".", "./services/*"]` — the shape `init --auto` itself generates for
@@ -41,18 +54,42 @@ Plan 1 (P0): make every answer reproducible and honest. This first step only
   which differs across filesystems and isn't guaranteed stable on any of them.
 - `mesh-mcp doctor` reports overlapping configured roots (which one is redundant, which one
   wins the shared files) instead of only validating that every root resolves.
+- **The 15ms wall-clock indexing parse timeout, the single largest cause of the audit's
+  nondeterminism finding, is gone** (P0 step 1.3). It made indexing outcomes depend on CPU
+  contention: under 4-worker Rayon load, ordinary files tripped it, and *which* files tripped
+  it depended on scheduling. Replaced with two budgets that were never one constant to begin
+  with: `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` (2s — a hang guard for the 13 tree-sitter
+  extractors' entry points, which now take an already-parsed `&Tree` instead of parsing inside
+  a `&mut Parser` themselves, via the new `AstGuard::parse_with`) for indexing, and
+  `AstGuard::QUERY_PARSE_TIMEOUT_MICROS` (500ms, unchanged in effect) for `smart_search`'s
+  on-demand decapitation, which must stay responsive on an agent's request path. A file whose
+  parse still fails gets one sequential retry outside the contended pool
+  (`WorkspaceIndexer::run_scan_pass`) before being counted into `IndexHealth`; on an incremental
+  reload, a still-failing file keeps its last known-good facts and is retried on the next
+  reload, instead of having its facts silently wiped to empty.
 
 ### Known violations (baseline, tracked by `#[ignore]`d tests until the fixing step lands)
 Measured with `scripts/determinism.sh` (distinct fingerprints over 13 runs, 5 sequential +
-8 concurrent), **after** the step 1.2 fix above: `examples/polyglot-shop` 1,
-`examples/volontariapp-fixture` 1, the determinism fixture 2 (was 2), Bank of Anthos 3 (was 8,
-11/13 runs now agree), Online Boutique 13 (unchanged — this repo has no overlapping roots),
-OpenTelemetry demo 12 (was 13). The remaining variance has two other causes, fixed next:
-- Results depend on thread count and CPU load (15 ms wall-clock parse timeout) — P0 step 1.3.
+8 concurrent). Progression through steps 1.2 and 1.3:
+
+| Workspace | Before P0 | After 1.2 | After 1.3 |
+| :--- | :---: | :---: | :---: |
+| `examples/polyglot-shop` | 1 | 1 | 1 |
+| `examples/volontariapp-fixture` | 1 | 1 | 1 |
+| determinism fixture (homonyms, imports, Kafka, properties) | 2 | 2 | 2 |
+| Bank of Anthos | 8 | 3 (11/13 agreed) | **1 — fully stable** |
+| OpenTelemetry demo | 13 | 13 | 6 |
+| Online Boutique | 13 | 13 | 13 |
+
+Online Boutique's variance was never caused by the timeout or by overlapping roots — it has
+neither. Its real gRPC service homonyms (shared `*_pb2_grpc.py` `Servicer` base classes across
+services) are resolved by whichever candidate a `HashMap` iterates first, which is exactly what
+P0 step 1.4 replaces with an explicit `ambiguous` edge to every candidate. The determinism
+fixture and the still-partial OpenTelemetry demo result are for the same reason:
 - Shuffling the file order, or simply re-running, changes the graph: import and RPC resolution
   keep the first candidate in `HashMap` order — P0 step 1.4.
 - An incremental reload does not converge to a full rebuild, sequentially or with concurrent
-  reloads — P0 steps 1.4 and 1.5.
+  reloads, for the same underlying reason — P0 steps 1.4 and 1.5.
 
 ## [3.1.0] — 2026-09-24
 

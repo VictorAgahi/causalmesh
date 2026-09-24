@@ -2,18 +2,25 @@ use crate::languages::FileIndex;
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 pub struct CppExtractor;
 
 impl CppExtractor {
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_file_index`] via `PolyglotIndexer`, which parses once
+    /// with `AstGuard::parse_with` so a parse failure is visible instead of silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_file_index(file_path, content, repo_id, parser).nodes
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_file_index(file_path, content, repo_id, &tree).nodes
     }
 
     /// Same extraction as [`Self::extract`], plus quoted `#include` dependencies
@@ -23,15 +30,10 @@ impl CppExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> FileIndex {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return FileIndex::default(),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = mesh_core::detect_service_package(&file_path, None);
@@ -500,7 +502,8 @@ public:
 };
 "#;
         let mut p = parser();
-        let index = CppExtractor::extract_file_index(Path::new("circle.cpp"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let index = CppExtractor::extract_file_index(Path::new("circle.cpp"), code, 0, &tree);
 
         // "vector" (system, angle-bracket) must never appear as a dependency target.
         assert!(
@@ -541,11 +544,17 @@ public:
 };
 "#;
         let mut p = parser();
+        let header_tree = p.parse(header_code, None).expect("parse");
         let header_index =
-            CppExtractor::extract_file_index(Path::new("Shape.hpp"), header_code, 0, &mut p);
+            CppExtractor::extract_file_index(Path::new("Shape.hpp"), header_code, 0, &header_tree);
         let mut p2 = parser();
-        let consumer_index =
-            CppExtractor::extract_file_index(Path::new("circle.cpp"), consumer_code, 0, &mut p2);
+        let consumer_tree = p2.parse(consumer_code, None).expect("parse");
+        let consumer_index = CppExtractor::extract_file_index(
+            Path::new("circle.cpp"),
+            consumer_code,
+            0,
+            &consumer_tree,
+        );
 
         let mut merged = FileIndex::default();
         merged.merge(header_index);
@@ -576,7 +585,8 @@ public:
 };
 "#;
         let mut p = parser();
-        let index = CppExtractor::extract_file_index(Path::new("client.cpp"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let index = CppExtractor::extract_file_index(Path::new("client.cpp"), code, 0, &tree);
         assert!(
             index
                 .dependencies

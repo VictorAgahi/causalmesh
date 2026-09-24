@@ -30,7 +30,7 @@ graph TD
 
     subgraph Parser Engine mesh-parsers
         Router --> AstGuard[AstGuard Limits & Timeouts]
-        AstGuard --> TreeSitter[Tree-sitter C-FFI 15ms Timeout]
+        AstGuard --> TreeSitter[Tree-sitter C-FFI budget-specific timeout]
         TreeSitter --> Decapitator[Polyglot Decapitator]
         Decapitator --> Markdown[Dense Markdown 48KB Formatter]
     end
@@ -157,13 +157,28 @@ Before passing any file to a Tree-sitter parser:
 4. **Nesting Depth Check**: Quick lexical scanner checks brace/parenthesis nesting depth. Files with depth > 64 are rejected to prevent C stack exhaustion.
 
 ### 5.2 C-FFI Timeout
-MeshMCP configures a hardware timeout for every parse session:
-```rust
-unsafe {
-    tree_sitter::ffi::ts_parser_set_timeout_micros(parser, 15_000); // 15 milliseconds
-}
-```
-If a complex file causes parsing to loop, Tree-sitter aborts cleanly and returns an error without stalling the agent.
+The timeout is budget-specific, not one constant shared everywhere — the two call sites want
+opposite things from it:
+
+- **Indexing** (`AstGuard::parse_with`, used by `PolyglotIndexer` for every full scan and
+  incremental reload) sets `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` — **2 seconds**. This used to
+  be 15ms, measured against an uncontended parse; under real load (multiple Rayon workers
+  competing for CPU), that budget tripped on ordinary files, and *which* files tripped it
+  depended on scheduling — a source of the index-determinism failures `scripts/determinism.sh`
+  now guards against. 2s is a hang guard, not a performance target: the lexical pre-checks in
+  §5.1 already reject anything that could make a real parse run long, so reaching this budget
+  means a genuine parser bug or a pathological file that slipped past them, either way worth
+  surfacing rather than silently swallowing.
+- **On-demand decapitation** (`AstGuard::with_parser`, used by `smart_search`'s
+  `include_body: false` path) keeps `AstGuard::QUERY_PARSE_TIMEOUT_MICROS` — **500ms** — since it
+  runs synchronously on an agent's request and must stay responsive even against a pathological
+  file; failure here falls back to `AstDecapitator::BOUNDED_ERROR_STUB`, unrelated to indexing.
+
+A parse failure during indexing does not silently produce an empty result: `FileIndex::parse_failed`
+is set, `WorkspaceIndexer` retries once, sequentially, outside the contended parallel pool (a
+transient timeout under CPU contention rarely recurs alone), and a still-failing file is counted
+in `IndexHealth` — surfaced by `mesh-mcp doctor` and any tool output whose scan wasn't fully
+healthy — instead of being indistinguishable from a file that is legitimately empty.
 
 ### 5.3 Streaming ReDoS Limits
 AST query matches are executed with a hard step counter:

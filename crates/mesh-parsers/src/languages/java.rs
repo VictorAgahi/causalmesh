@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 /// `(nodes, dependencies, producers)`, the latter two keyed by local node index
 /// in the same shape `languages::FileIndex.dependencies` / `.producers` expect.
@@ -14,14 +14,21 @@ type ExtractedRelations = (
 pub struct JavaExtractor;
 
 impl JavaExtractor {
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_relations`] via `PolyglotIndexer`, which parses once
+    /// with `AstGuard::parse_with` so a parse failure is visible instead of silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
         let (nodes, _dependencies, _producers) =
-            Self::extract_relations(file_path, content, repo_id, parser);
+            Self::extract_relations(file_path, content, repo_id, &tree);
         nodes
     }
 
@@ -39,16 +46,11 @@ impl JavaExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> ExtractedRelations {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut producers = Vec::new();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (nodes, Vec::new(), producers),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
@@ -442,12 +444,9 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
-            Path::new("OrderController.java"),
-            code,
-            1,
-            &mut parser,
-        );
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, dependencies, _producers) =
+            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let class_idx = nodes
             .iter()
@@ -473,12 +472,9 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
-            Path::new("OrderController.java"),
-            code,
-            1,
-            &mut parser,
-        );
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, dependencies, _producers) =
+            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let class_idx = nodes
             .iter()
@@ -510,12 +506,9 @@ public class OrderController {
 }
 "#;
         let mut parser = parser();
-        let (nodes, dependencies, _producers) = JavaExtractor::extract_relations(
-            Path::new("OrderController.java"),
-            code,
-            1,
-            &mut parser,
-        );
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, dependencies, _producers) =
+            JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let method_idx = nodes
             .iter()
@@ -553,21 +546,23 @@ public class OrderController {
 
         let mut graph = ContractGraph::new();
 
+        let billing_tree = p.parse(billing_code, None).expect("parse");
         let (billing_nodes, _deps, _producers) = JavaExtractor::extract_relations(
             Path::new("services/billing/BillingService.java"),
             billing_code,
             1,
-            &mut p,
+            &billing_tree,
         );
         for node in billing_nodes {
             graph.add_node(node);
         }
 
+        let order_tree = p.parse(order_code, None).expect("parse");
         let (order_nodes, order_deps, _producers2) = JavaExtractor::extract_relations(
             Path::new("services/orders/OrderController.java"),
             order_code,
             2,
-            &mut p,
+            &order_tree,
         );
         let order_ids: Vec<_> = order_nodes.into_iter().map(|n| graph.add_node(n)).collect();
         for (i, target) in order_deps {
@@ -592,8 +587,9 @@ public class OrderService {
 }
 "#;
         let mut parser = parser();
+        let tree = parser.parse(code, None).expect("parse");
         let (nodes, _deps, producers) =
-            JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &mut parser);
+            JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &tree);
 
         let method_idx = nodes
             .iter()
@@ -616,8 +612,9 @@ public class OrderService {
 }
 "#;
         let mut parser = parser();
+        let tree = parser.parse(code, None).expect("parse");
         let (_nodes, _deps, producers) =
-            JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &mut parser);
+            JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &tree);
         assert!(producers.is_empty());
     }
 
@@ -645,11 +642,12 @@ public class OrderNotifier {
 
         let mut graph = ContractGraph::new();
 
+        let producer_tree = p.parse(producer_code, None).expect("parse");
         let (producer_nodes, _deps, producers) = JavaExtractor::extract_relations(
             Path::new("services/orders/OrderService.java"),
             producer_code,
             1,
-            &mut p,
+            &producer_tree,
         );
         let producer_ids: Vec<_> = producer_nodes
             .into_iter()
@@ -659,11 +657,12 @@ public class OrderNotifier {
             graph.add_producer(producer_ids[i], topic.as_str());
         }
 
+        let consumer_tree = p.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, _deps2, _producers2) = JavaExtractor::extract_relations(
             Path::new("services/notifications/OrderNotifier.java"),
             consumer_code,
             2,
-            &mut p,
+            &consumer_tree,
         );
         for node in consumer_nodes {
             // Same wiring the Java branch of `languages::mod::PolyglotIndexer::extract`

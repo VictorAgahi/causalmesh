@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
+use crate::health::IndexHealth;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::vfs::DifferentialVfs;
@@ -23,6 +24,13 @@ pub struct MeshSnapshot {
     pub property_registry: PropertyRegistry,
     /// Monotonic counter bumped on every install; lets callers detect a reload.
     pub generation: u64,
+    /// Counts of what happened to every file since the last full rebuild.
+    /// Diagnostic, not content: excluded from `fingerprint()` for the same
+    /// reason `generation` is — it describes this build's run, not what it
+    /// found — but a tool footer or `mesh-mcp doctor` should surface it
+    /// whenever `!health.is_healthy()`, so a file that didn't make it into the
+    /// graph is never silently indistinguishable from a legitimately empty one.
+    pub health: IndexHealth,
 }
 
 /// Content fingerprint of a [`MeshSnapshot`]: one SHA-256 per index plus a

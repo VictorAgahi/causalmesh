@@ -4,7 +4,7 @@ use crate::types::{
 };
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// Query results borrow from the graph: the snapshot guard held by the caller
@@ -34,7 +34,16 @@ pub struct ImpactFlow<'g> {
 /// In-memory graph of polyglot architecture contracts and dependencies.
 #[derive(Debug, Clone, Default)]
 pub struct ContractGraph {
-    nodes: HashMap<NodeId, ContractNode>,
+    // `BTreeMap`, not `HashMap`: std's `HashMap` uses a per-process-random `SipHash`
+    // seed (`RandomState`), so iterating `.values()` — done below to resolve an
+    // ambiguous target (multiple proto methods sharing a bare name, multiple RPC
+    // call candidates, `analyze_grpc`'s anchor scan) — visits nodes in a different
+    // order on every process run even for byte-identical input. `BTreeMap` iterates
+    // in sorted `NodeId` order, which is itself deterministic (ids are assigned
+    // sequentially while folding files in the indexer's now-sorted crawl order), so
+    // "first candidate encountered" becomes reproducible instead of a coin flip
+    // seeded at process start (idempotence invariant I1).
+    nodes: BTreeMap<NodeId, ContractNode>,
     edges: Vec<ContractEdge>,
 
     // O(1) in-memory indices
@@ -150,23 +159,19 @@ impl ContractGraph {
         self.edges.push(edge);
     }
 
+    /// Records the raw fact "`consumer_node_id` imports `imported_target`". This is
+    /// the *only* place that fact is stored — no placeholder edge is created here.
+    /// `reconcile_edges` derives every `Imports` edge fresh, every time it runs, by
+    /// reading `reverse_deps` directly; that is what lets an incremental reload of
+    /// some *other* file still produce the correct edge for this (unchanged)
+    /// consumer without `consumer_node_id` itself being re-folded (idempotence
+    /// invariants I2/I3 — see the note on `reconcile_edges`).
     pub fn add_dependency(&mut self, consumer_node_id: NodeId, imported_target: &str) {
         let key = CompactStr::new(imported_target);
         self.reverse_deps
             .entry(key)
             .or_default()
             .push(consumer_node_id);
-
-        self.add_edge(ContractEdge {
-            from: consumer_node_id,
-            to: 0, // dynamic link resolved at query time
-            kind: EdgeKind::Imports,
-            metadata: Some(CompactStr::new(imported_target)),
-            // Placeholder — `reconcile_edges` overwrites this with the real
-            // confidence once `resolve_import_target` runs; `Heuristic` here
-            // is just a conservative default in case reconciliation never runs.
-            confidence: EdgeConfidence::Heuristic,
-        });
     }
 
     pub fn add_producer(&mut self, producer_node_id: NodeId, topic: &str) {
@@ -261,6 +266,41 @@ impl ContractGraph {
         }
     }
 
+    /// Fully removes one node (by id) from `self.nodes` and every secondary index
+    /// that references it — the same per-node cleanup `patch_files` does for a
+    /// whole file's worth of stale nodes, available standalone for garbage
+    /// collecting a single synthetic node (a `reconcile_edges`-created topic hub
+    /// that no longer has any producer or consumer backing it; see the note there).
+    fn remove_node(&mut self, id: NodeId) {
+        let Some(node) = self.nodes.remove(&id) else {
+            return;
+        };
+        Self::remove_from_index(&mut self.name_to_nodes, &node.name, id);
+        if node.kind == NodeKind::KafkaTopic
+            || node.kind == NodeKind::EventStream
+            || node.kind == NodeKind::Queue
+        {
+            let key = CompactStr::new(node.name.to_lowercase());
+            Self::remove_from_index(&mut self.name_to_nodes, &key, id);
+        }
+        if !node.package.is_empty() {
+            Self::remove_from_index(&mut self.package_to_nodes, &node.package, id);
+        }
+        if node.kind == NodeKind::GrpcMethod
+            || node.kind == NodeKind::GrpcService
+            || !node.package.is_empty()
+        {
+            let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
+            Self::remove_from_index(&mut self.fqcn_to_node, &fqcn, id);
+        }
+        if let Some(ids) = self.file_to_nodes.get_mut(&node.file_path) {
+            ids.retain(|x| *x != id);
+            if ids.is_empty() {
+                self.file_to_nodes.remove(&node.file_path);
+            }
+        }
+    }
+
     /// Splits a fully-qualified identifier into `(package, bare_name)`.
     ///
     /// Covers Java-style dotted FQCNs (`com.acme.billing.Invoice`) and
@@ -289,17 +329,91 @@ impl ContractGraph {
         None
     }
 
-    /// Resolves the target of a placeholder `Imports` edge using the O(1) indices.
-    ///
-    /// Returns the resolved node together with the confidence of the
-    /// strategy that found it (see `EdgeConfidence`).
-    fn resolve_import_target(
+    /// `ids.len() == 1`, or exactly one candidate whose `repo_id` matches
+    /// `importer_repo` — a legitimate, non-arbitrary tiebreak — returns that one
+    /// candidate at `confidence_if_unique`. Otherwise this is a genuine tie the
+    /// graph cannot resolve on its own: every candidate (or every same-repo
+    /// candidate, when more than one shares the importer's repo) is returned
+    /// tagged `Ambiguous`, rather than arbitrarily picking whichever one the
+    /// caller's index happened to list first. That pick used to depend on
+    /// `HashMap` iteration order and file processing order — a hidden source of
+    /// nondeterminism (idempotence invariant I1) as well as a silently wrong
+    /// answer for a real homonym (e.g. two proto packages each declaring their
+    /// own `AdminService`).
+    fn pick_or_ambiguous(
+        &self,
+        ids: &[NodeId],
+        importer_repo: Option<RepoId>,
+        confidence_if_unique: EdgeConfidence,
+    ) -> Vec<(NodeId, EdgeConfidence)> {
+        if let [only] = ids {
+            return vec![(*only, confidence_if_unique)];
+        }
+        let same_repo: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+            .collect();
+        match same_repo.as_slice() {
+            [only] => vec![(*only, confidence_if_unique)],
+            [] => ids
+                .iter()
+                .map(|&id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+            _ => same_repo
+                .into_iter()
+                .map(|id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+        }
+    }
+
+    /// Same shape as [`Self::pick_or_ambiguous`], grouping by declared `package`
+    /// instead of `repo_id` — used to disambiguate an RPC call's bare-method-name
+    /// candidates by the caller's own package.
+    fn pick_or_ambiguous_by_package(
+        &self,
+        ids: &[NodeId],
+        caller_package: &CompactStr,
+        confidence_if_unique: EdgeConfidence,
+    ) -> Vec<(NodeId, EdgeConfidence)> {
+        if let [only] = ids {
+            return vec![(*only, confidence_if_unique)];
+        }
+        let same_package: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|n| n.package == *caller_package)
+            })
+            .collect();
+        match same_package.as_slice() {
+            [only] => vec![(*only, confidence_if_unique)],
+            [] => ids
+                .iter()
+                .map(|&id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+            _ => same_package
+                .into_iter()
+                .map(|id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+        }
+    }
+
+    /// Resolves an `Imports` fact (`importer` imports `target_str`) using the O(1)
+    /// indices. Tries each strategy in priority order and returns as soon as one
+    /// produces any candidate(s) — one unambiguous winner, or every tied candidate
+    /// tagged `Ambiguous` (see [`Self::pick_or_ambiguous`]). An empty result means
+    /// no strategy matched at all (e.g. an external package like `@nestjs/common`).
+    fn resolve_import_targets(
         &self,
         importer: NodeId,
         target_str: &str,
-    ) -> Option<(NodeId, EdgeConfidence)> {
+    ) -> Vec<(NodeId, EdgeConfidence)> {
         let is_relative_or_absolute_path =
             target_str.starts_with('.') || target_str.starts_with('/');
+        let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
 
         // 1. Fully-qualified name (Java `a.b.C`, Rust `a::b::C`, gRPC
         // `package/Name`): an exact package+name pair is unambiguous, so
@@ -312,20 +426,12 @@ impl ContractGraph {
                             .get(id)
                             .is_some_and(|n| n.package.as_str() == pkg.as_ref())
                     }) {
-                        return Some((id, EdgeConfidence::Exact));
+                        return vec![(id, EdgeConfidence::Exact)];
                     }
                 }
                 let fqcn_key = format!("{pkg}/{name}");
                 if let Some(ids) = self.fqcn_to_node.get(fqcn_key.as_str()) {
-                    let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
-                    let chosen_id = ids
-                        .iter()
-                        .copied()
-                        .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
-                        .or_else(|| ids.first().copied());
-                    if let Some(id) = chosen_id {
-                        return Some((id, EdgeConfidence::Exact));
-                    }
+                    return self.pick_or_ambiguous(ids, importer_repo, EdgeConfidence::Exact);
                 }
             }
         }
@@ -334,32 +440,31 @@ impl ContractGraph {
         // unrelated types sharing it would collide; heuristic.
         // Prioritize a symbol in the same repository as the importer to avoid cross-repo false links.
         if let Some(ids) = self.name_to_nodes.get(target_str) {
-            let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
-            let chosen_id = ids
-                .iter()
-                .copied()
-                .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
-                .or_else(|| ids.first().copied());
-            if let Some(id) = chosen_id {
-                return Some((id, EdgeConfidence::Heuristic));
-            }
+            return self.pick_or_ambiguous(ids, importer_repo, EdgeConfidence::Heuristic);
         }
 
         let is_qualified = target_str.contains('/') || target_str.contains('.');
 
-        // 3. Relative import: match on file stem, same repo as the importer.
+        // 3. Relative import: match on file stem, same repo as the importer only
+        // (no cross-repo fallback — a relative import can never legitimately
+        // resolve outside the importer's own repository).
         if is_relative_or_absolute_path {
             let target_stem = Path::new(target_str)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(target_str);
-            let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
             if let Some(ids) = self.name_to_nodes.get(target_stem) {
-                if let Some(&id) = ids
+                let same_repo: Vec<NodeId> = ids
                     .iter()
-                    .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
-                {
-                    return Some((id, EdgeConfidence::Heuristic));
+                    .copied()
+                    .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                    .collect();
+                if !same_repo.is_empty() {
+                    return self.pick_or_ambiguous(
+                        &same_repo,
+                        importer_repo,
+                        EdgeConfidence::Heuristic,
+                    );
                 }
             }
         }
@@ -369,23 +474,15 @@ impl ContractGraph {
         // Prioritize package nodes in the importer's repository if available.
         if is_qualified && !is_relative_or_absolute_path {
             if let Some(ids) = self.package_to_nodes.get(target_str) {
-                let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
-                let chosen_id = ids
-                    .iter()
-                    .copied()
-                    .find(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
-                    .or_else(|| ids.first().copied());
-                if let Some(id) = chosen_id {
-                    return Some((id, EdgeConfidence::Heuristic));
-                }
+                return self.pick_or_ambiguous(ids, importer_repo, EdgeConfidence::Heuristic);
             }
         }
 
-        None
+        Vec::new()
     }
 
     /// Reconciles causal edges across microservices:
-    /// 1. Resolves or filters placeholder import edges (removes dangling to == 0).
+    /// 1. Derives `Imports` edges fresh from the raw `reverse_deps` facts.
     /// 2. Links topic producers & consumers to canonical Kafka/Event topic nodes.
     /// 3. Creates direct causal dispatch edges from producers to downstream consumers.
     /// 4. Links service handlers to protobuf RPC declarations (EdgeKind::Implements).
@@ -393,29 +490,51 @@ impl ContractGraph {
     ///
     /// Every lookup goes through the O(1) indices and edge de-duplication uses a
     /// `HashSet`, so the whole pass is linear in nodes + edges (was O(E²)).
+    ///
+    /// The whole edge set is **cleared and rebuilt from scratch** on every call,
+    /// rather than mutating whatever `self.edges` already held: an incremental
+    /// reload only re-folds the *changed* files' facts (`WorkspaceIndexer::reload`),
+    /// so an unchanged file's edge to a just-reindexed target would otherwise stay
+    /// stale (pointing at a node `patch_files` already removed) or vanish entirely
+    /// — silently, since that file was never touched this cycle to notice. Rebuilding
+    /// from the raw fact indices (`reverse_deps`, `topic_producers`, `topic_consumers`,
+    /// `rpc_calls`, and the node-kind scans below), which `patch_files` keeps current
+    /// for every *surviving* node regardless of what changed, makes one full rebuild
+    /// and any incremental reload converge to the same graph (idempotence invariants
+    /// I2 and I3: `derive(derive(g)) == derive(g)`).
     pub fn reconcile_edges(&mut self) {
-        // 1. Resolve / filter existing edges with placeholder target (to == 0)
-        let pending = std::mem::take(&mut self.edges);
-        let mut resolved_edges = Vec::with_capacity(pending.len() + 64);
-        for mut edge in pending {
-            if edge.kind == EdgeKind::Imports && edge.to == 0 {
-                let Some(target) = edge.metadata.as_deref() else {
-                    continue;
-                };
-                // External targets (e.g. '@nestjs/common') drop the placeholder edge.
-                if let Some((to_id, confidence)) = self.resolve_import_target(edge.from, target) {
-                    edge.to = to_id;
-                    edge.confidence = confidence;
-                    resolved_edges.push(edge);
+        self.edges.clear();
+        let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
+
+        // 1. Imports: resolve every (target, importer) raw fact fresh. Sorted so the
+        // edge push order — irrelevant to `canonical_lines()`, which sorts its own
+        // output, but a stale node id surviving in `reverse_deps` past its own
+        // removal (shouldn't happen; `patch_files` prunes it) can't panic either way
+        // since resolution only ever looks up ids still present in `self.nodes`.
+        let mut import_facts: Vec<(NodeId, &CompactStr)> = self
+            .reverse_deps
+            .iter()
+            .flat_map(|(target, ids)| ids.iter().map(move |&id| (id, target)))
+            .collect();
+        import_facts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let mut import_edges = Vec::new();
+        for (importer_id, target) in import_facts {
+            if !self.nodes.contains_key(&importer_id) {
+                continue;
+            }
+            for (to_id, confidence) in self.resolve_import_targets(importer_id, target.as_str()) {
+                if edge_set.insert((importer_id, to_id, EdgeKind::Imports)) {
+                    import_edges.push(ContractEdge {
+                        from: importer_id,
+                        to: to_id,
+                        kind: EdgeKind::Imports,
+                        metadata: Some(target.clone()),
+                        confidence,
+                    });
                 }
-            } else {
-                resolved_edges.push(edge);
             }
         }
-        self.edges = resolved_edges;
-
-        let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> =
-            self.edges.iter().map(|e| (e.from, e.to, e.kind)).collect();
+        self.edges.extend(import_edges);
 
         // 2 & 3. Topic hubs and causal dispatch.
         let mut all_topics: Vec<CompactStr> = self
@@ -426,6 +545,30 @@ impl ContractGraph {
             .collect();
         all_topics.sort_unstable();
         all_topics.dedup();
+
+        // A synthetic hub node from a *previous* reconcile call whose topic no
+        // longer has any producer or consumer fact (the file that used to publish
+        // it was edited to use a different topic, or deleted) must not linger
+        // forever: a full rebuild from the current facts alone would never create
+        // it, so leaving it in place would make an incremental reload permanently
+        // diverge from a full rebuild (idempotence invariant I2).
+        let live_topics: HashSet<&CompactStr> = all_topics.iter().collect();
+        let stale_hubs: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.package == "event-bus"
+                    && matches!(
+                        n.kind,
+                        NodeKind::EventStream | NodeKind::KafkaTopic | NodeKind::Queue
+                    )
+                    && !live_topics.contains(&n.name)
+            })
+            .map(|n| n.id)
+            .collect();
+        for id in stale_hubs {
+            self.remove_node(id);
+        }
 
         for topic_key in all_topics {
             // `add_node` indexes stream-like nodes under their lowercase name, and
@@ -600,7 +743,14 @@ impl ContractGraph {
         // detected node — when it isn't) is what lets `find_dependents`/
         // `analyze_grpc` resolve a real cross-service caller even when the
         // repo's `.proto` sources aren't in `roots` at all.
-        let mut proto_by_fqcn: HashMap<String, NodeId> =
+        // Both indexed by every matching candidate (not just the first found) —
+        // a bare service name like "AdminService" is exactly the shape two
+        // unrelated proto packages can legitimately both declare, and picking
+        // only the first one `self.nodes.values()` (or file processing order)
+        // happened to insert used to be a silent, order-dependent wrong answer
+        // (idempotence invariant I1). Real ties are surfaced via
+        // `pick_or_ambiguous_by_package` below instead.
+        let mut proto_by_fqcn: HashMap<String, Vec<NodeId>> =
             HashMap::with_capacity(proto_methods.len() * 2);
         let mut proto_by_bare: HashMap<String, Vec<NodeId>> =
             HashMap::with_capacity(proto_methods.len());
@@ -608,7 +758,8 @@ impl ContractGraph {
         for (id, name) in &proto_methods {
             proto_by_fqcn
                 .entry(name.as_str().to_lowercase())
-                .or_insert(*id);
+                .or_default()
+                .push(*id);
             if let Some(bare) = name.split('.').next_back() {
                 proto_by_bare
                     .entry(bare.to_lowercase())
@@ -620,7 +771,8 @@ impl ContractGraph {
             if node.kind == NodeKind::GrpcService {
                 proto_by_fqcn
                     .entry(node.name.as_str().to_lowercase())
-                    .or_insert(node.id);
+                    .or_default()
+                    .push(node.id);
             }
         }
 
@@ -631,31 +783,42 @@ impl ContractGraph {
             let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
             let target_bare_lower = target_bare.to_lowercase();
 
-            // 1. Exact FQCN match has top priority and highest confidence
-            let matched_proto = if let Some(&id) = proto_by_fqcn.get(&target_lower) {
-                Some((id, EdgeConfidence::Exact))
+            // 1. Exact FQCN match has top priority and highest confidence.
+            // 2. Bare-name fallback: lower confidence.
+            // At either tier, disambiguate multiple candidates by caller package;
+            // a genuine tie (no candidate shares the caller's package, or more than
+            // one does) fans out to every tied candidate as `Ambiguous` rather than
+            // picking whichever one the index happened to list first.
+            let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
+            let matches: Vec<(NodeId, EdgeConfidence)> = if let Some(candidates) =
+                proto_by_fqcn.get(&target_lower)
+            {
+                match &caller_package {
+                    Some(pkg) => {
+                        self.pick_or_ambiguous_by_package(candidates, pkg, EdgeConfidence::Exact)
+                    }
+                    None => candidates
+                        .iter()
+                        .map(|&id| (id, EdgeConfidence::Exact))
+                        .collect(),
+                }
             } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
-                // 2. Bare-name fallback: disambiguate by caller package if multiple candidates
-                if candidates.len() == 1 {
-                    Some((candidates[0], EdgeConfidence::Heuristic))
-                } else {
-                    let caller_node = self.nodes.get(caller_id);
-                    let matched_candidate = caller_node.and_then(|caller| {
-                        candidates.iter().find(|&&cid| {
-                            self.nodes
-                                .get(&cid)
-                                .is_some_and(|target_node| target_node.package == caller.package)
-                        })
-                    });
-                    matched_candidate
-                        .or_else(|| candidates.first())
-                        .map(|&id| (id, EdgeConfidence::Heuristic))
+                match &caller_package {
+                    Some(pkg) => self.pick_or_ambiguous_by_package(
+                        candidates,
+                        pkg,
+                        EdgeConfidence::Heuristic,
+                    ),
+                    None => candidates
+                        .iter()
+                        .map(|&id| (id, EdgeConfidence::Ambiguous))
+                        .collect(),
                 }
             } else {
-                None
+                Vec::new()
             };
 
-            if let Some((target_id, confidence)) = matched_proto {
+            for (target_id, confidence) in matches {
                 if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
                     rpc_edges.push(ContractEdge {
                         from: *caller_id,
@@ -1579,11 +1742,9 @@ mod tests {
                 .expect("resolved import edge should exist")
         };
 
-        let bare_edge = find_import_edge(bare_importer);
         let fqcn_edge = find_import_edge(fqcn_importer);
         let rust_edge = find_import_edge(rust_importer);
 
-        assert_eq!(bare_edge.confidence, EdgeConfidence::Heuristic);
         assert_eq!(fqcn_edge.confidence, EdgeConfidence::Exact);
         assert_eq!(rust_edge.confidence, EdgeConfidence::Exact);
 
@@ -1592,9 +1753,31 @@ mod tests {
         assert_eq!(fqcn_edge.to, acme_invoice);
         assert_eq!(rust_edge.to, acme_invoice);
 
-        // Bug-in-the-test guard: if every match ends up Exact (or every match
-        // ends up Heuristic), the confidence field is decorative, not signal.
-        assert_ne!(bare_edge.confidence, fqcn_edge.confidence);
+        // The bare import is a genuine tie: neither `Invoice` candidate shares
+        // `bare_importer`'s repo, so the graph must not silently pick one — it
+        // must emit an edge to *both*, tagged `Ambiguous`, rather than a single
+        // confident-looking `Heuristic` edge to whichever candidate happened to
+        // be inserted first.
+        let bare_edges: Vec<_> = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports && e.from == bare_importer)
+            .collect();
+        assert_eq!(
+            bare_edges.len(),
+            2,
+            "a genuine bare-name tie must fan out to every candidate, got: {bare_edges:?}"
+        );
+        assert!(bare_edges
+            .iter()
+            .all(|e| e.confidence == EdgeConfidence::Ambiguous));
+        let bare_targets: std::collections::HashSet<NodeId> =
+            bare_edges.iter().map(|e| e.to).collect();
+        assert!(bare_targets.contains(&acme_invoice));
+
+        // Bug-in-the-test guard: if every match ends up the same confidence, the
+        // field is decorative, not signal.
+        assert_ne!(bare_edges[0].confidence, fqcn_edge.confidence);
     }
 
     /// The `Implements` reconciliation likewise must not claim `Exact`

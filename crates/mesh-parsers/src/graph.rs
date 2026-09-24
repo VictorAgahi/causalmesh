@@ -196,11 +196,12 @@ impl GraphRenderer {
                     EdgeKind::Imports => "Imports",
                     EdgeKind::DispatchesTo => "Dispatches",
                 };
-                // Only flag `Heuristic` edges — marking every edge (including
-                // the structural `Exact` majority) would make the tag
-                // decorative noise instead of a real signal.
+                // Only flag `Heuristic`/`Ambiguous` edges — marking every edge
+                // (including the structural `Exact` majority) would make the
+                // tag decorative noise instead of a real signal.
                 let label = match edge.confidence {
                     EdgeConfidence::Heuristic => format!("{label} (heuristic)"),
+                    EdgeConfidence::Ambiguous => format!("{label} (ambiguous)"),
                     EdgeConfidence::Exact => label.to_string(),
                 };
                 let arrow = match edge.kind {

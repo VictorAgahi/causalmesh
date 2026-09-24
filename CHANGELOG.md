@@ -68,28 +68,72 @@ Plan 1 (P0): make every answer reproducible and honest. This first step only
   reload, a still-failing file keeps its last known-good facts and is retried on the next
   reload, instead of having its facts silently wiped to empty.
 
+### Added (P0 step 1.4)
+- **`EdgeConfidence::Ambiguous`**: when multiple candidates genuinely tie for an import, an RPC
+  call, or a bare gRPC service name — no repo/package tiebreak distinguishes them — the graph
+  now emits one edge to *every* tied candidate, tagged `Ambiguous`, instead of silently picking
+  whichever one a `HashMap` or file-processing order happened to list first. That pick used to
+  be both a hidden source of nondeterminism and, for a real homonym (two proto packages each
+  declaring their own `AdminService`), a silently wrong answer.
+- `ContractGraph::pick_or_ambiguous` / `pick_or_ambiguous_by_package`: the shared "one winner or
+  fan out to every tie" logic behind the above, grouping by `repo_id` (imports) or by the
+  caller's `package` (RPC calls).
+
+### Fixed (P0 step 1.4)
+- **`ContractGraph::nodes` is now a `BTreeMap`, not a `HashMap`.** Std's `HashMap` uses a
+  per-process-random `SipHash` seed, so every `self.nodes.values()` scan used for "pick a
+  matching candidate" logic (`analyze_grpc`'s anchor search, the proto-method/handler index
+  built by `reconcile_edges`) visited nodes in a *different order on every process run*, even
+  for byte-identical input on one thread. This was the dominant remaining cause of the
+  nondeterminism the audit measured — larger than the timeout (step 1.3) or overlapping roots
+  (step 1.2) — and is why sequential, single-threaded reruns of `mesh-mcp graph --format
+  fingerprint` on Online Boutique produced 5 different fingerprints in 5 runs before this fix,
+  with no concurrency involved at all. `BTreeMap` iterates in sorted, deterministic `NodeId`
+  order instead.
+- **`reconcile_edges` fully clears and rebuilds the edge set from raw per-node facts on every
+  call**, instead of resolving each `Imports` edge once and then only mutating around the edges
+  of that. An incremental reload only re-folds the *changed* files' facts, so an unchanged
+  file's edge to a target in a just-reindexed file used to go stale or vanish outright —
+  silently, since that unchanged file was never touched this cycle to notice.
+  `ContractGraph::add_dependency` no longer materializes a placeholder edge at all; it only
+  records the raw `reverse_deps` fact, which survives an unrelated file's reindex and is what
+  `reconcile_edges` now reads from directly, every time.
+- **Synthetic topic hub nodes are garbage-collected.** A hub node `reconcile_edges` creates for
+  a topic (e.g. a Kafka topic literal) used to live forever once created, even after every
+  producer and consumer of that topic stopped existing (the file was edited to use a different
+  topic, or deleted) — a full rebuild from the same current facts would never produce that node,
+  so an incremental reload permanently diverged from one. `reconcile_edges` now removes any
+  `event-bus`-package hub node whose topic no longer has a producer or consumer fact backing it.
+- **`PropertyRegistry` no longer resolves a `${...}` placeholder in place, destructively.** Once
+  a key resolved once, its own literal template was overwritten and lost, so a *different* key
+  it depended on (Spring's `${app.kafka.topic}`-style cross-file references) changing on a later
+  incremental reload could never be re-resolved against the new value — the stale resolved
+  string stuck around forever. `PropertyRegistry` now keeps the ingested value in a separate
+  `raw_values` map and derives `flat_properties` fresh from it on every
+  `resolve_all_placeholders()` call; a key already redacted to `REDACTED_SECRET` is left alone
+  (never re-derived from its own raw value, which would leak it back out).
+
 ### Known violations (baseline, tracked by `#[ignore]`d tests until the fixing step lands)
 Measured with `scripts/determinism.sh` (distinct fingerprints over 13 runs, 5 sequential +
-8 concurrent). Progression through steps 1.2 and 1.3:
+8 concurrent). Progression through steps 1.2–1.4:
 
-| Workspace | Before P0 | After 1.2 | After 1.3 |
-| :--- | :---: | :---: | :---: |
-| `examples/polyglot-shop` | 1 | 1 | 1 |
-| `examples/volontariapp-fixture` | 1 | 1 | 1 |
-| determinism fixture (homonyms, imports, Kafka, properties) | 2 | 2 | 2 |
-| Bank of Anthos | 8 | 3 (11/13 agreed) | **1 — fully stable** |
-| OpenTelemetry demo | 13 | 13 | 6 |
-| Online Boutique | 13 | 13 | 13 |
+| Workspace | Before P0 | After 1.2 | After 1.3 | After 1.4 |
+| :--- | :---: | :---: | :---: | :---: |
+| `examples/polyglot-shop` | 1 | 1 | 1 | 1 |
+| `examples/volontariapp-fixture` | 1 | 1 | 1 | 1 |
+| determinism fixture (homonyms, imports, Kafka, properties) | 2 | 2 | 2 | **1** |
+| Bank of Anthos | 8 | 3 | 1 | 1 |
+| OpenTelemetry demo | 13 | 13 | 6 | **1** |
+| Online Boutique | 13 | 13 | 13 | **1** |
 
-Online Boutique's variance was never caused by the timeout or by overlapping roots — it has
-neither. Its real gRPC service homonyms (shared `*_pb2_grpc.py` `Servicer` base classes across
-services) are resolved by whichever candidate a `HashMap` iterates first, which is exactly what
-P0 step 1.4 replaces with an explicit `ambiguous` edge to every candidate. The determinism
-fixture and the still-partial OpenTelemetry demo result are for the same reason:
-- Shuffling the file order, or simply re-running, changes the graph: import and RPC resolution
-  keep the first candidate in `HashMap` order — P0 step 1.4.
-- An incremental reload does not converge to a full rebuild, sequentially or with concurrent
-  reloads, for the same underlying reason — P0 steps 1.4 and 1.5.
+**Every workspace is now fully deterministic** — idempotence invariants I1 (thread count / file
+order / repeated runs), I2 and I3 (incremental reload and re-reconciling both converge to the
+same graph a full rebuild produces) all hold, verified by `cargo test -p mesh-server --test
+determinism -- --include-ignored` (6 of 7 tests, no longer `#[ignore]`d).
+
+The one remaining gap is concurrent reloads racing each other and installing a snapshot computed
+from a stale base — a synchronization bug (`concurrent_reloads_converge_to_full_build`, still
+`#[ignore]`d), not a resolution-ambiguity one, fixed next in P0 step 1.5.
 
 ## [3.1.0] — 2026-09-24
 

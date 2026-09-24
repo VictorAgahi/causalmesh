@@ -351,7 +351,6 @@ fn incremental_equals_full() {
 }
 
 #[test]
-#[ignore = "P0 step 1.5: overlapping reloads can install a snapshot computed from a stale base"]
 fn concurrent_reloads_converge_to_full_build() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let state = indexed_state(config(&["."]), resolved_roots(&config(&["."]), &base));

@@ -107,8 +107,19 @@ pub struct AppState {
     /// so two `AppState`s in one process (tests) don't share signatures.
     pub vfs: Mutex<DifferentialVfs>,
     /// Set while a reload is queued or running; coalesces bursts of watcher events
-    /// into one rescan instead of piling identical jobs on the Rayon pool.
+    /// into one rescan instead of piling identical jobs on the Rayon pool. Purely
+    /// an optimization — correctness (never two `WorkspaceIndexer::reload` calls
+    /// running at once) comes from `reload_lock` below, not from this flag.
     pub reload_pending: AtomicBool,
+    /// Held for the full duration of one `WorkspaceIndexer::reload` call, entirely
+    /// on the single Rayon-pool thread that acquired it (a `std::sync::MutexGuard`
+    /// never crosses threads here). Two reload closures can still both get spawned
+    /// (`reload_pending`'s coalescing check is best-effort, not exclusive), but the
+    /// second one simply blocks here until the first finishes and then runs its own
+    /// pass against then-current disk state — at most one reload ever mutates the
+    /// snapshot at a time, so a slower first pass can never install a snapshot that
+    /// clobbers a second, newer one that finished first (idempotence invariant I2).
+    pub reload_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -147,6 +158,7 @@ impl AppState {
             rescan,
             vfs: Mutex::new(DifferentialVfs::new()),
             reload_pending: AtomicBool::new(false),
+            reload_lock: Mutex::new(()),
         }
     }
 

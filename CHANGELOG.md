@@ -113,27 +113,48 @@ Plan 1 (P0): make every answer reproducible and honest. This first step only
   `resolve_all_placeholders()` call; a key already redacted to `REDACTED_SECRET` is left alone
   (never re-derived from its own raw value, which would leak it back out).
 
+### Added (P0 step 1.5)
+- **`AppState::reload_lock`**: a `Mutex<()>` held for the full duration of one
+  `WorkspaceIndexer::reload` call, acquired and released entirely on the single Rayon-pool
+  thread running that reload (a `MutexGuard` never crosses a thread boundary here). Two reload
+  jobs can still both get spawned — `reload_pending`'s coalescing check in
+  `FileWatcherService::schedule_reload` is a best-effort optimization, not the correctness
+  guarantee — but the second one now blocks on this lock until the first finishes, then runs
+  its own pass against then-current disk state, instead of racing it.
+
+### Fixed (P0 step 1.5)
+- **Concurrent reloads no longer clobber each other with a stale snapshot.** Before this fix, two
+  reload jobs triggered close together (a burst of filesystem events) could both crawl, both
+  build a graph, and both call `install_snapshot`; whichever one finished last won, even if it
+  had started from an older `snapshot_clone()` base and therefore produced a snapshot with
+  *less* information than the one already installed. `reload_lock` serializes the whole
+  crawl-build-install sequence so at most one reload ever mutates the snapshot at a time —
+  `concurrent_reloads_converge_to_full_build` no longer needs `#[ignore]`.
+- **`WorkspaceIndexer::build_graph` now delegates to `build_snapshot`** instead of duplicating a
+  second, independently-maintained indexing path. The CLI's `mesh-mcp graph` command, the
+  server, and the daemon now all go through exactly one code path from files to graph, so a fix
+  to `build_snapshot` (steps 1.1–1.5) can no longer silently fail to apply to one of the others.
+
 ### Known violations (baseline, tracked by `#[ignore]`d tests until the fixing step lands)
 Measured with `scripts/determinism.sh` (distinct fingerprints over 13 runs, 5 sequential +
-8 concurrent). Progression through steps 1.2–1.4:
+8 concurrent). Progression through steps 1.2–1.5:
 
-| Workspace | Before P0 | After 1.2 | After 1.3 | After 1.4 |
-| :--- | :---: | :---: | :---: | :---: |
-| `examples/polyglot-shop` | 1 | 1 | 1 | 1 |
-| `examples/volontariapp-fixture` | 1 | 1 | 1 | 1 |
-| determinism fixture (homonyms, imports, Kafka, properties) | 2 | 2 | 2 | **1** |
-| Bank of Anthos | 8 | 3 | 1 | 1 |
-| OpenTelemetry demo | 13 | 13 | 6 | **1** |
-| Online Boutique | 13 | 13 | 13 | **1** |
+| Workspace | Before P0 | After 1.2 | After 1.3 | After 1.4 | After 1.5 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `examples/polyglot-shop` | 1 | 1 | 1 | 1 | 1 |
+| `examples/volontariapp-fixture` | 1 | 1 | 1 | 1 | 1 |
+| determinism fixture (homonyms, imports, Kafka, properties) | 2 | 2 | 2 | 1 | 1 |
+| Bank of Anthos | 8 | 3 | 1 | 1 | 1 |
+| OpenTelemetry demo | 13 | 13 | 6 | 1 | 1 |
+| Online Boutique | 13 | 13 | 13 | 1 | 1 |
 
-**Every workspace is now fully deterministic** — idempotence invariants I1 (thread count / file
-order / repeated runs), I2 and I3 (incremental reload and re-reconciling both converge to the
-same graph a full rebuild produces) all hold, verified by `cargo test -p mesh-server --test
-determinism -- --include-ignored` (6 of 7 tests, no longer `#[ignore]`d).
-
-The one remaining gap is concurrent reloads racing each other and installing a snapshot computed
-from a stale base — a synchronization bug (`concurrent_reloads_converge_to_full_build`, still
-`#[ignore]`d), not a resolution-ambiguity one, fixed next in P0 step 1.5.
+**Every workspace is now fully deterministic, and all of Plan 1's idempotence invariants
+(I1–I3) fully hold**: same input ⇒ same snapshot regardless of thread count, file order, or
+repeated runs (I1); an incremental reload converges to the same graph as a full rebuild, even
+when reload jobs race each other (I2); re-reconciling an already-reconciled graph is a no-op
+(I3). `cargo test -p mesh-server --test determinism` now passes all 7 tests with zero
+`#[ignore]` remaining, and the `determinism` CI job (`.github/workflows/ci.yml`) is blocking
+instead of `continue-on-error`.
 
 ## [3.1.0] — 2026-09-24
 

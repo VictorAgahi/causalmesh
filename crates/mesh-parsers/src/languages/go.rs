@@ -99,12 +99,7 @@ impl GoExtractor {
         let mut grpc_server_types: HashSet<String> = HashSet::new();
         Self::collect_grpc_server_types(root, source_bytes, &mut grpc_server_types, 0);
 
-        // Pass 1b: top-level `var`/`const` string literal assignments, so a
-        // Kafka topic field referencing one by name (`kafka.Topic`) can
-        // resolve to the real topic string instead of the raw Go expression.
         let mut string_consts: HashMap<String, CompactStr> = HashMap::new();
-        Self::collect_string_consts(root, source_bytes, &mut string_consts, 0);
-
         let mut raw_imports: Vec<RawImport> = Vec::new();
         let mut raw_events: Vec<RawEvent> = Vec::new();
         let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
@@ -117,7 +112,7 @@ impl GoExtractor {
             &mut package_name,
             &mut nodes,
             &grpc_server_types,
-            &string_consts,
+            &mut string_consts,
             &mut raw_imports,
             &mut raw_events,
             &mut raw_rpc_calls,
@@ -147,7 +142,7 @@ impl GoExtractor {
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
         grpc_server_types: &HashSet<String>,
-        string_consts: &HashMap<String, CompactStr>,
+        string_consts: &mut HashMap<String, CompactStr>,
         raw_imports: &mut Vec<RawImport>,
         raw_events: &mut Vec<RawEvent>,
         raw_rpc_calls: &mut Vec<RawRpcCall>,
@@ -158,6 +153,9 @@ impl GoExtractor {
         }
 
         match node.kind() {
+            "var_spec" | "const_spec" => {
+                Self::collect_single_const_spec(node, source, string_consts);
+            }
             "package_clause" => {
                 if let Ok(text) = node.utf8_text(source) {
                     let clean = text.trim_start_matches("package ").trim();
@@ -563,11 +561,27 @@ impl GoExtractor {
             let Ok(key_text) = key.utf8_text(source) else {
                 continue;
             };
-            if key_text != "Topic" {
-                continue;
+            if key_text == "Topic" {
+                let value = elem.child_by_field_name("value")?;
+                return Self::extract_topic_value_text(value, source, string_consts);
             }
-            let value = elem.child_by_field_name("value")?;
-            return Self::extract_topic_value_text(value, source, string_consts);
+            if key_text == "TopicPartition" {
+                if let Some(val) = elem.child_by_field_name("value") {
+                    let mut inner = val;
+                    if inner.kind() == "literal_element" {
+                        inner = inner.named_child(0).unwrap_or(inner);
+                    }
+                    if inner.kind() == "unary_expression" {
+                        inner = inner.child_by_field_name("operand").unwrap_or(inner);
+                    }
+                    if inner.kind() == "composite_literal" {
+                        if let Some(topic) = Self::extract_topic_field(inner, source, string_consts)
+                        {
+                            return Some(topic);
+                        }
+                    }
+                }
+            }
         }
         None
     }
@@ -582,18 +596,16 @@ impl GoExtractor {
         if let Some(first) = literals.into_iter().next() {
             return Some(CompactStr::new(first.as_str()));
         }
-        // Non-literal topic: try resolving it as a reference to a top-level
-        // `var`/`const` string assignment (bare `Topic`, or `pkg.Topic` via a
-        // selector expression — both keyed on the bare field name in
-        // `string_consts`) before falling back to raw expression text. A
-        // composite literal's field value is wrapped in a `literal_element`
-        // node (`Topic: kafka.Topic` -> `value: (literal_element
-        // (selector_expression ...))`), so unwrap that first.
-        let unwrapped = if value.kind() == "literal_element" {
+        let mut unwrapped = if value.kind() == "literal_element" {
             value.named_child(0).unwrap_or(value)
         } else {
             value
         };
+        if unwrapped.kind() == "unary_expression" {
+            unwrapped = unwrapped
+                .child_by_field_name("operand")
+                .unwrap_or(unwrapped);
+        }
         let bare_name = match unwrapped.kind() {
             "identifier" => unwrapped.utf8_text(source).ok(),
             "selector_expression" => unwrapped
@@ -726,41 +738,30 @@ impl GoExtractor {
     /// conditionally via env-var lookup) — that requires real control-flow
     /// interpretation, out of scope here; such a reference simply won't be
     /// found in this map and falls back to raw text as before.
-    fn collect_string_consts(
-        node: Node,
-        source: &[u8],
-        out: &mut HashMap<String, CompactStr>,
-        depth: usize,
-    ) {
-        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+    fn collect_single_const_spec(node: Node, source: &[u8], out: &mut HashMap<String, CompactStr>) {
+        let Some(value_list) = node.child_by_field_name("value") else {
             return;
+        };
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children_by_field_name("name", &mut cursor) {
+            if let Ok(name) = child.utf8_text(source) {
+                names.push(name);
+            }
         }
-        if matches!(node.kind(), "var_spec" | "const_spec") {
-            // `value` is an `expression_list` wrapping the actual
-            // expression(s) — single-name-single-value is the only shape
-            // handled (`var X, Y = "a", "b"` is out of scope).
-            let single_value = node
-                .child_by_field_name("value")
-                .filter(|v| v.named_child_count() == 1)
-                .and_then(|v| v.named_child(0));
-            if let (Some(name_node), Some(value_node)) =
-                (node.child_by_field_name("name"), single_value)
-            {
-                if value_node.kind() == "interpreted_string_literal" {
-                    if let (Ok(name), Ok(value)) =
-                        (name_node.utf8_text(source), value_node.utf8_text(source))
-                    {
-                        let unquoted = value.trim_matches('"');
-                        if !unquoted.is_empty() {
-                            out.insert(name.to_string(), CompactStr::new(unquoted));
-                        }
+        let values: Vec<Node> = value_list.named_children(&mut value_list.walk()).collect();
+        for (name, value_node) in names.into_iter().zip(values) {
+            if matches!(
+                value_node.kind(),
+                "interpreted_string_literal" | "raw_string_literal"
+            ) {
+                if let Ok(value) = value_node.utf8_text(source) {
+                    let unquoted = value.trim_matches(|c: char| c == '"' || c == '`');
+                    if !unquoted.is_empty() {
+                        out.insert(name.to_string(), CompactStr::new(unquoted));
                     }
                 }
             }
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            Self::collect_string_consts(child, source, out, depth + 1);
         }
     }
 
@@ -1057,6 +1058,57 @@ func Emit() {
                 .iter()
                 .any(|(_, topic)| topic.as_str() == "orders"),
             "expected the resolved topic 'orders', got: {:?}",
+            relations.producers
+        );
+    }
+
+    #[test]
+    fn go_raw_string_literal_backtick_resolves_topic_value() {
+        let code = r#"
+package kafka
+
+const Topic = `orders-v2`
+
+func Emit() {
+    producer.SendMessage(&sarama.ProducerMessage{
+        Topic: Topic,
+    })
+}
+"#;
+        let mut p = parser();
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+        assert!(
+            relations
+                .producers
+                .iter()
+                .any(|(_, topic)| topic.as_str() == "orders-v2"),
+            "expected backtick raw string 'orders-v2', got: {:?}",
+            relations.producers
+        );
+    }
+
+    #[test]
+    fn confluent_kafka_topic_partition_struct_resolves_topic() {
+        let code = r#"
+package kafka
+
+func Emit() {
+    producer.Produce(&kafka.Message{
+        TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 1},
+        Value: []byte("payload"),
+    })
+}
+"#;
+        let mut p = parser();
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &mut p);
+        assert!(
+            relations
+                .producers
+                .iter()
+                .any(|(_, topic)| topic.as_str() == "topic"),
+            "expected confluent TopicPartition topic, got: {:?}",
             relations.producers
         );
     }

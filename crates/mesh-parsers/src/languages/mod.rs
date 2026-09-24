@@ -391,21 +391,37 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Kotlin => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    kotlin::KotlinExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    kotlin::KotlinExtractor::extract_with_relations(
+                        file_path, content, repo_id, parser,
+                    )
                 }) {
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
                         }
                     }
+                    for (i, topic) in relations.producers {
+                        out.producers.push((i, topic));
+                    }
+                    for (i, topic) in relations.consumers {
+                        out.consumers.push((i, topic));
+                    }
                     out.nodes = nodes;
                 }
             }
             LanguageKind::CSharp => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    csharp::CSharpExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    csharp::CSharpExtractor::extract_with_relations(
+                        file_path, content, repo_id, parser,
+                    )
                 }) {
+                    for (i, topic) in relations.producers {
+                        out.producers.push((i, topic));
+                    }
+                    for (i, topic) in relations.consumers {
+                        out.consumers.push((i, topic));
+                    }
                     out.nodes = nodes;
                 }
             }

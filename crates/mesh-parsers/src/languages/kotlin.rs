@@ -97,7 +97,7 @@ impl KotlinExtractor {
         found
     }
 
-    /// Pre-pass collecting `val`/`var X = ... ?: "literal"` elvis-default
+    /// Pre-pass collecting `val`/`var X = "literal"` or `val X = ... ?: "literal"`
     /// string assignments (any scope), keyed on the bare identifier.
     fn collect_elvis_string_defaults(
         node: Node,
@@ -114,6 +114,8 @@ impl KotlinExtractor {
                 .filter(|n| n.kind() == "variable_declaration")
                 .and_then(|vd| vd.named_child(0))
                 .and_then(|id| id.utf8_text(source).ok());
+            let direct_str = Self::direct_child_of_kind(node, "string_literal")
+                .and_then(|s| s.utf8_text(source).ok());
             let elvis_default =
                 Self::direct_child_of_kind(node, "binary_expression").and_then(|bin| {
                     let right = bin.child_by_field_name("right")?;
@@ -123,7 +125,7 @@ impl KotlinExtractor {
                         None
                     }
                 });
-            if let (Some(name), Some(value)) = (name, elvis_default) {
+            if let (Some(name), Some(value)) = (name, direct_str.or(elvis_default)) {
                 let unquoted = value.trim_matches('"');
                 if !unquoted.is_empty() {
                     out.insert(name.to_string(), CompactStr::new(unquoted));
@@ -163,13 +165,40 @@ impl KotlinExtractor {
         }
     }
 
-    /// Finds the first string literal among `node`'s descendants (bounded
-    /// depth); if none, falls back to the first identifier. Mirrors Go's
-    /// `collect_string_literals` "literal first, identifier fallback"
-    /// approach. Used to look inside a `.subscribe(listOf(topic))`-style
-    /// wrapped call for the real argument without needing to model every
-    /// possible wrapper function.
+    /// Finds the topic argument: checks ProducerRecord/listOf wrapper first,
+    /// then direct argument, falling back to string literal search.
     fn find_topic_arg(node: Node, source: &[u8]) -> Option<CompactStr> {
+        // 1. Check if arguments contain a ProducerRecord(...) or listOf(...) call
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let expr = if child.kind() == "value_argument" {
+                child.named_child(0).unwrap_or(child)
+            } else {
+                child
+            };
+            if expr.kind() == "call_expression" {
+                let fn_name = expr.named_child(0).and_then(|n| n.utf8_text(source).ok());
+                if matches!(
+                    fn_name,
+                    Some("ProducerRecord" | "listOf" | "setOf" | "arrayListOf")
+                ) {
+                    if let Some(inner_args) = expr.named_child(1) {
+                        if let Some(first_arg) = inner_args.named_child(0) {
+                            return Self::extract_single_topic_arg(first_arg, source);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Direct first argument of send/produce/subscribe
+        if let Some(first) = node.named_child(0) {
+            if let Some(t) = Self::extract_single_topic_arg(first, source) {
+                return Some(t);
+            }
+        }
+
+        // 3. Fallback to literal search
         let mut literals = Vec::new();
         Self::collect_kinds(node, source, "string_literal", &mut literals, 0);
         if let Some(first) = literals.into_iter().next() {
@@ -178,9 +207,34 @@ impl KotlinExtractor {
                 return Some(CompactStr::new(unquoted));
             }
         }
-        let mut idents = Vec::new();
-        Self::collect_kinds(node, source, "identifier", &mut idents, 0);
-        idents.into_iter().next().map(|s| CompactStr::new(s))
+        None
+    }
+
+    fn extract_single_topic_arg(node: Node, source: &[u8]) -> Option<CompactStr> {
+        let unwrapped = if node.kind() == "value_argument" {
+            node.named_child(0).unwrap_or(node)
+        } else {
+            node
+        };
+        if unwrapped.kind() == "string_literal" {
+            let text = unwrapped.utf8_text(source).ok()?;
+            let unquoted = text.trim_matches('"');
+            if !unquoted.is_empty() {
+                return Some(CompactStr::new(unquoted));
+            }
+        }
+        if unwrapped.kind() == "identifier" {
+            let text = unwrapped.utf8_text(source).ok()?;
+            return Some(CompactStr::new(text));
+        }
+        if unwrapped.kind() == "navigation_expression" {
+            if let Some(last) = unwrapped.named_child(1) {
+                if let Ok(text) = last.utf8_text(source) {
+                    return Some(CompactStr::new(text));
+                }
+            }
+        }
+        None
     }
 
     fn collect_kinds(node: Node, source: &[u8], kind: &str, out: &mut Vec<String>, depth: usize) {
@@ -334,11 +388,41 @@ impl KotlinExtractor {
             // `find_topic_arg`'s bounded recursive search rather than a
             // single direct child access.
             "call_expression" => {
-                let method_name = node
+                let nav = node
                     .named_child(0)
-                    .filter(|f| f.kind() == "navigation_expression")
-                    .and_then(|nav| nav.named_child(1))
+                    .filter(|f| f.kind() == "navigation_expression");
+                let receiver = nav
+                    .and_then(|n| n.named_child(0))
+                    .and_then(|r| r.utf8_text(source).ok());
+                let method_name = nav
+                    .and_then(|n| n.named_child(1))
                     .and_then(|n| n.utf8_text(source).ok());
+
+                // Guard: reject non-Kafka senders (HTTP clients, web sockets, mailers)
+                if let Some(r) = receiver {
+                    let r_lower = r.to_lowercase();
+                    if r_lower.contains("http")
+                        || r_lower.contains("mail")
+                        || r_lower.contains("socket")
+                    {
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            Self::visit_node(
+                                child,
+                                source,
+                                file_path,
+                                repo_id,
+                                package_name,
+                                nodes,
+                                string_defaults,
+                                raw_kafka_calls,
+                                depth + 1,
+                            );
+                        }
+                        return;
+                    }
+                }
+
                 let is_producer = match method_name {
                     Some("send") | Some("produce") => Some(true),
                     Some("subscribe") => Some(false),
@@ -473,5 +557,36 @@ object Constants {
             .find(|n| n.name == "Constants")
             .expect("object");
         assert_eq!(constants.kind, NodeKind::ServiceClass);
+    }
+
+    #[test]
+    fn test_kotlin_plain_constant_and_producer_record_extraction() {
+        let code = r#"
+package com.mesh.order
+
+class OrderService {
+    val topic = "orders-topic"
+
+    fun emit() {
+        kafkaProducer.send(ProducerRecord(topic, "message payload"))
+    }
+
+    fun callApi() {
+        httpClient.send("https://api.example.com")
+    }
+}
+"#;
+        let mut p = parser();
+        let (nodes, relations) =
+            KotlinExtractor::extract_with_relations(Path::new("OrderService.kt"), code, 0, &mut p);
+
+        assert_eq!(
+            relations.producers.len(),
+            1,
+            "expected only 1 kafka producer (httpClient rejected), got: {:?}",
+            relations.producers
+        );
+        assert_eq!(relations.producers[0].1.as_str(), "orders-topic");
+        assert_eq!(nodes[relations.producers[0].0].name.as_str(), "emit");
     }
 }

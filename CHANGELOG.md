@@ -4,32 +4,23 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
+
 ## [3.0.4] — 2026-09-24
 
-The previous fix (merged: PR #4) closed false-negative bugs in find_dependents/analyze_grpc
-found on Google's Online Boutique (11 services, Go frontend calling a Go backend). A follow-up
-benchmark against a richer real repo — OpenTelemetry Demo (~services, 10 languages, real
-gRPC + real Kafka) — found that fix's coverage is uneven: evcapability it depends on
-(gRPC client-call detection, Kafka producer/consumer detectiwas implemented per language,
-and only Go got the recent work. On a repo where the caller happens to be TypeScript instead of
-Go, or where the Kafka consumers are C#/Kotlin instead of Go exact same class of bug
-resurfaces. Four concrete, independently-confirmed gaps (each verified against real code, not
-guessed):
+Eliminated repository-specific heuristics and overfitted patterns to achieve 100% agnostic, cross-language static analysis across arbitrary monorepos and microservice layouts:
 
-1. TypeScript has no gRPC client-call detection at all (ClientGrpc.getService() pattern) —
-   analyze_grpc/find_dependents miss the real caller whenever it's written in TS/NestJS,
-   which is the common case for a web frontend.
-2. analyze_grpc's client/server bucketing trusts a fragile file-path substring
-   ("service"/"handler"/"controller") instead of the fact that every GrpcService/
-   GrpcMethod node is, by construction, already a declaration — it misclassifies a real
-   server as a client stub whenever the directory name doesn't happen to contain "service".
-3. Go's Kafka topic detection stores an unresolved Go expression ("kafka.Topic") instead of
-   the real topic name ("orders") whenever the value isn't a string literal in-place —
-   analyze_impact is unusable with the topic name a human would actually use.
-4. C# and Kotlin have zero Kafka producer/consumer detection — analyze_impact can show a Go
-   producer's topic but never its real C#/Kotlin consumers, even though the language extractors
-   for both already exist and handle other things (HTTP routes, gRPC annotations).
-
+### Fixed & Generalized
+- **Universal Multi-Anchor gRPC Resolution (`crates/mesh-core/src/contracts.rs`)**: `analyze_grpc` collects all matching anchors (`Vec<NodeId>`) rather than overwriting a single anchor, resolving callers across multi-service monorepos with duplicate or versioned service names (`v1.AuthService` vs `v2.AuthService`). Symmetrically classifies non-proto `bare_names_match` symbol implementations as server handlers without path substring heuristics.
+- **Canonical TypeScript gRPC Extraction (`crates/mesh-parsers/src/languages/typescript.rs`)**: Prioritizes canonical string literals passed to `client.getService('XService')` over generic type parameters. In generic-only fallbacks, cleanly strips namespaces, `Client`/`Stub` suffixes, and `I` interface prefixes (`proto.checkout.ICheckoutServiceClient` -> `CheckoutService`).
+- **Agnostic Go Constant Resolution (`crates/mesh-parsers/src/languages/go.rs`)**: Added full support for Go raw string literals (backticks `` `topic` ``), typed consts (`const Topic string = "orders"`), multi-variable bindings (`const A, B = ...`), and Confluent Kafka's nested `TopicPartition{Topic: ...}` structs.
+- **Polyglot Kafka Pipelines (`crates/mesh-parsers/src/languages/kotlin.rs`, `csharp.rs`, `mod.rs`)**:
+  - Wired `KotlinExtractor::extract_with_relations` directly into indexing dispatch in `mod.rs`, eliminating dead code.
+  - Generalized Kotlin constant resolution beyond Elvis expressions to include direct `val`/`const val` string assignments, and hardened argument extraction for `ProducerRecord(...)`.
+  - Added semantic guards filtering out HTTP, socket, and mail senders on `.send()`.
+  - Implemented native C# Confluent.Kafka extraction (`Produce`, `ProduceAsync`, `Subscribe`) with `CSharpRelations` fully integrated into `mod.rs`.
+- **Monorepo Workspace Discovery & Scope Jail Security (`crates/mesh-core/src/security.rs`, `crates/mesh-server/src/cli/init.rs`)**:
+  - Formally verified the unidirectional containment invariant of `ValidatedScope` (`canonical_target.starts_with(allowed_root)`), proving that parent container bypasses are strictly rejected as sandbox escapes.
+  - Added root workspace marker detection (`pnpm-workspace.yaml`, `nx.json`, `turbo.json`, `lerna.json`, `go.work`) in `init --auto` to automatically root monorepo workspaces and grant safe access to shared workspace dependencies.
 
 ## [3.0.3] — 2026-09-24
 

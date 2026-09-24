@@ -358,29 +358,49 @@ impl TypeScriptExtractor {
     }
 
     /// Reads the service name off a `getService<XServiceClient>('XService')`
-    /// call: prefers the generic type argument (stripping a trailing
-    /// `Client`), falling back to the first string-literal argument when no
-    /// type argument is present (plain-JS callers, or a `.d.ts`-less build).
+    /// call: prioritizes the canonical string-literal argument representing the
+    /// exact proto contract, falling back to the generic type argument when no
+    /// string literal is present (stripping namespace, `Client`/`Stub` suffix,
+    /// and `I` interface prefix).
     fn extract_get_service_target(node: Node, source: &[u8]) -> Option<String> {
-        if let Some(type_args) = node.child_by_field_name("type_arguments") {
-            let mut cursor = type_args.walk();
-            for child in type_args.named_children(&mut cursor) {
-                if let Ok(text) = child.utf8_text(source) {
-                    let name = text.strip_suffix("Client").unwrap_or(text);
-                    if !name.is_empty() {
-                        return Some(name.to_string());
+        // 1. Canonical string-literal argument (exact proto service name)
+        if let Some(args) = node.child_by_field_name("arguments") {
+            let mut cursor = args.walk();
+            for arg in args.named_children(&mut cursor) {
+                if arg.kind() == "string" {
+                    if let Ok(text) = arg.utf8_text(source) {
+                        let trimmed =
+                            text.trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
                     }
                 }
             }
         }
-        let args = node.child_by_field_name("arguments")?;
-        let mut cursor = args.walk();
-        for arg in args.named_children(&mut cursor) {
-            if arg.kind() == "string" {
-                if let Ok(text) = arg.utf8_text(source) {
-                    let trimmed = text.trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+
+        // 2. Generic type argument fallback (e.g. proto.checkout.ICheckoutServiceClient -> CheckoutService)
+        if let Some(type_args) = node.child_by_field_name("type_arguments") {
+            let mut cursor = type_args.walk();
+            for child in type_args.named_children(&mut cursor) {
+                if let Ok(text) = child.utf8_text(source) {
+                    let bare = text.rsplit('.').next().unwrap_or(text);
+                    let without_suffix = bare
+                        .strip_suffix("Client")
+                        .or_else(|| bare.strip_suffix("Stub"))
+                        .unwrap_or(bare);
+                    let clean_name = if without_suffix.starts_with('I')
+                        && without_suffix
+                            .chars()
+                            .nth(1)
+                            .is_some_and(|c| c.is_uppercase())
+                    {
+                        &without_suffix[1..]
+                    } else {
+                        without_suffix
+                    };
+                    if !clean_name.is_empty() {
+                        return Some(clean_name.to_string());
                     }
                 }
             }
@@ -909,5 +929,102 @@ export class CheckoutGateway {
         assert!(rpc_calls
             .iter()
             .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"));
+    }
+
+    /// Same call site with interface type prefix ICheckoutServiceClient -> CheckoutService.
+    #[test]
+    fn nestjs_get_service_call_handles_interface_prefix_type_arg() {
+        let code = r#"
+export class CheckoutGateway {
+    onModuleInit() {
+        this.checkoutService = this.client.getService<ICheckoutServiceClient>('CheckoutService');
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("gateways/rpc/Checkout.gateway.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "onModuleInit")
+            .expect("enclosing method node present");
+        assert!(rpc_calls
+            .iter()
+            .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"));
+    }
+
+    #[test]
+    fn nestjs_get_service_call_type_arg_only_with_i_prefix_and_stub_suffix() {
+        let code = r#"
+export class CheckoutGateway {
+    onModuleInit() {
+        this.checkoutService = this.client.getService<proto.checkout.ICheckoutServiceStub>();
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("gateways/rpc/Checkout.gateway.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "onModuleInit")
+            .expect("enclosing method node present");
+        assert!(rpc_calls
+            .iter()
+            .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"));
+    }
+
+    #[test]
+    fn nestjs_get_service_call_prioritizes_literal_over_custom_generic() {
+        let code = r#"
+export class CheckoutGateway {
+    onModuleInit() {
+        this.checkoutService = this.client.getService<CustomWrapperType>('RealProtoService');
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("gateways/rpc/Checkout.gateway.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "onModuleInit")
+            .expect("enclosing method node present");
+        assert!(rpc_calls
+            .iter()
+            .any(|(idx, target)| *idx == caller_idx && target.as_str() == "RealProtoService"));
     }
 }

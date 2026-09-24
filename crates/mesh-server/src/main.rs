@@ -65,7 +65,8 @@ enum Commands {
 
     /// Generate and view an interactive architecture graph of services, contracts, and topics
     Graph {
-        /// Format of the output: html, mermaid, or json
+        /// Format of the output: html, mermaid, json, or fingerprint (content hash of the
+        /// full index, for comparing two runs)
         #[arg(short, long, default_value = "html")]
         format: String,
 

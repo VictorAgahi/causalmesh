@@ -184,6 +184,19 @@ impl WorkspaceIndexer {
         vfs: Option<&mut DifferentialVfs>,
     ) -> MeshSnapshot {
         let files = Self::crawl_all(config, roots);
+        Self::build_snapshot_from_files(config, roots, &files, pool, vfs)
+    }
+
+    /// [`Self::build_snapshot`] over an explicit `(RepoId, path)` list instead of
+    /// a fresh crawl. The determinism tests use it to feed the same files in a
+    /// different order and check the snapshot fingerprint does not move.
+    pub fn build_snapshot_from_files(
+        config: &Config,
+        roots: &[PathBuf],
+        files: &[(RepoId, PathBuf)],
+        pool: Option<&BackgroundRescanEngine>,
+        vfs: Option<&mut DifferentialVfs>,
+    ) -> MeshSnapshot {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
@@ -447,7 +460,7 @@ impl WorkspaceIndexer {
     }
 
     /// Crawls all roots, tagging each file with the `RepoId` of its root.
-    fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
+    pub fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
         if roots.len() > RepoId::MAX as usize {
             tracing::error!(
                 target: "mesh::indexer",

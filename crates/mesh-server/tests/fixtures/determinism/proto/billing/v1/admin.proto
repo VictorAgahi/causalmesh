@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package billing.v1;
+
+// Same service name as users.v1.AdminService on purpose: a client that only
+// names "AdminService" is ambiguous between the two.
+service AdminService {
+  rpc Purge (PurgeRequest) returns (PurgeResponse);
+  rpc GetStatus (StatusRequest) returns (StatusResponse);
+}
+
+message PurgeRequest {}
+message PurgeResponse {}
+message StatusRequest {}
+message StatusResponse {}

@@ -5,6 +5,40 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [Unreleased]
+
+Plan 1 (P0): make every answer reproducible and honest. This first step only
+*measures* determinism; nothing about indexing behaviour changes yet.
+
+### Added
+- **Content fingerprint of the index.** `ContractGraph::canonical_lines()` /
+  `fingerprint()`, `DocIndex::canonical_lines()`, `PropertyRegistry::canonical_lines()` and
+  `MeshSnapshot::fingerprint()` (`crates/mesh-core`): a SHA-256 over a sorted,
+  `NodeId`-independent form of every node, edge and relation intent, so two builds of the same
+  workspace can be compared with a plain string equality. Exposed as
+  `mesh-mcp graph --format fingerprint`.
+- **`WorkspaceIndexer::build_snapshot_from_files`**: builds a snapshot from an explicit file
+  list (used by the determinism tests to shuffle input order); `crawl_all` is now public.
+- **Determinism test suite** (`crates/mesh-server/tests/determinism.rs` + fixture
+  `tests/fixtures/determinism/`) covering the four idempotence invariants: same input ⇒ same
+  snapshot (thread count, file order, repeated runs), incremental reload ⇒ same snapshot as a
+  full rebuild (sequential and concurrent reloads), reconcile idempotence, and one set of
+  facts per file under overlapping roots.
+- **`scripts/determinism.sh`** and a CI job running it: indexes each workspace 5 times
+  sequentially and 8 times concurrently and requires a single fingerprint.
+
+### Known violations (baseline, tracked by `#[ignore]`d tests until the fixing step lands)
+Measured with `scripts/determinism.sh` (distinct fingerprints over 13 runs, 5 sequential +
+8 concurrent): `examples/polyglot-shop` 1, `examples/volontariapp-fixture` 1, the
+determinism fixture 2, Online Boutique 13, OpenTelemetry demo 13, Bank of Anthos 8.
+- Results depend on thread count and CPU load (15 ms wall-clock parse timeout) — P0 step 1.3.
+- Shuffling the file order, or simply re-running, changes the graph: import and RPC resolution
+  keep the first candidate in `HashMap` order — P0 step 1.4.
+- A file under two overlapping roots is indexed once per root (18 duplicated nodes on the
+  fixture with roots `.` + `services/*`) — P0 step 1.2.
+- An incremental reload does not converge to a full rebuild, sequentially or with concurrent
+  reloads — P0 steps 1.4 and 1.5.
+
 ## [3.1.0] — 2026-09-24
 
 Architectural overhaul for total layout agnosticism, semantic extractor precision, 100% Tree-Sitter Protobuf parsing, and zero-noise codebase hygiene across all crates (`mesh-core`, `mesh-parsers`, `mesh-server`, `mesh-daemon`):

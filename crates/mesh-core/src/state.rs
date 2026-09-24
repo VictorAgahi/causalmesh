@@ -25,6 +25,65 @@ pub struct MeshSnapshot {
     pub generation: u64,
 }
 
+/// Content fingerprint of a [`MeshSnapshot`]: one SHA-256 per index plus a
+/// combined hash. Two snapshots built from the same workspace state must have
+/// equal fingerprints (idempotence invariants I1–I3); `generation` is a reload
+/// counter, not content, and is deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFingerprint {
+    pub combined: String,
+    pub graph: String,
+    pub docs: String,
+    pub properties: String,
+    pub nodes: usize,
+    pub edges: usize,
+    pub doc_sections: usize,
+    pub property_keys: usize,
+}
+
+impl std::fmt::Display for SnapshotFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "fingerprint: {}", self.combined)?;
+        writeln!(
+            f,
+            "graph:       {} ({} nodes, {} edges)",
+            self.graph, self.nodes, self.edges
+        )?;
+        writeln!(
+            f,
+            "docs:        {} ({} sections)",
+            self.docs, self.doc_sections
+        )?;
+        write!(
+            f,
+            "properties:  {} ({} keys)",
+            self.properties, self.property_keys
+        )
+    }
+}
+
+impl MeshSnapshot {
+    /// Fingerprints the three indices from their canonical forms.
+    pub fn fingerprint(&self) -> SnapshotFingerprint {
+        let sha = |lines: &[String]| AuditLogger::compute_sha256(lines.join("\n").as_bytes());
+        let graph = sha(&self.contract_graph.canonical_lines());
+        let docs = sha(&self.doc_index.canonical_lines());
+        let properties = sha(&self.property_registry.canonical_lines());
+        let combined =
+            AuditLogger::compute_sha256(format!("{graph}\n{docs}\n{properties}").as_bytes());
+        SnapshotFingerprint {
+            combined,
+            graph,
+            docs,
+            properties,
+            nodes: self.contract_graph.node_count(),
+            edges: self.contract_graph.edge_count(),
+            doc_sections: self.doc_index.section_count(),
+            property_keys: self.property_registry.len(),
+        }
+    }
+}
+
 /// Central application state per RFC-001 Commandment 1.
 ///
 /// Only `snapshot` is hot-swapped (lock-free, copy-on-write). Everything else is
@@ -209,5 +268,27 @@ roots = ["."]
         assert_eq!(view.generation, 1);
         assert_eq!(view.contract_graph.node_count(), 1);
         assert_eq!(view.doc_index.section_count(), 1);
+    }
+
+    #[test]
+    fn fingerprint_ignores_generation_but_tracks_every_index() {
+        let st = state();
+        let mut snap = st.snapshot_clone();
+        let before = snap.fingerprint();
+
+        snap.generation = 42;
+        assert_eq!(
+            snap.fingerprint(),
+            before,
+            "generation is a reload counter, not content"
+        );
+
+        snap.doc_index
+            .index_markdown_file(std::path::Path::new("d.md"), "# T\nbody");
+        let with_doc = snap.fingerprint();
+        assert_ne!(with_doc.docs, before.docs);
+        assert_eq!(with_doc.graph, before.graph);
+        assert_eq!(with_doc.properties, before.properties);
+        assert_ne!(with_doc.combined, before.combined);
     }
 }

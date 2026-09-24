@@ -194,6 +194,24 @@ impl PropertyRegistry {
         self.flat_properties.get(key).map(|v| v.as_str())
     }
 
+    /// Canonical, order-independent form of the registry (one sorted JSON line
+    /// per key: key, value, owning file), used to compare two builds.
+    pub fn canonical_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .flat_properties
+            .iter()
+            .map(|(key, value)| {
+                let source = self
+                    .sources
+                    .get(key)
+                    .map(|p| p.to_string_lossy().into_owned());
+                serde_json::json!([key, value, source]).to_string()
+            })
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
     /// Word-exact "auth"/"authorization" tokens — deliberately NOT a bare
     /// substring pattern in `SECRET_PATTERNS` (a plain `.contains("auth")`
     /// false-positives on `app.author.email`, "author" containing "auth" as

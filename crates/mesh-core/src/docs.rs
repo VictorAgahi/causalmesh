@@ -115,6 +115,28 @@ impl DocIndex {
         self.sections.extend(sections);
     }
 
+    /// Canonical, order-independent form of the indexed sections (one sorted
+    /// JSON line per section), used to compare two builds of the same workspace.
+    pub fn canonical_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .sections
+            .iter()
+            .map(|s| {
+                serde_json::json!([
+                    s.file_path.to_string_lossy(),
+                    s.start_line,
+                    s.end_line,
+                    s.level,
+                    s.title,
+                    s.content
+                ])
+                .to_string()
+            })
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
     /// Splits a markdown document into sections without touching the index —
     /// pure, so it can run on the Rayon pool during a workspace scan.
     pub fn parse_sections(&self, path: &Path, raw_content: &str) -> Vec<DocSection> {

@@ -1036,6 +1036,84 @@ impl ContractGraph {
     }
 }
 
+impl ContractGraph {
+    /// Canonical, `NodeId`-independent form of the graph, used to compare two
+    /// builds: one JSON line per node, edge and recorded relation intent, the
+    /// whole list sorted. The same facts give the same lines whatever the
+    /// insertion order, thread count or id numbering; duplicates are kept so a
+    /// file indexed twice stays visible.
+    pub fn canonical_lines(&self) -> Vec<String> {
+        let key_of = |id: NodeId| -> String {
+            self.nodes
+                .get(&id)
+                .map_or_else(|| String::from("<missing>"), Self::canonical_node_key)
+        };
+
+        let mut lines = Vec::with_capacity(
+            self.nodes.len() + self.edges.len() + self.rpc_calls.len() + self.reverse_deps.len(),
+        );
+        lines.extend(
+            self.nodes
+                .values()
+                .map(|n| format!("node {}", Self::canonical_node_key(n))),
+        );
+        for edge in &self.edges {
+            let line = serde_json::json!([
+                edge.kind,
+                key_of(edge.from),
+                key_of(edge.to),
+                edge.metadata,
+                edge.confidence
+            ]);
+            lines.push(format!("edge {line}"));
+        }
+        for (label, index) in [
+            ("dep", &self.reverse_deps),
+            ("produces", &self.topic_producers),
+            ("consumes", &self.topic_consumers),
+        ] {
+            for (target, ids) in index {
+                for &id in ids {
+                    lines.push(format!(
+                        "{label} {}",
+                        serde_json::json!([target, key_of(id)])
+                    ));
+                }
+            }
+        }
+        for (caller, target) in &self.rpc_calls {
+            lines.push(format!(
+                "rpc_call {}",
+                serde_json::json!([key_of(*caller), target])
+            ));
+        }
+
+        lines.sort_unstable();
+        lines
+    }
+
+    /// SHA-256 (hex) of [`Self::canonical_lines`].
+    pub fn fingerprint(&self) -> String {
+        crate::audit::AuditLogger::compute_sha256(self.canonical_lines().join("\n").as_bytes())
+    }
+
+    /// Every observable field of a node except its `NodeId`.
+    fn canonical_node_key(node: &ContractNode) -> String {
+        serde_json::json!([
+            node.file_path.to_string_lossy(),
+            node.line_start,
+            node.line_end,
+            node.kind,
+            node.name,
+            node.package,
+            node.repo_id,
+            node.signature,
+            node.docstring
+        ])
+        .to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1866,5 +1944,77 @@ mod tests {
             .client_stubs
             .iter()
             .any(|(c, _)| c.name.as_str() == "callAuthV2"));
+    }
+
+    fn fp_node(name: &str, file: &str, line: usize, kind: NodeKind) -> ContractNode {
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: Path::new(file).into(),
+            line_start: line,
+            line_end: line + 2,
+            package: CompactStr::new("pkg"),
+            repo_id: 0,
+            signature: Some(CompactStr::new(format!("sig {name}"))),
+            docstring: None,
+        }
+    }
+
+    /// The fingerprint must depend on graph content only: inserting the same
+    /// nodes and relations in a different order renumbers every `NodeId` but
+    /// must not change it.
+    #[test]
+    fn fingerprint_ignores_insertion_order_and_node_ids() {
+        let build = |reversed: bool| {
+            let mut graph = ContractGraph::new();
+            let mut specs = vec![
+                ("Widget", "a/widget.go", 1, NodeKind::ServiceClass),
+                ("Use", "b/use.go", 4, NodeKind::ServiceClass),
+                ("Emit", "c/emit.go", 7, NodeKind::ServiceClass),
+            ];
+            if reversed {
+                specs.reverse();
+            }
+            let mut ids = HashMap::new();
+            for (name, file, line, kind) in specs {
+                ids.insert(name, graph.add_node(fp_node(name, file, line, kind)));
+            }
+            graph.add_dependency(ids["Use"], "Widget");
+            graph.add_producer(ids["Emit"], "orders");
+            graph.add_consumer(ids["Use"], "orders");
+            graph.reconcile_edges();
+            graph
+        };
+
+        let forward = build(false);
+        let reversed = build(true);
+        assert_eq!(forward.canonical_lines(), reversed.canonical_lines());
+        assert_eq!(forward.fingerprint(), reversed.fingerprint());
+    }
+
+    /// Any content difference — here a single line number — must change it.
+    #[test]
+    fn fingerprint_changes_when_content_changes() {
+        let mut a = ContractGraph::new();
+        a.add_node(fp_node("Widget", "a/widget.go", 1, NodeKind::ServiceClass));
+        let mut b = ContractGraph::new();
+        b.add_node(fp_node("Widget", "a/widget.go", 2, NodeKind::ServiceClass));
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    /// A node indexed twice (e.g. through two overlapping roots) must stay
+    /// visible in the canonical form rather than collapse into one line.
+    #[test]
+    fn canonical_lines_keep_duplicate_nodes() {
+        let mut graph = ContractGraph::new();
+        graph.add_node(fp_node("Widget", "a/widget.go", 1, NodeKind::ServiceClass));
+        graph.add_node(fp_node("Widget", "a/widget.go", 1, NodeKind::ServiceClass));
+        let node_lines = graph
+            .canonical_lines()
+            .into_iter()
+            .filter(|l| l.starts_with("node "))
+            .count();
+        assert_eq!(node_lines, 2);
     }
 }

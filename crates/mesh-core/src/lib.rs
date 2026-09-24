@@ -32,7 +32,7 @@ pub use security::{SecurityError, ValidatedScope};
 #[cfg(windows)]
 pub use socket::pipe_name;
 pub use socket::{cleanup_stale_socket, socket_path};
-pub use state::{AppState, MeshSnapshot};
+pub use state::{AppState, MeshSnapshot, SnapshotFingerprint};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
     ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState,

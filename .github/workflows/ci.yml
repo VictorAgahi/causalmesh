@@ -60,6 +60,38 @@ jobs:
         run: cargo test --workspace --verbose
 
   # ============================================================================
+  # 2b. Determinism Gate (idempotence invariant I1)
+  # ============================================================================
+  # Indexes each example workspace 5x sequentially and 8x concurrently and
+  # requires a single content fingerprint per workspace (scripts/determinism.sh).
+  # Informational until P0 step 1.3 removes the 15 ms wall-clock parse timeout,
+  # which can still change results on a contended runner.
+  determinism:
+    name: "Determinism Gate (${{ matrix.os }})"
+    needs: test-suite
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Rust stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Rust Cache"
+        uses: Swatinem/rust-cache@v2
+
+      - name: "Compile Release Binary"
+        run: cargo build --release -p mesh-server
+
+      - name: "One fingerprint per workspace across sequential and concurrent runs"
+        run: scripts/determinism.sh
+
+  # ============================================================================
   # 3. Production Release Build & Smoke Test
   # ============================================================================
   release-smoke-test:

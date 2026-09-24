@@ -383,6 +383,7 @@ files): 20.5 MiB. Index size scales with your workspace — measure on yours.
 | `mesh-mcp init --auto --write-ide-config` | Also write `.cursor/mcp.json` and `.vscode/mcp.json`. |
 | `mesh-mcp doctor` | Validate config, roots, skill files, parsers, secret masking. |
 | `mesh-mcp graph [--format html\|mermaid\|json] [--open]` | Render the topology. |
+| `mesh-mcp graph --format fingerprint` | Print a content hash of the full index; two runs over an unchanged workspace must print the same value (`scripts/determinism.sh`). |
 | `mesh-mcp install-hooks` | Install the git pre-commit hook enforcing stop rules. |
 | `mesh-mcp stats [--since 7d\|24h\|all]` | Local-only summary of the audit log: calls per tool, error rate, most-queried scopes/targets. Nothing leaves the machine. |
 

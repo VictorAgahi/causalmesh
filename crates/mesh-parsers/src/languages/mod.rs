@@ -338,6 +338,7 @@ impl PolyglotIndexer {
             }
             LanguageKind::TypeScript => {
                 let mut imports = Vec::new();
+                let mut rpc_calls = Vec::new();
                 let nodes = AstGuard::with_parser(lang_kind, |parser| {
                     typescript::TypeScriptExtractor::extract_with_config(
                         file_path,
@@ -345,10 +346,12 @@ impl PolyglotIndexer {
                         repo_id,
                         parser,
                         &mut imports,
+                        &mut rpc_calls,
                         &cfg.controller_annotations,
                     )
                 })
                 .unwrap_or_default();
+                out.rpc_calls = rpc_calls;
 
                 if !imports.is_empty() {
                     let content_lines: Vec<&str> = content.lines().collect();
@@ -388,21 +391,37 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Kotlin => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    kotlin::KotlinExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    kotlin::KotlinExtractor::extract_with_relations(
+                        file_path, content, repo_id, parser,
+                    )
                 }) {
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
                         }
                     }
+                    for (i, topic) in relations.producers {
+                        out.producers.push((i, topic));
+                    }
+                    for (i, topic) in relations.consumers {
+                        out.consumers.push((i, topic));
+                    }
                     out.nodes = nodes;
                 }
             }
             LanguageKind::CSharp => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    csharp::CSharpExtractor::extract(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                    csharp::CSharpExtractor::extract_with_relations(
+                        file_path, content, repo_id, parser,
+                    )
                 }) {
+                    for (i, topic) in relations.producers {
+                        out.producers.push((i, topic));
+                    }
+                    for (i, topic) in relations.consumers {
+                        out.consumers.push((i, topic));
+                    }
                     out.nodes = nodes;
                 }
             }

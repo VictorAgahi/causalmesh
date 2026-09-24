@@ -274,4 +274,28 @@ mod tests {
         let scope = result.expect("resolved scope");
         assert!(scope.as_path().ends_with("billing"));
     }
+
+    #[test]
+    fn test_parent_directory_access_strictly_rejected() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let parent_root = temp_dir.path().join("monorepo");
+        let allowed_service = parent_root.join("services").join("checkout");
+        let other_service = parent_root.join("services").join("auth");
+
+        fs::create_dir_all(&allowed_service).expect("create checkout");
+        fs::create_dir_all(&other_service).expect("create auth");
+
+        let canonical_allowed = dunce::canonicalize(&allowed_service).expect("canonical allowed");
+        let canonical_parent = dunce::canonicalize(&parent_root).expect("canonical parent");
+
+        // Attempting to resolve parent monorepo directory when only a subservice is allowed
+        // MUST fail with SandboxEscapeAttempt.
+        let result =
+            ValidatedScope::resolve(&canonical_parent.to_string_lossy(), &[canonical_allowed]);
+        assert!(
+            matches!(result, Err(SecurityError::SandboxEscapeAttempt(_))),
+            "Parent directory must NEVER be allowed when only child is jailed: {:?}",
+            result
+        );
+    }
 }

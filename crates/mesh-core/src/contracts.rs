@@ -787,8 +787,7 @@ impl ContractGraph {
         // language's own service-implementation node (Go's
         // `RegisterFooServiceServer`-detected node, TS's `@GrpcService`
         // class, ...) is a perfectly good anchor for resolving callers via
-        // `CallsRpc`/`Implements` edges too.
-        let mut exact_match: Option<&ContractNode> = None;
+        let mut anchors: Vec<NodeId> = Vec::new();
         let mut client_stubs: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
         let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
@@ -814,43 +813,30 @@ impl ContractGraph {
                 EdgeConfidence::Heuristic
             };
 
-            if exact_name {
-                exact_match = Some(node);
-            }
+            let is_symbol_match = exact_name || Self::bare_names_match(&node.name, norm_target);
 
-            let path_str = node.file_path.to_string_lossy();
             if Self::is_proto_file(&node.file_path) {
-                proto_definition = Some(node);
-            } else if exact_name {
-                // Exact-name match: this node IS the target by construction,
-                // so a same-pass path-substring guess (client vs. server) is
-                // reasonable. A directory/file merely *containing* "service"
-                // is otherwise weak evidence — every service directory in a
-                // typical microservices repo matches it (confirmed false
-                // positive: a shared generated `*_pb2_grpc.py` stub vendored
-                // into unrelated services, matched only via a substring hit
-                // inside its own class name, e.g. "CheckoutServiceServicer"
-                // containing "CheckoutService" — not by being an exact name
-                // or a real `Implements` relationship). Non-exact (heuristic)
-                // matches are only surfaced below, gated on an actual
-                // `Implements`/`CallsRpc` graph edge to the proto definition.
-                if path_str.contains("controller")
-                    || path_str.contains("handler")
-                    || path_str.contains("service")
-                {
-                    server_handlers.push((node, confidence));
-                } else {
+                if exact_name || proto_definition.is_none() {
+                    proto_definition = Some(node);
+                }
+                anchors.push(node.id);
+            } else if is_symbol_match {
+                anchors.push(node.id);
+                // Exact or bare-name match: this node represents the target declaration/implementation.
+                // It defaults straight to server_handlers without relying on directory naming heuristics.
+                if node.name.as_str().starts_with("rpc:") {
                     client_stubs.push((node, confidence));
+                } else {
+                    server_handlers.push((node, confidence));
                 }
             }
         }
 
-        // Resolve implementors and callers via graph edges, anchored on the
-        // formal proto definition when one is indexed, falling back to the
-        // exact-name service/method node itself otherwise.
-        if let Some(anchor) = proto_definition.or(exact_match) {
+        // Resolve implementors and callers via graph edges for all matching anchors
+        // (proto definition or language-level service/method declarations).
+        for anchor_id in &anchors {
             for edge in &self.edges {
-                if edge.to != anchor.id {
+                if edge.to != *anchor_id {
                     continue;
                 }
                 match edge.kind {
@@ -1131,6 +1117,89 @@ mod tests {
         );
     }
 
+    /// Regression test for the OpenTelemetry Demo benchmark finding: an
+    /// exact-name-matched `GrpcService` node must be bucketed as a server
+    /// handler regardless of what its file path happens to contain — the
+    /// previous `path.contains("service"/"handler"/"controller")` heuristic
+    /// misclassified a real server as a client stub whenever the directory
+    /// was named e.g. `checkout/` rather than `checkoutservice/`.
+    #[test]
+    fn analyze_grpc_buckets_exact_match_as_server_handler_regardless_of_path_naming() {
+        let mut graph = ContractGraph::new();
+        let service_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutService"),
+            kind: NodeKind::GrpcService,
+            // Deliberately no "service"/"handler"/"controller" substring
+            // anywhere in this path.
+            file_path: Path::new("src/checkout/main.go").into(),
+            line_start: 142,
+            line_end: 142,
+            package: CompactStr::new("checkout"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        graph.add_node(service_node);
+
+        let trace = graph.analyze_grpc("CheckoutService");
+        assert!(
+            trace
+                .server_handlers
+                .iter()
+                .any(|(h, _)| h.name.as_str() == "CheckoutService"),
+            "an exact-name GrpcService match must be a server handler \
+             regardless of directory naming, got server_handlers={:?} \
+             client_stubs={:?}",
+            trace.server_handlers,
+            trace.client_stubs
+        );
+        assert!(
+            trace
+                .client_stubs
+                .iter()
+                .all(|(c, _)| c.name.as_str() != "CheckoutService"),
+            "must not also appear in client_stubs"
+        );
+    }
+
+    /// Regression test: a synthetic node created by the generic
+    /// custom-pattern engine's `PatternKind::Rpc` (name prefixed `"rpc:"`)
+    /// explicitly represents a client call site, not a declaration — it must
+    /// still route to client_stubs, not server_handlers, even under an
+    /// exact-name match.
+    #[test]
+    fn analyze_grpc_routes_custom_pattern_rpc_node_to_client_stubs() {
+        let mut graph = ContractGraph::new();
+        let rpc_call_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("rpc:CheckoutService"),
+            kind: NodeKind::GrpcMethod,
+            file_path: Path::new("src/some-service/handler.ts").into(),
+            line_start: 10,
+            line_end: 12,
+            package: CompactStr::new("some-service"),
+            repo_id: 0,
+            signature: Some(CompactStr::new("RPC call: CheckoutService")),
+            docstring: None,
+        };
+        graph.add_node(rpc_call_node);
+
+        let trace = graph.analyze_grpc("rpc:CheckoutService");
+        assert!(
+            trace
+                .client_stubs
+                .iter()
+                .any(|(c, _)| c.name.as_str() == "rpc:CheckoutService"),
+            "a custom-pattern RPC call-site node must be a client stub, got: {:?}",
+            trace
+        );
+        assert!(trace
+            .server_handlers
+            .iter()
+            .all(|(h, _)| h.name.as_str() != "rpc:CheckoutService"));
+    }
+
     /// Regression test: `analyze_grpc`'s client/server edge resolution must
     /// not require a `.proto` file to be indexed at all — a language's own
     /// exact-name service node (e.g. Go's `RegisterFooServiceServer`-detected
@@ -1199,6 +1268,14 @@ mod tests {
     /// `add_rpc_call` signal), not through `reverse_deps` at all. Exercises
     /// the actual end-to-end path: `add_rpc_call` -> `reconcile_edges` ->
     /// `find_dependents`.
+    ///
+    /// This graph-level mechanism is language-agnostic by construction —
+    /// `add_rpc_call` doesn't know which extractor produced its signal — so
+    /// this same test doubles as proof that a TypeScript
+    /// `getService<XServiceClient>(...)` caller (see
+    /// `typescript.rs::nestjs_get_service_call_is_recorded_as_an_rpc_call`,
+    /// which proves TS produces the identical `(idx, "CheckoutService")` raw
+    /// signal) resolves through the exact same path Go's does.
     #[test]
     fn find_dependents_resolves_a_real_cross_service_grpc_caller_via_reconcile_edges() {
         let mut graph = ContractGraph::new();
@@ -1709,5 +1786,103 @@ mod tests {
         assert!(symbols
             .iter()
             .any(|n| n.name.as_str() == "USER_SERVICE_NAME.SIGN_UP"));
+    }
+
+    #[test]
+    fn test_analyze_grpc_multi_service_anchors_resolves_all_callers() {
+        let mut graph = ContractGraph::new();
+
+        // Service v1 in auth
+        let svc_v1 = ContractNode {
+            id: 0,
+            name: CompactStr::new("AuthService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("services/auth-v1/server.go").into(),
+            line_start: 10,
+            line_end: 20,
+            package: CompactStr::new("auth.v1"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        };
+        // Service v2 in new auth
+        let svc_v2 = ContractNode {
+            id: 0,
+            name: CompactStr::new("AuthService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("services/auth-v2/server.go").into(),
+            line_start: 10,
+            line_end: 20,
+            package: CompactStr::new("auth.v2"),
+            repo_id: 2,
+            signature: None,
+            docstring: None,
+        };
+        // Caller A targeting v1
+        let caller_a = ContractNode {
+            id: 0,
+            name: CompactStr::new("callAuthV1"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/gateway/client1.go").into(),
+            line_start: 5,
+            line_end: 15,
+            package: CompactStr::new("gateway"),
+            repo_id: 3,
+            signature: None,
+            docstring: None,
+        };
+        // Caller B targeting v2
+        let caller_b = ContractNode {
+            id: 0,
+            name: CompactStr::new("callAuthV2"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("services/billing/client2.go").into(),
+            line_start: 5,
+            line_end: 15,
+            package: CompactStr::new("billing"),
+            repo_id: 4,
+            signature: None,
+            docstring: None,
+        };
+
+        let id_v1 = graph.add_node(svc_v1);
+        let id_v2 = graph.add_node(svc_v2);
+        let id_caller_a = graph.add_node(caller_a);
+        let id_caller_b = graph.add_node(caller_b);
+
+        graph.add_edge(ContractEdge {
+            from: id_caller_a,
+            to: id_v1,
+            kind: EdgeKind::CallsRpc,
+            metadata: Some(CompactStr::new("AuthService")),
+            confidence: EdgeConfidence::Exact,
+        });
+        graph.add_edge(ContractEdge {
+            from: id_caller_b,
+            to: id_v2,
+            kind: EdgeKind::CallsRpc,
+            metadata: Some(CompactStr::new("AuthService")),
+            confidence: EdgeConfidence::Exact,
+        });
+
+        let trace = graph.analyze_grpc("AuthService");
+        assert_eq!(
+            trace.server_handlers.len(),
+            2,
+            "both v1 and v2 AuthService must be server handlers"
+        );
+        assert_eq!(
+            trace.client_stubs.len(),
+            2,
+            "both callers to v1 and v2 must be resolved without anchor overwrite"
+        );
+        assert!(trace
+            .client_stubs
+            .iter()
+            .any(|(c, _)| c.name.as_str() == "callAuthV1"));
+        assert!(trace
+            .client_stubs
+            .iter()
+            .any(|(c, _)| c.name.as_str() == "callAuthV2"));
     }
 }

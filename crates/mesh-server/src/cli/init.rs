@@ -36,6 +36,16 @@ impl InitCommand {
             roots.push(".".to_string());
         }
 
+        let is_monorepo = cur_dir.join("pnpm-workspace.yaml").exists()
+            || cur_dir.join("lerna.json").exists()
+            || cur_dir.join("nx.json").exists()
+            || cur_dir.join("turbo.json").exists()
+            || cur_dir.join("go.work").exists();
+        if is_monorepo {
+            eprintln!("  Found: Monorepo workspace configuration (pnpm/nx/turbo/go.work)");
+            roots.push(".".to_string());
+        }
+
         if cur_dir.join("packages").exists() {
             eprintln!("  Found: Monorepo packages (./packages/*)");
             roots.push("./packages/*".to_string());
@@ -436,6 +446,19 @@ mod tests {
             !roots.iter().any(|r| r == "../src/*"),
             "an ordinary src/ with no nested language markers must not be \
              treated as a polyglot service container, got: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn monorepo_workspace_configuration_roots_the_whole_repo() {
+        let roots = roots_for(&["pnpm-workspace.yaml", "packages/frontend/package.json"]);
+        assert!(
+            roots.contains(&"..".to_string()),
+            "a monorepo with pnpm-workspace.yaml must root the workspace root '..', got: {roots:?}"
+        );
+        assert!(
+            roots.contains(&"../packages/*".to_string()),
+            "a monorepo with packages/ must also root '../packages/*', got: {roots:?}"
         );
     }
 }

@@ -5,7 +5,24 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [3.0.3] — Unreleased
+## [3.0.4] — 2026-09-24
+
+Eliminated repository-specific heuristics and overfitted patterns to achieve 100% agnostic, cross-language static analysis across arbitrary monorepos and microservice layouts:
+
+### Fixed & Generalized
+- **Universal Multi-Anchor gRPC Resolution (`crates/mesh-core/src/contracts.rs`)**: `analyze_grpc` collects all matching anchors (`Vec<NodeId>`) rather than overwriting a single anchor, resolving callers across multi-service monorepos with duplicate or versioned service names (`v1.AuthService` vs `v2.AuthService`). Symmetrically classifies non-proto `bare_names_match` symbol implementations as server handlers without path substring heuristics.
+- **Canonical TypeScript gRPC Extraction (`crates/mesh-parsers/src/languages/typescript.rs`)**: Prioritizes canonical string literals passed to `client.getService('XService')` over generic type parameters. In generic-only fallbacks, cleanly strips namespaces, `Client`/`Stub` suffixes, and `I` interface prefixes (`proto.checkout.ICheckoutServiceClient` -> `CheckoutService`).
+- **Agnostic Go Constant Resolution (`crates/mesh-parsers/src/languages/go.rs`)**: Added full support for Go raw string literals (backticks `` `topic` ``), typed consts (`const Topic string = "orders"`), multi-variable bindings (`const A, B = ...`), and Confluent Kafka's nested `TopicPartition{Topic: ...}` structs.
+- **Polyglot Kafka Pipelines (`crates/mesh-parsers/src/languages/kotlin.rs`, `csharp.rs`, `mod.rs`)**:
+  - Wired `KotlinExtractor::extract_with_relations` directly into indexing dispatch in `mod.rs`, eliminating dead code.
+  - Generalized Kotlin constant resolution beyond Elvis expressions to include direct `val`/`const val` string assignments, and hardened argument extraction for `ProducerRecord(...)`.
+  - Added semantic guards filtering out HTTP, socket, and mail senders on `.send()`.
+  - Implemented native C# Confluent.Kafka extraction (`Produce`, `ProduceAsync`, `Subscribe`) with `CSharpRelations` fully integrated into `mod.rs`.
+- **Monorepo Workspace Discovery & Scope Jail Security (`crates/mesh-core/src/security.rs`, `crates/mesh-server/src/cli/init.rs`)**:
+  - Formally verified the unidirectional containment invariant of `ValidatedScope` (`canonical_target.starts_with(allowed_root)`), proving that parent container bypasses are strictly rejected as sandbox escapes.
+  - Added root workspace marker detection (`pnpm-workspace.yaml`, `nx.json`, `turbo.json`, `lerna.json`, `go.work`) in `init --auto` to automatically root monorepo workspaces and grant safe access to shared workspace dependencies.
+
+## [3.0.3] — 2026-09-24
 
 Fixes found and verified while benchmarking `mesh-mcp` against real-world repositories,
 including large single-language repos (linux, rust-lang, vscode, grpc) and real polyglot

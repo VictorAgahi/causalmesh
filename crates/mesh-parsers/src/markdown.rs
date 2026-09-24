@@ -64,19 +64,24 @@ impl MarkdownFormatter {
         header
     }
 
+    /// Groups a result's file path into a sub-scope for truncation guidance.
+    /// Only `Normal` path components count — `RootDir`/`Prefix`/`CurDir` are
+    /// skipped so an absolute path doesn't yield a bogus scope like `/Users`
+    /// (the leading `/` treated as its own component) instead of the
+    /// workspace-relative directory the caller actually cares about.
     fn extract_sub_scope(path: &str) -> String {
         let p = Path::new(path);
-        let components: Vec<_> = p.components().collect();
-        if components.len() >= 2 {
-            format!(
-                "{}/{}",
-                components[0].as_os_str().to_string_lossy(),
-                components[1].as_os_str().to_string_lossy()
-            )
-        } else if let Some(first) = components.first() {
-            first.as_os_str().to_string_lossy().into_owned()
-        } else {
-            "root".to_string()
+        let components: Vec<_> = p
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        match components.len() {
+            0 => "root".to_string(),
+            1 => components[0].clone(),
+            _ => format!("{}/{}", components[0], components[1]),
         }
     }
 
@@ -93,7 +98,7 @@ impl MarkdownFormatter {
         output.push_str(body);
 
         let mut sorted_scopes: Vec<(&String, &usize)> = scope_counts.iter().collect();
-        sorted_scopes.sort_by_key(|a| std::cmp::Reverse(*a.1));
+        sorted_scopes.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
         let top_scope_name = sorted_scopes
             .first()
@@ -364,5 +369,41 @@ mod tests {
         assert!(formatted.contains("[PAYLOAD TRUNCATED at 48 KB"));
         assert!(formatted.contains("GUIDANCE TO PREVENT TOKEN OVERFLOW"));
         assert!(formatted.contains("ACTION REQUIRED: Repeat 'smart_search'"));
+    }
+
+    /// An absolute path used to produce a bogus scope like `/Users` (the
+    /// leading `RootDir` component counted as component 0) instead of the
+    /// workspace-relative directory a caller could actually act on.
+    #[test]
+    fn extract_sub_scope_ignores_root_component_on_absolute_paths() {
+        assert_eq!(
+            MarkdownFormatter::extract_sub_scope("/Users/dev/repo/services/auth/Auth.ts"),
+            "Users/dev"
+        );
+        assert_eq!(
+            MarkdownFormatter::extract_sub_scope("services/auth/Auth.ts"),
+            "services/auth"
+        );
+        assert_eq!(MarkdownFormatter::extract_sub_scope("Auth.ts"), "Auth.ts");
+    }
+
+    /// Two sub-scopes tied on match count used to fall back to `HashMap`
+    /// iteration order for tie-breaking, which is randomized per process.
+    #[test]
+    fn build_truncated_search_output_breaks_scope_ties_by_name() {
+        let mut scope_counts = HashMap::new();
+        scope_counts.insert("zzz/scope".to_string(), 3usize);
+        scope_counts.insert("aaa/scope".to_string(), 3usize);
+        scope_counts.insert("mmm/scope".to_string(), 3usize);
+
+        let out =
+            MarkdownFormatter::build_truncated_search_output("", "", 3, 9, "q", &scope_counts);
+        let aaa_pos = out.find("aaa/scope").unwrap();
+        let mmm_pos = out.find("mmm/scope").unwrap();
+        let zzz_pos = out.find("zzz/scope").unwrap();
+        assert!(
+            aaa_pos < mmm_pos && mmm_pos < zzz_pos,
+            "tied scopes must be listed in sorted-name order, not HashMap order"
+        );
     }
 }

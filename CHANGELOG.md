@@ -10,6 +10,37 @@ at 3.0.0 — there is no reconstructed history before it.
 Plan 1 (P0): make every answer reproducible and honest. This first step only
 *measures* determinism; nothing about indexing behaviour changes yet.
 
+### Fixed (P0 step 1.6)
+- **`ContractGraph::find_dependents`'s substring fallback (step 3) is now sorted by matched
+  package name.** It used to iterate `reverse_deps` — a `HashMap` — directly, so the returned
+  node order depended on the process's random hash seed instead of workspace content, silently
+  violating idempotence invariant I5 (same query on the same snapshot ⇒ byte-identical output)
+  every time this fallback path was hit.
+- **`ContractGraph::analyze_impact`'s topic-registry pass is now sorted by matched topic name.**
+  Same root cause: `topic_producers`/`topic_consumers` are `HashMap`s, iterated directly, so
+  `upstream_producers`/`downstream_consumers` order was randomized per process run.
+- **`ContractGraph::search_symbols`'s substring path is now sorted by file path.** It walked
+  `file_to_nodes` — a `HashMap` — directly to restrict the scan to in-scope files; sorted the
+  paths first instead.
+- **`WebGraphPayload` (JSON/Mermaid graph export) nodes are now sorted by `(file_path,
+  line_start, name)`** instead of left in internal `NodeId` order. `NodeId` is a content hash
+  (P0 step 1.4): stable across runs of the *same* workspace, but this export would still have
+  silently reordered itself if the hashing scheme ever changed, even though nothing about the
+  workspace did.
+- **`MarkdownFormatter::extract_sub_scope` no longer emits a bogus scope like `/Users`** for an
+  absolute path. It counted `Path::components()` positionally, so an absolute path's leading
+  `RootDir` component (the `/` itself) counted as "component 0," pushing the real top-level
+  directory out of the truncation-guidance scope label entirely. Only `Normal` components are
+  counted now.
+- **Tied sub-scopes in `MarkdownFormatter`'s truncation guidance are now ordered by name.**
+  `build_truncated_search_output` sorted scopes by match count only
+  (`sort_by_key(Reverse(count))`); ties fell back to `HashMap` iteration order, another
+  per-process-random ordering, for what should be a fully reproducible ranking.
+- **`DocIndex::search` now tie-breaks explicitly by `(file_path, start_line)`** instead of
+  relying on `sort_by_key`'s stability to preserve `self.sections`'s insertion order — a
+  deterministic result should not depend on an incidental property of the sort algorithm rather
+  than an explicit, documented rule.
+
 ### Added
 - **Content fingerprint of the index.** `ContractGraph::canonical_lines()` /
   `fingerprint()`, `DocIndex::canonical_lines()`, `PropertyRegistry::canonical_lines()` and

@@ -280,7 +280,15 @@ impl DocIndex {
                 .collect();
         }
 
-        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+        // Tie-break explicitly by (path, start_line) instead of relying on
+        // `sort_by_key`'s stability to preserve `self.sections`'s insertion
+        // order — a deterministic result should not depend on an incidental
+        // property of the sort algorithm.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.file_path.cmp(&b.1.file_path))
+                .then_with(|| a.1.start_line.cmp(&b.1.start_line))
+        });
         scored
             .into_iter()
             .take(max_sections)

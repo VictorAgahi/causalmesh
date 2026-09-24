@@ -4,8 +4,34 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
+## [3.0.4] — 2026-09-24
 
-## [3.0.3] — Unreleased
+The previous fix (merged: PR #4) closed false-negative bugs in find_dependents/analyze_grpc
+found on Google's Online Boutique (11 services, Go frontend calling a Go backend). A follow-up
+benchmark against a richer real repo — OpenTelemetry Demo (~services, 10 languages, real
+gRPC + real Kafka) — found that fix's coverage is uneven: evcapability it depends on
+(gRPC client-call detection, Kafka producer/consumer detectiwas implemented per language,
+and only Go got the recent work. On a repo where the caller happens to be TypeScript instead of
+Go, or where the Kafka consumers are C#/Kotlin instead of Go exact same class of bug
+resurfaces. Four concrete, independently-confirmed gaps (each verified against real code, not
+guessed):
+
+1. TypeScript has no gRPC client-call detection at all (ClientGrpc.getService() pattern) —
+   analyze_grpc/find_dependents miss the real caller whenever it's written in TS/NestJS,
+   which is the common case for a web frontend.
+2. analyze_grpc's client/server bucketing trusts a fragile file-path substring
+   ("service"/"handler"/"controller") instead of the fact that every GrpcService/
+   GrpcMethod node is, by construction, already a declaration — it misclassifies a real
+   server as a client stub whenever the directory name doesn't happen to contain "service".
+3. Go's Kafka topic detection stores an unresolved Go expression ("kafka.Topic") instead of
+   the real topic name ("orders") whenever the value isn't a string literal in-place —
+   analyze_impact is unusable with the topic name a human would actually use.
+4. C# and Kotlin have zero Kafka producer/consumer detection — analyze_impact can show a Go
+   producer's topic but never its real C#/Kotlin consumers, even though the language extractors
+   for both already exist and handle other things (HTTP routes, gRPC annotations).
+
+
+## [3.0.3] — 2026-09-24
 
 Fixes found and verified while benchmarking `mesh-mcp` against real-world repositories,
 including large single-language repos (linux, rust-lang, vscode, grpc) and real polyglot

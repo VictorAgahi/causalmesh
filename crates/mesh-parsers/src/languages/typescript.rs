@@ -9,6 +9,18 @@ pub struct TypeScriptExtractor;
 /// is not configured.
 const DEFAULT_GRPC_ANNOTATION: &str = "@GrpcMethod";
 
+/// A raw NestJS `ClientGrpc.getService<XServiceClient>(...)` call site,
+/// found at `(line_start, line_end)`, targeting service `service_name`.
+/// Resolved to its smallest enclosing declaration in `resolve_rpc_calls`,
+/// mirroring `go.rs`'s `RawRpcCall`/`resolve_rpc_calls` for
+/// `pb.NewFooServiceClient(...)` — same "detect the client-construction call
+/// site by name, don't track what happens to the value afterward" heuristic.
+struct RawRpcCall {
+    line_start: usize,
+    line_end: usize,
+    service_name: CompactStr,
+}
+
 /// Per-file invariants threaded through the recursive `visit_node` walk,
 /// bundled to keep its argument count down.
 struct VisitCtx<'a> {
@@ -27,12 +39,14 @@ impl TypeScriptExtractor {
         parser: &mut Parser,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
     ) -> Vec<ContractNode> {
+        let mut rpc_calls = Vec::new();
         Self::extract_with_config(
             file_path,
             content,
             repo_id,
             parser,
             imports,
+            &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
         )
     }
@@ -40,12 +54,18 @@ impl TypeScriptExtractor {
     /// Same as [`Self::extract`], but `grpc_annotations` (from
     /// `[engines.contracts.grpc] controller_annotations`) replaces the
     /// hardcoded `@GrpcMethod` decorator list used to recognise gRPC handlers.
+    /// `rpc_calls` is filled with `(local node index, target service name)`
+    /// pairs — the same shape `languages::FileIndex.rpc_calls` expects (see
+    /// `languages/mod.rs`) — resolved from every
+    /// `ClientGrpc.getService<XServiceClient>(...)` call site found.
+    #[allow(clippy::too_many_arguments)]
     pub fn extract_with_config(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
         imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+        rpc_calls: &mut Vec<(usize, CompactStr)>,
         grpc_annotations: &[String],
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
@@ -65,16 +85,50 @@ impl TypeScriptExtractor {
             grpc_annotations,
         };
 
-        Self::visit_node(root, source_bytes, &ctx, &mut nodes, imports, 0);
+        let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
+        Self::visit_node(
+            root,
+            source_bytes,
+            &ctx,
+            &mut nodes,
+            imports,
+            &mut raw_rpc_calls,
+            0,
+        );
+        Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls);
         nodes
     }
 
+    /// Attaches each raw `getService<XServiceClient>(...)` call to its
+    /// smallest enclosing declaration, mirroring `go.rs::resolve_rpc_calls`.
+    /// A call site with no enclosing declaration has no sensible caller to
+    /// attribute a `CallsRpc` edge to, so it is simply dropped.
+    fn resolve_rpc_calls(
+        nodes: &[ContractNode],
+        raw_rpc_calls: Vec<RawRpcCall>,
+        out: &mut Vec<(usize, CompactStr)>,
+    ) {
+        for call in raw_rpc_calls {
+            let enclosing = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.line_start <= call.line_start && n.line_end >= call.line_end)
+                .min_by_key(|(_, n)| n.line_end - n.line_start);
+
+            if let Some((idx, _)) = enclosing {
+                out.push((idx, call.service_name));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn visit_node(
         node: Node,
         source: &[u8],
         ctx: &VisitCtx,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<(String, String)>,
+        raw_rpc_calls: &mut Vec<RawRpcCall>,
         depth: usize,
     ) {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
@@ -212,11 +266,31 @@ impl TypeScriptExtractor {
                 });
             }
             // kafkajs: `consumer.subscribe({ topic: 'x' })` / `producer.send({ topic: 'x' })`.
+            // NestJS: `this.client.getService<FooServiceClient>('FooService')`
+            // (or the string-literal argument alone, when no generic type
+            // argument is present) — the standard `ClientGrpc` client
+            // construction call. Recorded here (raw, line-range only) and
+            // attributed to its smallest enclosing declaration in
+            // `resolve_rpc_calls`, mirroring `go.rs`'s `NewFooServiceClient`
+            // detection: the call site itself is sufficient evidence this
+            // code talks to the named service — what happens to the
+            // returned value afterward is not tracked.
             "call_expression" => {
                 if let Some(callee) = node.child_by_field_name("function") {
                     if callee.kind() == "member_expression" {
                         if let Some(prop) = callee.child_by_field_name("property") {
                             if let Ok(prop_name) = prop.utf8_text(source) {
+                                if prop_name == "getService" {
+                                    if let Some(service_name) =
+                                        Self::extract_get_service_target(node, source)
+                                    {
+                                        raw_rpc_calls.push(RawRpcCall {
+                                            line_start: node.start_position().row + 1,
+                                            line_end: node.end_position().row + 1,
+                                            service_name: CompactStr::new(service_name),
+                                        });
+                                    }
+                                }
                                 let signature = match prop_name {
                                     "subscribe" => Some("kafkajs consumer.subscribe"),
                                     "send" => Some("kafkajs producer.send"),
@@ -279,8 +353,39 @@ impl TypeScriptExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, ctx, nodes, imports, depth + 1);
+            Self::visit_node(child, source, ctx, nodes, imports, raw_rpc_calls, depth + 1);
         }
+    }
+
+    /// Reads the service name off a `getService<XServiceClient>('XService')`
+    /// call: prefers the generic type argument (stripping a trailing
+    /// `Client`), falling back to the first string-literal argument when no
+    /// type argument is present (plain-JS callers, or a `.d.ts`-less build).
+    fn extract_get_service_target(node: Node, source: &[u8]) -> Option<String> {
+        if let Some(type_args) = node.child_by_field_name("type_arguments") {
+            let mut cursor = type_args.walk();
+            for child in type_args.named_children(&mut cursor) {
+                if let Ok(text) = child.utf8_text(source) {
+                    let name = text.strip_suffix("Client").unwrap_or(text);
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        let args = node.child_by_field_name("arguments")?;
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor) {
+            if arg.kind() == "string" {
+                if let Ok(text) = arg.utf8_text(source) {
+                    let trimmed = text.trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Walks an `import_statement` node's `import_clause` -> `named_imports`
@@ -526,12 +631,14 @@ export class AuthController {
         // observably different result: the method is now recognised as a
         // gRPC handler and projected via the same `Service.Method` parsing.
         let mut imports2 = Vec::new();
+        let mut rpc_calls2 = Vec::new();
         let configured_nodes = TypeScriptExtractor::extract_with_config(
             Path::new("auth.controller.ts"),
             code,
             4,
             &mut parser,
             &mut imports2,
+            &mut rpc_calls2,
             &["@RpcHandler".to_string()],
         );
         assert!(configured_nodes
@@ -715,5 +822,92 @@ async function run() {
                 .any(|e| e.kind == EdgeKind::Consumes && e.to == consumer_id),
             "expected a Consumes edge from the topic to the kafkajs consumer"
         );
+    }
+
+    /// Regression test for the OpenTelemetry Demo benchmark finding: a
+    /// NestJS `ClientGrpc.getService<XServiceClient>('XService')` call site
+    /// (the real shape found in `frontend/gateways/rpc/Checkout.gateway.ts`)
+    /// must be recorded as an RPC call attributed to its enclosing method, so
+    /// `ContractGraph::reconcile_edges` can build a real `CallsRpc` edge and
+    /// `find_dependents`/`analyze_grpc` stop missing a TypeScript caller the
+    /// way they used to for Go before that detector existed.
+    #[test]
+    fn nestjs_get_service_call_is_recorded_as_an_rpc_call() {
+        let code = r#"
+import { Injectable, Inject, OnModuleInit } from '@nestjs/common';
+import { ClientGrpc } from '@nestjs/microservices';
+
+@Injectable()
+export class CheckoutGateway implements OnModuleInit {
+    private checkoutService: CheckoutServiceClient;
+
+    constructor(@Inject('CHECKOUT_PACKAGE') private client: ClientGrpc) {}
+
+    onModuleInit() {
+        this.checkoutService = this.client.getService<CheckoutServiceClient>('CheckoutService');
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("gateways/rpc/Checkout.gateway.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "onModuleInit")
+            .expect("enclosing method node present");
+
+        assert!(
+            rpc_calls
+                .iter()
+                .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"),
+            "expected an rpc_calls entry attributing CheckoutService to \
+             onModuleInit, got: {rpc_calls:?}"
+        );
+    }
+
+    /// Same call site, but with no generic type argument (plain-JS-style
+    /// call) — must fall back to the string-literal argument.
+    #[test]
+    fn nestjs_get_service_call_falls_back_to_string_literal_argument() {
+        let code = r#"
+export class CheckoutGateway {
+    onModuleInit() {
+        this.checkoutService = this.client.getService('CheckoutService');
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("gateways/rpc/Checkout.gateway.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "onModuleInit")
+            .expect("enclosing method node present");
+        assert!(rpc_calls
+            .iter()
+            .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"));
     }
 }

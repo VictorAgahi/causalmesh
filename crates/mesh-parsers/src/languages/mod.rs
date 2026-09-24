@@ -338,6 +338,7 @@ impl PolyglotIndexer {
             }
             LanguageKind::TypeScript => {
                 let mut imports = Vec::new();
+                let mut rpc_calls = Vec::new();
                 let nodes = AstGuard::with_parser(lang_kind, |parser| {
                     typescript::TypeScriptExtractor::extract_with_config(
                         file_path,
@@ -345,10 +346,12 @@ impl PolyglotIndexer {
                         repo_id,
                         parser,
                         &mut imports,
+                        &mut rpc_calls,
                         &cfg.controller_annotations,
                     )
                 })
                 .unwrap_or_default();
+                out.rpc_calls = rpc_calls;
 
                 if !imports.is_empty() {
                     let content_lines: Vec<&str> = content.lines().collect();

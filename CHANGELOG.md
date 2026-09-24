@@ -27,15 +27,30 @@ Plan 1 (P0): make every answer reproducible and honest. This first step only
 - **`scripts/determinism.sh`** and a CI job running it: indexes each workspace 5 times
   sequentially and 8 times concurrently and requires a single fingerprint.
 
+### Fixed
+- **Overlapping configured roots no longer double-index files** (P0 step 1.2). A workspace
+  configured as `roots = [".", "./services/*"]` — the shape `init --auto` itself generates for
+  a polyglot service container — used to crawl every file under `services/*` twice: once from
+  `.`, once from its own service root, each time under a different `repo_id`. Fixed at the
+  source: `WorkspaceIndexer::crawl_all` now excludes every nested root's subtree from its
+  ancestors' crawls, so each file is attributed to its single most specific containing root.
+  Confirmed on a real capture of Bank of Anthos: 532 → 358 nodes (the 174 duplicates the audit
+  measured are gone); `overlapping_roots_index_each_file_once` no longer needs `#[ignore]`.
+- `FilesystemCrawler::crawl_scope_with` now sorts each directory's entries by filename
+  (`ignore::WalkBuilder::sort_by_file_name`) instead of relying on the OS's readdir order,
+  which differs across filesystems and isn't guaranteed stable on any of them.
+- `mesh-mcp doctor` reports overlapping configured roots (which one is redundant, which one
+  wins the shared files) instead of only validating that every root resolves.
+
 ### Known violations (baseline, tracked by `#[ignore]`d tests until the fixing step lands)
 Measured with `scripts/determinism.sh` (distinct fingerprints over 13 runs, 5 sequential +
-8 concurrent): `examples/polyglot-shop` 1, `examples/volontariapp-fixture` 1, the
-determinism fixture 2, Online Boutique 13, OpenTelemetry demo 13, Bank of Anthos 8.
+8 concurrent), **after** the step 1.2 fix above: `examples/polyglot-shop` 1,
+`examples/volontariapp-fixture` 1, the determinism fixture 2 (was 2), Bank of Anthos 3 (was 8,
+11/13 runs now agree), Online Boutique 13 (unchanged — this repo has no overlapping roots),
+OpenTelemetry demo 12 (was 13). The remaining variance has two other causes, fixed next:
 - Results depend on thread count and CPU load (15 ms wall-clock parse timeout) — P0 step 1.3.
 - Shuffling the file order, or simply re-running, changes the graph: import and RPC resolution
   keep the first candidate in `HashMap` order — P0 step 1.4.
-- A file under two overlapping roots is indexed once per root (18 duplicated nodes on the
-  fixture with roots `.` + `services/*`) — P0 step 1.2.
 - An incremental reload does not converge to a full rebuild, sequentially or with concurrent
   reloads — P0 steps 1.4 and 1.5.
 

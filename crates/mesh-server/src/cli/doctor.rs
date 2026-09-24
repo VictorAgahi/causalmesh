@@ -242,6 +242,34 @@ impl DoctorCommand {
                             }
                         }
                     }
+
+                    // 1d. Overlapping roots: `expand_roots` only dedupes identical
+                    // canonical paths, so an enclosing root and one of its own
+                    // subdirectories (e.g. `roots = [".", "./services/*"]`) can both
+                    // be configured. The indexer now resolves this deterministically
+                    // (the more specific root wins the overlapping files, see
+                    // `WorkspaceIndexer::crawl_all`), but the config itself is still
+                    // worth flagging: it means one of the roots is redundant.
+                    let mut overlaps: Vec<(String, String)> = Vec::new();
+                    for outer in &roots {
+                        for inner in &roots {
+                            if inner != outer && inner.starts_with(outer) {
+                                overlaps.push((
+                                    outer.display().to_string(),
+                                    inner.display().to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if overlaps.is_empty() {
+                        eprintln!("✔ Root overlap: {} root(s), none overlapping", roots.len());
+                    } else {
+                        for (outer, inner) in overlaps {
+                            eprintln!(
+                                "⚠ Root overlap: '{inner}' is inside '{outer}' — files under it are indexed only once, attributed to '{inner}' (the more specific root)."
+                            );
+                        }
+                    }
                 }
             }
         }

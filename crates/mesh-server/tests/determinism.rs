@@ -298,7 +298,6 @@ fn reconcile_is_idempotent() {
 // ── I4: one file, one set of facts ─────────────────────────────────────────
 
 #[test]
-#[ignore = "P0 step 1.2: a file under two overlapping roots is indexed once per root"]
 fn overlapping_roots_index_each_file_once() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let config = config(&[".", "./services/*"]);

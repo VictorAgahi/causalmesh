@@ -169,6 +169,14 @@ impl FilesystemCrawler {
         builder.max_depth(Some(max_depth.unwrap_or(10)));
         builder.git_ignore(true);
         builder.hidden(false); // Scan hidden folders like .github, .agents, but exclude .git
+                               // `ignore::WalkBuilder` otherwise yields directory entries in whatever order the
+                               // OS/filesystem returns them (readdir order, not guaranteed stable — ext4, APFS
+                               // and NTFS all differ, and even one filesystem can reorder entries after a rename).
+                               // Sorting by filename makes the crawl itself reproducible; `canonical_lines()`
+                               // downstream still doesn't depend on it, but every other consumer of this file
+                               // list (VFS diffing, doctor's dead-config reporting, the sequential parse retry
+                               // in `WorkspaceIndexer`) benefits from a stable, reviewable order.
+        builder.sort_by_file_name(std::ffi::OsStr::cmp);
 
         // Prune excluded directories at the walker level so `node_modules/` is never descended.
         let root_for_filter = root.to_path_buf();

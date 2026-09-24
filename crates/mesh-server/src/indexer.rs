@@ -459,7 +459,20 @@ impl WorkspaceIndexer {
         }
     }
 
-    /// Crawls all roots, tagging each file with the `RepoId` of its root.
+    /// Crawls all roots, tagging each file with the `RepoId` of its **most specific**
+    /// containing root — the deepest one, when roots nest (e.g. `roots = [".",
+    /// "./services/*"]`, the common `[workspace] roots = [..., "./x/*"]` shape `init
+    /// --auto` and hand-written configs both produce). `expand_roots` only dedupes
+    /// *identical* canonical paths, so an enclosing root and its own subdirectories can
+    /// both be configured roots; without this, every file under the more specific root
+    /// would be indexed twice, once per root, as two nodes with different `repo_id`s
+    /// that `canonical_lines()` cannot tell apart from a real duplicate declaration
+    /// (idempotence invariant I4).
+    ///
+    /// Implemented by excluding each nested root's subtree from every one of its
+    /// ancestors' crawls — one file, one crawl, one `RepoId` — rather than crawling
+    /// everything and deduplicating after the fact, which would double the I/O on any
+    /// workspace using this shape.
     pub fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
         if roots.len() > RepoId::MAX as usize {
             tracing::error!(
@@ -478,11 +491,14 @@ impl WorkspaceIndexer {
                 &config.workspace.mount_aliases,
             ) {
                 Ok(scope) => {
-                    let files = FilesystemCrawler::crawl_scope(
-                        &scope,
+                    let exclusions = Self::exclude_patterns_for_root(
                         &config.workspace.exclude_patterns,
-                        Some(SCAN_DEPTH),
+                        roots,
+                        root,
                     );
+                    let matcher = ExcludeMatcher::compile(&exclusions);
+                    let files =
+                        FilesystemCrawler::crawl_scope_with(&scope, &matcher, Some(SCAN_DEPTH));
                     out.extend(files.into_iter().map(|f| (repo_id, f)));
                 }
                 Err(e) => {
@@ -490,7 +506,39 @@ impl WorkspaceIndexer {
                 }
             }
         }
+        // Deterministic order regardless of `roots`' order or the OS's directory
+        // iteration order — `canonical_lines()` doesn't need it, but every other
+        // consumer of this list (the differential VFS, `doctor`'s dead-config
+        // reporting) benefits from a stable, reviewable file order.
+        out.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
         out
+    }
+
+    /// `exclude_patterns` plus one `<relative>/**` glob per *other* configured root
+    /// that is a strict descendant of `root` — so `root`'s own crawl never descends
+    /// into a subtree a more specific root already owns. `roots` must already be the
+    /// canonicalized, deduplicated list `expand_roots` produces (equal paths never
+    /// occur twice, so "strict descendant" is the only overlap `PathBuf` prefixing can
+    /// mean here).
+    fn exclude_patterns_for_root(
+        exclude_patterns: &[String],
+        roots: &[PathBuf],
+        root: &Path,
+    ) -> Vec<String> {
+        let mut patterns = exclude_patterns.to_vec();
+        for other in roots {
+            if other == root || !other.starts_with(root) {
+                continue;
+            }
+            let Ok(rel) = other.strip_prefix(root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            patterns.push(format!("{}/**", rel.to_string_lossy().replace('\\', "/")));
+        }
+        patterns
     }
 
     /// Reads, guards and extracts one file. Runs on the pool; touches no shared state.
@@ -856,5 +904,73 @@ resolve_placeholders = true
             1,
             "docs/** expanded from ${{workspace_root}}/docs/** should be indexed"
         );
+    }
+
+    /// A file under a root nested inside another configured root (the common
+    /// `roots = [".", "./services/*"]` shape) is indexed exactly once, attributed to
+    /// the more specific (nested) root — not to both.
+    #[test]
+    fn crawl_all_attributes_overlapping_files_to_the_most_specific_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(base.join("services/billing")).expect("mkdir");
+        std::fs::write(base.join("services/billing/Widget.java"), "class Widget {}")
+            .expect("write");
+        std::fs::write(base.join("README.md"), "# root file").expect("write");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\", \"./services/*\"]\n",
+        )
+        .expect("config");
+        let roots = vec![base.clone(), base.join("services/billing")];
+
+        let files = WorkspaceIndexer::crawl_all(&cfg, &roots);
+        let widget_hits: Vec<RepoId> = files
+            .iter()
+            .filter(|(_, p)| p.ends_with("Widget.java"))
+            .map(|(repo_id, _)| *repo_id)
+            .collect();
+        assert_eq!(
+            widget_hits,
+            vec![1],
+            "Widget.java must be crawled exactly once, attributed to the more specific \
+             root (repo_id 1 = services/billing), got: {widget_hits:?}"
+        );
+
+        let readme_hits = files
+            .iter()
+            .filter(|(_, p)| p.ends_with("README.md"))
+            .count();
+        assert_eq!(
+            readme_hits, 1,
+            "README.md (only under the enclosing root) must still be crawled once"
+        );
+    }
+
+    /// `exclude_patterns_for_root` must add a `<relative>/**` exclusion for every
+    /// strict descendant root and nothing for a disjoint or non-nested one.
+    #[test]
+    fn exclude_patterns_for_root_only_excludes_strict_descendants() {
+        let base = PathBuf::from("/ws");
+        let roots = vec![
+            base.clone(),
+            base.join("services/billing"),
+            base.join("services/checkout"),
+            PathBuf::from("/other/ws"),
+        ];
+        let patterns =
+            WorkspaceIndexer::exclude_patterns_for_root(&["**/*.pem".to_string()], &roots, &base);
+        assert_eq!(
+            patterns,
+            vec![
+                "**/*.pem".to_string(),
+                "services/billing/**".to_string(),
+                "services/checkout/**".to_string(),
+            ]
+        );
+
+        // The most specific root has no descendants to exclude among its siblings.
+        let nested = WorkspaceIndexer::exclude_patterns_for_root(&[], &roots, &roots[1]);
+        assert!(nested.is_empty());
     }
 }

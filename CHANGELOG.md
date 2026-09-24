@@ -5,6 +5,90 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [3.0.3] — Unreleased
+
+Fixes found and verified while benchmarking `mesh-mcp` against real-world repositories,
+including large single-language repos (linux, rust-lang, vscode, grpc) and real polyglot
+microservice monorepos (Google's "Online Boutique" — 11 services, 7 languages, real gRPC
+wiring). Every item below was confirmed against actual source (file:line), not inferred
+from behavior alone, and each has a regression test reproducing the original failure —
+including an end-to-end run against the real Online Boutique clone, not just synthetic
+fixtures.
+
+### Fixed
+- **Crash**: `mesh-mcp` could abort the whole server process with a native stack overflow
+  while indexing a repository containing files with very deep expression/call-chain
+  nesting (reproduced on `rust-lang/rust`). `AstDecapitator::collect_body_replacements`
+  (`crates/mesh-parsers/src/decapitate.rs`) now carries a `depth` parameter capped at
+  `AstGuard::MAX_NESTING_DEPTH`, independent of `AstGuard`'s pre-parse lexical bracket
+  count (which is only a proxy for real CST depth and can be passed by files whose actual
+  parse tree is still hundreds of levels deep). The same unbounded-recursion pattern was
+  present in all 12 language extractors' own AST walkers and has been closed in each.
+
+- **`init --auto` silently dropped detected project roots**: `go.mod`, `pom.xml` /
+  `build.gradle`, and `pyproject.toml` / `requirements.txt` detection printed a message
+  but never added a root, so `smart_search` and every other tool saw none of that
+  project's source unless another marker (commonly `docs/`) happened to populate `roots`
+  first. Every detection block in `crates/mesh-server/src/cli/init.rs` now pushes a root
+  it detects, and duplicate whole-repo roots are deduplicated before being written out.
+
+- **`init --auto` missed nested per-service language markers entirely**: on a real
+  polyglot microservices monorepo where each service's manifest lives one level under a
+  container directory (`src/checkoutservice/go.mod`, `src/emailservice/pyproject.toml`,
+  ...) rather than at the repo root, no marker check ever fired and the generated config
+  indexed nothing but `docs/`. `init --auto` now detects a `src/`/`apps/` container
+  holding 2+ per-service language markers and roots the whole container as a glob
+  (`./src/*`), the same way the existing `services/`/`packages/` detection already does.
+  Confirmed on Online Boutique: went from indexing 0 of 11 services to all 11,
+  auto-detected, no manual config editing.
+
+- **`find_dependents` returned false negatives for real cross-service dependencies**:
+  three compounding gaps, all closed together since they're on the same code path
+  (`ContractGraph::find_dependents`, `crates/mesh-core/src/contracts.rs`):
+  - Querying by a declared symbol's own name (the tool's own schema example —
+    `"Target contract name (ex: 'UserAuthRequest')"`) silently returned nothing, because
+    the underlying lookup only matched literal import-path/package strings. Now bridges a
+    symbol-name query through `name_to_nodes`/`fqcn_to_node` to the declaring node's own
+    package before falling back further.
+  - A real cross-service gRPC caller (e.g. a Go client constructing
+    `pb.NewFooServiceClient(conn)`) is linked by a graph edge (`CallsRpc`), not an import
+    string at all — no file anywhere imports anything literally named after the service.
+    `find_dependents` now also walks `CallsRpc`/`Implements` edges targeting the resolved
+    symbol (or any node in its package) and returns their callers.
+  - The unscoped substring fallback flattened results across unrelated services that
+    happen to reuse the same locally-aliased package name (every service in a monorepo
+    vendoring its own `genproto`, for instance) into one undifferentiated list. Results
+    are now labeled with the root/service they were crawled from
+    (`crates/mesh-server/src/tools/find_dependents.rs`) and rendered grouped by that
+    label instead of flattened.
+  - Confirmed end-to-end on Online Boutique: `find_dependents("CheckoutService")` went
+    from 0 (false negative) to correctly resolving `frontend`'s real caller.
+
+- **The Go extractor never recorded gRPC client-call sites at all**
+  (`crates/mesh-parsers/src/languages/go.rs`): a `pb.NewFooServiceClient(conn)`
+  construction — the standard `protoc-gen-go-grpc` client constructor — was not
+  recognized, so no `CallsRpc` edge could ever exist for a Go caller, independent of the
+  `find_dependents` fixes above. Now detected symmetrically with the existing
+  `RegisterFooServiceServer` server-side detection, attributed to its smallest enclosing
+  declaration, and fed into `ContractGraph::add_rpc_call`.
+  `ContractGraph::reconcile_edges`'s `CallsRpc` matching also now indexes every declared
+  `GrpcService` node by name (not just proto-file `GrpcMethod` nodes), and
+  `analyze_grpc`'s edge resolution no longer requires a `.proto` file to be indexed at
+  all — a language's own service-implementation node is a sufficient anchor. Confirmed on
+  Online Boutique: `analyze_grpc("CheckoutService")`'s "Client Stubs" went from 0 to
+  correctly listing `frontend`'s real caller, with zero `.proto` files in scope.
+
+- **`analyze_grpc` reported false-positive server handlers on generated gRPC stub
+  files**: the Python extractor tagged *any* class ending in `Servicer` as a declared
+  `GrpcService`, including the shared base class inside a `grpc_tools.protoc`-generated
+  `*_pb2_grpc.py` file — vendored identically into every service, whether or not that
+  service actually implements it. `crates/mesh-parsers/src/languages/python.rs` no longer
+  tags a `*Servicer` class found in a `*_pb2_grpc.py` file. Separately, `analyze_grpc` no
+  longer buckets a heuristic (non-exact) name match into `server_handlers`/`client_stubs`
+  by a bare `path.contains("service")` check — every service directory in a typical
+  microservices repo satisfies that trivially. Only an exact-name match, or a real
+  `Implements`/`CallsRpc` graph edge, places a node in either bucket now.
+
 ## [3.0.2] - 2026-09-23
 
 ### Fixed

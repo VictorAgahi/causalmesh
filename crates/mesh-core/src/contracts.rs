@@ -597,6 +597,17 @@ impl ContractGraph {
 
         // 5. Reconcile RPC Client Calls (CallsRpc) — proto methods indexed by
         // lowercase full and bare name; first declaration wins, as before.
+        //
+        // Also indexed here: every declared `GrpcService` node, proto-anchored
+        // or not. A client-side call site (e.g. Go's `pb.NewFooServiceClient(conn)`
+        // construction) records the *service* it talks to, not a specific proto
+        // method FQCN — there is no proto method to name at that call site, only
+        // the service. Matching directly against the service's own name (its
+        // .proto declaration when indexed, or a language extractor's own
+        // service-implementation node — e.g. Go's `RegisterFooServiceServer`-
+        // detected node — when it isn't) is what lets `find_dependents`/
+        // `analyze_grpc` resolve a real cross-service caller even when the
+        // repo's `.proto` sources aren't in `roots` at all.
         let mut proto_by_name: HashMap<String, NodeId> =
             HashMap::with_capacity(proto_methods.len() * 2);
         for (id, name) in &proto_methods {
@@ -605,6 +616,13 @@ impl ContractGraph {
                 .or_insert(*id);
             if let Some(bare) = name.split('.').next_back() {
                 proto_by_name.entry(bare.to_lowercase()).or_insert(*id);
+            }
+        }
+        for node in self.nodes.values() {
+            if node.kind == NodeKind::GrpcService {
+                proto_by_name
+                    .entry(node.name.as_str().to_lowercase())
+                    .or_insert(node.id);
             }
         }
 
@@ -644,12 +662,17 @@ impl ContractGraph {
         path.extension().is_some_and(|e| e == "proto")
     }
 
-    /// O(1) in-memory reverse dependency resolution
+    /// O(1) in-memory reverse dependency resolution. `target` may be either a
+    /// literal import-path/package identifier (as it appears in another
+    /// file's `import`/`use` statement) or a declared contract symbol name
+    /// (e.g. a `GrpcService`'s name) — the latter is bridged to the package(s)
+    /// it's declared in before falling back to a raw substring scan.
     pub fn find_dependents(&self, target: &str) -> Vec<&ContractNode> {
         let mut result = Vec::new();
         let target_key = CompactStr::new(target);
 
-        // 1. Direct match in reverse_deps
+        // 1. Direct match in reverse_deps: `target` is itself the literal
+        // import-path/package string other files reference.
         if let Some(node_ids) = self.reverse_deps.get(&target_key) {
             for &id in node_ids {
                 if let Some(node) = self.nodes.get(&id) {
@@ -658,7 +681,87 @@ impl ContractGraph {
             }
         }
 
-        // 2. Fallback: package-level matches
+        // 2. Symbol bridge: `target` may instead be a declared contract name
+        // (what the tool's own schema example — "Target contract name (ex:
+        // 'UserAuthRequest')" — invites callers to pass) rather than the raw
+        // import string. Resolve it to its declaring node(s)' own package
+        // identity, then re-query reverse_deps with THAT — a declaring node
+        // always knows its own package even when nothing calls it by that
+        // exact literal string anywhere else.
+        if result.is_empty() {
+            let mut seen_packages: HashSet<&CompactStr> = HashSet::new();
+            let declaring_ids = self
+                .name_to_nodes
+                .get(&target_key)
+                .into_iter()
+                .flatten()
+                .chain(self.fqcn_to_node.get(&target_key).into_iter().flatten());
+            for &id in declaring_ids {
+                let Some(node) = self.nodes.get(&id) else {
+                    continue;
+                };
+                if node.package.is_empty() || !seen_packages.insert(&node.package) {
+                    continue;
+                }
+                if let Some(node_ids) = self.reverse_deps.get(&node.package) {
+                    for &dep_id in node_ids {
+                        if let Some(dep_node) = self.nodes.get(&dep_id) {
+                            result.push(dep_node);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Graph-edge bridge: a cross-service RPC caller is linked by a
+        // real `CallsRpc`/`Implements` edge (built in `reconcile_edges`), not
+        // by an import string at all — a Go client, for instance, constructs
+        // `pb.NewFooServiceClient(conn)` and never imports anything literally
+        // named "FooService". Resolve `target` to its declaring node(s) (the
+        // service itself, plus every other node declared in the same
+        // package — covers a proto method node living alongside its service),
+        // then collect the `from` side of any edge pointing at one of them.
+        if result.is_empty() {
+            let mut edge_targets: HashSet<NodeId> = HashSet::new();
+            let declaring_ids = self
+                .name_to_nodes
+                .get(&target_key)
+                .into_iter()
+                .flatten()
+                .chain(self.fqcn_to_node.get(&target_key).into_iter().flatten());
+            for &id in declaring_ids {
+                edge_targets.insert(id);
+                if let Some(node) = self.nodes.get(&id) {
+                    if !node.package.is_empty() {
+                        if let Some(sibling_ids) = self.package_to_nodes.get(&node.package) {
+                            edge_targets.extend(sibling_ids.iter().copied());
+                        }
+                    }
+                }
+            }
+            let mut seen_ids: HashSet<NodeId> = HashSet::new();
+            for edge in &self.edges {
+                if !matches!(edge.kind, EdgeKind::CallsRpc | EdgeKind::Implements) {
+                    continue;
+                }
+                if !edge_targets.contains(&edge.to) {
+                    continue;
+                }
+                if let Some(caller) = self.nodes.get(&edge.from) {
+                    if seen_ids.insert(caller.id) {
+                        result.push(caller);
+                    }
+                }
+            }
+        }
+
+        // 3. Last-resort fallback: unscoped substring match across every
+        // recorded dependency string. Can span multiple, unrelated services
+        // that happen to share a locally-aliased package name (e.g. every
+        // service in a polyglot monorepo vendoring its own `genproto`
+        // package) — callers should group results by `ContractNode::repo_id`
+        // before presenting this to a human/agent rather than treat it as a
+        // single flat, disambiguated answer.
         if result.is_empty() {
             for (pkg, node_ids) in &self.reverse_deps {
                 if pkg.contains(target) {
@@ -678,6 +781,14 @@ impl ContractGraph {
     pub fn analyze_grpc(&self, target: &str) -> GrpcTrace<'_> {
         let norm_target = target.trim();
         let mut proto_definition = None;
+        // Falls back to the exact-name-matched service/method node itself
+        // when no `.proto` declaration is indexed (e.g. `proto_dirs` isn't
+        // configured, or the workspace root simply wasn't crawled) — a
+        // language's own service-implementation node (Go's
+        // `RegisterFooServiceServer`-detected node, TS's `@GrpcService`
+        // class, ...) is a perfectly good anchor for resolving callers via
+        // `CallsRpc`/`Implements` edges too.
+        let mut exact_match: Option<&ContractNode> = None;
         let mut client_stubs: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
         let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
@@ -703,23 +814,43 @@ impl ContractGraph {
                 EdgeConfidence::Heuristic
             };
 
+            if exact_name {
+                exact_match = Some(node);
+            }
+
             let path_str = node.file_path.to_string_lossy();
             if Self::is_proto_file(&node.file_path) {
                 proto_definition = Some(node);
-            } else if path_str.contains("controller")
-                || path_str.contains("handler")
-                || path_str.contains("service")
-            {
-                server_handlers.push((node, confidence));
-            } else {
-                client_stubs.push((node, confidence));
+            } else if exact_name {
+                // Exact-name match: this node IS the target by construction,
+                // so a same-pass path-substring guess (client vs. server) is
+                // reasonable. A directory/file merely *containing* "service"
+                // is otherwise weak evidence — every service directory in a
+                // typical microservices repo matches it (confirmed false
+                // positive: a shared generated `*_pb2_grpc.py` stub vendored
+                // into unrelated services, matched only via a substring hit
+                // inside its own class name, e.g. "CheckoutServiceServicer"
+                // containing "CheckoutService" — not by being an exact name
+                // or a real `Implements` relationship). Non-exact (heuristic)
+                // matches are only surfaced below, gated on an actual
+                // `Implements`/`CallsRpc` graph edge to the proto definition.
+                if path_str.contains("controller")
+                    || path_str.contains("handler")
+                    || path_str.contains("service")
+                {
+                    server_handlers.push((node, confidence));
+                } else {
+                    client_stubs.push((node, confidence));
+                }
             }
         }
 
-        // If a formal proto definition is identified, resolve implementors and callers via graph edges
-        if let Some(proto) = proto_definition {
+        // Resolve implementors and callers via graph edges, anchored on the
+        // formal proto definition when one is indexed, falling back to the
+        // exact-name service/method node itself otherwise.
+        if let Some(anchor) = proto_definition.or(exact_match) {
             for edge in &self.edges {
-                if edge.to != proto.id {
+                if edge.to != anchor.id {
                     continue;
                 }
                 match edge.kind {
@@ -961,6 +1092,259 @@ mod tests {
         assert_eq!(
             trace.proto_definition.unwrap().name.as_str(),
             "AuthenticateUser"
+        );
+    }
+
+    /// Regression test for the Online Boutique benchmark finding: a node
+    /// that only matches the target via a *substring hit inside its own
+    /// name* (e.g. "CheckoutServiceServicer" containing "CheckoutService"),
+    /// with no exact-name match and no real `Implements` edge to a proto
+    /// definition, must not be bucketed into `server_handlers` just because
+    /// its path happens to contain "service" — every service directory in a
+    /// typical microservices repo satisfies that trivially.
+    #[test]
+    fn analyze_grpc_does_not_bucket_heuristic_name_matches_by_path_alone() {
+        let mut graph = ContractGraph::new();
+        let vendored_stub = ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutServiceServicer"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("src/emailservice/demo_pb2_grpc.py").into(),
+            line_start: 709,
+            line_end: 715,
+            package: CompactStr::new("emailservice"),
+            repo_id: 2,
+            signature: None,
+            docstring: None,
+        };
+        graph.add_node(vendored_stub);
+
+        let trace = graph.analyze_grpc("CheckoutService");
+        assert!(
+            trace
+                .server_handlers
+                .iter()
+                .all(|(h, _)| h.name.as_str() != "CheckoutServiceServicer"),
+            "a heuristic substring-only name match with no exact match and \
+             no Implements edge must not appear as a server handler, got: {:?}",
+            trace.server_handlers
+        );
+    }
+
+    /// Regression test: `analyze_grpc`'s client/server edge resolution must
+    /// not require a `.proto` file to be indexed at all — a language's own
+    /// exact-name service node (e.g. Go's `RegisterFooServiceServer`-detected
+    /// node) is a perfectly good anchor for a real `CallsRpc` edge.
+    #[test]
+    fn analyze_grpc_resolves_client_stubs_via_edge_without_a_proto_file() {
+        let mut graph = ContractGraph::new();
+
+        let service_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("src/checkoutservice/main.go").into(),
+            line_start: 142,
+            line_end: 142,
+            package: CompactStr::new("checkoutservice"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let service_id = graph.add_node(service_node);
+
+        let caller_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("placeOrderHandler"),
+            kind: NodeKind::HttpEndpoint,
+            file_path: Path::new("src/frontend/handlers.go").into(),
+            line_start: 320,
+            line_end: 401,
+            package: CompactStr::new("frontend"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        };
+        let caller_id = graph.add_node(caller_node);
+        graph.add_rpc_call(caller_id, "CheckoutService");
+        graph.reconcile_edges();
+
+        let trace = graph.analyze_grpc("CheckoutService");
+        assert!(trace.proto_definition.is_none());
+        assert_eq!(
+            trace
+                .server_handlers
+                .iter()
+                .find(|(h, _)| h.id == service_id)
+                .map(|_| ()),
+            Some(()),
+            "the service node itself must still be its own server handler entry"
+        );
+        assert!(
+            trace
+                .client_stubs
+                .iter()
+                .any(|(c, _)| c.name.as_str() == "placeOrderHandler"),
+            "expected the real CallsRpc caller to appear in client_stubs even \
+             with no .proto file indexed, got: {:?}",
+            trace.client_stubs
+        );
+    }
+
+    /// Regression test for the full Online Boutique benchmark scenario:
+    /// `frontend`'s handler constructs `pb.NewCheckoutServiceClient(conn)` and
+    /// calls it — no file anywhere imports a package literally named
+    /// "CheckoutService", so this can only be resolved through a real
+    /// `CallsRpc` graph edge (built by `reconcile_edges` from the raw
+    /// `add_rpc_call` signal), not through `reverse_deps` at all. Exercises
+    /// the actual end-to-end path: `add_rpc_call` -> `reconcile_edges` ->
+    /// `find_dependents`.
+    #[test]
+    fn find_dependents_resolves_a_real_cross_service_grpc_caller_via_reconcile_edges() {
+        let mut graph = ContractGraph::new();
+
+        let service_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("src/checkoutservice/main.go").into(),
+            line_start: 142,
+            line_end: 142,
+            package: CompactStr::new("checkoutservice"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        graph.add_node(service_node);
+
+        let caller_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("placeOrderHandler"),
+            kind: NodeKind::HttpEndpoint,
+            file_path: Path::new("src/frontend/handlers.go").into(),
+            line_start: 320,
+            line_end: 401,
+            package: CompactStr::new("frontend"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        };
+        let caller_id = graph.add_node(caller_node);
+
+        // The raw signal a language extractor records at a
+        // `pb.NewCheckoutServiceClient(conn)` call site — no import-path
+        // relationship involved at all.
+        graph.add_rpc_call(caller_id, "CheckoutService");
+        graph.reconcile_edges();
+
+        let dependents = graph.find_dependents("CheckoutService");
+        assert_eq!(
+            dependents.len(),
+            1,
+            "a real CallsRpc-edge caller must resolve even though no file \
+             imports anything named 'CheckoutService', got: {dependents:?}"
+        );
+        assert_eq!(dependents[0].name.as_str(), "placeOrderHandler");
+    }
+
+    /// Regression test for querying `find_dependents` by a declared symbol's
+    /// own name (a GrpcService, the exact shape the tool's own schema
+    /// example invites — "Target contract name (ex: 'UserAuthRequest')")
+    /// which must not silently return nothing just because no other file
+    /// happens to reference that literal string — `frontend` depends on
+    /// `checkoutservice`'s *package*, not on the string "CheckoutService".
+    #[test]
+    fn find_dependents_resolves_by_declared_symbol_name() {
+        let mut graph = ContractGraph::new();
+        let service_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("src/checkoutservice/main.go").into(),
+            line_start: 142,
+            line_end: 142,
+            package: CompactStr::new("checkoutservice"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        graph.add_node(service_node);
+
+        let caller_node = ContractNode {
+            id: 0,
+            name: CompactStr::new("placeOrderHandler"),
+            kind: NodeKind::HttpEndpoint,
+            file_path: Path::new("src/frontend/handlers.go").into(),
+            line_start: 320,
+            line_end: 401,
+            package: CompactStr::new("frontend"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        };
+        let caller_id = graph.add_node(caller_node);
+        // The caller's recorded dependency is on the *package*, never the
+        // literal gRPC service name.
+        graph.add_dependency(caller_id, "checkoutservice");
+
+        let dependents = graph.find_dependents("CheckoutService");
+        assert_eq!(
+            dependents.len(),
+            1,
+            "querying by the declared symbol name must resolve via its \
+             package, not return an empty (false-negative) result"
+        );
+        assert_eq!(dependents[0].name.as_str(), "placeOrderHandler");
+    }
+
+    /// Regression test for the second half of the same finding: once results
+    /// span multiple services that happen to share a locally-aliased package
+    /// name (every service vendoring its own `genproto`), each result still
+    /// carries enough info (`repo_id`) for a caller to group/disambiguate
+    /// them, rather than a single flattened, unscoped list.
+    #[test]
+    fn find_dependents_substring_fallback_preserves_repo_id_for_grouping() {
+        let mut graph = ContractGraph::new();
+
+        let svc_a_caller = ContractNode {
+            id: 0,
+            name: CompactStr::new("loadCatalog"),
+            kind: NodeKind::ServiceClass,
+            file_path: Path::new("src/productcatalogservice/catalog_loader.go").into(),
+            line_start: 33,
+            line_end: 42,
+            package: CompactStr::new("productcatalogservice"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let a_id = graph.add_node(svc_a_caller);
+        graph.add_dependency(a_id, "genproto");
+
+        let svc_b_caller = ContractNode {
+            id: 0,
+            name: CompactStr::new("placeOrderHandler"),
+            kind: NodeKind::HttpEndpoint,
+            file_path: Path::new("src/frontend/handlers.go").into(),
+            line_start: 320,
+            line_end: 401,
+            package: CompactStr::new("frontend"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        };
+        let b_id = graph.add_node(svc_b_caller);
+        graph.add_dependency(b_id, "genproto");
+
+        let dependents = graph.find_dependents("genproto");
+        assert_eq!(dependents.len(), 2);
+        let repo_ids: HashSet<RepoId> = dependents.iter().map(|n| n.repo_id).collect();
+        assert_eq!(
+            repo_ids.len(),
+            2,
+            "results from unrelated services sharing a locally-aliased \
+             package name must retain distinct repo_id so a caller can \
+             group them instead of treating this as one disambiguated match"
         );
     }
 

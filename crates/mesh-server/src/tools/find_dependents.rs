@@ -22,7 +22,7 @@ pub struct FindDependentsTool;
 
 impl McpTool for FindDependentsTool {
     const NAME: &'static str = "find_dependents";
-    const DESCRIPTION: &'static str = "Resolves in-memory O(1) reverse dependency graph across packages and shared modules. DO NOT USE to search freeform text or method signatures (use smart_search).";
+    const DESCRIPTION: &'static str = "Resolves in-memory O(1) reverse dependency graph across packages, shared modules, gRPC services, and event streams. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
     type Args = FindDependentsArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -50,9 +50,23 @@ impl McpTool for FindDependentsTool {
         let dependents = snapshot
             .contract_graph
             .find_dependents(args.target.as_str());
+        // Label each result with the root it was crawled from so the
+        // formatter can group same-named packages from unrelated services
+        // apart instead of flattening them into one undifferentiated list.
+        let labeled: Vec<(&_, String)> = dependents
+            .into_iter()
+            .map(|node| {
+                let label = state
+                    .allowed_roots
+                    .get(node.repo_id as usize)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown root)".to_string());
+                (node, label)
+            })
+            .collect();
         Ok(ToolOutput::text(MarkdownFormatter::format_dependents(
             args.target.as_str(),
-            &dependents,
+            &labeled,
         )))
     }
 }

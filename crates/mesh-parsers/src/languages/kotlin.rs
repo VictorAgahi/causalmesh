@@ -35,6 +35,7 @@ impl KotlinExtractor {
             repo_id,
             &mut package_name,
             &mut nodes,
+            0,
         );
         nodes
     }
@@ -52,7 +53,12 @@ impl KotlinExtractor {
         repo_id: RepoId,
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "package_header" => {
                 let mut cursor = node.walk();
@@ -168,7 +174,15 @@ impl KotlinExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, file_path, repo_id, package_name, nodes);
+            Self::visit_node(
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                nodes,
+                depth + 1,
+            );
         }
     }
 

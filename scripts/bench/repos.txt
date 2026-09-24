@@ -1,0 +1,16 @@
+# name  url  depth  notes
+# One line per repo: <name> <git-url> <shallow-depth>
+# Picked for a mix of: real microservice/monorepo layout (init --auto
+# actually finds roots) vs raw single-language stress (AstGuard/IOPS only).
+
+# --- structured monorepos (init --auto should find services/*, packages/*, proto, etc.) ---
+grpc            https://github.com/grpc/grpc.git                 1
+googleapis      https://github.com/googleapis/googleapis.git     1
+kubernetes      https://github.com/kubernetes/kubernetes.git     1
+deno            https://github.com/denoland/deno.git             1
+
+# --- raw single-language stress tests (falls back to root ".") ---
+linux           https://github.com/torvalds/linux.git            1
+rust-lang       https://github.com/rust-lang/rust.git             1
+vscode          https://github.com/microsoft/vscode.git           1
+react           https://github.com/facebook/react.git             1

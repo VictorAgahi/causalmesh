@@ -22,6 +22,13 @@ pub struct GoRelations {
     pub dependencies: Vec<(usize, CompactStr)>,
     pub producers: Vec<(usize, CompactStr)>,
     pub consumers: Vec<(usize, CompactStr)>,
+    /// `(caller node index, target RPC service name)` — the generic gRPC
+    /// client-call detection (item 5, client side): a `pb.NewFooServiceClient(conn)`
+    /// call site, attributed to its smallest enclosing declaration. Feeds
+    /// `ContractGraph::add_rpc_call` -> `reconcile_edges`'s `CallsRpc` edges,
+    /// which is what lets `find_dependents`/`analyze_grpc` resolve a real
+    /// cross-service caller instead of only a package-string match.
+    pub rpc_calls: Vec<(usize, CompactStr)>,
 }
 
 /// A raw `import_spec`, resolved to the identifier a Go source file would use to
@@ -40,6 +47,16 @@ struct RawEvent {
     line_end: usize,
     topic: CompactStr,
     is_producer: bool,
+}
+
+/// A raw gRPC client-call signal: `pb.NewFooServiceClient(conn)`, found at
+/// `(line_start, line_end)`, targeting service `FooService`. Resolved to its
+/// smallest enclosing declaration the same way a `RawEvent` is — see
+/// `resolve_rpc_calls`.
+struct RawRpcCall {
+    line_start: usize,
+    line_end: usize,
+    service_name: CompactStr,
 }
 
 impl GoExtractor {
@@ -80,10 +97,11 @@ impl GoExtractor {
         // `RegisterXServer(registrar, srv)` call, so method declarations on that
         // type can be classified as `GrpcMethod` rather than plain `ServiceClass`.
         let mut grpc_server_types: HashSet<String> = HashSet::new();
-        Self::collect_grpc_server_types(root, source_bytes, &mut grpc_server_types);
+        Self::collect_grpc_server_types(root, source_bytes, &mut grpc_server_types, 0);
 
         let mut raw_imports: Vec<RawImport> = Vec::new();
         let mut raw_events: Vec<RawEvent> = Vec::new();
+        let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
 
         Self::visit_node(
             root,
@@ -95,6 +113,8 @@ impl GoExtractor {
             &grpc_server_types,
             &mut raw_imports,
             &mut raw_events,
+            &mut raw_rpc_calls,
+            0,
         );
 
         Self::resolve_dependencies(content, &nodes, &raw_imports, &mut relations.dependencies);
@@ -106,6 +126,7 @@ impl GoExtractor {
             &package_name,
             &mut relations,
         );
+        Self::resolve_rpc_calls(&nodes, raw_rpc_calls, &mut relations);
 
         (nodes, relations)
     }
@@ -121,7 +142,13 @@ impl GoExtractor {
         grpc_server_types: &HashSet<String>,
         raw_imports: &mut Vec<RawImport>,
         raw_events: &mut Vec<RawEvent>,
+        raw_rpc_calls: &mut Vec<RawRpcCall>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "package_clause" => {
                 if let Ok(text) = node.utf8_text(source) {
@@ -209,6 +236,7 @@ impl GoExtractor {
                     package_name,
                     nodes,
                     raw_events,
+                    raw_rpc_calls,
                 );
             }
             "composite_literal" => {
@@ -229,6 +257,8 @@ impl GoExtractor {
                 grpc_server_types,
                 raw_imports,
                 raw_events,
+                raw_rpc_calls,
+                depth + 1,
             );
         }
     }
@@ -334,6 +364,7 @@ impl GoExtractor {
         package_name: &CompactStr,
         nodes: &mut Vec<ContractNode>,
         raw_events: &mut Vec<RawEvent>,
+        raw_rpc_calls: &mut Vec<RawRpcCall>,
     ) {
         let Some(func) = node.child_by_field_name("function") else {
             return;
@@ -347,6 +378,23 @@ impl GoExtractor {
         let Ok(method) = field.utf8_text(source) else {
             return;
         };
+
+        // gRPC client construction: `pb.NewFooServiceClient(conn)` — the
+        // standard `protoc-gen-go-grpc` client constructor, symmetric with
+        // the `RegisterFooServiceServer` server-side detection right below.
+        // Recorded here (raw, line-range only) and attributed to its smallest
+        // enclosing declaration in `resolve_rpc_calls`, the same two-pass
+        // shape already used for Kafka producer/consumer detection above.
+        if method.starts_with("New") && method.ends_with("Client") {
+            let service_name = &method["New".len()..method.len() - "Client".len()];
+            if !service_name.is_empty() {
+                raw_rpc_calls.push(RawRpcCall {
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    service_name: CompactStr::new(service_name),
+                });
+            }
+        }
 
         // gRPC server registration: `pb.RegisterFooServiceServer(grpcServer, srv)`.
         if method.starts_with("Register") && method.ends_with("Server") {
@@ -421,7 +469,7 @@ impl GoExtractor {
         if is_producer_call || is_consumer_call {
             let mut literals = Vec::new();
             if let Some(args) = node.child_by_field_name("arguments") {
-                Self::collect_string_literals(args, source, &mut literals);
+                Self::collect_string_literals(args, source, &mut literals, 0);
             }
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
@@ -508,7 +556,7 @@ impl GoExtractor {
 
     fn extract_topic_value_text(value: Node, source: &[u8]) -> Option<CompactStr> {
         let mut literals = Vec::new();
-        Self::collect_string_literals(value, source, &mut literals);
+        Self::collect_string_literals(value, source, &mut literals, 0);
         if let Some(first) = literals.into_iter().next() {
             return Some(CompactStr::new(first.as_str()));
         }
@@ -520,7 +568,10 @@ impl GoExtractor {
             .map(|t| CompactStr::new(t.trim_start_matches('&').trim()))
     }
 
-    fn collect_string_literals(node: Node, source: &[u8], out: &mut Vec<String>) {
+    fn collect_string_literals(node: Node, source: &[u8], out: &mut Vec<String>, depth: usize) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         if node.kind() == "interpreted_string_literal" {
             if let Ok(text) = node.utf8_text(source) {
                 let unquoted = text.trim_matches('"');
@@ -532,7 +583,7 @@ impl GoExtractor {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_string_literals(child, source, out);
+            Self::collect_string_literals(child, source, out, depth + 1);
         }
     }
 
@@ -595,9 +646,41 @@ impl GoExtractor {
         }
     }
 
+    /// Attaches each raw `New<Service>Client(...)` call to its smallest
+    /// enclosing declaration, mirroring `resolve_events` above — but unlike a
+    /// producer/consumer signal, a call site with no enclosing declaration
+    /// (e.g. a package-level `var` initializer) has no sensible caller to
+    /// attribute a `CallsRpc` edge to, so it is simply dropped rather than
+    /// given a synthetic node.
+    fn resolve_rpc_calls(
+        nodes: &[ContractNode],
+        raw_rpc_calls: Vec<RawRpcCall>,
+        relations: &mut GoRelations,
+    ) {
+        for call in raw_rpc_calls {
+            let enclosing = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.line_start <= call.line_start && n.line_end >= call.line_end)
+                .min_by_key(|(_, n)| n.line_end - n.line_start);
+
+            if let Some((idx, _)) = enclosing {
+                relations.rpc_calls.push((idx, call.service_name));
+            }
+        }
+    }
+
     // -- Item 5: gRPC registration ------------------------------------------
 
-    fn collect_grpc_server_types(node: Node, source: &[u8], out: &mut HashSet<String>) {
+    fn collect_grpc_server_types(
+        node: Node,
+        source: &[u8],
+        out: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         if node.kind() == "call_expression" {
             if let Some(func) = node.child_by_field_name("function") {
                 if func.kind() == "selector_expression" {
@@ -621,7 +704,7 @@ impl GoExtractor {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_grpc_server_types(child, source, out);
+            Self::collect_grpc_server_types(child, source, out, depth + 1);
         }
     }
 
@@ -929,6 +1012,42 @@ func main() {
                 .iter()
                 .any(|n| n.kind == NodeKind::GrpcMethod && n.name == "GetUser"),
             "expected GetUser to be classified as GrpcMethod, got: {nodes:?}"
+        );
+    }
+
+    /// Regression test for the Online Boutique benchmark finding: a
+    /// `pb.NewFooServiceClient(conn)` call site (the standard
+    /// `protoc-gen-go-grpc` client constructor — e.g. `frontend` calling
+    /// `checkoutservice`) must be recorded as an RPC call attributed to its
+    /// enclosing function, so `ContractGraph::reconcile_edges` can build a
+    /// real `CallsRpc` edge and `find_dependents`/`analyze_grpc` stop
+    /// returning a false negative for a real cross-service caller.
+    #[test]
+    fn grpc_client_construction_is_recorded_as_an_rpc_call() {
+        let code = r#"
+package main
+
+func (fe *frontendServer) placeOrder(w http.ResponseWriter, r *http.Request) {
+    client := pb.NewCheckoutServiceClient(fe.checkoutSvcConn)
+    client.PlaceOrder(ctx, req)
+}
+"#;
+        let mut p = parser();
+        let (nodes, relations) =
+            GoExtractor::extract_with_relations(Path::new("handlers.go"), code, 1, &mut p);
+
+        let caller_idx = nodes
+            .iter()
+            .position(|n| n.name == "placeOrder")
+            .expect("enclosing function node present");
+
+        assert!(
+            relations
+                .rpc_calls
+                .iter()
+                .any(|(idx, target)| *idx == caller_idx && target.as_str() == "CheckoutService"),
+            "expected an rpc_calls entry attributing CheckoutService to placeOrder, got: {:?}",
+            relations.rpc_calls
         );
     }
 

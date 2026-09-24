@@ -61,6 +61,7 @@ impl JavaExtractor {
             &mut package_name,
             &mut nodes,
             &mut producers,
+            0,
         );
 
         let imports = Self::collect_imports(root, source_bytes);
@@ -91,11 +92,19 @@ impl JavaExtractor {
     ///   - wildcard `import a.b.*;`  -> check "",   target "a.b",     always attach
     fn collect_imports(node: Node, source: &[u8]) -> Vec<(String, String, bool)> {
         let mut imports = Vec::new();
-        Self::collect_imports_inner(node, source, &mut imports);
+        Self::collect_imports_inner(node, source, &mut imports, 0);
         imports
     }
 
-    fn collect_imports_inner(node: Node, source: &[u8], out: &mut Vec<(String, String, bool)>) {
+    fn collect_imports_inner(
+        node: Node,
+        source: &[u8],
+        out: &mut Vec<(String, String, bool)>,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         if node.kind() == "import_declaration" {
             if let Ok(text) = node.utf8_text(source) {
                 let mut clean = text
@@ -128,7 +137,7 @@ impl JavaExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_imports_inner(child, source, out);
+            Self::collect_imports_inner(child, source, out, depth + 1);
         }
     }
 
@@ -158,6 +167,7 @@ impl JavaExtractor {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_node(
         node: Node,
         source: &[u8],
@@ -166,7 +176,12 @@ impl JavaExtractor {
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
         producers: &mut Vec<(usize, CompactStr)>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "package_declaration" => {
                 if let Ok(text) = node.utf8_text(source) {
@@ -288,6 +303,7 @@ impl JavaExtractor {
                 package_name,
                 nodes,
                 producers,
+                depth + 1,
             );
         }
     }

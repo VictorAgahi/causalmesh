@@ -155,6 +155,12 @@ Stage 2 walks `self.nodes.values()` filtering on `KafkaTopic | EventStream | Que
 PostProcessor` — a single O(N) pass, unlike the per-lookup scans that were removed
 elsewhere. If you add a bucket, extend that one pass rather than adding a second walk.
 
-`find_dependents` has a similar shape: an O(1) `reverse_deps` hit, and only when that is
-empty a fallback pass over the `reverse_deps` keys looking for a substring. The fallback
-is the reason a bare package fragment still finds something; it is not the fast path.
+`find_dependents` has a similar shape but three stages, not two: an O(1) `reverse_deps`
+hit on `target` as a literal import string; then, only if that's empty, a symbol bridge
+through `name_to_nodes`/`fqcn_to_node` (treating `target` as a declared contract name
+instead — it resolves to its declaring node(s)' own `.package`, which is re-queried
+against `reverse_deps`); then, only if that's still empty, a fallback pass over every
+`reverse_deps` key looking for a raw substring. The final fallback is the reason a bare
+package fragment still finds something across unrelated services — it is not the fast
+path, and it does not scope by service, so a caller (`find_dependents.rs`) groups
+results by `ContractNode::repo_id` before rendering them.

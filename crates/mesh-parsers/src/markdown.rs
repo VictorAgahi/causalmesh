@@ -121,7 +121,16 @@ impl MarkdownFormatter {
         output
     }
 
-    pub fn format_dependents(target: &str, dependents: &[&ContractNode]) -> String {
+    /// `dependents` pairs each result with a human-readable label for the
+    /// service/root it was crawled from (e.g. its resolved root path). A raw
+    /// substring dependency match can legitimately span several unrelated
+    /// services that happen to share a locally-aliased package name (every
+    /// service in a polyglot monorepo vendoring its own `genproto`, for
+    /// instance) — flattening those into one undifferentiated list is how a
+    /// caller ends up scanning dozens of irrelevant file paths by hand to
+    /// find the one real answer. Grouping by that label surfaces "matched in
+    /// N services" up front instead.
+    pub fn format_dependents(target: &str, dependents: &[(&ContractNode, String)]) -> String {
         let mut out = format!(
             "## In-Memory Reverse Dependency Graph for `{target}`\n*Total Dependents: {} consumer node(s) found (O(1) in-memory resolution)*\n\n",
             dependents.len()
@@ -132,17 +141,41 @@ impl MarkdownFormatter {
             return out;
         }
 
-        for (idx, node) in dependents.iter().enumerate() {
+        let mut groups: HashMap<&str, Vec<&ContractNode>> = HashMap::new();
+        let mut group_order: Vec<&str> = Vec::new();
+        for (node, label) in dependents {
+            let bucket = groups.entry(label.as_str()).or_insert_with(|| {
+                group_order.push(label.as_str());
+                Vec::new()
+            });
+            bucket.push(node);
+        }
+
+        if group_order.len() > 1 {
             out.push_str(&format!(
-                "### [{}] `{}` ({:?})\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
-                idx + 1,
-                node.name,
-                node.kind,
-                node.file_path.display(),
-                node.line_start,
-                node.line_end,
-                node.package
+                "*Matched across {} distinct services/roots — grouped below so \
+                 same-named packages from unrelated services aren't flattened \
+                 together.*\n\n",
+                group_order.len()
             ));
+        }
+
+        let mut idx = 0;
+        for label in group_order {
+            let nodes = &groups[label];
+            out.push_str(&format!("### {label} ({} match(es))\n\n", nodes.len()));
+            for node in nodes {
+                idx += 1;
+                out.push_str(&format!(
+                    "[{idx}] `{}` ({:?})\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
+                    node.name,
+                    node.kind,
+                    node.file_path.display(),
+                    node.line_start,
+                    node.line_end,
+                    node.package
+                ));
+            }
         }
 
         out

@@ -4,3 +4,5 @@
 *.log
 *RFC*
 .claude
+scripts/bench/results/
+scripts/bench/token-compare/out/

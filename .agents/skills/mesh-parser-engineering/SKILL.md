@@ -178,7 +178,17 @@ Replacement is done by byte range, never by character index: tree-sitter reports
 `node.start_byte()` / `node.end_byte()`, and indexing a UTF-8 string by character count is
 a panic waiting for the first non-ASCII identifier. `collect_body_replacements` gathers
 `(start_byte, end_byte, Cow<'static, str>)` triples, which are then applied **bottom-up**
-so earlier offsets stay valid:
+so earlier offsets stay valid.
+
+`collect_body_replacements` takes a `depth: usize` parameter, capped at
+`AstGuard::MAX_NESTING_DEPTH`, incremented on every recursive call into a child node —
+past the cap it stops recursing into that subtree rather than stripping it. This is a
+**separate** guard from `AstGuard::max_nesting_depth`'s pre-parse lexical bracket count:
+that one is a proxy over raw bytes and can be passed by a file whose real tree-sitter CST
+is still hundreds of levels deep (long chained calls / generics / match arms add no
+brackets), which previously native-stack-overflowed this exact recursive walk. If you add
+a language-specific recursive AST walker anywhere in `mesh-parsers`, thread the same
+`depth` cap through it — `AstGuard`'s lexical check alone is not sufficient protection.
 
 ```rust
 // Sort replacements in reverse order of start byte to apply bottom-up.

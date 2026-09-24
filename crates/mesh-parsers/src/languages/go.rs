@@ -11,12 +11,6 @@ pub struct GoExtractor;
 /// shape `mesh_parsers::languages::FileIndex`'s `dependencies`/`producers`/`consumers`
 /// fields expect (see `crates/mesh-parsers/src/languages/mod.rs`).
 ///
-/// `PolyglotIndexer::extract`'s `LanguageKind::Go` branch does not thread these
-/// through yet — it only takes `extract`'s `Vec<ContractNode>`. Wiring it up is a
-/// small, additive change mirroring the existing Java branch (which maps
-/// `NodeKind::KafkaTopic` nodes into `.consumers`) or the TypeScript branch (which
-/// takes an imports out-param): thread `extract_with_relations`'s second return
-/// value straight into `out.dependencies` / `out.producers` / `out.consumers`.
 #[derive(Debug, Default)]
 pub struct GoRelations {
     pub dependencies: Vec<(usize, CompactStr)>,
@@ -60,11 +54,7 @@ struct RawRpcCall {
 }
 
 impl GoExtractor {
-    /// Extracts declaration nodes only. Kept at its original arity so existing
-    /// call sites (`PolyglotIndexer::extract`'s `LanguageKind::Go` branch) do not
-    /// need to change. Still picks up the richer node set from item 5 (gRPC
-    /// registrations, router-declared endpoints) since those are ordinary
-    /// `ContractNode`s, not out-of-band relations.
+    /// Extracts declaration nodes only.
     pub fn extract(
         file_path: &Path,
         content: &str,
@@ -210,13 +200,20 @@ impl GoExtractor {
                     None
                 };
 
+                let is_http_signature = first_line.contains("ResponseWriter")
+                    || first_line.contains("Request")
+                    || first_line.contains("Context")
+                    || first_line.contains("Ctx");
+
                 let mut kind = NodeKind::ServiceClass;
                 if receiver_type
                     .as_deref()
                     .is_some_and(|rt| grpc_server_types.contains(rt))
                 {
                     kind = NodeKind::GrpcMethod;
-                } else if func_name.starts_with("Handle") || func_name.ends_with("Handler") {
+                } else if (func_name.starts_with("Handle") || func_name.ends_with("Handler"))
+                    && is_http_signature
+                {
                     kind = NodeKind::HttpEndpoint;
                 }
 
@@ -269,8 +266,7 @@ impl GoExtractor {
             );
         }
     }
-
-    // -- Item 2: imports -----------------------------------------------------
+    // Import extraction and resolution
 
     fn collect_imports(decl: Node, source: &[u8], out: &mut Vec<RawImport>) {
         let mut cursor = decl.walk();
@@ -359,8 +355,7 @@ impl GoExtractor {
             }
         }
     }
-
-    // -- Item 3: kafka-go / sarama / confluent-kafka-go producers/consumers --
+    // Kafka / event producer and consumer detection
 
     #[allow(clippy::too_many_arguments)]
     fn handle_call_expression(
@@ -392,7 +387,26 @@ impl GoExtractor {
         // Recorded here (raw, line-range only) and attributed to its smallest
         // enclosing declaration in `resolve_rpc_calls`, the same two-pass
         // shape already used for Kafka producer/consumer detection above.
-        if method.starts_with("New") && method.ends_with("Client") {
+        let operand_name = func
+            .child_by_field_name("operand")
+            .and_then(|o| o.utf8_text(source).ok())
+            .unwrap_or("");
+        let is_third_party_client = matches!(
+            operand_name,
+            "redis"
+                | "http"
+                | "mongo"
+                | "s3"
+                | "sqs"
+                | "vault"
+                | "elastic"
+                | "sql"
+                | "db"
+                | "kafka"
+                | "sarama"
+        );
+
+        if !is_third_party_client && method.starts_with("New") && method.ends_with("Client") {
             let service_name = &method["New".len()..method.len() - "Client".len()];
             if !service_name.is_empty() {
                 raw_rpc_calls.push(RawRpcCall {
@@ -485,12 +499,18 @@ impl GoExtractor {
                     .child_by_field_name("operand")
                     .and_then(|o| o.utf8_text(source).ok())
                     .unwrap_or("event");
-                raw_events.push(RawEvent {
-                    line_start,
-                    line_end,
-                    topic: CompactStr::new(receiver),
-                    is_producer: is_producer_call,
-                });
+                const GENERIC_IDENTIFIERS: &[&str] = &[
+                    "c", "s", "r", "w", "p", "ch", "ws", "conn", "client", "reader", "writer",
+                    "sub", "pub", "event", "ctx", "err",
+                ];
+                if !GENERIC_IDENTIFIERS.contains(&receiver) {
+                    raw_events.push(RawEvent {
+                        line_start,
+                        line_end,
+                        topic: CompactStr::new(receiver),
+                        is_producer: is_producer_call,
+                    });
+                }
             } else {
                 for lit in literals {
                     raw_events.push(RawEvent {
@@ -764,8 +784,7 @@ impl GoExtractor {
             }
         }
     }
-
-    // -- Item 5: gRPC registration ------------------------------------------
+    // gRPC server registration and method extraction
 
     fn collect_grpc_server_types(
         node: Node,
@@ -855,8 +874,7 @@ func (s *Server) AuthenticateUser(ctx context.Context, req *AuthRequest) (*AuthR
         assert!(nodes.iter().any(|n| n.name == "Server"));
         assert!(nodes.iter().any(|n| n.name == "AuthenticateUser"));
     }
-
-    // -- Item 2: imports -> FileIndex.dependencies ---------------------------
+    // Import dependency wiring tests
 
     #[test]
     fn find_dependents_links_consumer_via_go_import() {
@@ -935,8 +953,7 @@ func Init() {}
             .iter()
             .any(|(_, target)| target.as_str() == "github.com/lib/pq"));
     }
-
-    // -- Item 3: kafka-go / sarama producer<->consumer linking ---------------
+    // Kafka producer / consumer linking tests
 
     #[test]
     fn analyze_impact_links_kafka_go_producer_and_consumer() {
@@ -1029,12 +1046,9 @@ func Emit() {
             .any(|(_, topic)| topic.as_str() == "payments"));
     }
 
-    /// Regression test for the OpenTelemetry Demo benchmark finding: a
-    /// `sarama.ProducerMessage{Topic: kafka.Topic}` literal referencing a
-    /// package-level `var Topic = "orders"` constant must resolve to the
-    /// real topic name, not the raw Go expression text `"kafka.Topic"` —
-    /// `analyze_impact("orders")`, the name a human would actually use,
-    /// previously returned nothing for this extremely common shape.
+    /// A `sarama.ProducerMessage{Topic: kafka.Topic}` literal referencing a
+    /// package-level `var Topic = "orders"` constant resolves to the
+    /// real topic name, rather than raw expression text.
     #[test]
     fn sarama_topic_referencing_a_string_const_resolves_to_its_value() {
         let code = r#"
@@ -1199,8 +1213,7 @@ func Consume() {
             .iter()
             .any(|(_, t)| t.as_str() == "payments"));
     }
-
-    // -- Item 5: gRPC registration + router parity ---------------------------
+    // gRPC registration and router parity tests
 
     #[test]
     fn grpc_server_registration_emits_grpc_service_and_method_nodes() {
@@ -1234,13 +1247,8 @@ func main() {
         );
     }
 
-    /// Regression test for the Online Boutique benchmark finding: a
-    /// `pb.NewFooServiceClient(conn)` call site (the standard
-    /// `protoc-gen-go-grpc` client constructor — e.g. `frontend` calling
-    /// `checkoutservice`) must be recorded as an RPC call attributed to its
-    /// enclosing function, so `ContractGraph::reconcile_edges` can build a
-    /// real `CallsRpc` edge and `find_dependents`/`analyze_grpc` stop
-    /// returning a false negative for a real cross-service caller.
+    /// A `pb.NewFooServiceClient(conn)` call site is recorded as an RPC call
+    /// attributed to its enclosing function, enabling CallsRpc resolution.
     #[test]
     fn grpc_client_construction_is_recorded_as_an_rpc_call() {
         let code = r#"
@@ -1327,6 +1335,53 @@ func main() {
                 .iter()
                 .any(|n| n.kind == NodeKind::HttpEndpoint && n.name == "POST /orders"),
             "expected an echo-style HttpEndpoint node, got: {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn handle_func_without_http_param_is_not_http_endpoint() {
+        let code = r#"
+package main
+
+func HandlePanic(err error) {
+    println(err)
+}
+
+func HandleUser(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("ok"))
+}
+"#;
+        let mut p = parser();
+        let nodes = GoExtractor::extract(Path::new("main.go"), code, 1, &mut p);
+        let panic_node = nodes
+            .iter()
+            .find(|n| n.name == "HandlePanic")
+            .expect("HandlePanic");
+        assert_eq!(panic_node.kind, NodeKind::ServiceClass);
+        let user_node = nodes
+            .iter()
+            .find(|n| n.name == "HandleUser")
+            .expect("HandleUser");
+        assert_eq!(user_node.kind, NodeKind::HttpEndpoint);
+    }
+
+    #[test]
+    fn redis_new_client_does_not_emit_grpc_rpc_call() {
+        let code = r#"
+package main
+
+func Setup() {
+    client := redis.NewClient(&redis.Options{})
+    _ = client
+}
+"#;
+        let mut p = parser();
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("main.go"), code, 1, &mut p);
+        assert!(
+            relations.rpc_calls.is_empty(),
+            "redis.NewClient must not be treated as a gRPC RPC call: {:?}",
+            relations.rpc_calls
         );
     }
 }

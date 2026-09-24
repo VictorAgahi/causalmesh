@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::InstallHooks => {
             let (config, _base) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
             if HooksCommand::is_enabled(&config) {
-                HooksCommand::run()?;
+                HooksCommand::run(&config)?;
             } else {
                 eprintln!(
                     "✖ Skipped: [engines.policy] enforce_git_hooks = false — hook installation disabled by config."
@@ -263,8 +263,7 @@ async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Erro
 // ── Windows named pipe proxy helpers ─────────────────────────────────────────
 //
 // meshd has no Unix Domain Socket on Windows, so `mesh-mcp run` shares the
-// daemon over a named pipe instead (ROADMAP Item 13), mirroring the UDS proxy
-// helpers above.
+// daemon over a named pipe instead, mirroring the UDS proxy helpers above.
 
 /// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
 #[cfg(windows)]

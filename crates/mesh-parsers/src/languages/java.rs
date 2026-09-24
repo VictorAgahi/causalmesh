@@ -247,12 +247,28 @@ impl JavaExtractor {
                     }
                 }
 
-                if full_anno.contains("@KafkaListener") {
-                    kind = NodeKind::KafkaTopic;
-                    topic_target = Some(Self::extract_annotation_param(&full_anno, "topics"));
-                } else if full_anno.contains("@GetMapping")
-                    || full_anno.contains("@PostMapping")
-                    || full_anno.contains("@RequestMapping")
+                if Self::has_annotation(&full_anno, "KafkaListener") {
+                    if let Some(topic) = Self::extract_annotation_param(&full_anno, "topics") {
+                        kind = NodeKind::KafkaTopic;
+                        topic_target = Some(topic);
+                    }
+                } else if Self::has_annotation(&full_anno, "GetMapping")
+                    || Self::has_annotation(&full_anno, "PostMapping")
+                    || Self::has_annotation(&full_anno, "PutMapping")
+                    || Self::has_annotation(&full_anno, "DeleteMapping")
+                    || Self::has_annotation(&full_anno, "PatchMapping")
+                    || Self::has_annotation(&full_anno, "RequestMapping")
+                    || Self::has_annotation(&full_anno, "GET")
+                    || Self::has_annotation(&full_anno, "POST")
+                    || Self::has_annotation(&full_anno, "PUT")
+                    || Self::has_annotation(&full_anno, "DELETE")
+                    || Self::has_annotation(&full_anno, "PATCH")
+                    || Self::has_annotation(&full_anno, "Path")
+                    || Self::has_annotation(&full_anno, "Get")
+                    || Self::has_annotation(&full_anno, "Post")
+                    || Self::has_annotation(&full_anno, "Put")
+                    || Self::has_annotation(&full_anno, "Delete")
+                    || Self::has_annotation(&full_anno, "Patch")
                 {
                     kind = NodeKind::HttpEndpoint;
                 }
@@ -308,16 +324,62 @@ impl JavaExtractor {
         }
     }
 
-    fn extract_annotation_param(annotation: &str, param: &str) -> String {
+    fn has_annotation(full_anno: &str, name: &str) -> bool {
+        let needle = format!("@{name}");
+        let mut start = 0;
+        while let Some(pos) = full_anno[start..].find(&needle) {
+            let actual_pos = start + pos;
+            let after_idx = actual_pos + needle.len();
+            let prev_ok = actual_pos == 0
+                || full_anno[..actual_pos]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            let next_ok = after_idx >= full_anno.len()
+                || full_anno[after_idx..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if prev_ok && next_ok {
+                return true;
+            }
+            start = actual_pos + 1;
+        }
+        false
+    }
+
+    fn extract_annotation_param(annotation: &str, param: &str) -> Option<String> {
         if let Some(idx) = annotation.find(param) {
-            let rest = &annotation[idx + param.len()..];
-            if let Some(quote_start) = rest.find('"') {
-                if let Some(quote_end) = rest[quote_start + 1..].find('"') {
-                    return rest[quote_start + 1..quote_start + 1 + quote_end].to_string();
+            let rest = annotation[idx + param.len()..].trim_start();
+            let after_eq = if let Some(stripped) = rest.strip_prefix('=') {
+                stripped.trim_start()
+            } else {
+                rest
+            };
+            if let Some(quote_start) = after_eq.find('"') {
+                if let Some(quote_end) = after_eq[quote_start + 1..].find('"') {
+                    let val = &after_eq[quote_start + 1..quote_start + 1 + quote_end];
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
                 }
             }
         }
-        "unknown.topic".to_string()
+        // Fallback: check inside parentheses for direct string literal: @KafkaListener("orders.created")
+        if let Some(p_start) = annotation.find('(') {
+            if let Some(p_end) = annotation.rfind(')') {
+                let inside = &annotation[p_start + 1..p_end];
+                if let Some(q_start) = inside.find('"') {
+                    if let Some(q_end) = inside[q_start + 1..].find('"') {
+                        let val = &inside[q_start + 1..q_start + 1 + q_end];
+                        if !val.is_empty() {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -625,5 +687,81 @@ public class OrderNotifier {
             .iter()
             .any(|n| n.name == "placeOrder"));
         assert!(!impact.downstream_consumers.is_empty());
+    }
+
+    #[test]
+    fn test_java_http_annotations_and_getter_isolation() {
+        let code = r#"
+package com.mesh.api;
+
+public class ResourceController {
+    @PutMapping("/items/{id}")
+    public void updateItem() {}
+
+    @DeleteMapping("/items/{id}")
+    public void deleteItem() {}
+
+    @PatchMapping("/items/{id}")
+    public void patchItem() {}
+
+    @GET
+    @Path("/jaxrs")
+    public String getJaxRs() { return "ok"; }
+
+    @DELETE
+    public void deleteJaxRs() {}
+
+    // Lombok or custom getter should not trigger @GET false positive
+    @Getter
+    public String getName() { return "name"; }
+}
+"#;
+        let mut parser = parser();
+        let nodes =
+            JavaExtractor::extract(Path::new("ResourceController.java"), code, 1, &mut parser);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "updateItem" && n.kind == NodeKind::HttpEndpoint));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "deleteItem" && n.kind == NodeKind::HttpEndpoint));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "patchItem" && n.kind == NodeKind::HttpEndpoint));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "getJaxRs" && n.kind == NodeKind::HttpEndpoint));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "deleteJaxRs" && n.kind == NodeKind::HttpEndpoint));
+
+        let getter_node = nodes
+            .iter()
+            .find(|n| n.name == "getName")
+            .expect("getName method found");
+        assert_ne!(getter_node.kind, NodeKind::HttpEndpoint);
+    }
+
+    #[test]
+    fn test_java_kafka_topic_parsing() {
+        let code = r#"
+package com.mesh.events;
+
+public class EventConsumer {
+    @KafkaListener("orders.direct")
+    public void handleDirect(String event) {}
+
+    @KafkaListener
+    public void handleDynamic(String event) {}
+}
+"#;
+        let mut parser = parser();
+        let nodes = JavaExtractor::extract(Path::new("EventConsumer.java"), code, 1, &mut parser);
+
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "orders.direct" && n.kind == NodeKind::KafkaTopic));
+        assert!(!nodes.iter().any(|n| n.name == "unknown.topic"));
     }
 }

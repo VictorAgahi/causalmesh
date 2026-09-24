@@ -251,6 +251,7 @@ impl AstGuard {
             && Self::create_bounded_parser(&tree_sitter_php::LANGUAGE_PHP.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_swift::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_scala::LANGUAGE.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_proto::LANGUAGE.into()).is_ok()
     }
 
     /// Initializes a bounded tree-sitter parser with a strict 15ms C-FFI timeout
@@ -274,7 +275,7 @@ impl AstGuard {
             static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
                 const {
                     RefCell::new([
-                        None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
                     ])
                 };
         }

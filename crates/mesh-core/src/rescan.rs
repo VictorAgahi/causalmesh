@@ -109,9 +109,8 @@ mod tests {
     }
 
     /// Windows-only: verifies the rescan pool's priority-setting call actually
-    /// drops the calling thread's scheduling priority below normal, per
-    /// ROADMAP Item 13's definition of done. Gated to `target_os = "windows"`
-    /// since it exercises the Win32 thread priority APIs directly.
+    /// drops the calling thread's scheduling priority below normal.
+    /// Gated to `target_os = "windows"` since it exercises Win32 thread APIs directly.
     #[cfg(target_os = "windows")]
     #[test]
     fn test_windows_rescan_thread_runs_below_normal_priority() {

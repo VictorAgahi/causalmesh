@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.4"
+version = "3.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["CausalMesh Enterprise Contributors"]
@@ -74,6 +74,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
 tree-sitter-swift = "0.6"
 tree-sitter-scala = "0.23"
+tree-sitter-proto = "0.2.0"
 
 [profile.release]
 opt-level = 3

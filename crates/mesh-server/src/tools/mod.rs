@@ -219,7 +219,7 @@ impl ToolRegistry {
                     out.text.push_str(&Self::render_skill_hint(skill));
                 }
 
-                // Centralized 48 KB Payload Budget Capping (Feedback Item 2)
+                // Centralized 48 KB Payload Budget Capping
                 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
                 if out.text.len() > MAX_TOOL_OUTPUT_BYTES {
                     let mut cut_off = MAX_TOOL_OUTPUT_BYTES - 384;
@@ -364,9 +364,8 @@ roots = ["."]
         Arc::new(AppState::new(config, vec![], audit, rescan))
     }
 
-    /// Definition of done for ROADMAP item 4: a tool call against a guarded
-    /// subject is refused by RSAH through the real `ToolRegistry::invoke` path
-    /// (not just a direct `evaluate_guard` unit test).
+    /// A tool call against a guarded subject is refused by RSAH through the
+    /// real `ToolRegistry::invoke` path (not just a direct `evaluate_guard` unit test).
     #[tokio::test]
     async fn test_invoke_blocks_mutating_call_on_guarded_subject() {
         let state = governed_state();

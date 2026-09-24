@@ -574,7 +574,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh-core"
-version = "3.0.4"
+version = "3.1.0"
 dependencies = [
  "arc-swap",
  "compact_str",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-daemon"
-version = "3.0.4"
+version = "3.1.0"
 dependencies = [
  "arc-swap",
  "clap",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-parsers"
-version = "3.0.4"
+version = "3.1.0"
 dependencies = [
  "compact_str",
  "mesh-core",
@@ -656,6 +656,7 @@ dependencies = [
  "tree-sitter-kotlin-ng",
  "tree-sitter-language",
  "tree-sitter-php",
+ "tree-sitter-proto",
  "tree-sitter-python",
  "tree-sitter-ruby",
  "tree-sitter-rust",
@@ -666,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-server"
-version = "3.0.4"
+version = "3.1.0"
 dependencies = [
  "clap",
  "compact_str",
@@ -1447,6 +1448,16 @@ name = "tree-sitter-php"
 version = "0.23.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f066e94e9272cfe4f1dcb07a1c50c66097eca648f2d7233d299c8ae9ed8c130c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-proto"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e4360b434b5980fc397137ef29e1988619fef4159ac86fa7ac5777d459d3924"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -27,8 +27,7 @@ pub struct WebEdge {
     pub kind: String,
     pub metadata: Option<String>,
     /// "exact" or "heuristic" — see `mesh_core::EdgeConfidence`. Surfaced so
-    /// consumers of the graph export don't silently treat a bare-name
-    /// heuristic match as fact (ROADMAP Item 6).
+    /// consumers of the graph export can distinguish exact from heuristic edges.
     pub confidence: String,
 }
 

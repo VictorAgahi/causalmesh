@@ -141,15 +141,31 @@ impl TypeScriptExtractor {
         let grpc_annotations = ctx.grpc_annotations;
         match node.kind() {
             "import_statement" => {
-                if let Ok(text) = node.utf8_text(source) {
-                    if let Some(from_idx) = text.find("from") {
-                        let from_str = text[from_idx + 4..]
-                            .trim()
+                let from_str_opt = node
+                    .child_by_field_name("source")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| {
+                        s.trim()
                             .trim_matches(';')
                             .trim()
                             .trim_matches('\'')
-                            .trim_matches('"');
+                            .trim_matches('"')
+                    })
+                    .or_else(|| {
+                        node.utf8_text(source).ok().and_then(|text| {
+                            text.rfind("from").map(|from_idx| {
+                                text[from_idx + 4..]
+                                    .trim()
+                                    .trim_matches(';')
+                                    .trim()
+                                    .trim_matches('\'')
+                                    .trim_matches('"')
+                            })
+                        })
+                    });
 
+                if let Some(from_str) = from_str_opt {
+                    if !from_str.is_empty() {
                         imports.push((String::new(), from_str.to_string()));
 
                         for named in Self::collect_named_import_specifiers(node, source) {
@@ -158,6 +174,7 @@ impl TypeScriptExtractor {
                     }
                 }
             }
+
             "class_declaration" | "interface_declaration" => {
                 let class_name = node
                     .child_by_field_name("name")
@@ -228,6 +245,11 @@ impl TypeScriptExtractor {
                 } else if full_text.contains("@Get")
                     || full_text.contains("@Post")
                     || full_text.contains("@Put")
+                    || full_text.contains("@Delete")
+                    || full_text.contains("@Patch")
+                    || full_text.contains("@Options")
+                    || full_text.contains("@Head")
+                    || full_text.contains("@All")
                 {
                     kind = NodeKind::HttpEndpoint;
                 } else if full_text.contains("@EventPattern") {
@@ -823,11 +845,8 @@ async function run() {
             !impact.downstream_consumers.is_empty(),
             "expected the kafkajs consumer to be linked as a downstream consumer"
         );
-        // ROADMAP #11 dropped direct producer->consumer `DispatchesTo` edges (they
-        // were O(producers * consumers) per topic); the same information is now
-        // carried by the two-hop `Produces`/`Consumes` walk through the topic,
-        // which `analyze_impact` already reads directly from the topic registry
-        // above — not by materializing a direct edge here.
+        // Direct `Produces` and `Consumes` edges carry topic routing via a
+        // two-hop walk through the topic node with linear edge complexity.
         assert!(
             graph
                 .all_edges()
@@ -844,13 +863,9 @@ async function run() {
         );
     }
 
-    /// Regression test for the OpenTelemetry Demo benchmark finding: a
-    /// NestJS `ClientGrpc.getService<XServiceClient>('XService')` call site
-    /// (the real shape found in `frontend/gateways/rpc/Checkout.gateway.ts`)
-    /// must be recorded as an RPC call attributed to its enclosing method, so
-    /// `ContractGraph::reconcile_edges` can build a real `CallsRpc` edge and
-    /// `find_dependents`/`analyze_grpc` stop missing a TypeScript caller the
-    /// way they used to for Go before that detector existed.
+    /// A NestJS `ClientGrpc.getService<XServiceClient>('XService')` call site
+    /// is recorded as an RPC call attributed to its enclosing method, allowing
+    /// `ContractGraph::reconcile_edges` to build a `CallsRpc` edge.
     #[test]
     fn nestjs_get_service_call_is_recorded_as_an_rpc_call() {
         let code = r#"
@@ -1026,5 +1041,74 @@ export class CheckoutGateway {
         assert!(rpc_calls
             .iter()
             .any(|(idx, target)| *idx == caller_idx && target.as_str() == "RealProtoService"));
+    }
+
+    #[test]
+    fn test_ts_import_from_substring_safety() {
+        let code = r#"
+import { fromEvent } from 'rxjs';
+import { escapeFromHtml } from './security';
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let _ = TypeScriptExtractor::extract_with_config(
+            Path::new("app.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[],
+        );
+        let imported_modules: Vec<&str> = imports.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(
+            imported_modules,
+            vec!["rxjs", "fromEvent", "./security", "escapeFromHtml"]
+        );
+        assert!(
+            !imported_modules.iter().any(|m| m.contains("} from")),
+            "imported modules must not be corrupted by identifiers containing 'from': {:?}",
+            imported_modules
+        );
+    }
+
+    #[test]
+    fn test_ts_rest_delete_patch_endpoints() {
+        let code = r#"
+export class UserController {
+    @Delete(':id')
+    deleteUser() {}
+
+    @Patch(':id')
+    updateUser() {}
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new("user.controller.ts"),
+            code,
+            1,
+            &mut parser,
+            &mut imports,
+            &mut rpc_calls,
+            &[],
+        );
+        let del = nodes
+            .iter()
+            .find(|n| n.name == "deleteUser")
+            .expect("deleteUser");
+        assert_eq!(del.kind, NodeKind::HttpEndpoint);
+        let patch = nodes
+            .iter()
+            .find(|n| n.name == "updateUser")
+            .expect("updateUser");
+        assert_eq!(patch.kind, NodeKind::HttpEndpoint);
     }
 }

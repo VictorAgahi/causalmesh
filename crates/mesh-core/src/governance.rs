@@ -83,12 +83,21 @@ impl GovernanceEngine {
             .map(|(_, path)| path.as_str())
     }
 
-    /// Evaluates if a given scope or target triggers an architectural STOP rule
+    /// Evaluates if a given scope or target triggers an architectural STOP rule.
+    ///
+    /// Matches `guarded_key` as a whole path SEGMENT of `target_or_scope`, not a
+    /// bare substring: `init --auto` now emits short, generic guarded directory
+    /// names (`"proto"`, `"k8s"`, `"deploy"`, agnostic to any specific repo's
+    /// naming convention — see `cli::init`), and an unanchored substring match
+    /// on a word that short would block any path merely *containing* it
+    /// (`src/protobuf_helpers.py`, `internal/prototype/test.go`,
+    /// `cmd/redeploy/main.go`) rather than only paths actually inside the
+    /// guarded directory.
     pub fn evaluate_guard(&self, target_or_scope: &str) -> Option<RsahResponse> {
         let lower = target_or_scope.to_lowercase();
 
         for (guarded_key, rule_description) in &self.stop_rules {
-            if lower.contains(guarded_key.as_str()) {
+            if Self::has_path_segment(&lower, guarded_key.to_lowercase().as_str()) {
                 return Some(Self::build_rsah_response(
                     guarded_key.as_str(),
                     rule_description,
@@ -99,38 +108,57 @@ impl GovernanceEngine {
         None
     }
 
+    /// True if `segment` appears as a whole `/`-delimited path component of
+    /// `haystack` — not merely as a substring straddling a component boundary
+    /// (e.g. `"proto"` must match `"proto-registry/x.proto"` and
+    /// `"src/proto/x"`, but not `"internal/prototype/test.go"`).
+    fn has_path_segment(haystack: &str, segment: &str) -> bool {
+        if segment.is_empty() {
+            return false;
+        }
+        haystack.split('/').any(|part| part == segment)
+    }
+
     fn build_rsah_response(guarded_key: &str, rule_description: &str) -> RsahResponse {
-        match guarded_key {
-            "proto-registry" => RsahResponse {
+        let lower_key = guarded_key.to_lowercase();
+        if lower_key.contains("proto") {
+            RsahResponse {
                 status: "GOVERNANCE_BLOCKED".to_string(),
                 policy: "CONTRACT_FIRST_CASCADE_CI".to_string(),
-                violation: format!("Guarded boundary '{}' accessed. {rule_description}", guarded_key),
+                violation: format!("Guarded contract boundary '{guarded_key}' accessed. {rule_description}"),
                 required_workflow: RsahWorkflow {
-                    step_1: "Validate proto contract syntax via 'buf lint' in 'proto-registry'".to_string(),
-                    step_2: "Commit changes exclusively inside 'proto-registry'".to_string(),
-                    step_3: "Open a Pull Request on 'proto-registry' and await GitHub Actions CI stub generation".to_string(),
-                    step_4: "DO NOT modify 'api-gateway' or 'services/*' until the published packages are available.".to_string(),
+                    step_1: format!("Validate schema syntax and breaking changes in '{guarded_key}'"),
+                    step_2: format!("Commit changes exclusively inside '{guarded_key}'"),
+                    step_3: format!("Submit contract review and verify CI schema generation for '{guarded_key}'"),
+                    step_4: "Do not modify downstream services until the generated contract packages are published.".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: "I detected a mutation targeting the Protobuf contract in 'proto-registry'. Per active architecture governance, I'm stopping here: you must submit the contract PR and let CI generate the stubs before adapting the microservices.".to_string(),
-            },
-            "k8s-infrastructure" => RsahResponse {
+                message_to_user: format!("Detected mutation targeting contract in '{guarded_key}'. Per active architecture governance: submit contract changes and await CI verification before adapting downstream consumers. {rule_description}"),
+            }
+        } else if lower_key.contains("k8s")
+            || lower_key.contains("infra")
+            || lower_key.contains("deploy")
+        {
+            RsahResponse {
                 status: "GOVERNANCE_BLOCKED".to_string(),
                 policy: "INFRASTRUCTURE_AS_CODE_REVIEW".to_string(),
-                violation: format!("Guarded infrastructure repository '{}' accessed. {rule_description}", guarded_key),
+                violation: format!("Guarded infrastructure boundary '{guarded_key}' accessed. {rule_description}"),
                 required_workflow: RsahWorkflow {
-                    step_1: "Review Kubernetes resource limits and security context".to_string(),
-                    step_2: "Run 'helm lint' or 'kubeconform' on modified manifests".to_string(),
-                    step_3: "Submit changes to DevOps review board".to_string(),
-                    step_4: "Await ArgoCD / Flux deployment sync".to_string(),
+                    step_1: format!("Review infrastructure resource specifications in '{guarded_key}'"),
+                    step_2: "Run manifest linter and policy compliance checks".to_string(),
+                    step_3: "Submit changes to infrastructure review board".to_string(),
+                    step_4: "Await infrastructure deployment synchronization".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: "Modifying K8s manifests requires mandatory DevOps review. Please validate the manifests with the Infrastructure team before deployment.".to_string(),
-            },
-            _ => RsahResponse {
+                message_to_user: format!("Modifying infrastructure in '{guarded_key}' requires mandatory operational review. {rule_description}"),
+            }
+        } else {
+            RsahResponse {
                 status: "GOVERNANCE_BLOCKED".to_string(),
                 policy: "ACTIVE_GOVERNANCE_POLICY".to_string(),
-                violation: format!("Action blocked by active rule for '{guarded_key}': {rule_description}"),
+                violation: format!(
+                    "Action blocked by active rule for '{guarded_key}': {rule_description}"
+                ),
                 required_workflow: RsahWorkflow {
                     step_1: format!("Verify policy for '{guarded_key}'"),
                     step_2: "Obtain human confirmation".to_string(),
@@ -138,8 +166,10 @@ impl GovernanceEngine {
                     step_4: "Verify downstream dependencies".to_string(),
                 },
                 agent_next_action: "STOP_AND_REPORT_TO_USER".to_string(),
-                message_to_user: format!("This action requires human validation per the active rule: {rule_description}"),
-            },
+                message_to_user: format!(
+                    "This action requires human validation per the active rule: {rule_description}"
+                ),
+            }
         }
     }
 }
@@ -207,5 +237,65 @@ mod tests {
         let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
         let result = engine.evaluate_guard("services/billing/BillingController.java");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_guard_case_insensitivity_and_generic_fallback() {
+        let mut rules = HashMap::new();
+        rules.insert(CompactStr::new("Proto-Registry"), "Proto check".to_string());
+        rules.insert(
+            CompactStr::new("Billing-DB"),
+            "Database migrations require DBA approval".to_string(),
+        );
+
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
+
+        // Lowercase path matches uppercase rule key
+        let r1 = engine
+            .evaluate_guard("services/proto-registry/auth.proto")
+            .expect("proto match");
+        assert_eq!(r1.policy, "CONTRACT_FIRST_CASCADE_CI");
+
+        // Generic rule fallback
+        let r2 = engine
+            .evaluate_guard("services/billing-db/migration.sql")
+            .expect("db match");
+        assert_eq!(r2.policy, "ACTIVE_GOVERNANCE_POLICY");
+        assert_eq!(r2.status, "GOVERNANCE_BLOCKED");
+    }
+
+    /// Regression test for the ultrareview finding on PR #6: `init --auto`
+    /// emits short, generic guarded keys (`"proto"`, `"k8s"`, `"deploy"`,
+    /// agnostic to any specific repo's directory-naming convention) —
+    /// `evaluate_guard` must not treat these as bare substrings, or any path
+    /// merely *containing* the word (not inside the guarded directory at
+    /// all) gets a fabricated GOVERNANCE_BLOCKED refusal.
+    #[test]
+    fn evaluate_guard_matches_a_whole_path_segment_not_a_bare_substring() {
+        let mut rules = HashMap::new();
+        rules.insert(CompactStr::new("proto"), "Contract boundary".to_string());
+
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
+
+        // Real matches: "proto" is a whole path segment.
+        assert!(engine.evaluate_guard("proto/user.proto").is_some());
+        assert!(engine.evaluate_guard("src/proto/billing.proto").is_some());
+
+        // False positives the old bare-substring match produced — none of
+        // these have "proto" as a whole path segment.
+        assert!(
+            engine.evaluate_guard("src/protobuf_helpers.py").is_none(),
+            "protobuf_helpers.py must not trip the 'proto' guard"
+        );
+        assert!(
+            engine
+                .evaluate_guard("internal/prototype/test.go")
+                .is_none(),
+            "prototype/ must not trip the 'proto' guard"
+        );
+        assert!(
+            engine.evaluate_guard("cmd/redeploy/main.go").is_none(),
+            "redeploy/ must not trip a 'deploy' guard's substring"
+        );
     }
 }

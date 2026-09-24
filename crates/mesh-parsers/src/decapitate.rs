@@ -21,8 +21,8 @@ pub enum LanguageKind {
 
 impl LanguageKind {
     /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
-    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala).
-    pub const TREE_SITTER_COUNT: usize = 12;
+    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf).
+    pub const TREE_SITTER_COUNT: usize = 13;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -62,7 +62,8 @@ impl LanguageKind {
             Self::Php => Some(9),
             Self::Swift => Some(10),
             Self::Scala => Some(11),
-            Self::Protobuf | Self::Yaml | Self::Unknown => None,
+            Self::Protobuf => Some(12),
+            Self::Yaml | Self::Unknown => None,
         }
     }
 
@@ -81,7 +82,8 @@ impl LanguageKind {
             Self::Php => Some(tree_sitter_php::LANGUAGE_PHP.into()),
             Self::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
             Self::Scala => Some(tree_sitter_scala::LANGUAGE.into()),
-            Self::Protobuf | Self::Yaml | Self::Unknown => None,
+            Self::Protobuf => Some(tree_sitter_proto::LANGUAGE.into()),
+            Self::Yaml | Self::Unknown => None,
         }
     }
 

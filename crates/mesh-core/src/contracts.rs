@@ -292,7 +292,7 @@ impl ContractGraph {
     /// Resolves the target of a placeholder `Imports` edge using the O(1) indices.
     ///
     /// Returns the resolved node together with the confidence of the
-    /// strategy that found it (see `EdgeConfidence` / ROADMAP Item 6).
+    /// strategy that found it (see `EdgeConfidence`).
     fn resolve_import_target(
         &self,
         importer: NodeId,
@@ -505,17 +505,9 @@ impl ContractGraph {
                 }
             }
 
-            // ROADMAP #11: `DispatchesTo` used to materialize one edge per
-            // (producer, consumer) pair here, which is O(producers * consumers)
-            // per topic — a 50x50 hub topic alone produced 2,500 edges, growing
-            // with the square. `EdgeKind::DispatchesTo` is not read by any query
-            // engine or traversal (only referenced defensively in
-            // `mesh-parsers::graph` render match arms); the `Produces` and
-            // `Consumes` edges added above already carry the same information
-            // via a two-hop producer -> topic -> consumer walk. So rather than
-            // capping the pair count, we drop the direct-edge generation
-            // entirely and rely on the two-hop traversal, which is O(producers +
-            // consumers) per topic instead of O(producers * consumers).
+            // Direct `Produces` and `Consumes` edges carry topic routing via a
+            // two-hop producer -> topic -> consumer walk with linear O(producers + consumers)
+            // edge complexity, rather than quadratic O(producers * consumers) edge growth.
         }
 
         // 4. Reconcile gRPC Proto Definitions <-> Service Handlers (Implements)
@@ -608,19 +600,25 @@ impl ContractGraph {
         // detected node — when it isn't) is what lets `find_dependents`/
         // `analyze_grpc` resolve a real cross-service caller even when the
         // repo's `.proto` sources aren't in `roots` at all.
-        let mut proto_by_name: HashMap<String, NodeId> =
+        let mut proto_by_fqcn: HashMap<String, NodeId> =
             HashMap::with_capacity(proto_methods.len() * 2);
+        let mut proto_by_bare: HashMap<String, Vec<NodeId>> =
+            HashMap::with_capacity(proto_methods.len());
+
         for (id, name) in &proto_methods {
-            proto_by_name
+            proto_by_fqcn
                 .entry(name.as_str().to_lowercase())
                 .or_insert(*id);
             if let Some(bare) = name.split('.').next_back() {
-                proto_by_name.entry(bare.to_lowercase()).or_insert(*id);
+                proto_by_bare
+                    .entry(bare.to_lowercase())
+                    .or_default()
+                    .push(*id);
             }
         }
         for node in self.nodes.values() {
             if node.kind == NodeKind::GrpcService {
-                proto_by_name
+                proto_by_fqcn
                     .entry(node.name.as_str().to_lowercase())
                     .or_insert(node.id);
             }
@@ -629,18 +627,33 @@ impl ContractGraph {
         let mut rpc_edges = Vec::new();
         for (caller_id, target_rpc) in &self.rpc_calls {
             let target_str = target_rpc.as_str();
+            let target_lower = target_str.to_lowercase();
             let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
-            // A full-name (case-insensitive) match is unambiguous; falling
-            // back to the bare method name is a heuristic that can match
-            // the wrong service's method of the same name.
-            let matched_proto = proto_by_name
-                .get(&target_str.to_lowercase())
-                .map(|&id| (id, EdgeConfidence::Exact))
-                .or_else(|| {
-                    proto_by_name
-                        .get(&target_bare.to_lowercase())
+            let target_bare_lower = target_bare.to_lowercase();
+
+            // 1. Exact FQCN match has top priority and highest confidence
+            let matched_proto = if let Some(&id) = proto_by_fqcn.get(&target_lower) {
+                Some((id, EdgeConfidence::Exact))
+            } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
+                // 2. Bare-name fallback: disambiguate by caller package if multiple candidates
+                if candidates.len() == 1 {
+                    Some((candidates[0], EdgeConfidence::Heuristic))
+                } else {
+                    let caller_node = self.nodes.get(caller_id);
+                    let matched_candidate = caller_node.and_then(|caller| {
+                        candidates.iter().find(|&&cid| {
+                            self.nodes
+                                .get(&cid)
+                                .is_some_and(|target_node| target_node.package == caller.package)
+                        })
+                    });
+                    matched_candidate
+                        .or_else(|| candidates.first())
                         .map(|&id| (id, EdgeConfidence::Heuristic))
-                });
+                }
+            } else {
+                None
+            };
 
             if let Some((target_id, confidence)) = matched_proto {
                 if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
@@ -791,7 +804,6 @@ impl ContractGraph {
         let mut client_stubs: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
         let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
-        // Search for matching proto methods or services
         for node in self.nodes.values() {
             if !matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod) {
                 continue;
@@ -832,8 +844,6 @@ impl ContractGraph {
             }
         }
 
-        // Resolve implementors and callers via graph edges for all matching anchors
-        // (proto definition or language-level service/method declarations).
         for anchor_id in &anchors {
             for edge in &self.edges {
                 if edge.to != *anchor_id {
@@ -1081,13 +1091,9 @@ mod tests {
         );
     }
 
-    /// Regression test for the Online Boutique benchmark finding: a node
-    /// that only matches the target via a *substring hit inside its own
-    /// name* (e.g. "CheckoutServiceServicer" containing "CheckoutService"),
-    /// with no exact-name match and no real `Implements` edge to a proto
-    /// definition, must not be bucketed into `server_handlers` just because
-    /// its path happens to contain "service" — every service directory in a
-    /// typical microservices repo satisfies that trivially.
+    /// A node that only matches the target via a substring hit inside its own
+    /// name (with no exact match and no real Implements edge to a proto definition)
+    /// must not be bucketed into server_handlers.
     #[test]
     fn analyze_grpc_does_not_bucket_heuristic_name_matches_by_path_alone() {
         let mut graph = ContractGraph::new();
@@ -1117,12 +1123,8 @@ mod tests {
         );
     }
 
-    /// Regression test for the OpenTelemetry Demo benchmark finding: an
-    /// exact-name-matched `GrpcService` node must be bucketed as a server
-    /// handler regardless of what its file path happens to contain — the
-    /// previous `path.contains("service"/"handler"/"controller")` heuristic
-    /// misclassified a real server as a client stub whenever the directory
-    /// was named e.g. `checkout/` rather than `checkoutservice/`.
+    /// An exact-name-matched GrpcService node is bucketed as a server
+    /// handler regardless of file path naming.
     #[test]
     fn analyze_grpc_buckets_exact_match_as_server_handler_regardless_of_path_naming() {
         let mut graph = ContractGraph::new();
@@ -1260,22 +1262,8 @@ mod tests {
         );
     }
 
-    /// Regression test for the full Online Boutique benchmark scenario:
-    /// `frontend`'s handler constructs `pb.NewCheckoutServiceClient(conn)` and
-    /// calls it — no file anywhere imports a package literally named
-    /// "CheckoutService", so this can only be resolved through a real
-    /// `CallsRpc` graph edge (built by `reconcile_edges` from the raw
-    /// `add_rpc_call` signal), not through `reverse_deps` at all. Exercises
-    /// the actual end-to-end path: `add_rpc_call` -> `reconcile_edges` ->
-    /// `find_dependents`.
-    ///
-    /// This graph-level mechanism is language-agnostic by construction —
-    /// `add_rpc_call` doesn't know which extractor produced its signal — so
-    /// this same test doubles as proof that a TypeScript
-    /// `getService<XServiceClient>(...)` caller (see
-    /// `typescript.rs::nestjs_get_service_call_is_recorded_as_an_rpc_call`,
-    /// which proves TS produces the identical `(idx, "CheckoutService")` raw
-    /// signal) resolves through the exact same path Go's does.
+    /// Resolves a cross-service gRPC caller via CallsRpc edge: client construction
+    /// links caller to GrpcService through reconcile_edges.
     #[test]
     fn find_dependents_resolves_a_real_cross_service_grpc_caller_via_reconcile_edges() {
         let mut graph = ContractGraph::new();
@@ -1425,10 +1413,8 @@ mod tests {
         );
     }
 
-    /// ROADMAP Item 6, short-term step: a bare-name import (ambiguous across
-    /// packages) must not be reported with the same confidence as an exact
-    /// fully-qualified import — and the FQCN match must land on the *right*
-    /// node, not just any node sharing the bare name.
+    /// A bare-name import (ambiguous across packages) must not be reported with
+    /// the same confidence as an exact fully-qualified import.
     #[test]
     fn test_import_resolution_confidence_distinguishes_fqcn_from_bare_name() {
         let mut graph = ContractGraph::new();
@@ -1640,12 +1626,8 @@ mod tests {
         assert_eq!(high_repo_node.unwrap().name.as_str(), "ServiceHandler498");
     }
 
-    /// ROADMAP #11: a hub topic with 50 producers and 50 consumers used to
-    /// generate 50*50 = 2,500 `DispatchesTo` edges from `reconcile_edges`
-    /// alone. With direct-edge generation dropped, the same topic must only
-    /// ever produce the `Produces` and `Consumes` edges (50 + 50 = 100, one
-    /// per participant), independent of the quadratic pair count, and zero
-    /// `DispatchesTo` edges.
+    /// A hub topic with producers and consumers generates linear O(P + C)
+    /// Produces/Consumes edges, rather than quadratic O(P * C) edges.
     #[test]
     fn test_hub_topic_edge_growth_is_linear_not_quadratic() {
         let mut graph = ContractGraph::new();

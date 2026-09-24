@@ -660,9 +660,8 @@ mod tests {
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
     }
 
-    /// Item 10: `PropertyRegistry` provenance. Deleting one of two properties files must remove
-    /// exactly its keys on the next incremental reload, leaving the other file's keys intact —
-    /// previously `merge` only ever added, so deleted keys persisted until a full restart.
+    /// `PropertyRegistry` provenance: deleting one of two properties files must remove
+    /// exactly its keys on the next incremental reload, leaving the other file's keys intact.
     #[test]
     fn reload_removes_deleted_properties_files_keys_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -699,9 +698,8 @@ mod tests {
         assert_eq!(view.property_registry.get("app.b.name"), None);
     }
 
-    /// Item 1: `[engines.contracts.spring]` `property_files` / `auto_redact_secrets` /
-    /// `resolve_placeholders` must produce observably different behaviour from the (implicit)
-    /// defaults exercised by the other tests in this module.
+    /// `[engines.contracts.spring]` `property_files` / `auto_redact_secrets` /
+    /// `resolve_placeholders` configuration changes scan behaviour.
     #[test]
     fn spring_config_keys_change_scan_behaviour() {
         let tmp = tempfile::tempdir().expect("tempdir");

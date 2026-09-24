@@ -83,12 +83,21 @@ impl GovernanceEngine {
             .map(|(_, path)| path.as_str())
     }
 
-    /// Evaluates if a given scope or target triggers an architectural STOP rule
+    /// Evaluates if a given scope or target triggers an architectural STOP rule.
+    ///
+    /// Matches `guarded_key` as a whole path SEGMENT of `target_or_scope`, not a
+    /// bare substring: `init --auto` now emits short, generic guarded directory
+    /// names (`"proto"`, `"k8s"`, `"deploy"`, agnostic to any specific repo's
+    /// naming convention — see `cli::init`), and an unanchored substring match
+    /// on a word that short would block any path merely *containing* it
+    /// (`src/protobuf_helpers.py`, `internal/prototype/test.go`,
+    /// `cmd/redeploy/main.go`) rather than only paths actually inside the
+    /// guarded directory.
     pub fn evaluate_guard(&self, target_or_scope: &str) -> Option<RsahResponse> {
         let lower = target_or_scope.to_lowercase();
 
         for (guarded_key, rule_description) in &self.stop_rules {
-            if lower.contains(guarded_key.to_lowercase().as_str()) {
+            if Self::has_path_segment(&lower, guarded_key.to_lowercase().as_str()) {
                 return Some(Self::build_rsah_response(
                     guarded_key.as_str(),
                     rule_description,
@@ -97,6 +106,17 @@ impl GovernanceEngine {
         }
 
         None
+    }
+
+    /// True if `segment` appears as a whole `/`-delimited path component of
+    /// `haystack` — not merely as a substring straddling a component boundary
+    /// (e.g. `"proto"` must match `"proto-registry/x.proto"` and
+    /// `"src/proto/x"`, but not `"internal/prototype/test.go"`).
+    fn has_path_segment(haystack: &str, segment: &str) -> bool {
+        if segment.is_empty() {
+            return false;
+        }
+        haystack.split('/').any(|part| part == segment)
     }
 
     fn build_rsah_response(guarded_key: &str, rule_description: &str) -> RsahResponse {
@@ -242,5 +262,40 @@ mod tests {
             .expect("db match");
         assert_eq!(r2.policy, "ACTIVE_GOVERNANCE_POLICY");
         assert_eq!(r2.status, "GOVERNANCE_BLOCKED");
+    }
+
+    /// Regression test for the ultrareview finding on PR #6: `init --auto`
+    /// emits short, generic guarded keys (`"proto"`, `"k8s"`, `"deploy"`,
+    /// agnostic to any specific repo's directory-naming convention) —
+    /// `evaluate_guard` must not treat these as bare substrings, or any path
+    /// merely *containing* the word (not inside the guarded directory at
+    /// all) gets a fabricated GOVERNANCE_BLOCKED refusal.
+    #[test]
+    fn evaluate_guard_matches_a_whole_path_segment_not_a_bare_substring() {
+        let mut rules = HashMap::new();
+        rules.insert(CompactStr::new("proto"), "Contract boundary".to_string());
+
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
+
+        // Real matches: "proto" is a whole path segment.
+        assert!(engine.evaluate_guard("proto/user.proto").is_some());
+        assert!(engine.evaluate_guard("src/proto/billing.proto").is_some());
+
+        // False positives the old bare-substring match produced — none of
+        // these have "proto" as a whole path segment.
+        assert!(
+            engine.evaluate_guard("src/protobuf_helpers.py").is_none(),
+            "protobuf_helpers.py must not trip the 'proto' guard"
+        );
+        assert!(
+            engine
+                .evaluate_guard("internal/prototype/test.go")
+                .is_none(),
+            "prototype/ must not trip the 'proto' guard"
+        );
+        assert!(
+            engine.evaluate_guard("cmd/redeploy/main.go").is_none(),
+            "redeploy/ must not trip a 'deploy' guard's substring"
+        );
     }
 }

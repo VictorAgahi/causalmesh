@@ -194,6 +194,15 @@ impl PropertyRegistry {
         self.flat_properties.get(key).map(|v| v.as_str())
     }
 
+    /// Word-exact "auth"/"authorization" tokens — deliberately NOT a bare
+    /// substring pattern in `SECRET_PATTERNS` (a plain `.contains("auth")`
+    /// false-positives on `app.author.email`, "author" containing "auth" as
+    /// a substring but being an unrelated word). Checked against
+    /// word-segment-split tokens instead, so `AUTH_KEY`/`api.authKey`/
+    /// `Authorization` are still caught without `author`/`authoring`/etc.
+    /// being swept in too.
+    const AUTH_WORDS: &'static [&'static str] = &["auth", "authorization", "authn"];
+
     #[inline]
     pub fn is_sensitive_key(&self, key: &str) -> bool {
         if !self.redact_secrets {
@@ -218,7 +227,41 @@ impl PropertyRegistry {
         {
             return true;
         }
+        if Self::split_words(key)
+            .iter()
+            .any(|w| Self::AUTH_WORDS.contains(&w.as_str()))
+        {
+            return true;
+        }
         false
+    }
+
+    /// Splits `s` into lowercase word segments on `.`/`_`/`-` and camelCase
+    /// boundaries (lowercase-to-uppercase transitions), so a word-exact
+    /// check doesn't false-positive on a substring occurring inside an
+    /// unrelated word (e.g. "auth" inside "author").
+    fn split_words(s: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut prev_lower = false;
+        for c in s.chars() {
+            if c == '.' || c == '_' || c == '-' {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current).to_lowercase());
+                }
+                prev_lower = false;
+                continue;
+            }
+            if c.is_uppercase() && prev_lower && !current.is_empty() {
+                words.push(std::mem::take(&mut current).to_lowercase());
+            }
+            current.push(c);
+            prev_lower = c.is_lowercase();
+        }
+        if !current.is_empty() {
+            words.push(current.to_lowercase());
+        }
+        words
     }
 
     pub fn insert_sanitized(&mut self, key: &str, raw_val: &str) {
@@ -469,6 +512,41 @@ spring:
         assert_eq!(
             registry.get("db.secret_key"),
             Some(PropertyRegistry::REDACTED_PLACEHOLDER)
+        );
+    }
+
+    /// Regression test: dropping bare "auth" from `SECRET_PATTERNS` (to stop
+    /// `app.author.email` false-positiving on "auth" being a substring of
+    /// "author") must not also stop real auth credentials from being
+    /// redacted — `AUTH_KEY`, `api.authKey`, and `Authorization` are all
+    /// real secret-bearing keys.
+    #[test]
+    fn auth_keys_are_still_redacted_without_flagging_author() {
+        let mut registry = PropertyRegistry::new();
+        registry.insert_sanitized("AUTH_KEY", "super-secret-value");
+        registry.insert_sanitized("api.authKey", "another-secret");
+        registry.insert_sanitized("Authorization", "Bearer abc123");
+        registry.insert_sanitized("app.author.email", "dev@example.com");
+
+        assert_eq!(
+            registry.get("AUTH_KEY"),
+            Some(PropertyRegistry::REDACTED_PLACEHOLDER),
+            "AUTH_KEY must still be redacted"
+        );
+        assert_eq!(
+            registry.get("api.authKey"),
+            Some(PropertyRegistry::REDACTED_PLACEHOLDER),
+            "api.authKey must still be redacted"
+        );
+        assert_eq!(
+            registry.get("Authorization"),
+            Some(PropertyRegistry::REDACTED_PLACEHOLDER),
+            "Authorization must still be redacted"
+        );
+        assert_eq!(
+            registry.get("app.author.email"),
+            Some("dev@example.com"),
+            "app.author.email must NOT be redacted — 'author' is not 'auth'"
         );
     }
 }

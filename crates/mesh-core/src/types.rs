@@ -175,9 +175,26 @@ pub fn detect_service_package(
         }
     }
 
+    // Bounds every upward directory walk below: a real project's file tree
+    // is never this deep, and without a cap a file with no manifest/container
+    // anywhere above it (or a relative path with a long, manifest-less
+    // ancestry) walks all the way to the filesystem root — `has_compilation_manifest`
+    // alone stats up to 12 candidate filenames per level, so an unbounded walk
+    // multiplies that cost per file, across every language extractor, on
+    // every scan. Deliberately not a persistent cross-file cache instead: a
+    // manifest can appear/disappear on disk during a live daemon session, and
+    // nothing here has a hook to invalidate a directory-level cache when a
+    // *different* file's edit changes what one is — the depth cap only
+    // bounds worst-case cost, so it can't go stale.
+    const MAX_WALK_DEPTH: usize = 32;
+
     // 2. Walk upwards looking for compilation manifests
     let mut current = file_path.parent();
+    let mut depth = 0;
     while let Some(dir) = current {
+        if depth >= MAX_WALK_DEPTH {
+            break;
+        }
         if has_compilation_manifest(dir) {
             if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
                 if !name.is_empty() {
@@ -186,11 +203,16 @@ pub fn detect_service_package(
             }
         }
         current = dir.parent();
+        depth += 1;
     }
 
     // 3. Check for service container convention without hardcoded microservice names
     current = file_path.parent();
+    depth = 0;
     while let Some(dir) = current {
+        if depth >= MAX_WALK_DEPTH {
+            break;
+        }
         if let Some(parent) = dir.parent() {
             if let Some(pname) = parent.file_name().and_then(|s| s.to_str()) {
                 if is_container_dir(pname) {
@@ -201,17 +223,23 @@ pub fn detect_service_package(
             }
         }
         current = dir.parent();
+        depth += 1;
     }
 
     // 4. Fallback: first non-technical directory
     current = file_path.parent();
+    depth = 0;
     while let Some(dir) = current {
+        if depth >= MAX_WALK_DEPTH {
+            break;
+        }
         if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
             if !is_technical_source_dir(name) {
                 return CompactStr::new(name);
             }
         }
         current = dir.parent();
+        depth += 1;
     }
 
     CompactStr::new("shared")
@@ -313,5 +341,18 @@ mod tests {
             detect_service_package(Path::new("pkg/storage/s3.go"), None).as_str(),
             "storage"
         );
+    }
+
+    /// Regression test for the ultrareview finding on PR #6: an unbounded
+    /// upward directory walk (no manifest/container match anywhere in a very
+    /// deep, all-technical-named ancestry) must terminate promptly rather
+    /// than walking indefinitely — 40 nested `src/` segments exceeds the
+    /// walk's depth cap, so the fallback ("shared") must still be reached
+    /// without hanging or panicking.
+    #[test]
+    fn test_detect_service_package_terminates_on_pathologically_deep_path() {
+        let deep_path: String = "src/".repeat(40) + "main.go";
+        let result = detect_service_package(Path::new(&deep_path), None);
+        assert_eq!(result.as_str(), "shared");
     }
 }

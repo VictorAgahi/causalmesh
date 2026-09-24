@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::InstallHooks => {
             let (config, _base) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
             if HooksCommand::is_enabled(&config) {
-                HooksCommand::run()?;
+                HooksCommand::run(&config)?;
             } else {
                 eprintln!(
                     "✖ Skipped: [engines.policy] enforce_git_hooks = false — hook installation disabled by config."

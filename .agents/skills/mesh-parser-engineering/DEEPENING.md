@@ -148,3 +148,14 @@ than strip: when a function has no explicit `return_type`, it inspects the retur
 literal (`extract_returned_object_keys`) and synthesises a type hint, so the decapitated
 signature still tells the reader the shape of the result. If you add a language, decide
 explicitly whether you want that behaviour; the plain Java/Go arms are the simpler model.
+
+It also carries a `depth: usize` argument, capped at `AstGuard::MAX_NESTING_DEPTH` and
+incremented on the one recursive call into `node.children()`. This is not redundant with
+`AstGuard::should_parse_path`'s pre-parse lexical bracket count (`guard.rs`) — that count
+is a rough proxy over raw bytes, and a file with long chained method calls, deep generic
+nesting, or many match arms can produce a real tree-sitter CST hundreds of levels deep
+while using almost no `{`/`(`/`[` characters, sailing straight past the lexical guard. That
+was a confirmed, reproducible native stack overflow on `rust-lang/rust` before this depth
+parameter existed — the lexical guard alone is not a substitute for bounding the walk
+itself. Any new recursive AST walker added to `mesh-parsers` (a language extractor's own
+`visit_node`, a `collect_*` helper) needs the same treatment, not just this one function.

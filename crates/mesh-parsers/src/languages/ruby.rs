@@ -37,6 +37,7 @@ impl RubyExtractor {
             is_routes_file,
             false,
             &mut nodes,
+            0,
         );
         nodes
     }
@@ -51,7 +52,12 @@ impl RubyExtractor {
         is_routes_file: bool,
         in_controller: bool,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         let mut child_in_controller = in_controller;
 
         match node.kind() {
@@ -153,6 +159,7 @@ impl RubyExtractor {
                 is_routes_file,
                 child_in_controller,
                 nodes,
+                depth + 1,
             );
         }
     }

@@ -34,10 +34,12 @@ impl PhpExtractor {
             &package_name,
             false,
             &mut nodes,
+            0,
         );
         nodes
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_node(
         node: Node,
         source: &[u8],
@@ -46,7 +48,12 @@ impl PhpExtractor {
         package_name: &CompactStr,
         in_controller: bool,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         let mut child_in_controller = in_controller;
 
         match node.kind() {
@@ -134,6 +141,7 @@ impl PhpExtractor {
                 package_name,
                 child_in_controller,
                 nodes,
+                depth + 1,
             );
         }
     }
@@ -146,10 +154,13 @@ impl PhpExtractor {
         if !text.contains("Route") {
             return None;
         }
-        Self::first_string_literal(attrs, source)
+        Self::first_string_literal(attrs, source, 0)
     }
 
-    fn first_string_literal(node: Node, source: &[u8]) -> Option<String> {
+    fn first_string_literal(node: Node, source: &[u8], depth: usize) -> Option<String> {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return None;
+        }
         if node.kind() == "string" {
             return node
                 .utf8_text(source)
@@ -158,7 +169,7 @@ impl PhpExtractor {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if let Some(found) = Self::first_string_literal(child, source) {
+            if let Some(found) = Self::first_string_literal(child, source, depth + 1) {
                 return Some(found);
             }
         }
@@ -193,7 +204,7 @@ impl PhpExtractor {
         let path = call
             .child_by_field_name("arguments")
             .and_then(|args| args.named_child(0))
-            .and_then(|arg| Self::first_string_literal(arg, source))?;
+            .and_then(|arg| Self::first_string_literal(arg, source, 0))?;
 
         let name = format!("{} {}", verb.to_uppercase(), path);
         Some(ContractNode {

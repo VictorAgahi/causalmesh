@@ -51,6 +51,7 @@ impl RustExtractor {
             &mut out.producers,
             &mut out.consumers,
             false,
+            0,
         );
 
         Self::attach_dependencies(content, &out.nodes, &imports, &mut out.dependencies);
@@ -105,6 +106,7 @@ impl RustExtractor {
         producers: &mut Vec<(usize, CompactStr)>,
         consumers: &mut Vec<(usize, CompactStr)>,
         in_grpc_body: bool,
+        depth: usize,
     ) {
         let mut cursor = node.walk();
         let mut pending_attr = String::new();
@@ -128,6 +130,7 @@ impl RustExtractor {
                 consumers,
                 &pending_attr,
                 in_grpc_body,
+                depth + 1,
             );
             pending_attr.clear();
         }
@@ -146,7 +149,15 @@ impl RustExtractor {
         consumers: &mut Vec<(usize, CompactStr)>,
         pending_attr: &str,
         in_grpc_body: bool,
+        depth: usize,
     ) {
+        // See decapitate.rs's collect_body_replacements for why this guard exists
+        // independently of AstGuard's pre-parse lexical check: deep expression/call
+        // chains reach here without ever tripping the byte-level bracket count.
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "struct_item" | "enum_item" => {
                 let name = node
@@ -297,6 +308,7 @@ impl RustExtractor {
                         producers,
                         consumers,
                         is_grpc,
+                        depth,
                     );
                 }
                 return;
@@ -364,6 +376,7 @@ impl RustExtractor {
             producers,
             consumers,
             false,
+            depth,
         );
     }
 

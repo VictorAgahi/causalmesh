@@ -77,11 +77,33 @@ impl PythonExtractor {
             repo_id,
             &package_name,
             None,
+            root,
             &mut nodes,
             &mut imports,
             &mut relations.producers,
             &mut relations.consumers,
+            0,
         );
+
+        if nodes.is_empty() && !content.trim().is_empty() {
+            let stem = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("module");
+            let line_count = content.lines().count().max(1);
+            nodes.push(ContractNode {
+                id: 0,
+                name: CompactStr::new(stem),
+                kind: NodeKind::ServiceClass,
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: line_count,
+                package: package_name.clone(),
+                repo_id,
+                signature: Some(CompactStr::new(format!("module {}", stem))),
+                docstring: None,
+            });
+        }
 
         relations.dependencies = Self::resolve_import_dependencies(content, &nodes, &imports);
         (nodes, relations)
@@ -95,11 +117,17 @@ impl PythonExtractor {
         repo_id: RepoId,
         package_name: &CompactStr,
         enclosing: Option<usize>,
+        root: Node,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<ImportRef>,
         producers: &mut Vec<(usize, CompactStr)>,
         consumers: &mut Vec<(usize, CompactStr)>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         let mut child_enclosing = enclosing;
 
         match node.kind() {
@@ -122,7 +150,22 @@ impl PythonExtractor {
                     .unwrap_or_else(|| format!("class {class_name}:"));
 
                 let mut kind = NodeKind::ServiceClass;
-                if class_name.ends_with("Servicer") {
+                // `grpc_tools.protoc` always names its generated gRPC stub
+                // module `<proto>_pb2_grpc.py`; it defines a `*Servicer` base
+                // class for EVERY service in the shared .proto file, and every
+                // service that imports it (to build its own handler
+                // elsewhere) vendors an identical copy. Tagging the base class
+                // itself as a declared GrpcService node here makes every
+                // vendored copy look like a real implementation to
+                // `analyze_grpc`'s server-handler search, even for services
+                // that never subclass it. The real implementation (a
+                // subclass, or the file that instantiates a server with it)
+                // lives elsewhere and is picked up on its own merits.
+                let is_generated_grpc_stub = file_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|f| f.ends_with("_pb2_grpc.py"));
+                if class_name.ends_with("Servicer") && !is_generated_grpc_stub {
                     kind = NodeKind::GrpcService;
                 }
 
@@ -159,10 +202,6 @@ impl PythonExtractor {
                 if let Some(prev) = node.prev_sibling() {
                     if prev.kind() == "decorator" {
                         if let Ok(dec_text) = prev.utf8_text(source) {
-                            // Celery task decorators (`@task`, `@app.task`, `@celery.task`)
-                            // are checked first: a Celery app is conventionally named `app`,
-                            // so `@app.task` would otherwise also match the generic
-                            // `@app.`-prefix HTTP-endpoint heuristic below.
                             if Self::is_celery_task_decorator(dec_text) {
                                 kind = NodeKind::Queue;
                                 celery_task_name = Self::celery_task_name_override(dec_text)
@@ -194,8 +233,9 @@ impl PythonExtractor {
                 child_enclosing = Some(idx);
             }
             "call" => {
-                if let Some(idx) = enclosing {
-                    Self::detect_event_call(node, source, idx, producers, consumers);
+                let idx = enclosing.unwrap_or(0);
+                if !nodes.is_empty() {
+                    Self::detect_event_call(node, source, idx, producers, consumers, root);
                 }
             }
             _ => {}
@@ -210,10 +250,12 @@ impl PythonExtractor {
                 repo_id,
                 package_name,
                 child_enclosing,
+                root,
                 nodes,
                 imports,
                 producers,
                 consumers,
+                depth + 1,
             );
         }
     }
@@ -223,21 +265,13 @@ impl PythonExtractor {
     fn collect_import_names(node: Node, source: &[u8], imports: &mut Vec<ImportRef>) {
         let mut cursor = node.walk();
         for name in node.children_by_field_name("name", &mut cursor) {
-            Self::push_name_ref(name, source, false, imports);
+            Self::push_name_ref(name, source, true, imports);
         }
     }
 
     fn collect_import_from(node: Node, source: &[u8], imports: &mut Vec<ImportRef>) {
-        let has_wildcard = node
-            .children(&mut node.walk())
-            .any(|c| c.kind() == "wildcard_import");
-
         if let Some(module) = node.child_by_field_name("module_name") {
             match module.kind() {
-                // Relative import (`from .x import y` / `from ..x import y` /
-                // `from . import y`): the module text itself can't be matched
-                // against a body substring reliably, so mark it module-like
-                // (always "used") rather than silently dropping it.
                 "relative_import" => {
                     if let Ok(text) = module.utf8_text(source) {
                         imports.push(ImportRef {
@@ -252,7 +286,7 @@ impl PythonExtractor {
                         imports.push(ImportRef {
                             target: text.to_string(),
                             search_text: text.to_string(),
-                            module_like: has_wildcard,
+                            module_like: true,
                         });
                     }
                 }
@@ -296,11 +330,6 @@ impl PythonExtractor {
         }
     }
 
-    /// Reuses the TypeScript "is it actually used in this node's line range?"
-    /// heuristic (`languages/mod.rs` ~185-205): a file-level import only
-    /// attaches to the symbols whose body text actually references it,
-    /// except for the module-like cases (relative / wildcard imports) that
-    /// cannot be matched that way and are attached everywhere instead.
     fn resolve_import_dependencies(
         content: &str,
         nodes: &[ContractNode],
@@ -336,20 +365,13 @@ impl PythonExtractor {
 
     // ---- Item 3: native event producer/consumer detection ---------------
 
-    /// Recognises, on a `call` node, the dominant client-library shapes for
-    /// `confluent_kafka` / `aiokafka` (`.produce()`, `.send()`,
-    /// `.send_and_wait()`, `.publish()` as producers; `.subscribe()` and the
-    /// `AIOKafkaConsumer(...)` constructor as consumers) and Celery
-    /// (`.delay()` / `.apply_async()` as producers). Topic/task names are
-    /// frequently variables rather than literals; the literal case is
-    /// unwrapped, and the non-literal case still emits the variable's source
-    /// text as the target instead of being dropped.
     fn detect_event_call(
         node: Node,
         source: &[u8],
         enclosing: usize,
         producers: &mut Vec<(usize, CompactStr)>,
         consumers: &mut Vec<(usize, CompactStr)>,
+        root: Node,
     ) {
         let Some(func) = node.child_by_field_name("function") else {
             return;
@@ -369,9 +391,6 @@ impl PythonExtractor {
 
                 match method {
                     "delay" | "apply_async" => {
-                        // Celery producer call: the task name is the call's
-                        // receiver (e.g. `process_order.delay(...)` ->
-                        // `process_order`), not an argument.
                         if let Some(object) = func.child_by_field_name("object") {
                             if let Ok(object_text) = object.utf8_text(source) {
                                 let task_name =
@@ -383,12 +402,12 @@ impl PythonExtractor {
                         }
                     }
                     "produce" | "send" | "send_and_wait" | "publish" => {
-                        if let Some(topic) = Self::first_arg_value(args, source, "topic") {
+                        if let Some(topic) = Self::first_arg_value(args, source, "topic", root) {
                             producers.push((enclosing, CompactStr::new(topic)));
                         }
                     }
                     "subscribe" => {
-                        for topic in Self::list_or_scalar_values(args, source) {
+                        for topic in Self::list_or_scalar_values(args, source, root) {
                             consumers.push((enclosing, CompactStr::new(topic)));
                         }
                     }
@@ -398,7 +417,7 @@ impl PythonExtractor {
             "identifier" => {
                 if let Ok(name) = func.utf8_text(source) {
                     if name == "AIOKafkaConsumer" {
-                        for topic in Self::positional_string_values(args, source) {
+                        for topic in Self::positional_string_values(args, source, root) {
                             consumers.push((enclosing, CompactStr::new(topic)));
                         }
                     }
@@ -412,9 +431,6 @@ impl PythonExtractor {
         dec_text.contains("@task") || dec_text.contains("@celery") || dec_text.contains(".task")
     }
 
-    /// Pulls an explicit `name="..."` override out of a decorator like
-    /// `@app.task(name="my.task")`, falling back to the function's own name
-    /// (done by the caller) when there is none.
     fn celery_task_name_override(dec_text: &str) -> Option<String> {
         let name_idx = dec_text.find("name")?;
         let rest = &dec_text[name_idx + 4..];
@@ -429,11 +445,7 @@ impl PythonExtractor {
         Some(after_quote[..end].to_string())
     }
 
-    /// The first positional argument's value, or the named keyword's value
-    /// if there is no positional argument. Returns the unwrapped literal for
-    /// a string, or the raw source text otherwise (the non-literal /
-    /// variable-name fallback).
-    fn first_arg_value(args: Node, source: &[u8], kw_name: &str) -> Option<String> {
+    fn first_arg_value(args: Node, source: &[u8], kw_name: &str, root: Node) -> Option<String> {
         let mut cursor = args.walk();
         let mut kw_val: Option<String> = None;
         for child in args.children(&mut cursor) {
@@ -448,21 +460,18 @@ impl PythonExtractor {
                         == Some(kw_name);
                     if matches_name {
                         if let Some(value) = child.child_by_field_name("value") {
-                            kw_val = Some(Self::expr_value(value, source));
+                            kw_val = Self::resolve_expr_to_string(value, source, root);
                         }
                     }
                 }
                 continue;
             }
-            return Some(Self::expr_value(child, source));
+            return Self::resolve_expr_to_string(child, source, root);
         }
         kw_val
     }
 
-    /// Every positional argument up to (excluding) the first keyword
-    /// argument — used for constructors like `AIOKafkaConsumer('topic', ...)`
-    /// where topics are leading positional args.
-    fn positional_string_values(args: Node, source: &[u8]) -> Vec<String> {
+    fn positional_string_values(args: Node, source: &[u8], root: Node) -> Vec<String> {
         let mut out = Vec::new();
         let mut cursor = args.walk();
         for child in args.children(&mut cursor) {
@@ -472,14 +481,14 @@ impl PythonExtractor {
             if child.kind() == "keyword_argument" {
                 break;
             }
-            out.push(Self::expr_value(child, source));
+            if let Some(val) = Self::resolve_expr_to_string(child, source, root) {
+                out.push(val);
+            }
         }
         out
     }
 
-    /// The argument's values: every element if it is a list literal,
-    /// otherwise the single scalar value (literal or variable name).
-    fn list_or_scalar_values(args: Node, source: &[u8]) -> Vec<String> {
+    fn list_or_scalar_values(args: Node, source: &[u8], root: Node) -> Vec<String> {
         let mut cursor = args.walk();
         let Some(first) = args
             .children(&mut cursor)
@@ -493,23 +502,54 @@ impl PythonExtractor {
             first
                 .children(&mut inner_cursor)
                 .filter(|c| c.is_named())
-                .map(|c| Self::expr_value(c, source))
+                .filter_map(|c| Self::resolve_expr_to_string(c, source, root))
                 .collect()
         } else {
-            vec![Self::expr_value(first, source)]
+            Self::resolve_expr_to_string(first, source, root)
+                .into_iter()
+                .collect()
         }
     }
 
-    fn expr_value(node: Node, source: &[u8]) -> String {
+    fn resolve_expr_to_string(node: Node, source: &[u8], root: Node) -> Option<String> {
         if node.kind() == "string" {
-            if let Some(v) = Self::string_literal_value(node, source) {
-                return v;
+            return Self::string_literal_value(node, source);
+        }
+        if node.kind() == "identifier" || node.kind() == "attribute" {
+            let var_name = node.utf8_text(source).ok()?.trim();
+            if let Some(val) = Self::find_assignment_in_root(root, source, var_name) {
+                return Some(val);
             }
         }
-        node.utf8_text(source).unwrap_or("").trim().to_string()
+        None
     }
 
-    /// Unwraps a simple single/double-quoted string literal's contents.
+    fn find_assignment_in_root(root: Node, source: &[u8], target_name: &str) -> Option<String> {
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "expression_statement" {
+                if let Some(assign) = child.child(0) {
+                    if assign.kind() == "assignment" {
+                        let left = assign.child_by_field_name("left")?;
+                        let right = assign.child_by_field_name("right")?;
+                        let left_name = left.utf8_text(source).ok()?.trim();
+                        if left_name == target_name {
+                            return Self::string_literal_value(right, source);
+                        }
+                    }
+                }
+            } else if child.kind() == "assignment" {
+                let left = child.child_by_field_name("left")?;
+                let right = child.child_by_field_name("right")?;
+                let left_name = left.utf8_text(source).ok()?.trim();
+                if left_name == target_name {
+                    return Self::string_literal_value(right, source);
+                }
+            }
+        }
+        None
+    }
+
     fn string_literal_value(node: Node, source: &[u8]) -> Option<String> {
         let text = node.utf8_text(source).ok()?.trim();
         let quote_pos = text.find(['\'', '"'])?;
@@ -553,6 +593,64 @@ def list_users():
         assert!(nodes
             .iter()
             .any(|n| n.name == "list_users" && n.kind == NodeKind::HttpEndpoint));
+    }
+
+    /// Regression test for the Online Boutique benchmark finding: a
+    /// `*Servicer` class defined inside a `grpc_tools.protoc`-generated
+    /// `*_pb2_grpc.py` stub is the shared base class for every service in
+    /// the .proto file — every service that imports it vendors an identical
+    /// copy — and must NOT be tagged `GrpcService`, or every vendored copy
+    /// looks like a real implementation to `analyze_grpc`.
+    #[test]
+    fn generated_pb2_grpc_servicer_base_class_is_not_tagged_grpc_service() {
+        let code = r#"
+class CheckoutServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def PlaceOrder(self, request, context):
+        raise NotImplementedError()
+"#;
+        let mut parser = make_parser();
+        let nodes = PythonExtractor::extract(
+            Path::new("src/emailservice/demo_pb2_grpc.py"),
+            code,
+            3,
+            &mut parser,
+        );
+        let servicer = nodes
+            .iter()
+            .find(|n| n.name == "CheckoutServiceServicer")
+            .expect("class node present");
+        assert_eq!(
+            servicer.kind,
+            NodeKind::ServiceClass,
+            "a Servicer base class inside a generated *_pb2_grpc.py stub \
+             must not be tagged GrpcService, got: {:?}",
+            servicer.kind
+        );
+    }
+
+    /// A real handler subclassing the generated base outside a `_pb2_grpc.py`
+    /// file is unaffected — it's still tagged `GrpcService` as before.
+    #[test]
+    fn real_servicer_subclass_outside_generated_stub_is_still_tagged_grpc_service() {
+        let code = r#"
+class CheckoutServiceServicer(checkout_pb2_grpc.CheckoutServiceServicer):
+    def PlaceOrder(self, request, context):
+        return do_checkout(request)
+"#;
+        let mut parser = make_parser();
+        let nodes = PythonExtractor::extract(
+            Path::new("src/checkoutservice/main.py"),
+            code,
+            3,
+            &mut parser,
+        );
+        let servicer = nodes
+            .iter()
+            .find(|n| n.name == "CheckoutServiceServicer")
+            .expect("class node present");
+        assert_eq!(servicer.kind, NodeKind::GrpcService);
     }
 
     /// Item 2 (plain `from x import y`): a symbol declared in one file and
@@ -809,9 +907,42 @@ def send_event():
             relations
                 .producers
                 .iter()
-                .any(|(i, topic)| *i == idx && topic.as_str() == "TOPIC"),
-            "expected the variable name TOPIC to be emitted, got: {:?}",
+                .any(|(i, topic)| *i == idx && topic.as_str() == "orders"),
+            "expected the resolved constant value 'orders' to be emitted, got: {:?}",
             relations.producers
+        );
+    }
+
+    #[test]
+    fn test_python_script_file_imports() {
+        let script_code = r#"
+import kafka
+
+producer = kafka.KafkaProducer(bootstrap_servers='localhost:9092')
+"#;
+        let mut graph = ContractGraph::default();
+        let mut parser = make_parser();
+        let (nodes, relations) = PythonExtractor::extract_with_relations(
+            Path::new("services/producer_script.py"),
+            script_code,
+            1,
+            &mut parser,
+        );
+        assert_eq!(nodes.len(), 1, "expected 1 module node for script file");
+        assert_eq!(nodes[0].name.as_str(), "producer_script");
+        let ids: Vec<_> = nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        for (i, target) in relations.dependencies {
+            graph.add_dependency(ids[i], target.as_str());
+        }
+
+        let dependents = graph.find_dependents("kafka");
+        assert!(
+            dependents.iter().any(|n| n.name == "producer_script"),
+            "expected `producer_script` in find_dependents('kafka'), got: {:?}",
+            dependents
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

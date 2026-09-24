@@ -65,7 +65,7 @@ impl TypeScriptExtractor {
             grpc_annotations,
         };
 
-        Self::visit_node(root, source_bytes, &ctx, &mut nodes, imports);
+        Self::visit_node(root, source_bytes, &ctx, &mut nodes, imports, 0);
         nodes
     }
 
@@ -75,7 +75,12 @@ impl TypeScriptExtractor {
         ctx: &VisitCtx,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<(String, String)>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         let file_path = ctx.file_path;
         let repo_id = ctx.repo_id;
         let package_name = ctx.package_name;
@@ -274,7 +279,7 @@ impl TypeScriptExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, ctx, nodes, imports);
+            Self::visit_node(child, source, ctx, nodes, imports, depth + 1);
         }
     }
 

@@ -30,6 +30,7 @@ impl CSharpExtractor {
             repo_id,
             &mut package_name,
             &mut nodes,
+            0,
         );
         nodes
     }
@@ -41,7 +42,12 @@ impl CSharpExtractor {
         repo_id: RepoId,
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
                 if let Some(name) = node
@@ -125,7 +131,15 @@ impl CSharpExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, file_path, repo_id, package_name, nodes);
+            Self::visit_node(
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                nodes,
+                depth + 1,
+            );
         }
     }
 

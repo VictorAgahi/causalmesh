@@ -37,7 +37,7 @@ impl CppExtractor {
         let mut package_name = mesh_core::detect_service_package(&file_path, None);
 
         let mut grpc_services = Vec::new();
-        Self::collect_grpc_service_names(root, source_bytes, &mut grpc_services);
+        Self::collect_grpc_service_names(root, source_bytes, &mut grpc_services, 0);
 
         Self::visit_node(
             root,
@@ -47,6 +47,7 @@ impl CppExtractor {
             &mut package_name,
             &grpc_services,
             &mut nodes,
+            0,
         );
 
         let mut dependencies = Vec::new();
@@ -81,11 +82,14 @@ impl CppExtractor {
     /// system headers and are deliberately excluded.
     fn quoted_local_includes(root: Node, source: &[u8]) -> Vec<CompactStr> {
         let mut out = Vec::new();
-        Self::collect_includes(root, source, &mut out);
+        Self::collect_includes(root, source, &mut out, 0);
         out
     }
 
-    fn collect_includes(node: Node, source: &[u8], out: &mut Vec<CompactStr>) {
+    fn collect_includes(node: Node, source: &[u8], out: &mut Vec<CompactStr>, depth: usize) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         if node.kind() == "preproc_include" {
             if let Some(path_node) = node.child_by_field_name("path") {
                 if path_node.kind() == "string_literal" {
@@ -104,10 +108,11 @@ impl CppExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_includes(child, source, out);
+            Self::collect_includes(child, source, out, depth + 1);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_node(
         node: Node,
         source: &[u8],
@@ -116,7 +121,12 @@ impl CppExtractor {
         package_name: &mut CompactStr,
         grpc_services: &[CompactStr],
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "namespace_definition" => {
                 // The first named namespace becomes the package; nested ones are scoped below it.
@@ -207,6 +217,7 @@ impl CppExtractor {
                 package_name,
                 grpc_services,
                 nodes,
+                depth + 1,
             );
         }
     }
@@ -227,7 +238,15 @@ impl CppExtractor {
     /// Collects the names of every class/struct in the tree that derives from
     /// `::grpc::Service`, so out-of-line method definitions (`Foo::Method`) can be
     /// attributed back to their owning gRPC service.
-    fn collect_grpc_service_names(node: Node, source: &[u8], out: &mut Vec<CompactStr>) {
+    fn collect_grpc_service_names(
+        node: Node,
+        source: &[u8],
+        out: &mut Vec<CompactStr>,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         if matches!(node.kind(), "class_specifier" | "struct_specifier")
             && node.child_by_field_name("body").is_some()
             && Self::has_grpc_service_base(node, source)
@@ -242,7 +261,7 @@ impl CppExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_grpc_service_names(child, source, out);
+            Self::collect_grpc_service_names(child, source, out, depth + 1);
         }
     }
 

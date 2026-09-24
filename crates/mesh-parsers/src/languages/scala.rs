@@ -33,6 +33,7 @@ impl ScalaExtractor {
             repo_id,
             &package_name,
             &mut nodes,
+            0,
         );
         nodes
     }
@@ -44,7 +45,12 @@ impl ScalaExtractor {
         repo_id: RepoId,
         package_name: &CompactStr,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "class_definition" | "trait_definition" | "object_definition" => {
                 let name = node
@@ -79,7 +85,15 @@ impl ScalaExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, file_path, repo_id, package_name, nodes);
+            Self::visit_node(
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                nodes,
+                depth + 1,
+            );
         }
     }
 
@@ -110,7 +124,7 @@ impl ScalaExtractor {
         let Some(args) = func.child_by_field_name("arguments") else {
             return;
         };
-        let Some(path_lit) = Self::first_string_literal(args, source) else {
+        let Some(path_lit) = Self::first_string_literal(args, source, 0) else {
             return;
         };
         let Some(body) = node.child_by_field_name("arguments") else {
@@ -118,7 +132,7 @@ impl ScalaExtractor {
         };
 
         let mut verbs = Vec::new();
-        Self::collect_verbs(body, source, &mut verbs);
+        Self::collect_verbs(body, source, &mut verbs, 0);
 
         let emit_names: Vec<String> = if verbs.is_empty() {
             vec![format!("ANY {path_lit}")]
@@ -145,7 +159,10 @@ impl ScalaExtractor {
         }
     }
 
-    fn collect_verbs<'a>(node: Node<'a>, source: &'a [u8], out: &mut Vec<&'a str>) {
+    fn collect_verbs<'a>(node: Node<'a>, source: &'a [u8], out: &mut Vec<&'a str>, depth: usize) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
         const VERBS: &[&str] = &["get", "post", "put", "patch", "delete"];
         if node.kind() == "call_expression" {
             if let Some(name) = node
@@ -159,11 +176,14 @@ impl ScalaExtractor {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_verbs(child, source, out);
+            Self::collect_verbs(child, source, out, depth + 1);
         }
     }
 
-    fn first_string_literal(node: Node, source: &[u8]) -> Option<String> {
+    fn first_string_literal(node: Node, source: &[u8], depth: usize) -> Option<String> {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return None;
+        }
         if node.kind() == "string" {
             return node
                 .utf8_text(source)
@@ -172,7 +192,7 @@ impl ScalaExtractor {
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if let Some(found) = Self::first_string_literal(child, source) {
+            if let Some(found) = Self::first_string_literal(child, source, depth + 1) {
                 return Some(found);
             }
         }

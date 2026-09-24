@@ -34,6 +34,7 @@ impl SwiftExtractor {
             repo_id,
             &package_name,
             &mut nodes,
+            0,
         );
         nodes
     }
@@ -45,7 +46,12 @@ impl SwiftExtractor {
         repo_id: RepoId,
         package_name: &CompactStr,
         nodes: &mut Vec<ContractNode>,
+        depth: usize,
     ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         match node.kind() {
             "class_declaration" | "protocol_declaration" => {
                 let name = node
@@ -114,7 +120,15 @@ impl SwiftExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::visit_node(child, source, file_path, repo_id, package_name, nodes);
+            Self::visit_node(
+                child,
+                source,
+                file_path,
+                repo_id,
+                package_name,
+                nodes,
+                depth + 1,
+            );
         }
     }
 

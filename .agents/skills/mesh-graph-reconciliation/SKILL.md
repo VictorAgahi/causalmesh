@@ -196,12 +196,25 @@ before folding the new fragments in — `WorkspaceIndexer::reload` does exactly 
 
 ## 6. Queries
 
-- `find_dependents(target)` — `reverse_deps` direct hit; if empty, falls back to scanning
-  the `reverse_deps` keys for a substring match (package-level). Returns `Vec<&ContractNode>`.
+- `find_dependents(target)` — three steps, each only tried if the previous found nothing:
+  1. `reverse_deps` direct hit on `target` as a literal import-path/package string.
+  2. Symbol bridge: resolve `target` via `name_to_nodes`/`fqcn_to_node` (it may be a
+     declared contract name, not an import string — e.g. a `GrpcService`'s own name),
+     take each declaring node's `.package`, and re-query `reverse_deps` with that.
+  3. Last-resort unscoped substring scan over every `reverse_deps` key. Can span multiple
+     services that share a locally-aliased package name; callers should group the
+     returned nodes by `ContractNode::repo_id` before presenting them (the
+     `find_dependents` MCP tool does this — see `mesh-tool-authoring`).
+  Returns `Vec<&ContractNode>`.
 - `analyze_grpc(target)` — `GrpcTrace<'_>` with `proto_definition`, `client_stubs`,
   `server_handlers`. Matches `GrpcService` / `GrpcMethod` nodes by name (ASCII
   case-insensitive) or by FQCN containment; `is_proto_file` decides what counts as the
-  definition.
+  definition. The immediate per-node client/server path-substring bucketing
+  (`"controller"`/`"handler"`/`"service"` in the path) only runs for an **exact** name
+  match — a heuristic (non-exact) name/FQCN match is only surfaced via a real
+  `Implements`/`CallsRpc` graph edge to the proto definition below, never by path alone
+  (a directory merely named `*service` is not evidence of anything on its own — every
+  service in a typical microservices repo satisfies it).
 - `analyze_impact(target)` — `ImpactFlow<'_>` with `upstream_producers`, `topics`,
   `downstream_consumers`, `related_sagas`.
 - `search_symbols(query, scope_filter)` — exact-name fast path through `name_to_nodes`

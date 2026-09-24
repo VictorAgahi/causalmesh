@@ -187,7 +187,7 @@ impl AstDecapitator {
         };
 
         let mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)> = Vec::new();
-        Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements);
+        Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements, 0);
 
         if replacements.is_empty() {
             return content.to_string();
@@ -217,7 +217,19 @@ impl AstDecapitator {
         node: Node,
         lang_kind: LanguageKind,
         replacements: &mut Vec<(usize, usize, std::borrow::Cow<'static, str>)>,
+        depth: usize,
     ) {
+        // Guards against a native stack overflow: `AstGuard::max_nesting_depth` is a
+        // lexical bracket count over raw bytes and only a rough proxy for real CST
+        // depth (chained calls/generics/match arms add tree-sitter nesting without
+        // brackets), so a file can pass that pre-parse filter and still produce a
+        // parse tree deep enough to blow the stack here. Cap at the same limit for
+        // consistency and leave unvisited subtrees unmodified (safer than emitting a
+        // partial/incorrect replacement span).
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+
         let kind = node.kind();
 
         match lang_kind {
@@ -408,7 +420,7 @@ impl AstDecapitator {
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::collect_body_replacements(source, child, lang_kind, replacements);
+            Self::collect_body_replacements(source, child, lang_kind, replacements, depth + 1);
         }
     }
 
@@ -483,6 +495,7 @@ impl AstDecapitator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::AstGuard;
     use tree_sitter::Parser;
 
     #[test]
@@ -832,6 +845,30 @@ export const computeDiscount = (rate: number) => rate * 0.15;
             "Concise arrow function must be decapitated"
         );
         assert!(!decapitated.contains("rate * 0.15"));
+    }
+
+    #[test]
+    fn test_deeply_nested_cst_does_not_overflow_stack() {
+        // Regression test for the rust-lang/rust benchmark crash: a long chain of binary
+        // operators produces a CST hundreds/thousands of levels deep (one binary_expression
+        // node per operator) while using zero '{', '(', '[' characters, so it sails straight
+        // past AstGuard::max_nesting_depth's lexical bracket count (a proxy, not a real CST
+        // depth check) and would previously blow the native stack in
+        // `collect_body_replacements`, which had no depth limit of its own.
+        let deep_chain = (0..5_000).map(|_| "1").collect::<Vec<_>>().join(" + ");
+        let code = format!("const DEEP: i32 = {deep_chain};");
+
+        assert!(
+            AstGuard::max_nesting_depth(code.as_bytes()) <= AstGuard::MAX_NESTING_DEPTH,
+            "test fixture must pass the lexical guard to actually exercise the CST-depth cap"
+        );
+
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        // Must return without panicking or aborting the process.
+        let _ = AstDecapitator::decapitate(&code, LanguageKind::Rust, &mut parser, false);
     }
 
     #[test]

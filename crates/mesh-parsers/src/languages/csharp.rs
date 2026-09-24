@@ -387,7 +387,7 @@ public class BillingController : ControllerBase
         assert!(nodes.iter().all(|n| n.repo_id == 2));
         assert_eq!(
             find("BillingController").unwrap().package.as_str(),
-            "billing"
+            "Mesh.Billing"
         );
     }
 

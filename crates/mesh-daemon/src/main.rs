@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Socket path (Unix) / named pipe address (Windows) ───────────────────────
     // `meshd` has no UDS on Windows, so IDE clients share the daemon over a
-    // named pipe instead (ROADMAP Item 13). `--socket` overrides either form.
+    // named pipe instead. `--socket` overrides either form.
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
         Some(p) => p,

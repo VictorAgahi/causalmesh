@@ -54,7 +54,7 @@ impl AuditLogger {
     ///
     /// v1 (legacy) hashed only `prev_hash || timestamp || session_id || tool || args_digest`,
     /// which left `status`, `files_accessed` and `secrets_redacted_count` mutable without
-    /// breaking verification (ROADMAP item 9). v2 folds those three fields into the hash.
+    /// breaking verification. v2 folds those three fields into the hash.
     ///
     /// Rows carry their own `chain_version` so pre-existing databases keep verifying under
     /// the formula they were written with (`verify_db` dispatches per row) instead of having
@@ -227,7 +227,7 @@ impl AuditLogger {
         //
         // v1 covered only the first five fields, which let `status`, `files_accessed`
         // and `secrets_redacted_count` be tampered with in the row without breaking the
-        // chain (ROADMAP item 9). All new writes use v2; see `CHAIN_VERSION`.
+        // chain. All new writes use v2; see `CHAIN_VERSION`.
         let hash_input = format!(
             "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
         );
@@ -614,9 +614,8 @@ mod tests {
         assert!(is_valid);
     }
 
-    /// ROADMAP item 9: `status`, `files_accessed` and `secrets_redacted_count` are stored
-    /// in the same row as the hash but were not covered by chain v1. This asserts tampering
-    /// with `status` after the fact is now detected as a broken chain.
+    /// Asserts that tampering with `status`, `files_accessed` or `secrets_redacted_count`
+    /// is detected under chain v2 as a broken chain.
     #[test]
     fn test_tampering_with_status_breaks_chain() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");

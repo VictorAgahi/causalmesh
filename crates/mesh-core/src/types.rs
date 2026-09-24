@@ -106,9 +106,9 @@ pub enum EdgeKind {
     DispatchesTo,
 }
 
-/// Confidence of a `ContractEdge`'s resolution. The graph is built mostly from
-/// string matching (symbol names, packages, substrings — see ROADMAP Item 6),
-/// so an edge is only as trustworthy as the strategy that produced it. This
+/// Confidence of a `ContractEdge`'s resolution. The graph is built from
+/// exact declarations, FQCN imports, and heuristic resolutions, so an
+/// edge is only as trustworthy as the strategy that produced it. This
 /// lets callers weigh a result instead of treating every edge as fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -154,17 +154,46 @@ pub struct RepoState {
     pub file_count: usize,
 }
 
-/// Heuristic to detect a clean service or package name from file path and optional AST package
+/// Detects a canonical package or service name from optional AST package and file path.
+///
+/// Precedence:
+/// 1. Explicit, non-generic AST package declaration (e.g. Java FQCN, Go package name, C# namespace).
+///    Generic keywords like "main" fall through to directory/manifest detection.
+/// 2. Deepest project manifest boundary (`Cargo.toml`, `go.mod`, `package.json`, `pom.xml`, etc.).
+/// 3. Service container folder (`services/`, `apps/`, `packages/`, `modules/`, `crates/`, `libs/`, `subprojects/`).
+/// 4. First non-technical parent directory (skipping `src`, `lib`, `cmd`, `pkg`, `internal`, `proto`).
+/// 5. Fallback: "shared".
 pub fn detect_service_package(
     file_path: &std::path::Path,
     raw_package: Option<&str>,
 ) -> CompactStr {
-    // 1. If inside a services/, apps/, or packages/ directory, microservice folder is canonical!
+    // 1. Explicit AST package takes precedence when non-empty and non-generic
+    if let Some(pkg) = raw_package {
+        let trimmed = pkg.trim();
+        if !trimmed.is_empty() && trimmed != "main" {
+            return CompactStr::new(trimmed);
+        }
+    }
+
+    // 2. Walk upwards looking for compilation manifests
     let mut current = file_path.parent();
     while let Some(dir) = current {
+        if has_compilation_manifest(dir) {
+            if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+                if !name.is_empty() {
+                    return CompactStr::new(name);
+                }
+            }
+        }
+        current = dir.parent();
+    }
+
+    // 3. Check for service container convention without hardcoded microservice names
+    current = file_path.parent();
+    while let Some(dir) = current {
         if let Some(parent) = dir.parent() {
-            if let Some(pname) = parent.file_name() {
-                if pname == "services" || pname == "apps" || pname == "packages" {
+            if let Some(pname) = parent.file_name().and_then(|s| s.to_str()) {
+                if is_container_dir(pname) {
                     if let Some(svc_name) = dir.file_name().and_then(|s| s.to_str()) {
                         return CompactStr::new(svc_name);
                     }
@@ -174,40 +203,115 @@ pub fn detect_service_package(
         current = dir.parent();
     }
 
-    // 2. Otherwise use explicit non-generic raw package (e.g. proto package shop.checkout.v1)
-    if let Some(pkg) = raw_package {
-        let trimmed = pkg.trim();
-        if !trimmed.is_empty()
-            && trimmed != "main"
-            && trimmed != "app"
-            && trimmed != "crate"
-            && trimmed != "src"
-            && trimmed != "module"
-            && trimmed != "custom"
-        {
-            return CompactStr::new(trimmed);
-        }
-    }
-
-    // 3. Fallback directory inspection
+    // 4. Fallback: first non-technical directory
     current = file_path.parent();
     while let Some(dir) = current {
-        if let Some(name) = dir.file_name() {
-            if name != "src"
-                && name != "lib"
-                && name != "cmd"
-                && name != "pkg"
-                && name != "internal"
-                && name != "services"
-                && name != "proto"
-            {
-                if let Some(name_str) = name.to_str() {
-                    return CompactStr::new(name_str);
-                }
+        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+            if !is_technical_source_dir(name) {
+                return CompactStr::new(name);
             }
         }
         current = dir.parent();
     }
 
     CompactStr::new("shared")
+}
+
+#[inline]
+fn has_compilation_manifest(dir: &std::path::Path) -> bool {
+    dir.join("go.mod").exists()
+        || dir.join("Cargo.toml").exists()
+        || dir.join("package.json").exists()
+        || dir.join("pom.xml").exists()
+        || dir.join("build.gradle").exists()
+        || dir.join("build.gradle.kts").exists()
+        || dir.join("pyproject.toml").exists()
+        || dir.join("Pipfile").exists()
+        || dir.join("setup.py").exists()
+        || dir.join("Gemfile").exists()
+        || dir.join("composer.json").exists()
+        || dir.join("Package.swift").exists()
+}
+
+#[inline]
+fn is_container_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "services"
+            | "apps"
+            | "packages"
+            | "modules"
+            | "crates"
+            | "libs"
+            | "subprojects"
+            | "projects"
+    )
+}
+
+#[inline]
+fn is_technical_source_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "src" | "lib" | "cmd" | "pkg" | "internal" | "proto" | "api" | "test" | "tests"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_detect_service_package_ast_precedence() {
+        let path = Path::new("services/checkout/pkg/jwt.go");
+        // AST package must take precedence over directory structure
+        assert_eq!(
+            detect_service_package(path, Some("auth.jwt")).as_str(),
+            "auth.jwt"
+        );
+        assert_eq!(detect_service_package(path, Some("app")).as_str(), "app");
+        assert_eq!(
+            detect_service_package(path, Some("custom")).as_str(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn test_detect_service_package_main_falls_through_to_directory() {
+        let path = Path::new("services/checkout/main.go");
+        // "main" is generic in Go entry points, falls through to service directory
+        assert_eq!(
+            detect_service_package(path, Some("main")).as_str(),
+            "checkout"
+        );
+        assert_eq!(detect_service_package(path, None).as_str(), "checkout");
+    }
+
+    #[test]
+    fn test_detect_service_package_container_dirs() {
+        assert_eq!(
+            detect_service_package(Path::new("modules/billing/src/Payment.java"), None).as_str(),
+            "billing"
+        );
+        assert_eq!(
+            detect_service_package(Path::new("crates/mesh-core/src/lib.rs"), None).as_str(),
+            "mesh-core"
+        );
+        assert_eq!(
+            detect_service_package(Path::new("libs/auth/index.ts"), None).as_str(),
+            "auth"
+        );
+    }
+
+    #[test]
+    fn test_detect_service_package_flat_technical_dirs() {
+        assert_eq!(
+            detect_service_package(Path::new("cmd/worker/main.go"), None).as_str(),
+            "worker"
+        );
+        assert_eq!(
+            detect_service_package(Path::new("pkg/storage/s3.go"), None).as_str(),
+            "storage"
+        );
+    }
 }

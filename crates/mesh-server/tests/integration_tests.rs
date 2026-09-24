@@ -444,8 +444,8 @@ async fn test_smart_search_is_index_first_with_opt_in_fuzzy_fallback() {
 
 #[tokio::test]
 async fn test_smart_search_ranks_exact_match_over_alphabetically_earlier_substring() {
-    // Regression for ROADMAP item 16: smart_search must rank results by relevance
-    // (exact symbol-name match first) rather than by alphabetical file path order.
+    // smart_search must rank results by relevance (exact symbol-name match first)
+    // rather than by alphabetical file path order.
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let base_path = dunce::canonicalize(temp_dir.path()).expect("canonicalize");
 
@@ -723,7 +723,7 @@ async fn test_volontariapp_fixture_end_to_end_indexing() {
 }
 
 /// Functional integration test verifying that `proto_dirs` configured with `${workspace_root}`
-/// actually extracts `.proto` definitions at runtime rather than being parsed and ignored (Écart 1 fix).
+/// extracts `.proto` definitions at runtime.
 #[test]
 fn test_proto_dirs_workspace_root_expansion_functional_wiring() {
     let temp = tempfile::tempdir().expect("temp");

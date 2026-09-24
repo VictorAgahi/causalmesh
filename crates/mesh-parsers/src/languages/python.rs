@@ -45,11 +45,10 @@ impl PythonExtractor {
         Self::extract_with_relations(file_path, content, repo_id, parser).0
     }
 
-    /// Same nodes as `extract`, plus native import dependencies (Item 2:
-    /// `import x`, `from x import y`, relative `from .x import y`) and native
-    /// event producer/consumer detection (Item 3: `confluent_kafka`,
-    /// `aiokafka`, Celery `@task` / `@app.task` / `.delay()` /
-    /// `.apply_async()`).
+    /// Same nodes as `extract`, plus native import dependencies (`import x`,
+    /// `from x import y`, relative `from .x import y`) and native event
+    /// producer/consumer detection (`confluent_kafka`, `aiokafka`, Celery
+    /// `@task` / `@app.task` / `.delay()` / `.apply_async()`).
     pub fn extract_with_relations(
         file_path: &Path,
         content: &str,
@@ -198,19 +197,42 @@ impl PythonExtractor {
 
                 let mut kind = NodeKind::ServiceClass;
                 let mut celery_task_name: Option<String> = None;
-                // Check previous siblings for decorators
-                if let Some(prev) = node.prev_sibling() {
-                    if prev.kind() == "decorator" {
-                        if let Ok(dec_text) = prev.utf8_text(source) {
-                            if Self::is_celery_task_decorator(dec_text) {
-                                kind = NodeKind::Queue;
-                                celery_task_name = Self::celery_task_name_override(dec_text)
-                                    .or_else(|| Some(func_name.to_string()));
-                            } else if dec_text.contains("@app.") || dec_text.contains("@router.") {
-                                kind = NodeKind::HttpEndpoint;
+                // Check decorators (supporting multiple stacked decorators, e.g. @app.get + @login_required)
+                let mut check_decorator = |dec_node: Node| {
+                    if let Ok(dec_text) = dec_node.utf8_text(source) {
+                        if Self::is_celery_task_decorator(dec_text) {
+                            kind = NodeKind::Queue;
+                            celery_task_name = Self::celery_task_name_override(dec_text)
+                                .or_else(|| Some(func_name.to_string()));
+                        } else if dec_text.contains("@app.")
+                            || dec_text.contains("@router.")
+                            || dec_text.contains("@api_router.")
+                        {
+                            kind = NodeKind::HttpEndpoint;
+                        }
+                    }
+                };
+
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "decorated_definition" {
+                        for i in 0..parent.child_count() {
+                            if let Some(child) = parent.child(i) {
+                                if child.kind() == "decorator" {
+                                    check_decorator(child);
+                                }
                             }
                         }
                     }
+                }
+                // Fallback for sibling decorators
+                let mut prev_opt = node.prev_sibling();
+                while let Some(prev) = prev_opt {
+                    if prev.kind() == "decorator" {
+                        check_decorator(prev);
+                    } else if prev.kind() != "comment" && prev.kind() != "\n" {
+                        break;
+                    }
+                    prev_opt = prev.prev_sibling();
                 }
 
                 let idx = nodes.len();
@@ -260,7 +282,7 @@ impl PythonExtractor {
         }
     }
 
-    // ---- Item 2: import extraction --------------------------------------
+    // Import extraction
 
     fn collect_import_names(node: Node, source: &[u8], imports: &mut Vec<ImportRef>) {
         let mut cursor = node.walk();
@@ -363,7 +385,7 @@ impl PythonExtractor {
         deps
     }
 
-    // ---- Item 3: native event producer/consumer detection ---------------
+    // Native event producer/consumer detection
 
     fn detect_event_call(
         node: Node,
@@ -595,12 +617,8 @@ def list_users():
             .any(|n| n.name == "list_users" && n.kind == NodeKind::HttpEndpoint));
     }
 
-    /// Regression test for the Online Boutique benchmark finding: a
-    /// `*Servicer` class defined inside a `grpc_tools.protoc`-generated
-    /// `*_pb2_grpc.py` stub is the shared base class for every service in
-    /// the .proto file — every service that imports it vendors an identical
-    /// copy — and must NOT be tagged `GrpcService`, or every vendored copy
-    /// looks like a real implementation to `analyze_grpc`.
+    /// A `*Servicer` class defined inside a `grpc_tools.protoc`-generated
+    /// `*_pb2_grpc.py` stub is a base class and must NOT be tagged `GrpcService`.
     #[test]
     fn generated_pb2_grpc_servicer_base_class_is_not_tagged_grpc_service() {
         let code = r#"
@@ -653,7 +671,7 @@ class CheckoutServiceServicer(checkout_pb2_grpc.CheckoutServiceServicer):
         assert_eq!(servicer.kind, NodeKind::GrpcService);
     }
 
-    /// Item 2 (plain `from x import y`): a symbol declared in one file and
+    /// Plain `from x import y`: a symbol declared in one file and
     /// imported (and used) in another links the two through `find_dependents`.
     #[test]
     fn test_python_plain_import_dependency() {
@@ -706,8 +724,7 @@ def process():
         );
     }
 
-    /// Item 2 (relative `from .x import y`): same as above, through a
-    /// relative import.
+    /// Relative `from .x import y`: imports resolved through a relative path.
     #[test]
     fn test_python_relative_import_dependency() {
         let producer_code = r#"
@@ -756,9 +773,8 @@ def process():
         );
     }
 
-    /// Item 3 (confluent_kafka / aiokafka): a `.produce()` call in one file
-    /// and a `.subscribe()` loop in another are linked through
-    /// `analyze_impact`, with no custom pattern configured.
+    /// Confluent-kafka / aiokafka: a `.produce()` call in one file
+    /// and a `.subscribe()` loop in another are linked through `analyze_impact`.
     #[test]
     fn test_python_kafka_producer_consumer_impact() {
         let producer_code = r#"
@@ -820,7 +836,7 @@ def run_consumer_loop():
             .any(|n| n.name == "run_consumer_loop"));
     }
 
-    /// Item 3 (Celery): `.delay()` as a producer and `@app.task` as a
+    /// Celery: `.delay()` as a producer and `@app.task` as a
     /// consumer are linked through `analyze_impact`.
     #[test]
     fn test_python_celery_producer_consumer_impact() {
@@ -943,6 +959,33 @@ producer = kafka.KafkaProducer(bootstrap_servers='localhost:9092')
                 .iter()
                 .map(|n| n.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_multi_stacked_decorators() {
+        let code = r#"
+@app.get("/items")
+@login_required
+@permission_required("admin")
+def get_items():
+    pass
+"#;
+        let mut parser = make_parser();
+        let (nodes, _) = PythonExtractor::extract_with_relations(
+            Path::new("app/routes.py"),
+            code,
+            0,
+            &mut parser,
+        );
+        let endpoint = nodes
+            .iter()
+            .find(|n| n.name == "get_items")
+            .expect("get_items node");
+        assert_eq!(
+            endpoint.kind,
+            NodeKind::HttpEndpoint,
+            "stacked decorators must correctly identify HttpEndpoint"
         );
     }
 }

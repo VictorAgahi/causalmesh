@@ -179,7 +179,7 @@ impl SmartSearchTool {
     }
 
     /// Reads one file under the AstGuard budget and extracts the snippet around the
-    /// first line mentioning `query` in its decapitated form.
+    /// first line mentioning `query` mapped to original file line numbers.
     fn search_file(file_path: &Path, query: &str, include_body: bool) -> Option<SearchResult> {
         let metadata = fs::metadata(file_path).ok()?;
         // Commandment 2: size check before the read.
@@ -188,7 +188,9 @@ impl SmartSearchTool {
         }
         let content_bytes = fs::read(file_path).ok()?;
         let content_str = std::str::from_utf8(&content_bytes).ok()?;
-        if !content_str.contains(query) {
+        let query_lower = query.to_lowercase();
+        let content_lower = content_str.to_lowercase();
+        if !content_lower.contains(&query_lower) {
             return None;
         }
 
@@ -210,13 +212,57 @@ impl SmartSearchTool {
         }
 
         let decapitated = AstDecapitator::decapitate_auto(content_str, lang_kind, include_body);
+        let orig_lines: Vec<&str> = content_str.lines().collect();
 
         // Single pass over the decapitated lines: find the first hit, then take the
-        // window around it (was a second `.lines().skip(n)` walk from the start).
-        let lines: Vec<&str> = decapitated.lines().collect();
-        let hit = lines.iter().position(|l| l.contains(query))?;
-        let start = hit.saturating_sub(SNIPPET_LEAD);
-        let window = &lines[start..lines.len().min(start + SNIPPET_LINES)];
+        // window around it. Fall back to original lines if body was decapitated.
+        let decap_lines: Vec<&str> = decapitated.lines().collect();
+        let (window, orig_line_start, orig_line_end) = if let Some(hit) = decap_lines
+            .iter()
+            .position(|l| l.to_lowercase().contains(&query_lower))
+        {
+            let start = hit.saturating_sub(SNIPPET_LEAD);
+            let win = &decap_lines[start..decap_lines.len().min(start + SNIPPET_LINES)];
+
+            // Map hit line to line number in original content
+            let hit_line_text = decap_lines[hit].trim();
+            let orig_hit = orig_lines
+                .iter()
+                .position(|l| l.trim() == hit_line_text)
+                .or_else(|| {
+                    orig_lines
+                        .iter()
+                        .position(|l| l.to_lowercase().contains(&query_lower))
+                })
+                .unwrap_or(0);
+            let orig_start = (orig_hit + 1)
+                .saturating_sub(hit.saturating_sub(start))
+                .max(1);
+
+            let mut orig_end = orig_hit + 1;
+            if let Some(last_line) = win.last() {
+                let last_trimmed = last_line.trim();
+                if !last_trimmed.is_empty() {
+                    if let Some(pos) = orig_lines[orig_hit..]
+                        .iter()
+                        .position(|l| l.trim() == last_trimmed)
+                    {
+                        orig_end = orig_hit + pos + 1;
+                    }
+                }
+            }
+            if orig_end < orig_start {
+                orig_end = (orig_start + win.len()).min(orig_lines.len().max(1));
+            }
+            (win, orig_start, orig_end)
+        } else {
+            let orig_hit = orig_lines
+                .iter()
+                .position(|l| l.to_lowercase().contains(&query_lower))?;
+            let start = orig_hit.saturating_sub(SNIPPET_LEAD);
+            let win = &orig_lines[start..orig_lines.len().min(start + SNIPPET_LINES)];
+            (win, start + 1, start + win.len())
+        };
 
         let snippet = window
             .iter()
@@ -233,8 +279,8 @@ impl SmartSearchTool {
 
         Some(SearchResult {
             file_path: path_string,
-            line_start: start + 1,
-            line_end: start + window.len(),
+            line_start: orig_line_start,
+            line_end: orig_line_end,
             language: lang_kind.as_str().to_string(),
             snippet,
         })

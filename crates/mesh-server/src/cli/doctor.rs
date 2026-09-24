@@ -1,3 +1,4 @@
+use crate::indexer::SCAN_DEPTH;
 use mesh_core::{expand_roots, Config, PropertyRegistry};
 use mesh_parsers::AstGuard;
 use std::path::{Path, PathBuf};
@@ -87,32 +88,7 @@ impl DoctorCommand {
             }
         }
 
-        // 1c. Source repository version drift check (Issue 5)
-        let cargo_path = PathBuf::from("Cargo.toml");
-        if cargo_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&cargo_path) {
-                if let Ok(val) = content.parse::<toml::Value>() {
-                    let local_version = val
-                        .get("workspace")
-                        .and_then(|w| w.get("package"))
-                        .and_then(|p| p.get("version"))
-                        .or_else(|| val.get("package").and_then(|p| p.get("version")))
-                        .and_then(|v| v.as_str());
-                    if let Some(version) = local_version {
-                        let running_version = env!("CARGO_PKG_VERSION");
-                        if version != running_version {
-                            eprintln!(
-                                "⚠ Binary version drift warning: Running binary is v{running_version}, but local workspace Cargo.toml is v{version} — consider running 'cargo build --release' or updating."
-                            );
-                        } else {
-                            eprintln!("✔ Binary version match: Running binary matches local workspace Cargo.toml (v{running_version})");
-                        }
-                    }
-                }
-            }
-        }
-
-        // 1d. Dead configuration pattern inspection on positive selection fields (Feedback Item 1)
+        // 1c. Dead configuration pattern inspection on positive selection fields
         if let Some(p) = cfg_path {
             if let Ok(cfg) = Config::load_from_file(p) {
                 let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
@@ -150,7 +126,7 @@ impl DoctorCommand {
                                     let files = mesh_core::FilesystemCrawler::crawl_scope(
                                         &scope,
                                         &[],
-                                        Some(5),
+                                        Some(SCAN_DEPTH),
                                     );
                                     for f in files {
                                         if let Ok(rel) = f.strip_prefix(root) {
@@ -198,7 +174,7 @@ impl DoctorCommand {
                                         let files = mesh_core::FilesystemCrawler::crawl_scope(
                                             &scope,
                                             &[],
-                                            Some(5),
+                                            Some(SCAN_DEPTH),
                                         );
                                         for f in files {
                                             if f.extension().is_some_and(|ext| ext == "proto") {
@@ -242,7 +218,7 @@ impl DoctorCommand {
                                             let files = mesh_core::FilesystemCrawler::crawl_scope(
                                                 &scope,
                                                 &[],
-                                                Some(5),
+                                                Some(SCAN_DEPTH),
                                             );
                                             for f in files {
                                                 if extract_cfg
@@ -322,7 +298,7 @@ impl DoctorCommand {
         // 6. Tree-sitter parsers initialization
         if AstGuard::verify_all_parsers() {
             eprintln!(
-                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala)"
+                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)"
             );
         } else {
             eprintln!("✖ Tree-sitter parsers: Initialization error");

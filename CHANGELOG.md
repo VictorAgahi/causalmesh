@@ -5,6 +5,46 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [3.1.0] — 2026-09-24
+
+Architectural overhaul for total layout agnosticism, semantic extractor precision, 100% Tree-Sitter Protobuf parsing, and zero-noise codebase hygiene across all crates (`mesh-core`, `mesh-parsers`, `mesh-server`, `mesh-daemon`):
+
+### Added & Overhauled
+- **100% Tree-Sitter Protobuf Parser (`crates/mesh-parsers/src/languages/proto.rs`, `decapitate.rs`, `guard.rs`)**:
+  - Integrated `tree-sitter-proto` as the 13th native grammar (`LanguageKind::Protobuf`) into `AstGuard` and `AstDecapitator`.
+  - Replaced legacy string normalization and semicolon splitting with exact CST traversal (`service_definition`, `rpc`, `message_definition`, `package_statement`).
+  - Full support for multi-line and nested custom options (`option (google.api.http) = { ... }`).
+  - 100% exact source line numbers (`line_start`/`line_end`) preserved across all Protobuf contract nodes.
+- **Agnostic Package & Microservice Boundary Detection (`crates/mesh-core/src/types.rs`)**:
+  - Refactored `detect_service_package` to strictly prioritize AST-level declarations (`package`, `namespace`).
+  - Implemented compilation boundary discovery via manifest files (`go.mod`, `Cargo.toml`, `package.json`, `pom.xml`, `build.gradle`, `pyproject.toml`).
+  - Eliminated arbitrary directory name blacklists (`app`, `module`, `custom`) and prioritized standard service container structures (`services`, `apps`, `packages`, `modules`, `crates`, `libs`).
+- **Semantic Multi-Language Extractor Precision (`crates/mesh-parsers/src/languages/`)**:
+  - **Python (`python.rs`)**: Multi-decorator support via recursive `decorated_definition` traversal; eliminated false-positive event producers/consumers without confirmed imports.
+  - **TypeScript (`typescript.rs`)**: Switched import extraction to AST `child_by_field_name("source")` (eliminating `.find("from")` false positives); expanded full HTTP decorator coverage (`@Delete`, `@Patch`, `@Options`, `@Head`, `@All`).
+  - **Go (`go.rs`)**: Enforced parameter inspection (`ResponseWriter`, `Request`, `Context`) before classifying `Handle*` as HTTP endpoints; excluded non-gRPC third-party clients (`redis`, `mongo`, `s3`, `http`) from gRPC RPC detection; filtered generic identifiers from Kafka topic fallback.
+  - **C++ (`cpp.rs`)**: Resolved intra-project angle-bracket includes (`#include <billing/service.h>`) without system header pollution.
+  - **Java (`java.rs`)**: Eliminated `"unknown.topic"` fallback dummy nodes; expanded REST mapping across Spring (`@PutMapping`, `@DeleteMapping`, `@PatchMapping`) and JAX-RS / Jakarta REST (`@GET`, `@POST`, `@PUT`, `@DELETE`, `@PATCH`, `@Path`) with Lombok `@Getter` isolation.
+
+### Fixed & Hardened
+- **Case-Insensitive & Source-Mapped Smart Search (`crates/mesh-server/src/tools/smart_search.rs`)**:
+  - Aligned `search_file` case-insensitivity with `search_symbols`.
+  - Mapped snippet line spans to the original source file line numbers rather than decapitated AST line coordinates.
+- **gRPC FQCN Disambiguation (`crates/mesh-core/src/contracts.rs`)**:
+  - Separated FQCN (`proto_by_fqcn`) from bare-name (`proto_by_bare`) indices in `reconcile_edges`, preventing name collisions on generic method names (`Ping`, `Status`).
+- **Dynamic RSAH Governance (`crates/mesh-core/src/governance.rs`)**:
+  - Fixed case-sensitivity bug in `GovernanceEngine::evaluate_guard`.
+  - Replaced hardcoded demo workflows with dynamic, rule-derived `RsahResponse` messages.
+- **Word-Boundary Secret Redaction (`crates/mesh-core/src/properties.rs`)**:
+  - Refined `is_sensitive_key` with strict word boundaries (`_key$`, `.key$`, `secret`, `password`), preventing false-positive redaction of legitimate properties like `kafka.partition.key` and `app.author.email`.
+- **Agnostic Init & Doctor Commands (`crates/mesh-server/src/cli/`)**:
+  - `init --auto` now derives stop rule keys from actual existing directories (`proto`, `k8s`, `deploy`) and workspace names from directory identity.
+  - Pre-commit hook generator detects interface contracts by file extension (`*.proto`) rather than hardcoded path prefixes.
+  - `doctor` eliminated user `Cargo.toml` version drift checks and aligned crawler depth to `SCAN_DEPTH = 10`.
+- **Codebase Hygiene**:
+  - Removed all internal roadmap markers, obsolete docstrings, and benchmark narrative justifications across all crates.
+  - Zero warnings under `cargo clippy --all-targets -- -D warnings`; 255/255 passing tests.
+
 ## [3.0.4] — 2026-09-24
 
 Eliminated repository-specific heuristics and overfitted patterns to achieve 100% agnostic, cross-language static analysis across arbitrary monorepos and microservice layouts:

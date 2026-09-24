@@ -101,8 +101,25 @@ impl CppExtractor {
                             .unwrap_or(trimmed);
                         out.push(CompactStr::new(stem));
                     }
+                } else if path_node.kind() == "system_lib_string" {
+                    if let Ok(text) = path_node.utf8_text(source) {
+                        let inner = text.trim_matches('<').trim_matches('>');
+                        // Intra-project headers formatted in Google/CMake style (e.g. <billing/service.h>
+                        // or <core/types.hpp>) contain directory separators or non-standard C++ extensions.
+                        // Standard library headers like <vector>, <string>, <iostream> are excluded.
+                        if inner.contains('/')
+                            || inner.ends_with(".hpp")
+                            || inner.ends_with(".hh")
+                            || inner.ends_with(".hxx")
+                        {
+                            let stem = Path::new(inner)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(inner);
+                            out.push(CompactStr::new(stem));
+                        }
+                    }
                 }
-                // `system_lib_string` (`<vector>`) is a system header — excluded.
             }
         }
 
@@ -541,6 +558,42 @@ public:
         assert!(
             dependents.iter().any(|n| n.name == "Circle"),
             "Circle should be a dependent of Shape via the quoted #include"
+        );
+    }
+
+    #[test]
+    fn test_cpp_intra_project_angle_bracket_include() {
+        let code = r#"
+#include <vector>
+#include <billing/service.h>
+#include <auth/jwt.hpp>
+
+class BillingClient {
+public:
+    service::BillingService svc;
+    jwt::Token tok;
+    void Pay() {}
+};
+"#;
+        let mut p = parser();
+        let index = CppExtractor::extract_file_index(Path::new("client.cpp"), code, 0, &mut p);
+        assert!(
+            index
+                .dependencies
+                .iter()
+                .all(|(_, t)| t.as_str() != "vector"),
+            "vector must be excluded"
+        );
+        assert!(
+            index
+                .dependencies
+                .iter()
+                .any(|(_, t)| t.as_str() == "service"),
+            "service.h must be included"
+        );
+        assert!(
+            index.dependencies.iter().any(|(_, t)| t.as_str() == "jwt"),
+            "jwt.hpp must be included"
         );
     }
 }

@@ -223,7 +223,7 @@ mod unix_impl {
 // ── Windows named pipe transport ─────────────────────────────────────────────
 //
 // meshd has no Unix Domain Socket on Windows, so IDE clients share the daemon
-// over a named pipe instead (ROADMAP Item 13). Windows named pipe servers are
+// over a named pipe instead. Windows named pipe servers are
 // single-instance: each accepted client owns one `NamedPipeServer`, and a
 // fresh instance must be created before (or immediately after) accepting the
 // next connection to keep listening.
@@ -443,8 +443,8 @@ mod unix_tests {
         token.cancel();
     }
 
-    /// Definition of done for ROADMAP item 8: a deliberately slow tool
-    /// call on one client must not delay a `ping` from another client.
+    /// A deliberately slow tool call on one client must not delay a `ping`
+    /// from another client.
     /// This is structurally guaranteed by `spawn_blocking` inside
     /// `ToolRegistry::invoke`, but nothing previously verified it — a
     /// future refactor could silently drop the `spawn_blocking` and

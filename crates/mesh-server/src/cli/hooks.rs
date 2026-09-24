@@ -34,14 +34,15 @@ set -e
 
 STAGED_FILES=$(git diff --cached --name-only)
 
-# Check if modifying microservices while proto contracts were changed
-HAS_PROTO=$(echo "$STAGED_FILES" | grep -E '^(proto-registry/|proto/)' || true)
-HAS_SERVICES=$(echo "$STAGED_FILES" | grep -E '^(services/|api-gateway/)' || true)
+# Contract-first cascade CI verification:
+# Interface contracts (.proto) must be committed and CI-propagated before modifying dependent service code
+HAS_CONTRACTS=$(echo "$STAGED_FILES" | grep -E '\.(proto)$' || true)
+HAS_SERVICES=$(echo "$STAGED_FILES" | grep -E '\.(go|rs|java|kt|ts|tsx|py|cpp|cs|php|rb|swift|scala)$' || true)
 
-if [ -n "$HAS_PROTO" ] && [ -n "$HAS_SERVICES" ]; then
+if [ -n "$HAS_CONTRACTS" ] && [ -n "$HAS_SERVICES" ]; then
     echo "🛑 [MeshMCP GOVERNANCE BLOCKED: CONTRACT_FIRST_CASCADE_CI]"
-    echo "Cross-service mutation detected: Contract in 'proto-registry' must be committed and CI-propagated BEFORE mutating microservices."
-    echo "👉 Required Action: Unstage services/ and api-gateway/, and commit proto changes exclusively."
+    echo "Cross-boundary mutation detected: Interface contracts (*.proto) must be committed and CI-propagated BEFORE mutating service implementations."
+    echo "👉 Required Action: Unstage service implementation files and commit contract definitions exclusively."
     exit 1
 fi
 

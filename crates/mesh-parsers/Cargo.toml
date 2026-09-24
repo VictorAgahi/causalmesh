@@ -32,6 +32,7 @@ tree-sitter-ruby.workspace = true
 tree-sitter-php.workspace = true
 tree-sitter-swift.workspace = true
 tree-sitter-scala.workspace = true
+tree-sitter-proto.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

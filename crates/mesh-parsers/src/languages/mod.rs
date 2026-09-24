@@ -289,14 +289,20 @@ impl PolyglotIndexer {
         match lang_kind {
             LanguageKind::Protobuf => {
                 if cfg.allows_proto_path(&path_str) {
-                    out.nodes = proto::ProtoExtractor::extract_with_config(
-                        file_path,
-                        content,
-                        repo_id,
-                        cfg.canonical_fqcn_projection,
-                    );
+                    if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                        proto::ProtoExtractor::extract_with_parser(
+                            file_path,
+                            content,
+                            repo_id,
+                            cfg.canonical_fqcn_projection,
+                            parser,
+                        )
+                    }) {
+                        out.nodes = nodes;
+                    }
                 }
             }
+
             LanguageKind::Java => {
                 if let Some((nodes, dependencies, producers)) =
                     AstGuard::with_parser(lang_kind, |parser| {

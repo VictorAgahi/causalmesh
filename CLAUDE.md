@@ -95,4 +95,3 @@ Claude Code must strictly enforce these invariants on every edit:
 - Developer & Tree-sitter guide: [`docs/development.md`](docs/development.md)
 - Governance & RSAH: [`docs/governance-rsah.md`](docs/governance-rsah.md)
 - Performance & Token benchmarks: [`docs/benchmarks.md`](docs/benchmarks.md)
-- Authoritative Specification: [`RFC-001-CAUSAL-MCP.md`](RFC-001-CAUSAL-MCP.md)

@@ -1,0 +1,90 @@
+# Ground truth for the OpenTelemetry Demo (open-telemetry/opentelemetry-demo),
+# pinned at the commit in scripts/golden/repos.txt. Written by hand from the
+# real source (pb/demo.proto's service list, grep for `New*ServiceClient`/
+# `*ServiceStub(`/`new *ServiceClient(` construction sites in each caller,
+# and the Kafka producer/consumer wiring under src/checkout, src/accounting,
+# src/fraud-detection), not derived from mesh-mcp's own output — that would
+# make the "ground truth" circular.
+#
+# Scoring (scripts/golden/score.py) computes precision/recall of
+# `mesh-mcp graph --format json`'s gRPC edges against `grpc_edges` below.
+# The `topics` section is ground truth for a future async-topic scoring mode
+# (see docs/quality.md, "What's NOT measured yet") — not consumed by
+# score.py yet.
+repo: otel-demo
+commit: 898ede2f314b2c1e92a2d9a6ebd7efc188709290
+
+# One entry per service declared in pb/demo.proto that has a real server
+# implementation under src/ (FeatureFlagService is served by the flagd
+# sidecar, not a service under src/, so it is intentionally omitted here —
+# there is no caller/callee edge for it to appear in below).
+grpc_services:
+  - name: CartService
+    language: csharp
+  - name: RecommendationService
+    language: python
+  - name: ProductCatalogService
+    language: go
+  - name: ShippingService
+    language: rust
+  - name: CurrencyService
+    language: cpp
+  - name: PaymentService
+    language: javascript
+  - name: EmailService
+    language: ruby
+  - name: CheckoutService
+    language: go
+  - name: AdService
+    language: java
+
+# Real caller -> callee edges, confirmed by grepping each caller for the
+# generated client's construction (`new <Service>Client(...)` in
+# src/frontend/gateways/rpc/*.gateway.ts, `pb.New<Service>Client(...)` in Go,
+# `<Service>Stub(...)` in Python). `from` is the calling service's directory
+# name under src/ (unlike online-boutique, otel-demo's directories drop the
+# "service" suffix — `src/checkout`, not `src/checkoutservice` — so `from`
+# must match that real spelling for `score.py`'s path-inferred caller name
+# to compare equal; `to` is still the proto service name, which score.py
+# normalizes the same way on both sides). frontend has no .proto service of
+# its own but is a real gRPC client of six others.
+grpc_edges:
+  # src/frontend/gateways/rpc/*.gateway.ts
+  - {from: frontend, to: AdService}
+  - {from: frontend, to: CartService}
+  - {from: frontend, to: CheckoutService}
+  - {from: frontend, to: CurrencyService}
+  - {from: frontend, to: ProductCatalogService}
+  - {from: frontend, to: RecommendationService}
+  # Unlike online-boutique, frontend does not call ShippingService directly
+  # here — shipping cost/address validation only happens inside checkout's
+  # own PlaceOrder flow. Asserting this absence is itself part of the ground
+  # truth: a scorer must not invent a frontend -> ShippingService edge.
+  # src/checkout/main.go
+  - {from: checkout, to: ShippingService}
+  - {from: checkout, to: CartService}
+  - {from: checkout, to: ProductCatalogService}
+  - {from: checkout, to: CurrencyService}
+  - {from: checkout, to: PaymentService}
+  - {from: checkout, to: EmailService}
+  # src/recommendation/recommendation_server.py
+  - {from: recommendation, to: ProductCatalogService}
+
+# Kafka topic producer/consumer wiring — this demo's first real
+# asynchronous-blast-radius chain in the golden corpus (online-boutique has
+# none). Not yet scored by score.py; recorded here as ground truth for when
+# a topic-scoring mode lands.
+#
+# checkout/kafka/producer.go declares `Topic = getTopic()` (env
+# `KAFKA_TOPIC`, default "orders") and publishes to it from
+# checkout/main.go:671 (`Topic: kafka.Topic`) — a different file from the
+# declaration, the exact cross-file gap step 2.5 documented as open in
+# docs/quality.md. Both consumers subscribe to the same "orders" default via
+# their own `KAFKA_TOPIC`-with-"orders"-fallback idiom:
+#   - src/accounting/Consumer.cs:30 (C#, `?? "orders"`)
+#   - src/fraud-detection/src/main/kotlin/frauddetection/main.kt:26
+#     (Kotlin, `?: "orders"`)
+topics:
+  - name: orders
+    producers: [CheckoutService]
+    consumers: [accounting, fraud-detection]

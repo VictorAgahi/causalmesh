@@ -7,7 +7,30 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 2 (P1): make inter-service joins precise, not just deterministic.
+## [5.0.0] — 2026-09-25
+
+**Plan 2 (P1) complete: inter-service joins are precise, not just deterministic.** Eight steps
+landed as one PR apiece (#17–#24), each green on `cargo fmt`/`clippy -D warnings`/
+`cargo test --workspace`, `scripts/determinism.sh`, and `scripts/golden/score.py` against the
+real golden corpus (`online-boutique`, `otel-demo`, `bank-of-anthos`). `find_dependents` and
+`analyze_impact` gained new opt-in parameters (`granularity`, `depth`) and two more golden files
+were written by hand from real source — hence the major version bump, since a caller relying on
+either tool's exact prior output shape should re-check it, even though every existing default
+stayed byte-for-byte unchanged.
+
+Closing out the plan meant running the golden scorer against the two corpus repos this plan
+added, not just the one (`online-boutique`) step 2.0 started with — which is exactly what caught
+a genuine, previously-unknown gap: `otel-demo`'s TypeScript frontend uses a `@grpc/grpc-js`
+client-construction idiom (`new XServiceClient(...)`) `typescript.rs` doesn't recognize (only the
+NestJS `getService<XServiceClient>(...)` idiom is covered), scoring 87.5%/53.8% rather than
+100%/100% — documented honestly in `docs/quality.md` as an open finding, not fixed under time
+pressure, and not hidden by adjusting the golden file. `bank-of-anthos` was confirmed genuinely
+gRPC-free (a correct vacuous 100%/100%) with its 18 real Flask HTTP routes recorded as ground
+truth ahead of an `http_routes` scoring mode.
+
+P2 step 3.1 (real incremental reload from watcher paths) was implemented and ruthlessly reviewed
+alongside this plan but is deliberately **not** included in this release — it lands as its own PR
+(#25) stacked separately, kept out of this version bump per plan sequencing.
 
 ### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
 - **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`

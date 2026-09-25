@@ -21,6 +21,7 @@ use mesh_core::{
     CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, NodeKind,
     PatternKind, RepoId,
 };
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Default TS decorator that marks a method as a gRPC handler when
@@ -153,7 +154,12 @@ fn spec_file_matches(path_str: &str, pattern: &str) -> bool {
 /// Extraction is decoupled from graph mutation so it can run on the Rayon pool
 /// (`ContractGraph` is `&mut` and single-writer). `apply` assigns real `NodeId`s
 /// by inserting into the graph sequentially.
-#[derive(Debug, Default)]
+///
+/// `Serialize`/`Deserialize`: this is exactly the unit `PersistentIndexCache` (P2 step 3.2)
+/// persists per content hash — pre-`NodeId`-numbering, so a cache hit skips tree-sitter
+/// entirely without touching global node numbering (see `mesh_core::index_cache`'s module
+/// doc).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileIndex {
     pub nodes: Vec<ContractNode>,
     /// (local node index, imported target)

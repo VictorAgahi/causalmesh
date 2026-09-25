@@ -758,6 +758,7 @@ exact_phrase_boost = 60
         &state.allowed_roots,
         None,
         None,
+        None,
     );
     state.install_snapshot(snapshot);
 
@@ -794,6 +795,7 @@ async fn test_volontariapp_fixture_end_to_end_indexing() {
     let snapshot = mesh_server::WorkspaceIndexer::build_snapshot(
         &state.config,
         &state.allowed_roots,
+        None,
         None,
         None,
     );
@@ -859,7 +861,7 @@ proto_dirs = ["${workspace_root}/proto-registry/proto"]
     .expect("roots");
 
     let snapshot =
-        mesh_server::WorkspaceIndexer::build_snapshot(&config, &allowed_roots, None, None);
+        mesh_server::WorkspaceIndexer::build_snapshot(&config, &allowed_roots, None, None, None);
 
     let trace = snapshot.contract_graph.analyze_grpc("Invoice");
     assert!(

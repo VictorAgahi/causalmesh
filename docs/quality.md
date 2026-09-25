@@ -349,6 +349,64 @@ without a repeatable, numeric baseline first.
   every PR — wall-clock budgets are noisy on shared CI runners, and gating every push on them
   would make the gate itself flaky rather than meaningful.
 
+## Update (2026-09-26, step 3.2 — persistent SQLite/WAL content-hash cache for `FileIndex`)
+
+Goal (per Plan 3's handoff doc): avoid a full tree-sitter re-parse/re-derive on every cold start
+for large workspaces, using a content-hash key rather than Plan 1's `NodeId`.
+
+- **`NodeId` correction**: Plan 1's `NodeId`s (`ContractGraph`'s `BTreeMap<NodeId, ContractNode>`
+  key) are *deterministic*, not *stable* — they're a plain `u32` assigned sequentially while
+  folding files into the graph in sorted crawl order (`contracts.rs`'s own doc comment on
+  `nodes`), specifically so `BTreeMap` iteration order is reproducible run-to-run (idempotence
+  invariant I1). They are **not** content-addressed and shift on any add/remove elsewhere in the
+  workspace. Persisting them directly as a cache key would have been wrong — the cache instead
+  keys on `mesh_parsers::FileIndex`, the per-file, pre-numbering fragment `WorkspaceIndexer::fold`
+  consumes to assign fresh `NodeId`s on every build, cache hit or not. Global numbering is
+  identical whether a file's `FileIndex` came from a fresh parse or a cache hit.
+- **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): SQLite in WAL mode at
+  `~/.cache/mesh-mcp/index-cache.db` (mode `0600`, same convention as the Commandment 7 audit db),
+  one `file_index_cache(cache_key BLOB PRIMARY KEY, payload BLOB, updated_at INTEGER)` table.
+  `cache_key = SHA256(schema_version || path || content_hash || repo_id || config_fingerprint)`:
+  path and repo id are folded in (not just the content hash) because the same bytes at two paths,
+  or the same file re-scanned under a different `repo_id`, are not guaranteed to extract
+  identically (e.g. path-derived package inference); `config_fingerprint` is `SHA256(Debug of
+  ExtractConfig)`, computed once per scan, so editing `[engines.contracts.*]` (proto dirs,
+  controller annotations, `infer_string_topics`, ...) invalidates stale entries instead of
+  silently serving extraction computed under different rules; `schema_version` is folded in
+  rather than stored-and-checked, so a future format change orphans old rows for free.
+- **Wiring**: `WorkspaceIndexer::process_file`'s two `PolyglotIndexer::extract_with_config` call
+  sites go through a new `extract_with_cache` helper — cache hit deserializes and skips
+  tree-sitter entirely; miss parses as before and hands back `(FileIndex, Some((key, bytes)))` for
+  the caller to persist. A parse that fails (`FileIndex::parse_failed`) is never cached — it's
+  retried by `run_scan_pass`'s existing sequential-retry path, and caching a transient failure
+  would wrongly persist "no facts" past that retry. Writes are collected across the whole parallel
+  scan pass and flushed once via `put_batch` (one transaction), not per file — sqlite writes from
+  every Rayon thread would serialize against fsync latency and defeat running extraction on the
+  pool at all. Threaded through `build_snapshot`/`build_snapshot_from_files`/`build_graph` as a
+  new `Option<&PersistentIndexCache>` parameter, `None` everywhere except the two real server boot
+  paths (`mesh-server`'s `run_standalone`, `meshd`'s initial ingestion) — incremental `reload()`
+  (step 3.1) is untouched: it already only re-parses differential-VFS-flagged changed files, so a
+  content-hash cache has nothing additional to skip there. A cache the process can't open
+  (permissions, disk full) degrades to "parse everything," never fails the boot.
+- **Real measured baseline** (this machine, release build, `scale_bench.py` — cold run against a
+  freshly generated synthetic workspace with an empty cache, then an immediate warm re-run against
+  the same on-disk workspace and now-populated cache; nothing else changed between the two runs):
+
+  | file count | boot_ms cold | boot_ms warm | reduction |
+  |---|---|---|---|
+  | 5,000  | 283.5  | ~90–105 (3 warm runs) | ~65% |
+  | 30,000 | 1,344.9 | 668.0 | ~50% |
+
+  A third 5,000-file warm run (90.7ms, then 104.9ms) confirms the warm number is stable rather
+  than a one-off fluke. `search_p50_ms`/`search_p95_ms`/`reload_ms` are within noise of each other
+  cold vs. warm, as expected — this cache only short-circuits tree-sitter parsing, not
+  `smart_search` (step 3.4's job) or incremental reload.
+- **Honest limitation**: the benchmark above measures "same workspace, unchanged files, unchanged
+  config, second boot" — the scenario the handoff explicitly asked for. It does not yet measure a
+  *partial* cache-hit cold start (e.g. 90% of a large workspace unchanged, 10% edited since the
+  last boot) or cache behavior once `index-cache.db` itself grows large across many distinct
+  workspaces sharing the same machine-wide path — no eviction/size cap exists yet.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*
@@ -372,6 +430,10 @@ without a repeatable, numeric baseline first.
   ground truth for one now exists (`otel-demo`'s `orders` topic chain, above), but no
   `score.py`-style transitive-impact scorer has been run against it yet; verified so far only
   against the synthetic cycle-detection regression test in step 2.7.
+- `PersistentIndexCache` (step 3.2) has no eviction or size cap: `index-cache.db` grows
+  unboundedly as distinct workspaces/paths/configs accumulate entries on a shared machine over
+  time. Only the "same workspace, second boot" scenario is measured so far — not a mixed
+  cache-hit-rate cold start, nor long-run db size under many different repos.
 
 ## Ratchet policy
 

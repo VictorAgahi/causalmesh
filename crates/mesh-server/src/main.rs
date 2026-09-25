@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
+use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine, PersistentIndexCache};
 use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand, StatsCommand};
 use mesh_server::{run_server, WorkspaceIndexer};
 use std::path::{Path, PathBuf};
@@ -408,10 +408,32 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
     let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
 
+    // Persistent, content-hash-keyed cache of tree-sitter `FileIndex` fragments (P2 step 3.2):
+    // an unchanged file under an unchanged config is a SQLite lookup instead of a re-parse on
+    // this cold start. A cache the process can't open (permissions, disk full) degrades to
+    // "parse everything" rather than failing the boot — it's a performance optimization, never
+    // a correctness dependency.
+    let index_cache = match PersistentIndexCache::open(None) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            tracing::warn!(
+                target: "mesh::indexer",
+                "Failed to open persistent index cache, continuing without it: {e}"
+            );
+            None
+        }
+    };
+
     // Single parallel scan over all roots, one reconcile, one atomic install.
     let snapshot = {
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
-        WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs))
+        WorkspaceIndexer::build_snapshot(
+            &state.config,
+            &state.allowed_roots,
+            None,
+            Some(&mut vfs),
+            index_cache.as_ref(),
+        )
     };
     state.install_snapshot(snapshot);
 

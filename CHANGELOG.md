@@ -7,7 +7,37 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 3 (P2): scale. Step 3.1 — real incremental reload, driven by the watcher's own paths.
+Plan 3 (P2): scale. Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 —
+real incremental reload, driven by the watcher's own paths.
+
+### Added (P2 step 3.2 — persistent SQLite/WAL content-hash cache for cold-start indexing)
+- **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): a SQLite-in-WAL-mode cache
+  (`~/.cache/mesh-mcp/index-cache.db`, mode `0600`, same convention as the Commandment 7 audit db)
+  of `mesh_parsers::FileIndex` — the per-file, pre-`NodeId`-numbering tree-sitter extraction
+  fragment — keyed by `SHA256(schema_version, path, content_hash, repo_id, config_fingerprint)`.
+  An unchanged file rescanned under an unchanged `[engines.contracts.*]` config on a later cold
+  start is now a single indexed lookup instead of a full tree-sitter re-parse. Wired into the two
+  real server boot paths (`mesh-server run_standalone`, `meshd`'s initial ingestion) via a new
+  `Option<&PersistentIndexCache>` parameter on `WorkspaceIndexer::build_snapshot` (and
+  `build_snapshot_from_files`/`build_graph`); a cache the process can't open degrades to "parse
+  everything" rather than failing the boot. Incremental `reload()` (step 3.1) is untouched — it
+  already only re-parses differential-VFS-flagged changed files.
+- **Not Plan 1's `NodeId`s, deliberately**: `NodeId`s are a deterministic-but-not-stable sequential
+  counter assigned while folding files into the graph (idempotence invariant I1), never
+  content-addressed, so they shift on any workspace add/remove and would have been the wrong cache
+  key. The cache stores the pre-numbering `FileIndex` fragment instead; global `NodeId`s are still
+  freshly (re-)assigned on every build regardless of cache hits. See `docs/quality.md`'s step 3.2
+  section for the full reasoning.
+- Real measured baseline (`scale_bench.py`, cold vs. warm cache, same workspace/config unchanged
+  between runs): boot time down ~65% at 5,000 files (283.5ms → ~90–105ms) and ~50% at 30,000 files
+  (1,344.9ms → 668.0ms). `smart_search`/`reload_ms` are unaffected, as expected — this cache only
+  short-circuits tree-sitter parsing.
+- Honest limitation: no eviction or size cap yet — `index-cache.db` grows unboundedly across
+  distinct workspaces/configs on a shared machine over time; only the "same workspace, second
+  boot" scenario is measured so far, not a mixed cache-hit-rate cold start.
+- Verified: `cargo test --workspace` (352 passed, +5 new: `PersistentIndexCache` key/get/put-batch
+  cases), `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all --
+  --check` (clean).
 
 ### Added (P2 step 3.1 — real incremental reload from watcher paths)
 - **The file watcher no longer re-crawls the whole tree to find out what changed.**

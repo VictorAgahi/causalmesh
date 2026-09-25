@@ -3,10 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
-/// `(nodes, dependencies, producers)`, the latter two keyed by local node index
-/// in the same shape `languages::FileIndex.dependencies` / `.producers` expect.
+/// `(nodes, dependencies, producers, rpc_calls)`, the latter three keyed by
+/// local node index in the same shape `languages::FileIndex.dependencies` /
+/// `.producers` / `.rpc_calls` expect.
 type ExtractedRelations = (
     Vec<ContractNode>,
+    Vec<(usize, CompactStr)>,
     Vec<(usize, CompactStr)>,
     Vec<(usize, CompactStr)>,
 );
@@ -27,7 +29,7 @@ impl JavaExtractor {
         let Some(tree) = parser.parse(content, None) else {
             return Vec::new();
         };
-        let (nodes, _dependencies, _producers) =
+        let (nodes, _dependencies, _producers, _rpc_calls) =
             Self::extract_relations(file_path, content, repo_id, &tree);
         nodes
     }
@@ -51,6 +53,7 @@ impl JavaExtractor {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut producers = Vec::new();
+        let mut rpc_calls = Vec::new();
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
@@ -63,6 +66,8 @@ impl JavaExtractor {
             &mut package_name,
             &mut nodes,
             &mut producers,
+            &mut rpc_calls,
+            None,
             0,
         );
 
@@ -84,7 +89,7 @@ impl JavaExtractor {
             }
         }
 
-        (nodes, dependencies, producers)
+        (nodes, dependencies, producers, rpc_calls)
     }
 
     /// Walks the tree collecting `import_declaration` nodes into
@@ -141,6 +146,47 @@ impl JavaExtractor {
         for child in node.children(&mut cursor) {
             Self::collect_imports_inner(child, source, out, depth + 1);
         }
+    }
+
+    /// grpc-java's own universal codegen convention (protoc-gen-grpc-java,
+    /// not Spring-specific): a client stub is built as
+    /// `<Service>Grpc.newBlockingStub(channel)` / `.newStub(...)` /
+    /// `.newFutureStub(...)`. Returns `<Service>` when found — e.g.
+    /// `AdServiceGrpc.newBlockingStub(channel)` (Online Boutique's real
+    /// adservice client) yields `"AdService"`.
+    /// Finds every `<Service>Grpc.new{Blocking,Future,}Stub(...)` call in
+    /// `text`, in source order. Returns all of them, not just the first —
+    /// a constructor building stubs for two different services (`var a =
+    /// FooServiceGrpc.newStub(ch); var b = BarServiceGrpc.newBlockingStub(ch);`)
+    /// must not lose the earlier one just because a *different* suffix
+    /// happens to be checked first in a fixed candidate list.
+    fn extract_grpc_client_services(text: &str) -> Vec<String> {
+        let mut hits: Vec<(usize, &str)> = Vec::new();
+        for suffix in [".newBlockingStub(", ".newStub(", ".newFutureStub("] {
+            let mut search_start = 0;
+            while let Some(rel_idx) = text[search_start..].find(suffix) {
+                let idx = search_start + rel_idx;
+                hits.push((idx, suffix));
+                search_start = idx + suffix.len();
+            }
+        }
+        hits.sort_by_key(|(idx, _)| *idx);
+
+        let mut services = Vec::new();
+        for (idx, _) in hits {
+            let before = &text[..idx];
+            let ident_start = before
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let ident = &before[ident_start..];
+            if let Some(service) = ident.strip_suffix("Grpc") {
+                if !service.is_empty() {
+                    services.push(service.to_string());
+                }
+            }
+        }
+        services
     }
 
     /// Finds `<kafkaIdent>.send(<topic>, ...)` call sites within `text`, returning
@@ -207,11 +253,15 @@ impl JavaExtractor {
         package_name: &mut CompactStr,
         nodes: &mut Vec<ContractNode>,
         producers: &mut Vec<(usize, CompactStr)>,
+        rpc_calls: &mut Vec<(usize, CompactStr)>,
+        enclosing_class_idx: Option<usize>,
         depth: usize,
     ) {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
             return;
         }
+
+        let mut child_enclosing_class_idx = enclosing_class_idx;
 
         match node.kind() {
             "package_declaration" => {
@@ -239,6 +289,23 @@ impl JavaExtractor {
                 if node_text.contains("@GrpcService") {
                     kind = NodeKind::GrpcService;
                 }
+                // Plain (non-Spring) grpc-java server: `class FooServiceImpl
+                // extends FooServiceGrpc.FooServiceImplBase`. The generated
+                // `<Service>Grpc.<Service>ImplBase` base class is grpc-java's
+                // own universal convention (protoc-gen-grpc-java), unlike
+                // `@GrpcService`, which is Spring-specific and already
+                // covered above. Requires both "Grpc" and "ImplBase" in the
+                // superclass reference, not "ImplBase" alone — a bare
+                // substring match would also tag any unrelated
+                // `*ImplBase`-suffixed base class from a non-gRPC framework
+                // using the same generic naming convention.
+                if node
+                    .child_by_field_name("superclass")
+                    .and_then(|s| s.utf8_text(source).ok())
+                    .is_some_and(|t| t.contains("Grpc") && t.contains("ImplBase"))
+                {
+                    kind = NodeKind::GrpcService;
+                }
 
                 nodes.push(ContractNode {
                     id: 0,
@@ -252,6 +319,7 @@ impl JavaExtractor {
                     signature: Some(CompactStr::new(format!("class {class_name}"))),
                     docstring: None,
                 });
+                child_enclosing_class_idx = Some(nodes.len() - 1);
             }
             "method_declaration" => {
                 let method_name = node
@@ -318,6 +386,7 @@ impl JavaExtractor {
 
                 let method_text = node.utf8_text(source).unwrap_or("");
                 let producer_topic = Self::extract_kafka_producer_topic(method_text);
+                let grpc_client_services = Self::extract_grpc_client_services(method_text);
 
                 nodes.push(ContractNode {
                     id: 0,
@@ -335,6 +404,25 @@ impl JavaExtractor {
                 if let Some(topic) = producer_topic {
                     producers.push((nodes.len() - 1, CompactStr::new(topic)));
                 }
+                for service in grpc_client_services {
+                    rpc_calls.push((nodes.len() - 1, CompactStr::new(service)));
+                }
+            }
+            "constructor_declaration" => {
+                // grpc-java's client stub is conventionally built in the
+                // client class's own constructor (`AdServiceClient(ManagedChannel
+                // channel) { blockingStub = AdServiceGrpc.newBlockingStub(channel); }`
+                // — Online Boutique's real `AdServiceClient.java` does exactly
+                // this), not necessarily a named method. Constructors aren't
+                // otherwise extracted as their own `ContractNode`s, so any
+                // stub built here is attributed to the *enclosing class's*
+                // node instead of a synthetic constructor node.
+                if let Some(class_idx) = enclosing_class_idx {
+                    let ctor_text = node.utf8_text(source).unwrap_or("");
+                    for service in Self::extract_grpc_client_services(ctor_text) {
+                        rpc_calls.push((class_idx, CompactStr::new(service)));
+                    }
+                }
             }
             _ => {}
         }
@@ -349,6 +437,8 @@ impl JavaExtractor {
                 package_name,
                 nodes,
                 producers,
+                rpc_calls,
+                child_enclosing_class_idx,
                 depth + 1,
             );
         }
@@ -460,7 +550,7 @@ impl JavaExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_core::ContractGraph;
+    use mesh_core::{ContractGraph, NodeId};
 
     fn parser() -> Parser {
         let mut parser = Parser::new();
@@ -498,6 +588,212 @@ public class BillingController {
         assert!(nodes
             .iter()
             .any(|n| n.name == "billing.events" && n.kind == NodeKind::KafkaTopic));
+    }
+
+    /// Plain (non-Spring) grpc-java server: a class extending the generated
+    /// `<Service>Grpc.<Service>ImplBase` (protoc-gen-grpc-java's own
+    /// universal convention, e.g. Online Boutique's real
+    /// `AdServiceImpl extends AdServiceGrpc.AdServiceImplBase`) must be
+    /// tagged `GrpcService` — previously only Spring's `@GrpcService`
+    /// annotation was recognized.
+    #[test]
+    fn grpc_java_impl_base_subclass_is_tagged_grpc_service() {
+        let code = r#"
+package hipstershop;
+
+class AdServiceImpl extends AdServiceGrpc.AdServiceImplBase {
+    public void getAds(AdRequest req, StreamObserver<AdResponse> responseObserver) {}
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let nodes = JavaExtractor::extract(Path::new("AdService.java"), code, 1, &mut parser);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "AdServiceImpl")
+            .expect("AdServiceImpl node");
+        assert_eq!(node.kind, NodeKind::GrpcService);
+    }
+
+    /// grpc-java's client stub is built as `<Service>Grpc.newBlockingStub(channel)`
+    /// / `.newStub(...)` / `.newFutureStub(...)` — the real shape in Online
+    /// Boutique's own `AdServiceClient.java`
+    /// (`blockingStub = hipstershop.AdServiceGrpc.newBlockingStub(channel);`).
+    /// Must be recorded as an RPC call to `AdService`.
+    #[test]
+    fn grpc_java_client_stub_construction_is_recorded_as_an_rpc_call() {
+        let code = r#"
+package hipstershop;
+
+class AdServiceClient {
+    private void createStub() {
+        blockingStub = hipstershop.AdServiceGrpc.newBlockingStub(channel);
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _deps, _producers, rpc_calls) =
+            JavaExtractor::extract_relations(Path::new("AdServiceClient.java"), code, 1, &tree);
+        assert_eq!(
+            rpc_calls.len(),
+            1,
+            "expected 1 rpc call, got: {:?}",
+            rpc_calls
+        );
+        assert_eq!(rpc_calls[0].1.as_str(), "AdService");
+        assert_eq!(nodes[rpc_calls[0].0].name.as_str(), "createStub");
+    }
+
+    /// The real, motivating shape (Online Boutique's actual
+    /// `AdServiceClient.java`): the stub is built in the class's own
+    /// *constructor*, not a named method. Constructors aren't extracted as
+    /// their own `ContractNode`s, so the rpc_call must be attributed to the
+    /// enclosing class instead.
+    #[test]
+    fn grpc_java_client_stub_construction_in_constructor_is_recorded() {
+        let code = r#"
+package hipstershop;
+
+class AdServiceClient {
+    private AdServiceClient(ManagedChannel channel) {
+        blockingStub = hipstershop.AdServiceGrpc.newBlockingStub(channel);
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _deps, _producers, rpc_calls) =
+            JavaExtractor::extract_relations(Path::new("AdServiceClient.java"), code, 1, &tree);
+        assert_eq!(
+            rpc_calls.len(),
+            1,
+            "expected 1 rpc call from the constructor, got: {:?}",
+            rpc_calls
+        );
+        assert_eq!(rpc_calls[0].1.as_str(), "AdService");
+        assert_eq!(nodes[rpc_calls[0].0].name.as_str(), "AdServiceClient");
+    }
+
+    /// Two stubs for two different services built in the same method must
+    /// both be recorded, in source order — a fixed candidate-suffix list
+    /// checked in a fixed order must not silently drop whichever suffix
+    /// isn't checked first.
+    #[test]
+    fn grpc_java_multiple_stub_constructions_in_one_method_are_all_recorded() {
+        let code = r#"
+package hipstershop;
+
+class MultiClient {
+    private void createStubs() {
+        var a = FooServiceGrpc.newStub(channel);
+        var b = BarServiceGrpc.newBlockingStub(channel);
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(code, None).expect("parse");
+        let (_nodes, _deps, _producers, rpc_calls) =
+            JavaExtractor::extract_relations(Path::new("MultiClient.java"), code, 1, &tree);
+        let services: Vec<&str> = rpc_calls.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(
+            services,
+            vec!["FooService", "BarService"],
+            "both stubs must be recorded, in source order"
+        );
+    }
+
+    /// A class extending an unrelated `*ImplBase` base class from a
+    /// non-gRPC framework using the same generic naming convention must not
+    /// be mistagged `GrpcService` — the superclass reference must contain
+    /// both "Grpc" and "ImplBase", the real grpc-java shape, not "ImplBase"
+    /// alone.
+    #[test]
+    fn unrelated_impl_base_subclass_is_not_tagged_grpc_service() {
+        let code = r#"
+class Foo extends SomeCorbaSkeletonImplBase {
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let nodes = JavaExtractor::extract(Path::new("Foo.java"), code, 1, &mut parser);
+        let node = nodes.iter().find(|n| n.name == "Foo").expect("Foo node");
+        assert_ne!(
+            node.kind,
+            NodeKind::GrpcService,
+            "an unrelated *ImplBase convention must not be mistaken for grpc-java's own"
+        );
+    }
+
+    /// End-to-end: a Java client's stub construction must actually resolve
+    /// to a real `CallsRpc` edge through `ContractGraph::reconcile_edges`
+    /// when a `.proto`-declared `GrpcService` node exists for the target —
+    /// the real shape every golden-corpus repo uses (a service always has a
+    /// `.proto` declaration; nothing here depends on the impl class's own
+    /// name, which conventionally differs from the bare service name, e.g.
+    /// `AdServiceImpl` vs. `AdService` — deliberately not "fixed" by loosening
+    /// `ContractGraph`'s own bare-name matching, since a generic `Impl`
+    /// suffix is far too common outside gRPC to safely strip there).
+    #[test]
+    fn grpc_java_client_stub_resolves_to_a_real_edge_against_a_proto_declared_service() {
+        let mut graph = ContractGraph::new();
+
+        let service_id = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("AdService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("protos/demo.proto").into(),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new("hipstershop"),
+            repo_id: 0,
+            signature: Some(CompactStr::new("service AdService")),
+            docstring: None,
+        });
+
+        let code = r#"
+package hipstershop;
+
+class AdServiceClient {
+    private AdServiceClient(ManagedChannel channel) {
+        blockingStub = hipstershop.AdServiceGrpc.newBlockingStub(channel);
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(code, None).expect("parse");
+        let (client_nodes, _deps, _producers, rpc_calls) =
+            JavaExtractor::extract_relations(Path::new("AdServiceClient.java"), code, 1, &tree);
+        let client_ids: Vec<NodeId> = client_nodes
+            .into_iter()
+            .map(|n| graph.add_node(n))
+            .collect();
+        for (idx, target) in rpc_calls {
+            graph.add_rpc_call(client_ids[idx], target.as_str());
+        }
+        graph.reconcile_edges();
+
+        let caller_id = client_ids[0];
+        let has_edge = graph
+            .all_edges()
+            .iter()
+            .any(|e| e.from == caller_id && e.to == service_id);
+        assert!(
+            has_edge,
+            "expected a CallsRpc edge from the AdServiceClient caller to the \
+             proto-declared AdService node, found edges: {:?}",
+            graph.all_edges()
+        );
     }
 
     /// `@KafkaListener`'s topic fallback must never reach across into a
@@ -570,7 +866,7 @@ public class OrderController {
 "#;
         let mut parser = parser();
         let tree = parser.parse(code, None).expect("parse");
-        let (nodes, dependencies, _producers) =
+        let (nodes, dependencies, _producers, _rpc_calls) =
             JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let class_idx = nodes
@@ -598,7 +894,7 @@ public class OrderController {
 "#;
         let mut parser = parser();
         let tree = parser.parse(code, None).expect("parse");
-        let (nodes, dependencies, _producers) =
+        let (nodes, dependencies, _producers, _rpc_calls) =
             JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let class_idx = nodes
@@ -632,7 +928,7 @@ public class OrderController {
 "#;
         let mut parser = parser();
         let tree = parser.parse(code, None).expect("parse");
-        let (nodes, dependencies, _producers) =
+        let (nodes, dependencies, _producers, _rpc_calls) =
             JavaExtractor::extract_relations(Path::new("OrderController.java"), code, 1, &tree);
 
         let method_idx = nodes
@@ -672,7 +968,7 @@ public class OrderController {
         let mut graph = ContractGraph::new();
 
         let billing_tree = p.parse(billing_code, None).expect("parse");
-        let (billing_nodes, _deps, _producers) = JavaExtractor::extract_relations(
+        let (billing_nodes, _deps, _producers, _rpc_calls) = JavaExtractor::extract_relations(
             Path::new("services/billing/BillingService.java"),
             billing_code,
             1,
@@ -683,7 +979,7 @@ public class OrderController {
         }
 
         let order_tree = p.parse(order_code, None).expect("parse");
-        let (order_nodes, order_deps, _producers2) = JavaExtractor::extract_relations(
+        let (order_nodes, order_deps, _producers2, _rpc_calls2) = JavaExtractor::extract_relations(
             Path::new("services/orders/OrderController.java"),
             order_code,
             2,
@@ -713,7 +1009,7 @@ public class OrderService {
 "#;
         let mut parser = parser();
         let tree = parser.parse(code, None).expect("parse");
-        let (nodes, _deps, producers) =
+        let (nodes, _deps, producers, _rpc_calls) =
             JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &tree);
 
         let method_idx = nodes
@@ -738,7 +1034,7 @@ public class OrderService {
 "#;
         let mut parser = parser();
         let tree = parser.parse(code, None).expect("parse");
-        let (_nodes, _deps, producers) =
+        let (_nodes, _deps, producers, _rpc_calls) =
             JavaExtractor::extract_relations(Path::new("OrderService.java"), code, 1, &tree);
         assert!(producers.is_empty());
     }
@@ -768,7 +1064,7 @@ public class OrderNotifier {
         let mut graph = ContractGraph::new();
 
         let producer_tree = p.parse(producer_code, None).expect("parse");
-        let (producer_nodes, _deps, producers) = JavaExtractor::extract_relations(
+        let (producer_nodes, _deps, producers, _rpc_calls) = JavaExtractor::extract_relations(
             Path::new("services/orders/OrderService.java"),
             producer_code,
             1,
@@ -783,7 +1079,7 @@ public class OrderNotifier {
         }
 
         let consumer_tree = p.parse(consumer_code, None).expect("parse");
-        let (consumer_nodes, _deps2, _producers2) = JavaExtractor::extract_relations(
+        let (consumer_nodes, _deps2, _producers2, _rpc_calls2) = JavaExtractor::extract_relations(
             Path::new("services/notifications/OrderNotifier.java"),
             consumer_code,
             2,

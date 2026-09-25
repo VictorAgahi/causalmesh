@@ -7,6 +7,17 @@ use tree_sitter::{Node, Tree};
 
 pub struct ProtoExtractor;
 
+/// `dependencies` mirrors every other language extractor's own relations
+/// struct: `(node index, imported path)`, fed to `ContractGraph::add_dependency`
+/// -> `find_dependents`. A `.proto` file's `import "other.proto";` is a
+/// file-level declaration any node in the file can rely on (a message field
+/// typed `google.type.Money`, say), so every import is attributed to every
+/// node declared in the file, not to one specific declaration.
+#[derive(Debug, Default)]
+pub struct ProtoRelations {
+    pub dependencies: Vec<(usize, CompactStr)>,
+}
+
 impl ProtoExtractor {
     /// Extracts with the canonical projection: RPC nodes are named `Service.Method`.
     pub fn extract(file_path: &Path, content: &str, repo_id: RepoId) -> Vec<ContractNode> {
@@ -51,21 +62,41 @@ impl ProtoExtractor {
         canonical_fqcn_projection: bool,
         tree: &Tree,
     ) -> Vec<ContractNode> {
+        Self::extract_with_relations(file_path, content, repo_id, canonical_fqcn_projection, tree).0
+    }
+
+    /// Same nodes as [`Self::extract_with_parser`], plus `import "other.proto";`
+    /// dependencies.
+    pub fn extract_with_relations(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        canonical_fqcn_projection: bool,
+        tree: &Tree,
+    ) -> (Vec<ContractNode>, ProtoRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
+        let mut imports: Vec<CompactStr> = Vec::new();
 
         let source = content.as_bytes();
         let root = tree.root_node();
         let mut current_package = CompactStr::default();
 
-        // 1. Locate top-level package declaration if present
+        // 1. Locate top-level package declaration and imports
         for i in 0..root.child_count() {
             if let Some(child) = root.child(i) {
-                if child.kind() == "package" {
-                    if let Some(pkg) = Self::extract_package_name(child, source) {
-                        current_package = pkg;
-                        break;
+                match child.kind() {
+                    "package" => {
+                        if let Some(pkg) = Self::extract_package_name(child, source) {
+                            current_package = pkg;
+                        }
                     }
+                    "import" => {
+                        if let Some(path) = Self::extract_import_path(child, source) {
+                            imports.push(path);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -81,7 +112,51 @@ impl ProtoExtractor {
             &mut nodes,
         );
 
-        nodes
+        // A `.proto` import is a file-level declaration, not tied to one
+        // specific message/service — but which node actually *uses* a given
+        // import's types can't be determined without parsing the imported
+        // file too (real cross-file type resolution, out of scope here). A
+        // first version attributed every import to every node in the file;
+        // caught by review: `ContractGraph::reconcile_edges` doesn't dedup
+        // Imports edges across different `importer_id`s, so that produced up
+        // to N-imports x M-nodes real edges in the graph, and
+        // `find_dependents(import_path)` would return every node in the file
+        // as a "dependent" even if only one actually used it — false-positive
+        // fan-out, not just extra internal bookkeeping. Attributed to the
+        // file's own first declared node instead: one edge per import,
+        // traceable back to the file, without fabricating M-fold usage this
+        // extractor has no evidence for.
+        let mut relations = ProtoRelations::default();
+        if !nodes.is_empty() {
+            for path in imports {
+                relations.dependencies.push((0, path));
+            }
+        }
+
+        (nodes, relations)
+    }
+
+    /// `import "path/to/file.proto";` / `import public "...";` / `import weak "...";`
+    /// — the imported path is always the (only) `string` child, quotes stripped.
+    fn extract_import_path(import_node: Node, source: &[u8]) -> Option<CompactStr> {
+        let mut cursor = import_node.walk();
+        for child in import_node.children(&mut cursor) {
+            if child.kind() == "string" {
+                if let Ok(text) = child.utf8_text(source) {
+                    // The protobuf grammar allows single- or double-quoted
+                    // string literals for an import path (`choice('"', "'")`
+                    // in tree-sitter-proto's own `string` rule) — only
+                    // stripping double quotes left `import 'other.proto';`'s
+                    // dependency key as the literal `'other.proto'`, quotes
+                    // included, which would never match a real file path.
+                    let unquoted = text.trim_matches(['"', '\'']);
+                    if !unquoted.is_empty() {
+                        return Some(CompactStr::new(unquoted));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn extract_package_name(package_node: Node, source: &[u8]) -> Option<CompactStr> {
@@ -276,6 +351,101 @@ impl ProtoExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Parser;
+
+    fn parser() -> Parser {
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_proto::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        parser
+    }
+
+    /// `import "other.proto";` must be recorded as a file-level dependency,
+    /// attributed to every node declared in the file — any of them could
+    /// legitimately reference a type declared in the imported file (a
+    /// message field typed `google.type.Money`, say).
+    #[test]
+    fn proto_import_is_recorded_as_a_dependency_on_every_node() {
+        let proto = r#"
+syntax = "proto3";
+package hipstershop;
+
+import "google/protobuf/money.proto";
+import public "other/types.proto";
+
+service CartService {
+    rpc GetCart(GetCartRequest) returns (Cart) {}
+}
+
+message Cart {
+    string user_id = 1;
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(proto, None).expect("parse");
+        let (nodes, relations) = ProtoExtractor::extract_with_relations(
+            Path::new("protos/demo.proto"),
+            proto,
+            0,
+            true,
+            &tree,
+        );
+        assert_eq!(nodes.len(), 3, "CartService, CartService.GetCart, Cart");
+
+        let deps: Vec<&str> = relations
+            .dependencies
+            .iter()
+            .map(|(_, d)| d.as_str())
+            .collect();
+        assert!(deps.contains(&"google/protobuf/money.proto"));
+        assert!(deps.contains(&"other/types.proto"));
+
+        // One edge per import, attributed to the file's own first declared
+        // node — not every node (see this function's own doc comment for
+        // why: reconcile_edges doesn't dedup Imports edges across different
+        // importer_ids, so attributing to every node fanned out into
+        // find_dependents false positives for nodes that never actually
+        // referenced the import).
+        assert_eq!(relations.dependencies.len(), 2);
+        assert!(relations.dependencies.iter().all(|(idx, _)| *idx == 0));
+    }
+
+    /// A `.proto` file with no imports at all must record none — not an
+    /// empty-string placeholder or a fabricated dependency.
+    #[test]
+    fn proto_with_no_imports_records_no_dependencies() {
+        let proto = r#"
+syntax = "proto3";
+package hipstershop;
+
+message Empty {}
+"#;
+        let mut p = parser();
+        let tree = p.parse(proto, None).expect("parse");
+        let (_, relations) = ProtoExtractor::extract_with_relations(
+            Path::new("protos/demo.proto"),
+            proto,
+            0,
+            true,
+            &tree,
+        );
+        assert!(relations.dependencies.is_empty());
+    }
+
+    /// The protobuf grammar allows single- or double-quoted string literals
+    /// for an import path. Only stripping double quotes left a
+    /// single-quoted import's dependency key as the literal `'other.proto'`,
+    /// quotes included — never matching a real file path.
+    #[test]
+    fn proto_import_with_single_quotes_is_unquoted_correctly() {
+        let proto = "syntax = \"proto3\";\n\nimport 'other.proto';\n\nmessage M {}\n";
+        let mut p = parser();
+        let tree = p.parse(proto, None).expect("parse");
+        let (_, relations) =
+            ProtoExtractor::extract_with_relations(Path::new("demo.proto"), proto, 0, true, &tree);
+        assert_eq!(relations.dependencies.len(), 1);
+        assert_eq!(relations.dependencies[0].1.as_str(), "other.proto");
+    }
 
     #[test]
     fn test_proto_extraction() {

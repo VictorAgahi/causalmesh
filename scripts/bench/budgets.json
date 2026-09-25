@@ -1,0 +1,7 @@
+{
+  "boot_ms": 3000,
+  "reload_ms": 3000,
+  "rss_peak_mb": 300,
+  "search_p50_ms": 300,
+  "search_p95_ms": 800
+}

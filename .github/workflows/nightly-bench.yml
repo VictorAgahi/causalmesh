@@ -1,0 +1,51 @@
+name: MeshMCP Nightly Scale Bench
+
+on:
+  schedule:
+    # 03:00 UTC daily
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scale-bench:
+    name: "Scale Bench (synthetic, 5k files)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Rust stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Rust Cache"
+        uses: Swatinem/rust-cache@v2
+
+      - name: "Compile Release Binary with Thin LTO & mimalloc"
+        run: cargo build --workspace --release
+
+      - name: "Generate synthetic workspace (5k files, fixed seed)"
+        run: python3 scripts/bench/gen_synthetic.py /tmp/mesh-synth-5k 5000 --services 8
+
+      - name: "mesh-mcp init --auto"
+        run: |
+          cd /tmp/mesh-synth-5k
+          "$GITHUB_WORKSPACE/target/release/mesh-mcp" init --auto
+
+      - name: "Run scale bench against budgets"
+        env:
+          MESH_MCP_BIN: ${{ github.workspace }}/target/release/mesh-mcp
+        run: |
+          python3 scripts/bench/scale_bench.py \
+            /tmp/mesh-synth-5k /tmp/mesh-synth-5k/.agents/mesh-mcp.toml \
+            --queries 30 --budget-json scripts/bench/budgets.json \
+            | tee /tmp/scale-bench-5k.json
+
+      - name: "Upload bench result"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-bench-5k
+          path: /tmp/scale-bench-5k.json

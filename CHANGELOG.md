@@ -86,6 +86,63 @@ Plan 3 (P2): scale. Step 3.1 — real incremental reload, driven by the watcher'
   - Verified again after all seven fixes: `cargo test --workspace` (347 passed, +6 more:
     symlink-escape, parent-directory-gone fallback, TOCTOU resurrection, root-level `.ignore`,
     `.git/info/exclude`, and `path == root` cases), clippy/fmt clean, golden/determinism unaffected.
+### Added (P2 step 3.0 — scale bench: synthetic generator, boot/reload/RSS/p50/p95, nightly budgets)
+- **`scripts/bench/gen_synthetic.py`**: deterministic (fixed-seed) multi-root synthetic workspace
+  generator, so scale numbers are reproducible across machines and runs instead of depending on a
+  moving upstream HEAD like the existing real-repo corpus (`scripts/bench/repos.txt`).
+- **`scripts/bench/scale_bench.py`**: boots `mesh-mcp run --standalone` for real (same code path
+  as production, including the real `FileWatcherService`), then measures `boot_ms`, `rss_peak_mb`
+  (sampled via `ps` across the run, not just at boot), `search_p50_ms`/`search_p95_ms` over N real
+  `smart_search` calls, and end-to-end `reload_ms` (append a uniquely-named symbol to a tracked
+  file on disk, poll `smart_search` until it's visible through the real watcher → `reload_paths`
+  path). Exits non-zero and names each violation when a metric exceeds
+  `scripts/bench/budgets.json`.
+- **`.github/workflows/nightly-bench.yml`**: runs the above at 5,000 synthetic files once a day,
+  uploads the raw JSON as a build artifact. Not wired into per-PR CI — wall-clock budgets are
+  noisy on shared runners, so gating every push on them would make the gate flaky, not meaningful.
+- `/code-review` on this branch caught three real bugs in the first version of the harness (all
+  fixed, see `docs/quality.md`): the reload probe's substring match was a false positive against
+  `smart_search`'s own "no results" header echo (originally reported 6ms/41ms reload numbers were
+  not real); the TypeScript symbol it injected (a bare function) is never indexed by
+  `typescript.rs`'s extractor, so a `.ts` target polled forever; and the generator's
+  `marker.json`-per-directory convention was never read by `init.rs`, so the claimed "multi-root"
+  workspace always silently fell back to a single root. Fixing the third finding (real
+  `services/svc-N/` layout, discovered by `init --auto`) surfaced a fourth issue in the harness
+  itself: `ValidatedScope::resolve` requires a query's scope to be inside one specific allowed
+  root, so a hardcoded `scope: "."` sandbox-escapes once there's more than one root — fixed by
+  reading real roots back out of the generated config and round-robining scope across them.
+- **Real, honest baseline measured on this machine** (release build, single-root workspace so
+  `smart_search` scope covers the whole tree): 5,000 files boots in 186ms, 47MB peak RSS,
+  `smart_search` p50/p95 65ms/176ms, reload 452ms. At 30,000 files: 1,097ms boot, 125MB peak RSS,
+  `smart_search` p50/p95 460ms/1,264ms — already over generous budgets built from the 5,000-file
+  baseline — and 842ms reload. This gap is recorded in `docs/quality.md` as the numeric motivation
+  for steps 3.4 (`smart_search` limits/early-stop) and 3.5 (memory/CPU at scale), not silently
+  fixed by loosening the budget or hidden by only ever benchmarking the size that passes.
+
+## [5.0.0] — 2026-09-25
+
+**Plan 2 (P1) complete: inter-service joins are precise, not just deterministic.** Eight steps
+landed as one PR apiece (#17–#24), each green on `cargo fmt`/`clippy -D warnings`/
+`cargo test --workspace`, `scripts/determinism.sh`, and `scripts/golden/score.py` against the
+real golden corpus (`online-boutique`, `otel-demo`, `bank-of-anthos`). `find_dependents` and
+`analyze_impact` gained new opt-in parameters (`granularity`, `depth`) and two more golden files
+were written by hand from real source — hence the major version bump, since a caller relying on
+either tool's exact prior output shape should re-check it, even though every existing default
+stayed byte-for-byte unchanged.
+
+Closing out the plan meant running the golden scorer against the two corpus repos this plan
+added, not just the one (`online-boutique`) step 2.0 started with — which is exactly what caught
+a genuine, previously-unknown gap: `otel-demo`'s TypeScript frontend uses a `@grpc/grpc-js`
+client-construction idiom (`new XServiceClient(...)`) `typescript.rs` doesn't recognize (only the
+NestJS `getService<XServiceClient>(...)` idiom is covered), scoring 87.5%/53.8% rather than
+100%/100% — documented honestly in `docs/quality.md` as an open finding, not fixed under time
+pressure, and not hidden by adjusting the golden file. `bank-of-anthos` was confirmed genuinely
+gRPC-free (a correct vacuous 100%/100%) with its 18 real Flask HTTP routes recorded as ground
+truth ahead of an `http_routes` scoring mode.
+
+P2 step 3.1 (real incremental reload from watcher paths) was implemented and ruthlessly reviewed
+alongside this plan but is deliberately **not** included in this release — it lands as its own PR
+(#25) stacked separately, kept out of this version bump per plan sequencing.
 
 ### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
 - **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`

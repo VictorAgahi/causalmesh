@@ -6,3 +6,4 @@
 .claude
 scripts/bench/results/
 scripts/bench/token-compare/out/
+__pycache__/

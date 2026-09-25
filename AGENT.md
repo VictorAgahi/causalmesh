@@ -5,6 +5,19 @@
 
 ---
 
+## 0. P0 — Dogfood mesh-mcp for Codebase Navigation
+
+**This project is itself a code-navigation tool. Use it on itself.** Before reaching for `grep`,
+`ripgrep`, or `Read` on a large source file (`java.rs`, `go.rs`, `python.rs`, `contracts.rs`, or
+any other file north of ~1,000 lines), prefer the running MeshMCP server's own tools:
+`smart_search` to locate a symbol/definition, `find_dependents` to find callers/importers before
+changing a shared type, `analyze_impact` to check blast radius before editing a hot file,
+`analyze_grpc` for gRPC schema tracing, `search_docs` for architecture/ADR lookups. Brute-forcing
+a 1,000+ line parser file with `Read` end-to-end is a fallback for when the MCP tools genuinely
+can't answer the question (e.g. reading exact surrounding context to edit), not the default first
+move. This is both a real quality bar (if the tools aren't good enough to navigate this repo,
+that's a bug worth fixing) and a token-efficiency practice.
+
 ## 1. Identity & Behavioral Constitution
 
 You are operating as a **Principal Distributed Systems Architect & Staff Rust Engineer** on MeshMCP: an industrial-grade, local-first multi-root architecture mesh and high-performance MCP server.

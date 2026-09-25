@@ -1,0 +1,62 @@
+# Ground truth for Bank of Anthos (GoogleCloudPlatform/bank-of-anthos),
+# pinned at the commit in scripts/golden/repos.txt. Written by hand from the
+# real source (grep for `@app.route` in every Flask service under src/),
+# not derived from mesh-mcp's own output — that would make the "ground
+# truth" circular.
+#
+# This repo is mostly synchronous HTTP/REST internally, not gRPC — there is
+# no comparable `grpc_edges` section here on purpose (see docs/quality.md,
+# "What's NOT measured yet": no `score.py` mode for HTTP routes exists yet,
+# so nothing in this file is scored in CI today; it exists as ground truth
+# for when that mode lands).
+repo: bank-of-anthos
+commit: db35fea9fd090150e2398106aadb475576f80d94
+
+# Real Flask/FastAPI HTTP routes, one entry per `@app.route(...)` decorator
+# found, matching the `"<METHOD> <path>"` shape `extract_flask_route`
+# (step 2.6) surfaces in a route handler's `signature`. `service` is the
+# directory name under src/, `function` the decorated handler's name.
+#
+# Only src/accounts/userservice, src/accounts/contacts, and src/frontend are
+# covered here: they are the repo's three Flask services. The three ledger
+# services (src/ledger/balancereader, /ledgerwriter, /transactionhistory)
+# are Java/Spring MVC (`@RestController`/`@RequestMapping`/`@GetMapping`),
+# a different framework step 2.6 does not extract — flagged honestly rather
+# than silently omitted or fabricated as Flask routes. Left as ground truth
+# for a future Spring-annotation extractor, not represented as http_routes
+# below.
+http_routes:
+  # src/accounts/userservice/userservice.py
+  - {service: userservice, function: version, method: GET, path: /version}
+  - {service: userservice, function: readiness, method: GET, path: /ready}
+  - {service: userservice, function: create_user, method: POST, path: /users}
+  - {service: userservice, function: login, method: GET, path: /login}
+  # src/accounts/contacts/contacts.py
+  - {service: contacts, function: version, method: GET, path: /version}
+  - {service: contacts, function: ready, method: GET, path: /ready}
+  - {service: contacts, function: get_contacts, method: GET, path: /contacts/<username>}
+  - {service: contacts, function: add_contact, method: POST, path: /contacts/<username>}
+  # src/frontend/frontend.py — `/` and `/home` declare no `methods=` kwarg,
+  # which is Flask's own default of GET-only; ground truth records that
+  # resolved method, not the absence of the kwarg, since that is what a
+  # correct extractor must also resolve rather than skip/misreport.
+  - {service: frontend, function: version, method: GET, path: /version}
+  - {service: frontend, function: readiness, method: GET, path: /ready}
+  - {service: frontend, function: whereami, method: GET, path: /whereami}
+  - {service: frontend, function: root, method: GET, path: /}
+  - {service: frontend, function: home, method: GET, path: /home}
+  - {service: frontend, function: payment, method: POST, path: /payment}
+  - {service: frontend, function: deposit, method: POST, path: /deposit}
+  - {service: frontend, function: login_page, method: GET, path: /login}
+  - {service: frontend, function: login, method: POST, path: /login}
+  - {service: frontend, function: consent_page, method: GET, path: /consent}
+  - {service: frontend, function: consent, method: POST, path: /consent}
+  - {service: frontend, function: signup_page, method: GET, path: /signup}
+  - {service: frontend, function: signup, method: POST, path: /signup}
+  - {service: frontend, function: logout, method: POST, path: /logout}
+
+# No Kafka/Pub-Sub topics in this demo — synchronous HTTP/REST and gRPC-free
+# service-to-service calls only (frontend calls the other services' own HTTP
+# APIs via src/frontend/api_call.py, not gRPC or an async broker). An empty
+# list here is itself part of the ground truth.
+topics: []

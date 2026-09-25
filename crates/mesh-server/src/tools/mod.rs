@@ -579,6 +579,7 @@ roots = ["."]
 
         let find_deps_args = super::find_dependents::FindDependentsArgs {
             target: mesh_core::CompactStr::new("UserAuthRequest"),
+            granularity: None,
             _meta: None,
         };
         let hint_deps = FindDependentsTool::truncation_hint(&find_deps_args, &state).unwrap();
@@ -606,6 +607,7 @@ roots = ["."]
 
         let impact_args = super::analyze_impact::AnalyzeImpactArgs {
             target: mesh_core::CompactStr::new("EVENT_CREATED"),
+            depth: None,
             _meta: None,
         };
         let hint_impact = AnalyzeImpactTool::truncation_hint(&impact_args, &state).unwrap();

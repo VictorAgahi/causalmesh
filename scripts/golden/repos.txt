@@ -1,0 +1,11 @@
+# Golden-corpus repos, pinned to an exact commit for reproducible precision/
+# recall scoring (Plan 2 step 2.0). Unlike scripts/bench/repos.txt (shallow,
+# latest-commit clones for scale/smoke testing), every repo here is checked
+# out at the exact SHA its tests/golden/<name>.expected.yaml was written
+# against — the ground truth would silently drift out of sync with the repo
+# otherwise.
+#
+# format: <name> <git-url> <pinned-sha>
+online-boutique  https://github.com/GoogleCloudPlatform/microservices-demo.git  38e7348eb289eb5b87c0c6e8cb19ced0449dc389
+otel-demo        https://github.com/open-telemetry/opentelemetry-demo.git       898ede2f314b2c1e92a2d9a6ebd7efc188709290
+bank-of-anthos   https://github.com/GoogleCloudPlatform/bank-of-anthos.git      db35fea9fd090150e2398106aadb475576f80d94

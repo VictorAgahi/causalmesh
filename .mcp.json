@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mesh-mcp": {
+      "type": "stdio",
+      "command": "/Users/victoragahi/.local/bin/mesh-mcp",
+      "args": [
+        "run",
+        "--config",
+        ".agents/mesh-mcp.toml"
+      ],
+      "env": {}
+    }
+  }
+}

@@ -31,6 +31,15 @@ pub struct PythonRelations {
     pub dependencies: Vec<(usize, CompactStr)>,
     pub producers: Vec<(usize, CompactStr)>,
     pub consumers: Vec<(usize, CompactStr)>,
+    /// `(caller node index, target RPC service name)` — a
+    /// `grpc_tools.protoc`-generated `<Service>Stub(channel)` construction
+    /// site, attributed to its smallest enclosing declaration. Feeds
+    /// `ContractGraph::add_rpc_call` -> `reconcile_edges`'s `CallsRpc` edges,
+    /// the same client-side signal Go/TypeScript/C#/Kotlin already emit —
+    /// Python had none at all, so a Python gRPC client was invisible to
+    /// `find_dependents`/`analyze_grpc` even when the service it called was
+    /// indexed correctly on the server side.
+    pub rpc_calls: Vec<(usize, CompactStr)>,
 }
 
 pub struct PythonExtractor;
@@ -71,6 +80,7 @@ impl PythonExtractor {
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
 
+        let mut module_idx: Option<usize> = None;
         Self::visit_node(
             root,
             source_bytes,
@@ -83,6 +93,8 @@ impl PythonExtractor {
             &mut imports,
             &mut relations.producers,
             &mut relations.consumers,
+            &mut relations.rpc_calls,
+            &mut module_idx,
             0,
         );
 
@@ -123,6 +135,8 @@ impl PythonExtractor {
         imports: &mut Vec<ImportRef>,
         producers: &mut Vec<(usize, CompactStr)>,
         consumers: &mut Vec<(usize, CompactStr)>,
+        rpc_calls: &mut Vec<(usize, CompactStr)>,
+        module_idx: &mut Option<usize>,
         depth: usize,
     ) {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
@@ -199,6 +213,7 @@ impl PythonExtractor {
 
                 let mut kind = NodeKind::ServiceClass;
                 let mut celery_task_name: Option<String> = None;
+                let mut route: Option<(String, String)> = None;
                 // Check decorators (supporting multiple stacked decorators, e.g. @app.get + @login_required)
                 let mut check_decorator = |dec_node: Node| {
                     if let Ok(dec_text) = dec_node.utf8_text(source) {
@@ -211,6 +226,9 @@ impl PythonExtractor {
                             || dec_text.contains("@api_router.")
                         {
                             kind = NodeKind::HttpEndpoint;
+                            if route.is_none() {
+                                route = Self::extract_flask_route(dec_node, source);
+                            }
                         }
                     }
                 };
@@ -242,6 +260,17 @@ impl PythonExtractor {
                     consumers.push((idx, CompactStr::new(task_name)));
                 }
 
+                // A route decorator's actual path/method (`@app.route('/users',
+                // methods=['POST'])`, `@router.get("/health")`) used to be
+                // discarded entirely — only the Python function name
+                // (`create_user`) was kept, with no record anywhere of the
+                // real HTTP contract it serves. Surfaced in `signature`
+                // rather than replacing `name`, so existing symbol-name
+                // lookups (`find_dependents`/`search_symbols`) are unaffected.
+                let route_sig = route
+                    .as_ref()
+                    .map(|(method, path)| format!("{method} {path}"));
+
                 nodes.push(ContractNode {
                     id: 0,
                     name: CompactStr::new(func_name),
@@ -251,7 +280,7 @@ impl PythonExtractor {
                     line_end: node.end_position().row + 1,
                     package: package_name.clone(),
                     repo_id,
-                    signature: Some(CompactStr::new(first_line)),
+                    signature: Some(CompactStr::new(route_sig.unwrap_or(first_line))),
                     docstring: None,
                 });
                 child_enclosing = Some(idx);
@@ -261,6 +290,23 @@ impl PythonExtractor {
                 if !nodes.is_empty() {
                     Self::detect_event_call(node, source, idx, producers, consumers, root);
                 }
+                // Deliberately NOT gated by `!nodes.is_empty()` like the event
+                // detection above: a gRPC client is very often wired up at
+                // module scope with no prior def/class in the file at all
+                // (a minimal script that just imports grpc, opens a channel,
+                // and builds a stub) — gating on `nodes` being non-empty
+                // would silently drop that shape, defeating the whole point
+                // of `module_node_idx` lazily creating one on demand. A
+                // real-world example with at least one prior declaration:
+                // Online Boutique's recommendationservice builds its
+                // ProductCatalogService stub directly inside
+                // `if __name__ == "__main__":`, not inside any function.
+                // Node 0 (whatever ContractNode happened to be declared
+                // first) would be a wrong, arbitrary attribution there.
+                let rpc_idx = enclosing.unwrap_or_else(|| {
+                    Self::module_node_idx(nodes, file_path, package_name, repo_id, module_idx)
+                });
+                Self::detect_grpc_stub_call(node, source, rpc_idx, rpc_calls);
             }
             _ => {}
         }
@@ -279,9 +325,94 @@ impl PythonExtractor {
                 imports,
                 producers,
                 consumers,
+                rpc_calls,
+                module_idx,
                 depth + 1,
             );
         }
+    }
+
+    /// Returns the index of a synthetic module-level `ContractNode`,
+    /// creating it (named after the file's stem, e.g. `recommendation_server`
+    /// for `recommendation_server.py`) the first time it's actually needed —
+    /// most Python files never call this, since most calls happen inside a
+    /// function or class the normal walk already attributes them to.
+    fn module_node_idx(
+        nodes: &mut Vec<ContractNode>,
+        file_path: &FilePath,
+        package_name: &CompactStr,
+        repo_id: RepoId,
+        module_idx: &mut Option<usize>,
+    ) -> usize {
+        if let Some(idx) = *module_idx {
+            return idx;
+        }
+        let stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("module");
+        let idx = nodes.len();
+        nodes.push(ContractNode {
+            id: 0,
+            name: CompactStr::new(stem),
+            kind: NodeKind::ServiceClass,
+            file_path: file_path.clone(),
+            line_start: 1,
+            line_end: 1,
+            package: package_name.clone(),
+            repo_id,
+            signature: Some(CompactStr::new(format!("module {stem}"))),
+            docstring: None,
+        });
+        *module_idx = Some(idx);
+        idx
+    }
+
+    /// `grpc_tools.protoc` always names a service's generated client stub
+    /// class `<Service>Stub`, in a module itself named `<proto>_pb2_grpc.py`
+    /// — constructed at the real call site as
+    /// `<proto>_pb2_grpc.<Service>Stub(channel)`, e.g.
+    /// `demo_pb2_grpc.ProductCatalogServiceStub(channel)`. Only that
+    /// qualified-attribute shape counts: a bare `<Service>Stub(...)` call
+    /// with no `_pb2_grpc`-module qualifier is not accepted, because nothing
+    /// then distinguishes a real generated stub from a hand-written test
+    /// double or mock also named `<Something>Stub` — a common Python testing
+    /// idiom that would otherwise fabricate an RPC-call edge to a real
+    /// service of the same name.
+    fn detect_grpc_stub_call(
+        node: Node,
+        source: &[u8],
+        idx: usize,
+        rpc_calls: &mut Vec<(usize, CompactStr)>,
+    ) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "attribute" {
+            return;
+        }
+        let Some(module_obj) = func.child_by_field_name("object") else {
+            return;
+        };
+        let Ok(module_text) = module_obj.utf8_text(source) else {
+            return;
+        };
+        if !module_text.ends_with("_pb2_grpc") {
+            return;
+        }
+        let Some(attr) = func.child_by_field_name("attribute") else {
+            return;
+        };
+        let Ok(name) = attr.utf8_text(source) else {
+            return;
+        };
+        let Some(service) = name.strip_suffix("Stub") else {
+            return;
+        };
+        if service.is_empty() {
+            return;
+        }
+        rpc_calls.push((idx, CompactStr::new(service)));
     }
 
     // Import extraction
@@ -451,6 +582,86 @@ impl PythonExtractor {
         }
     }
 
+    /// Extracts `(METHOD, path)` from an `@app.route(...)` / `@router.get(...)`
+    /// / `@api_router.post(...)`-style decorator's own call expression.
+    /// Flask's `@app.route(path, methods=[...])` gets its method from the
+    /// `methods` keyword argument (defaulting to `"GET"`, Flask's own
+    /// default when it's omitted); FastAPI/typical `APIRouter`-style
+    /// `@router.<verb>(path)` gets it directly from the attribute name
+    /// (`get`, `post`, ...) instead — a real, different shape from the same
+    /// `@app.`/`@router.` prefix this file's caller already gates on.
+    fn extract_flask_route(dec_node: Node, source: &[u8]) -> Option<(String, String)> {
+        let call = dec_node.named_child(0).filter(|c| c.kind() == "call")?;
+        let func = call.child_by_field_name("function")?;
+        if func.kind() != "attribute" {
+            return None;
+        }
+        let verb = func
+            .child_by_field_name("attribute")
+            .and_then(|a| a.utf8_text(source).ok())?;
+
+        let args = call.child_by_field_name("arguments")?;
+        let mut positional_path = None;
+        let mut rule_kwarg_path = None;
+        let mut methods_kwarg: Vec<String> = Vec::new();
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor) {
+            match arg.kind() {
+                "string" if positional_path.is_none() => {
+                    positional_path = Self::string_literal_value(arg, source);
+                }
+                "keyword_argument" => {
+                    let kwarg_name = arg
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok());
+                    match kwarg_name {
+                        // Flask's `@app.route(rule='/x')` — `rule` is a
+                        // legitimate named parameter, not just positional.
+                        Some("rule") => {
+                            rule_kwarg_path = arg
+                                .child_by_field_name("value")
+                                .and_then(|v| Self::string_literal_value(v, source));
+                        }
+                        Some("methods") => {
+                            if let Some(list) = arg.child_by_field_name("value") {
+                                if matches!(list.kind(), "list" | "tuple") {
+                                    let mut list_cursor = list.walk();
+                                    methods_kwarg = list
+                                        .named_children(&mut list_cursor)
+                                        .filter_map(|s| Self::string_literal_value(s, source))
+                                        .collect();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let path = positional_path.or(rule_kwarg_path)?;
+
+        let method = if verb.eq_ignore_ascii_case("route") {
+            if methods_kwarg.is_empty() {
+                "GET".to_string()
+            } else {
+                // Every declared method, not just the first — a route
+                // registered for `methods=['GET', 'POST']` really does
+                // accept both; silently keeping only "GET" would misreport
+                // its actual HTTP contract.
+                methods_kwarg.join(",")
+            }
+        } else if matches!(
+            verb.to_ascii_lowercase().as_str(),
+            "get" | "post" | "put" | "delete" | "patch" | "head" | "options"
+        ) {
+            verb.to_string()
+        } else {
+            return None;
+        };
+        Some((method.to_ascii_uppercase(), path))
+    }
+
     fn is_celery_task_decorator(dec_text: &str) -> bool {
         dec_text.contains("@task") || dec_text.contains("@celery") || dec_text.contains(".task")
     }
@@ -587,7 +798,7 @@ impl PythonExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_core::ContractGraph;
+    use mesh_core::{ContractGraph, NodeId};
 
     fn make_parser() -> Parser {
         let mut parser = Parser::new();
@@ -671,6 +882,194 @@ class CheckoutServiceServicer(checkout_pb2_grpc.CheckoutServiceServicer):
             .find(|n| n.name == "CheckoutServiceServicer")
             .expect("class node present");
         assert_eq!(servicer.kind, NodeKind::GrpcService);
+    }
+
+    /// `<Service>Stub(channel)` — a `grpc_tools.protoc`-generated client
+    /// stub's real construction site — must be recorded as an RPC call to
+    /// `<Service>`. Caught empirically scoring `mesh-mcp` against the real
+    /// Online Boutique demo (`tests/golden/online-boutique.expected.yaml`):
+    /// `recommendationservice`'s `demo_pb2_grpc.ProductCatalogServiceStub(channel)`
+    /// was invisible to `find_dependents`/`analyze_grpc` before this fix.
+    #[test]
+    fn grpc_stub_construction_is_recorded_as_an_rpc_call() {
+        let code = r#"
+def get_product_catalog_stub(channel):
+    return demo_pb2_grpc.ProductCatalogServiceStub(channel)
+
+def list_recommendations(product_catalog_stub):
+    return product_catalog_stub.ListProducts(demo_pb2.Empty())
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, relations) = PythonExtractor::extract_with_relations(
+            Path::new("src/recommendationservice/recommendation_server.py"),
+            code,
+            0,
+            &tree,
+        );
+        assert_eq!(
+            relations.rpc_calls.len(),
+            1,
+            "expected exactly 1 rpc call, got: {:?}",
+            relations.rpc_calls
+        );
+        assert_eq!(relations.rpc_calls[0].1.as_str(), "ProductCatalogService");
+        assert_eq!(
+            nodes[relations.rpc_calls[0].0].name.as_str(),
+            "get_product_catalog_stub"
+        );
+    }
+
+    /// A bare `<Something>Stub(...)` construction with no `_pb2_grpc`-module
+    /// qualifier must NOT be recorded — a common Python testing idiom is a
+    /// hand-written fake named after the real service it doubles for (e.g.
+    /// `class PaymentServiceStub: ...` as a test double), and nothing
+    /// distinguishes that from a real generated client without requiring the
+    /// qualified `<proto>_pb2_grpc.<Service>Stub` shape.
+    #[test]
+    fn bare_stub_construction_without_pb2_grpc_qualifier_records_nothing() {
+        let code = r#"
+def make_fake_payment_client():
+    return PaymentServiceStub()
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (_, relations) =
+            PythonExtractor::extract_with_relations(Path::new("tests/fakes.py"), code, 0, &tree);
+        assert!(
+            relations.rpc_calls.is_empty(),
+            "expected no rpc call from an unqualified Stub-named construction, got: {:?}",
+            relations.rpc_calls
+        );
+    }
+
+    /// A module-level stub construction (no enclosing function/class) has no
+    /// legitimate node to attribute the call to and must be skipped, not
+    /// mis-attributed to whichever `ContractNode` happens to be declared
+    /// first in the file.
+    #[test]
+    fn module_level_stub_construction_attributes_to_a_module_node_not_the_first_unrelated_one() {
+        let code = r#"
+class Unrelated:
+    pass
+
+if __name__ == "__main__":
+    channel = grpc.insecure_channel("localhost:50051")
+    stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, relations) = PythonExtractor::extract_with_relations(
+            Path::new("recommendation_server.py"),
+            code,
+            0,
+            &tree,
+        );
+        assert_eq!(
+            relations.rpc_calls.len(),
+            1,
+            "expected 1 rpc call, got: {:?}",
+            relations.rpc_calls
+        );
+        let (idx, target) = &relations.rpc_calls[0];
+        assert_eq!(target.as_str(), "ProductCatalogService");
+        assert_ne!(
+            nodes[*idx].name.as_str(),
+            "Unrelated",
+            "must not be misattributed to the first unrelated node"
+        );
+        assert_eq!(nodes[*idx].name.as_str(), "recommendation_server");
+    }
+
+    /// End-to-end: a Python client's `<Service>Stub(channel)` construction
+    /// must actually resolve to a real `CallsRpc` edge through
+    /// `ContractGraph::reconcile_edges` — not just produce the right raw
+    /// `(idx, target)` tuple in isolation, which alone wouldn't catch a
+    /// resolution-side naming mismatch. The server side here is a
+    /// `GrpcService` node added directly, the same shape a `.proto`
+    /// declaration produces (`proto.rs`'s extractor) — this is the actual
+    /// resolution path the real Online Boutique fix (`docs/quality.md`)
+    /// exercises: every golden-corpus repo's services are declared in a real
+    /// `.proto` file, not resolved via Python's own `*Servicer` class naming
+    /// alone.
+    #[test]
+    fn grpc_stub_resolves_to_a_real_edge_against_a_proto_declared_service() {
+        let mut graph = ContractGraph::new();
+
+        let service_id = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("CheckoutService"),
+            kind: NodeKind::GrpcService,
+            file_path: Path::new("protos/demo.proto").into(),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new("hipstershop"),
+            repo_id: 0,
+            signature: Some(CompactStr::new("service CheckoutService")),
+            docstring: None,
+        });
+
+        let client_code = r#"
+def place_order(channel):
+    stub = checkout_pb2_grpc.CheckoutServiceStub(channel)
+    return stub.PlaceOrder(request)
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(client_code, None).expect("parse");
+        let (client_nodes, client_relations) = PythonExtractor::extract_with_relations(
+            Path::new("src/frontend/handlers.py"),
+            client_code,
+            1,
+            &tree,
+        );
+        let client_ids: Vec<NodeId> = client_nodes
+            .into_iter()
+            .map(|n| graph.add_node(n))
+            .collect();
+        for (idx, target) in client_relations.rpc_calls {
+            graph.add_rpc_call(client_ids[idx], target.as_str());
+        }
+        graph.reconcile_edges();
+
+        let caller_id = client_ids[0];
+        let has_edge = graph
+            .all_edges()
+            .iter()
+            .any(|e| e.from == caller_id && e.to == service_id);
+        assert!(
+            has_edge,
+            "expected a CallsRpc edge from the CheckoutServiceStub caller to the \
+             proto-declared CheckoutService node, found edges: {:?}",
+            graph.all_edges()
+        );
+    }
+
+    /// A gRPC stub construction with zero prior def/class in the file (no
+    /// enclosing declaration, and `nodes` still empty when the call is
+    /// visited) must still be recorded via the lazily-created module node —
+    /// not silently dropped by a stray `!nodes.is_empty()` guard meant only
+    /// for the unrelated event-producer/consumer detection.
+    #[test]
+    fn grpc_stub_with_zero_prior_declarations_is_still_recorded() {
+        let code = r#"
+import grpc
+import demo_pb2_grpc
+
+channel = grpc.insecure_channel("localhost:50051")
+stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, relations) =
+            PythonExtractor::extract_with_relations(Path::new("client.py"), code, 0, &tree);
+        assert_eq!(
+            relations.rpc_calls.len(),
+            1,
+            "expected 1 rpc call even with zero prior declarations, got: {:?}",
+            relations.rpc_calls
+        );
+        assert_eq!(relations.rpc_calls[0].1.as_str(), "ProductCatalogService");
+        assert_eq!(nodes[relations.rpc_calls[0].0].name.as_str(), "client");
     }
 
     /// Plain `from x import y`: a symbol declared in one file and
@@ -1027,5 +1426,114 @@ def get_items():
             NodeKind::HttpEndpoint,
             "stacked decorators must correctly identify HttpEndpoint"
         );
+    }
+
+    /// A `@app.route(path, methods=[...])` decorator's real path and method
+    /// used to be discarded entirely — only the Python function name was
+    /// kept, with no record anywhere of the actual HTTP contract it serves.
+    /// Verbatim shape from the real Bank of Anthos userservice.
+    #[test]
+    fn flask_route_path_and_method_are_surfaced_in_signature() {
+        let code = r#"
+@app.route('/users', methods=['POST'])
+def create_user():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "create_user")
+            .expect("create_user node");
+        assert_eq!(node.kind, NodeKind::HttpEndpoint);
+        assert_eq!(node.signature.as_deref(), Some("POST /users"));
+    }
+
+    /// `@app.route(path)` with no `methods=` keyword argument defaults to
+    /// `GET`, matching Flask's own default.
+    #[test]
+    fn flask_route_with_no_methods_kwarg_defaults_to_get() {
+        let code = r#"
+@app.route('/version')
+def version():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "version")
+            .expect("version node");
+        assert_eq!(node.signature.as_deref(), Some("GET /version"));
+    }
+
+    /// A route registered for multiple methods (`methods=['GET', 'POST']`)
+    /// really does accept both — only capturing the first would misreport
+    /// its actual HTTP contract.
+    #[test]
+    fn flask_route_with_multiple_methods_keeps_all_of_them() {
+        let code = r#"
+@app.route('/users/<int:id>', methods=['GET', 'POST'])
+def user_detail():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "user_detail")
+            .expect("user_detail node");
+        assert_eq!(node.signature.as_deref(), Some("GET,POST /users/<int:id>"));
+    }
+
+    /// Flask's `@app.route(rule='/x')` — `rule` is a legitimate named
+    /// parameter, not just a positional argument — must still be recognized
+    /// as the route path, not silently dropped back to the plain function
+    /// signature despite the node still being tagged `HttpEndpoint`.
+    #[test]
+    fn flask_route_with_keyword_only_rule_argument_is_recognized() {
+        let code = r#"
+@app.route(rule='/x')
+def x_handler():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("app.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "x_handler")
+            .expect("x_handler node");
+        assert_eq!(node.signature.as_deref(), Some("GET /x"));
+    }
+
+    /// FastAPI/`APIRouter`-style `@router.<verb>(path)` gets its method
+    /// directly from the attribute name, not a `methods=` keyword argument —
+    /// a genuinely different shape from Flask's `@app.route`, sharing only
+    /// the `@app.`/`@router.` prefix this file's caller gates on.
+    #[test]
+    fn fastapi_router_verb_decorator_is_surfaced_in_signature() {
+        let code = r#"
+@router.get("/health")
+def health_check():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("main.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "health_check")
+            .expect("health_check node");
+        assert_eq!(node.kind, NodeKind::HttpEndpoint);
+        assert_eq!(node.signature.as_deref(), Some("GET /health"));
     }
 }

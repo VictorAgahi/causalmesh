@@ -321,8 +321,8 @@ impl PolyglotIndexer {
         match lang_kind {
             LanguageKind::Protobuf => {
                 if cfg.allows_proto_path(&path_str) {
-                    if let Some(nodes) = parsed!(|tree| {
-                        proto::ProtoExtractor::extract_with_parser(
+                    if let Some((nodes, relations)) = parsed!(|tree| {
+                        proto::ProtoExtractor::extract_with_relations(
                             file_path,
                             content,
                             repo_id,
@@ -331,12 +331,13 @@ impl PolyglotIndexer {
                         )
                     }) {
                         out.nodes = nodes;
+                        out.dependencies = relations.dependencies;
                     }
                 }
             }
 
             LanguageKind::Java => {
-                if let Some((nodes, dependencies, producers)) = parsed!(|tree| {
+                if let Some((nodes, dependencies, producers, rpc_calls)) = parsed!(|tree| {
                     java::JavaExtractor::extract_relations(file_path, content, repo_id, tree)
                 }) {
                     for (i, node) in nodes.iter().enumerate() {
@@ -347,6 +348,7 @@ impl PolyglotIndexer {
                     out.nodes = nodes;
                     out.dependencies = dependencies;
                     out.producers = producers;
+                    out.rpc_calls = rpc_calls;
                 }
             }
             LanguageKind::Go => {

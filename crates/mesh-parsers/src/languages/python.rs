@@ -213,6 +213,7 @@ impl PythonExtractor {
 
                 let mut kind = NodeKind::ServiceClass;
                 let mut celery_task_name: Option<String> = None;
+                let mut route: Option<(String, String)> = None;
                 // Check decorators (supporting multiple stacked decorators, e.g. @app.get + @login_required)
                 let mut check_decorator = |dec_node: Node| {
                     if let Ok(dec_text) = dec_node.utf8_text(source) {
@@ -225,6 +226,9 @@ impl PythonExtractor {
                             || dec_text.contains("@api_router.")
                         {
                             kind = NodeKind::HttpEndpoint;
+                            if route.is_none() {
+                                route = Self::extract_flask_route(dec_node, source);
+                            }
                         }
                     }
                 };
@@ -256,6 +260,17 @@ impl PythonExtractor {
                     consumers.push((idx, CompactStr::new(task_name)));
                 }
 
+                // A route decorator's actual path/method (`@app.route('/users',
+                // methods=['POST'])`, `@router.get("/health")`) used to be
+                // discarded entirely — only the Python function name
+                // (`create_user`) was kept, with no record anywhere of the
+                // real HTTP contract it serves. Surfaced in `signature`
+                // rather than replacing `name`, so existing symbol-name
+                // lookups (`find_dependents`/`search_symbols`) are unaffected.
+                let route_sig = route
+                    .as_ref()
+                    .map(|(method, path)| format!("{method} {path}"));
+
                 nodes.push(ContractNode {
                     id: 0,
                     name: CompactStr::new(func_name),
@@ -265,7 +280,7 @@ impl PythonExtractor {
                     line_end: node.end_position().row + 1,
                     package: package_name.clone(),
                     repo_id,
-                    signature: Some(CompactStr::new(first_line)),
+                    signature: Some(CompactStr::new(route_sig.unwrap_or(first_line))),
                     docstring: None,
                 });
                 child_enclosing = Some(idx);
@@ -565,6 +580,86 @@ impl PythonExtractor {
             }
             _ => {}
         }
+    }
+
+    /// Extracts `(METHOD, path)` from an `@app.route(...)` / `@router.get(...)`
+    /// / `@api_router.post(...)`-style decorator's own call expression.
+    /// Flask's `@app.route(path, methods=[...])` gets its method from the
+    /// `methods` keyword argument (defaulting to `"GET"`, Flask's own
+    /// default when it's omitted); FastAPI/typical `APIRouter`-style
+    /// `@router.<verb>(path)` gets it directly from the attribute name
+    /// (`get`, `post`, ...) instead — a real, different shape from the same
+    /// `@app.`/`@router.` prefix this file's caller already gates on.
+    fn extract_flask_route(dec_node: Node, source: &[u8]) -> Option<(String, String)> {
+        let call = dec_node.named_child(0).filter(|c| c.kind() == "call")?;
+        let func = call.child_by_field_name("function")?;
+        if func.kind() != "attribute" {
+            return None;
+        }
+        let verb = func
+            .child_by_field_name("attribute")
+            .and_then(|a| a.utf8_text(source).ok())?;
+
+        let args = call.child_by_field_name("arguments")?;
+        let mut positional_path = None;
+        let mut rule_kwarg_path = None;
+        let mut methods_kwarg: Vec<String> = Vec::new();
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor) {
+            match arg.kind() {
+                "string" if positional_path.is_none() => {
+                    positional_path = Self::string_literal_value(arg, source);
+                }
+                "keyword_argument" => {
+                    let kwarg_name = arg
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok());
+                    match kwarg_name {
+                        // Flask's `@app.route(rule='/x')` — `rule` is a
+                        // legitimate named parameter, not just positional.
+                        Some("rule") => {
+                            rule_kwarg_path = arg
+                                .child_by_field_name("value")
+                                .and_then(|v| Self::string_literal_value(v, source));
+                        }
+                        Some("methods") => {
+                            if let Some(list) = arg.child_by_field_name("value") {
+                                if matches!(list.kind(), "list" | "tuple") {
+                                    let mut list_cursor = list.walk();
+                                    methods_kwarg = list
+                                        .named_children(&mut list_cursor)
+                                        .filter_map(|s| Self::string_literal_value(s, source))
+                                        .collect();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let path = positional_path.or(rule_kwarg_path)?;
+
+        let method = if verb.eq_ignore_ascii_case("route") {
+            if methods_kwarg.is_empty() {
+                "GET".to_string()
+            } else {
+                // Every declared method, not just the first — a route
+                // registered for `methods=['GET', 'POST']` really does
+                // accept both; silently keeping only "GET" would misreport
+                // its actual HTTP contract.
+                methods_kwarg.join(",")
+            }
+        } else if matches!(
+            verb.to_ascii_lowercase().as_str(),
+            "get" | "post" | "put" | "delete" | "patch" | "head" | "options"
+        ) {
+            verb.to_string()
+        } else {
+            return None;
+        };
+        Some((method.to_ascii_uppercase(), path))
     }
 
     fn is_celery_task_decorator(dec_text: &str) -> bool {
@@ -1331,5 +1426,114 @@ def get_items():
             NodeKind::HttpEndpoint,
             "stacked decorators must correctly identify HttpEndpoint"
         );
+    }
+
+    /// A `@app.route(path, methods=[...])` decorator's real path and method
+    /// used to be discarded entirely — only the Python function name was
+    /// kept, with no record anywhere of the actual HTTP contract it serves.
+    /// Verbatim shape from the real Bank of Anthos userservice.
+    #[test]
+    fn flask_route_path_and_method_are_surfaced_in_signature() {
+        let code = r#"
+@app.route('/users', methods=['POST'])
+def create_user():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "create_user")
+            .expect("create_user node");
+        assert_eq!(node.kind, NodeKind::HttpEndpoint);
+        assert_eq!(node.signature.as_deref(), Some("POST /users"));
+    }
+
+    /// `@app.route(path)` with no `methods=` keyword argument defaults to
+    /// `GET`, matching Flask's own default.
+    #[test]
+    fn flask_route_with_no_methods_kwarg_defaults_to_get() {
+        let code = r#"
+@app.route('/version')
+def version():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "version")
+            .expect("version node");
+        assert_eq!(node.signature.as_deref(), Some("GET /version"));
+    }
+
+    /// A route registered for multiple methods (`methods=['GET', 'POST']`)
+    /// really does accept both — only capturing the first would misreport
+    /// its actual HTTP contract.
+    #[test]
+    fn flask_route_with_multiple_methods_keeps_all_of_them() {
+        let code = r#"
+@app.route('/users/<int:id>', methods=['GET', 'POST'])
+def user_detail():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("userservice.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "user_detail")
+            .expect("user_detail node");
+        assert_eq!(node.signature.as_deref(), Some("GET,POST /users/<int:id>"));
+    }
+
+    /// Flask's `@app.route(rule='/x')` — `rule` is a legitimate named
+    /// parameter, not just a positional argument — must still be recognized
+    /// as the route path, not silently dropped back to the plain function
+    /// signature despite the node still being tagged `HttpEndpoint`.
+    #[test]
+    fn flask_route_with_keyword_only_rule_argument_is_recognized() {
+        let code = r#"
+@app.route(rule='/x')
+def x_handler():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("app.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "x_handler")
+            .expect("x_handler node");
+        assert_eq!(node.signature.as_deref(), Some("GET /x"));
+    }
+
+    /// FastAPI/`APIRouter`-style `@router.<verb>(path)` gets its method
+    /// directly from the attribute name, not a `methods=` keyword argument —
+    /// a genuinely different shape from Flask's `@app.route`, sharing only
+    /// the `@app.`/`@router.` prefix this file's caller gates on.
+    #[test]
+    fn fastapi_router_verb_decorator_is_surfaced_in_signature() {
+        let code = r#"
+@router.get("/health")
+def health_check():
+    pass
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("main.py"), code, 0, &tree);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == "health_check")
+            .expect("health_check node");
+        assert_eq!(node.kind, NodeKind::HttpEndpoint);
+        assert_eq!(node.signature.as_deref(), Some("GET /health"));
     }
 }

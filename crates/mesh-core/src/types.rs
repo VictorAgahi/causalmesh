@@ -202,10 +202,35 @@ pub fn detect_service_package(
     let mut current = file_path.parent();
     let mut depth = 0;
     while let Some(dir) = current {
-        if depth >= MAX_WALK_DEPTH {
+        // `Path::parent()` on a relative path eventually yields `""` (the
+        // empty path) as its own final ancestor — and `"".join("Cargo.toml")`
+        // resolves against the *process's own current directory*, not
+        // against anything belonging to the (possibly synthetic, filesystem
+        // -less) `file_path` being classified. Inside this very workspace,
+        // that's always a real Cargo.toml, so an unguarded walk over a
+        // relative path with no real manifest anywhere in its own ancestry
+        // would silently read *this crate's own* manifest instead of finding
+        // nothing. Stopping at the empty path keeps the walk scoped to
+        // `file_path`'s own ancestry, exactly like `MAX_WALK_DEPTH` keeps it
+        // bounded.
+        if depth >= MAX_WALK_DEPTH || dir.as_os_str().is_empty() {
             break;
         }
         if has_compilation_manifest(dir) {
+            // The manifest's own declared name — go.mod's `module` path's
+            // last segment, package.json's `name` (npm-scope stripped),
+            // Cargo.toml's `[package].name`, pyproject.toml's
+            // `[project].name`/`[tool.poetry].name` — is the actual service
+            // identity a human or another tool would recognize. The
+            // directory name is only a fallback when the manifest has none
+            // (or fails to parse): a folder named `svc` whose go.mod declares
+            // `module github.com/acme/billing-service` should be identified
+            // as `billing-service`, not `svc`.
+            if let Some(declared) = manifest_declared_name(dir) {
+                if !declared.is_empty() {
+                    return CompactStr::new(declared);
+                }
+            }
             if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
                 if !name.is_empty() {
                     return CompactStr::new(name);
@@ -269,6 +294,84 @@ fn has_compilation_manifest(dir: &std::path::Path) -> bool {
         || dir.join("Gemfile").exists()
         || dir.join("composer.json").exists()
         || dir.join("Package.swift").exists()
+}
+
+/// Reads the service identity a manifest actually declares — not the
+/// directory it happens to sit in, which can drift from it (a folder named
+/// `svc` whose `go.mod` declares `module github.com/acme/billing-service`).
+/// `None` when no manifest in `dir` declares a name, or none of them parse.
+/// Callers must ensure `dir` is a real, meaningful path first (never the
+/// empty path — see the caller's own guard) since this does real filesystem
+/// reads.
+fn manifest_declared_name(dir: &std::path::Path) -> Option<String> {
+    read_go_mod_module(dir)
+        .or_else(|| read_package_json_name(dir))
+        .or_else(|| read_cargo_toml_name(dir))
+        .or_else(|| read_pyproject_name(dir))
+}
+
+/// A real manifest's `name`/`module` declaration lives in its first few
+/// lines; this is already generous for one. Unlike every other file this
+/// indexing pipeline reads, a manifest lookup has no `AstGuard` size check in
+/// front of it (this crate doesn't depend on `mesh-parsers`, which owns that
+/// guard) — checked here directly instead, so a multi-hundred-MB `go.mod`/
+/// `package.json`/`Cargo.toml`/`pyproject.toml` in a scanned repo (accidental
+/// or crafted) can't force a full read into memory on every source file
+/// under that directory.
+const MAX_MANIFEST_SIZE_BYTES: u64 = 64 * 1024;
+
+fn read_manifest_bounded(path: &std::path::Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_MANIFEST_SIZE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn read_go_mod_module(dir: &std::path::Path) -> Option<String> {
+    let content = read_manifest_bounded(&dir.join("go.mod"))?;
+    let line = content
+        .lines()
+        .find(|l| l.trim_start().starts_with("module "))?;
+    let module_path = line.trim_start().strip_prefix("module ")?.trim();
+    let name = module_path.rsplit('/').next().unwrap_or(module_path);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn read_package_json_name(dir: &std::path::Path) -> Option<String> {
+    let content = read_manifest_bounded(&dir.join("package.json"))?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let raw = json.get("name")?.as_str()?;
+    // A scoped npm package name (`@scope/name`) identifies the same service
+    // as its unscoped form for our purposes here.
+    let name = raw.rsplit('/').next().unwrap_or(raw);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn read_cargo_toml_name(dir: &std::path::Path) -> Option<String> {
+    let content = read_manifest_bounded(&dir.join("Cargo.toml"))?;
+    let value: toml::Value = content.parse().ok()?;
+    value
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn read_pyproject_name(dir: &std::path::Path) -> Option<String> {
+    let content = read_manifest_bounded(&dir.join("pyproject.toml"))?;
+    let value: toml::Value = content.parse().ok()?;
+    value
+        .get("project")
+        .and_then(|p| p.get("name"))
+        .or_else(|| {
+            value
+                .get("tool")
+                .and_then(|t| t.get("poetry"))
+                .and_then(|p| p.get("name"))
+        })
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
 }
 
 #[inline]
@@ -364,5 +467,144 @@ mod tests {
         let deep_path: String = "src/".repeat(40) + "main.go";
         let result = detect_service_package(Path::new(&deep_path), None);
         assert_eq!(result.as_str(), "shared");
+    }
+
+    /// A folder's own name and its manifest's declared name can legitimately
+    /// differ (a folder named `svc` whose `go.mod` declares `module
+    /// github.com/acme/billing-service`) — the declared name is the real
+    /// service identity and must win. Uses a real tempdir with a real
+    /// manifest file, not a synthetic path: `has_compilation_manifest`/
+    /// `manifest_declared_name` do real filesystem I/O, so a fake path could
+    /// only ever exercise the "no manifest found" branch.
+    #[test]
+    fn detect_service_package_prefers_go_mod_declared_module_over_dir_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("svc");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(
+            svc_dir.join("go.mod"),
+            "module github.com/acme/billing-service\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let file_path = svc_dir.join("main.go");
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "billing-service",
+            "the go.mod-declared module name must win over the directory name 'svc'"
+        );
+    }
+
+    #[test]
+    fn detect_service_package_prefers_package_json_declared_name_over_dir_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("svc");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(
+            svc_dir.join("package.json"),
+            r#"{"name": "@acme/checkout-service", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        let file_path = svc_dir.join("index.js");
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "checkout-service",
+            "the npm scope must be stripped from a scoped package name"
+        );
+    }
+
+    #[test]
+    fn detect_service_package_prefers_cargo_toml_declared_name_over_dir_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("svc");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(
+            svc_dir.join("Cargo.toml"),
+            "[package]\nname = \"payments-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let file_path = svc_dir.join("src").join("lib.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "payments-core"
+        );
+    }
+
+    #[test]
+    fn detect_service_package_prefers_pyproject_declared_name_over_dir_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("svc");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(
+            svc_dir.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"recommendation-service\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let file_path = svc_dir.join("main.py");
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "recommendation-service"
+        );
+    }
+
+    /// A manifest with no name field the reader understands (or one that
+    /// fails to parse) must fall back to the directory name exactly as
+    /// before this feature — not to an empty string or a panic.
+    #[test]
+    fn detect_service_package_falls_back_to_dir_name_when_manifest_has_no_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("checkout");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(svc_dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let file_path = svc_dir.join("main.rs");
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "checkout"
+        );
+    }
+
+    /// A manifest larger than `MAX_MANIFEST_SIZE_BYTES` must not be read into
+    /// memory at all — falls back to the directory name, the same as an
+    /// unparseable one, instead of a full read on every source file under a
+    /// directory whose manifest happens to be huge (accidental or crafted).
+    #[test]
+    fn detect_service_package_does_not_read_an_oversized_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc_dir = dir.path().join("checkout");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        let oversized = format!(
+            "[package]\nname = \"should-be-ignored\"\n# {}\n",
+            "x".repeat(70 * 1024)
+        );
+        std::fs::write(svc_dir.join("Cargo.toml"), oversized).unwrap();
+        let file_path = svc_dir.join("src").join("main.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        assert_eq!(
+            detect_service_package(&file_path, None).as_str(),
+            "checkout",
+            "an oversized manifest must be skipped entirely, not read and parsed"
+        );
+    }
+
+    /// Regression for the empty-path pitfall `manifest_declared_name`
+    /// introduced a real risk for: a synthetic relative path with no real
+    /// manifest anywhere in its own ancestry must never read *this crate's
+    /// own* real `Cargo.toml` (name `"mesh-core"`) just because
+    /// `Path::parent()` eventually yields the empty path, which resolves
+    /// against the process's actual cwd.
+    #[test]
+    fn detect_service_package_does_not_leak_the_running_crates_own_manifest() {
+        let result = detect_service_package(Path::new("totally/synthetic/path/main.go"), None);
+        assert_ne!(
+            result.as_str(),
+            "mesh-core",
+            "must not silently resolve to this crate's own real Cargo.toml via the empty-path ancestor"
+        );
     }
 }

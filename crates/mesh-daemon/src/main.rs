@@ -57,13 +57,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
+    // ── Config loading ────────────────────────────────────────────────────────
+    // Resolved before the socket path: the default (no `--socket`) is scoped
+    // to this workspace specifically (see below), which needs `base_dir` first.
+    let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
+    let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
+
     // ── Socket path (Unix) / named pipe address (Windows) ───────────────────────
     // `meshd` has no UDS on Windows, so IDE clients share the daemon over a
-    // named pipe instead. `--socket` overrides either form.
+    // named pipe instead. `--socket` (always passed by `mesh-mcp`'s own
+    // auto-spawn) overrides either form; the default here — used only when
+    // meshd is started by hand — is scoped to this workspace + binary
+    // version, never the one-per-machine legacy path, so two unrelated
+    // workspaces can never end up sharing (or racing to bind) the same
+    // socket and silently serving each other's data (idempotence invariant
+    // I7).
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
         Some(p) => p,
-        None => socket::socket_path(),
+        None => socket::socket_path_for(&socket::workspace_id(&base_dir)),
     };
 
     // Clean up any stale socket from a previous crashed daemon
@@ -73,30 +85,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     let pipe_name = match args.socket.clone() {
         Some(p) => p.to_string_lossy().into_owned(),
-        None => socket::pipe_name(),
+        None => socket::pipe_name_for(&socket::workspace_id(&base_dir)),
     };
-
-    // ── Config loading ────────────────────────────────────────────────────────
-    let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
-    let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
 
     // ── AppState (shared, single instance) ───────────────────────────────────
     let audit = Arc::new(AuditLogger::new(None)?);
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
     let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
 
-    // ── Initial ingestion: one parallel scan, one reconcile, one atomic install ─
-    tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
-    let snapshot = {
-        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
-        WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs))
-    };
-    state.install_snapshot(snapshot);
-    tracing::info!(
-        target: "meshd",
-        "Ingestion complete: {} contract nodes indexed.",
-        state.snapshot().contract_graph.node_count()
-    );
+    // ── Initial ingestion: runs in the background, not before the IPC server
+    // starts. A large workspace's first scan can take long enough that a
+    // client polling for the socket to appear (`mesh-mcp`'s `ensure_daemon_running`)
+    // used to time out and silently fall back to standalone mode — spinning
+    // up a second, redundant in-process index instead of just waiting a
+    // little longer for the one meshd already building. The socket now
+    // accepts connections immediately; `initialize`/`ping` succeed right
+    // away, and `tools/call` reports "still indexing" (via `generation == 0`,
+    // see `server::dispatch`) until this task's first `install_snapshot`.
+    // Held under `reload_lock`, the same as every later `WorkspaceIndexer::reload`
+    // call, so a filesystem event racing the initial scan can't install a
+    // snapshot computed from a stale base out from under it (idempotence
+    // invariant I2 — see `AppState::reload_lock`'s own doc).
+    let ingest_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard = ingest_state
+            .reload_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
+        let snapshot = {
+            let mut vfs = ingest_state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+            WorkspaceIndexer::build_snapshot(
+                &ingest_state.config,
+                &ingest_state.allowed_roots,
+                None,
+                Some(&mut vfs),
+            )
+        };
+        ingest_state.install_snapshot(snapshot);
+        tracing::info!(
+            target: "meshd",
+            "Ingestion complete: {} contract nodes indexed.",
+            ingest_state.snapshot().contract_graph.node_count()
+        );
+    });
 
     // ── Cancellation token + signal handler ───────────────────────────────────
     let cancel_token = CancellationToken::new();

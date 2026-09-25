@@ -136,7 +136,7 @@ impl MarkdownFormatter {
     /// N services" up front instead.
     pub fn format_dependents(target: &str, dependents: &[(&ContractNode, String)]) -> String {
         let mut out = format!(
-            "## In-Memory Reverse Dependency Graph for `{target}`\n*Total Dependents: {} consumer node(s) found (O(1) in-memory resolution)*\n\n",
+            "## In-Memory Reverse Dependency Graph for `{target}`\n*Total Dependents: {} consumer node(s) found*\n\n",
             dependents.len()
         );
 

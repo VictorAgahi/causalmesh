@@ -270,43 +270,78 @@ can't validate later scale work (3.2 persistent index, 3.4 `smart_search` limits
 without a repeatable, numeric baseline first.
 
 - `scripts/bench/gen_synthetic.py <out_dir> <file_count> [--seed N] [--services N]` generates a
-  deterministic multi-root workspace (Rust/Go/Python/TypeScript/Java files split across N
-  `service-*/` directories, each with a `marker.json` so `init --auto` finds them as real roots).
-  Fixed seed by default — reproducible across runs and machines, unlike a clone of `linux` or
-  `kubernetes` whose HEAD moves. `scripts/bench/repos.txt`'s real large repos (`linux`,
-  `kubernetes`, `vscode`, `grpc`, ...) remain useful for functional smoke testing
-  (`scripts/bench/bench.sh`) but are not used for the numeric scale budgets below — too slow to
-  clone and not reproducible enough to gate CI on.
+  deterministic workspace (Rust/Go/Python/TypeScript/Java files split across N
+  `services/svc-N/` directories). Fixed seed by default — reproducible across runs and machines,
+  unlike a clone of `linux` or `kubernetes` whose HEAD moves. `scripts/bench/repos.txt`'s real
+  large repos (`linux`, `kubernetes`, `vscode`, `grpc`, ...) remain useful for functional smoke
+  testing (`scripts/bench/bench.sh`) but are not used for the numeric scale budgets below — too
+  slow to clone and not reproducible enough to gate CI on.
 - `scripts/bench/scale_bench.py <repo_dir> <config_path> [--queries N] [--budget-json path]`
   launches `mesh-mcp run --standalone` (the same code path `main.rs::run_standalone` uses in
   production: `build_snapshot` runs to completion before the JSON-RPC loop starts, and
   `FileWatcherService::spawn` really runs), then measures:
   - `boot_ms` — wall clock from process spawn to a successful `initialize` response.
-  - `rss_peak_mb` — max RSS sampled via `ps -o rss=` across the whole run, not just at boot.
+  - `rss_peak_mb` — max RSS sampled via `ps -o rss=` across the whole run, not just at boot; if
+    every single `ps` sample fails (missing binary, sandboxed CI image), that's surfaced as an
+    explicit `rss_peak_mb=unmeasurable` violation rather than silently reading as "0 MB, in
+    budget".
   - `search_p50_ms` / `search_p95_ms` — percentiles over `--queries` (default 30) real
     `smart_search` calls, not a single sample (a single `tools/call` timing, as in the older
     `scripts/bench/mcp_client.py` functional smoke test, hides tail latency entirely).
-  - `reload_ms` — end-to-end incremental-reload latency: appends a uniquely-named symbol to a
-    generated file on disk, then polls `smart_search` for that exact symbol until it's visible or
+  - `reload_ms` — end-to-end incremental-reload latency: appends a real, per-language declared
+    symbol (a function/class, not a comment — `smart_search` only matches declared symbol *names*,
+    crates/mesh-core/src/contracts.rs `search_symbols`, never raw file text) to a generated file on
+    disk, then polls `smart_search` for that exact symbol until the reported match count is > 0, or
     a 20s deadline, through the real `notify`/`FileWatcherService` → `reload_paths` path (step
     3.1), not a synthetic call into `reload_paths()` directly.
   - Exits non-zero if any metric exceeds `scripts/bench/budgets.json` (or `DEFAULT_BUDGETS` if no
     `--budget-json` given), and the violations are listed by name in the JSON output, not just a
     pass/fail bit.
-- **Real measured baseline** (this machine, release build, synthetic workspace, 30 queries):
+- **`/code-review` caught three real bugs in the first version of this harness before it merged**,
+  all fixed here rather than left as known-broken:
+  1. The reload probe wrote the marker into a `//` comment and matched on raw substring-in-response,
+     which is a false positive: `MarkdownFormatter::format_search_results` always echoes the query
+     into its header (`"## Search Results for `<query>`"`) even on zero matches, so the very first
+     poll "succeeded" immediately — the originally reported reload numbers (6ms / 41ms) were not
+     real measurements. Fixed by appending a real per-language declared symbol and requiring the
+     parsed `Matches: N definitions found` count to be `> 0`.
+  2. `typescript.rs`'s extractor only turns `class_declaration`/`interface_declaration` into indexed
+     symbols, never a bare top-level function — so a `.ts` target file made the reload probe poll
+     forever. Fixed by emitting `export class <Marker> {}` instead of a function for `.ts` targets.
+  3. The generator's `marker.json`-per-directory convention was never actually read by
+     `crates/mesh-server/src/cli/init.rs` (`has_language_marker`'s fixed list is `go.mod`,
+     `package.json`, `pyproject.toml`, `requirements.txt`, `pom.xml`, `build.gradle`, `Cargo.toml`;
+     the only directory name it recognizes for a services container is a literal top-level
+     `services/`) — so `init --auto` always fell back to a single root `.` and the "multi-root"
+     claim was false. Fixed by generating `services/svc-N/` instead, which `init --auto` does
+     discover as `./services/*`.
+  A fourth finding — `ValidatedScope::resolve` requires a query's `scope` to canonicalize *inside
+  one specific allowed root*, not merely be an ancestor covering several — meant `scope: "."` threw
+  a sandbox-escape error once root discovery actually started returning N per-service roots instead
+  of one. `scale_bench.py` now reads the real roots back out of the generated
+  `.agents/mesh-mcp.toml` (`discover_scopes`) and round-robins `smart_search` calls across them
+  instead of assuming `"."` is always valid.
+- **Real measured baseline** (this machine, release build, single-root synthetic workspace so
+  `smart_search` scope covers the whole tree — see the multi-root note below for why that matters):
 
   | file count | boot_ms | rss_peak_mb | search_p50_ms | search_p95_ms | reload_ms |
   |---|---|---|---|---|---|
-  | 5,000  | 184  | 47  | 58   | 176   | 6  |
-  | 30,000 | 882  | 127 | 393  | 1,282 | 41 |
+  | 5,000  | 186  | 47  | 65   | 176   | 452 |
+  | 30,000 | 1,097 | 125 | 460  | 1,264 | 842 |
 
   `scripts/bench/budgets.json` (used by the nightly CI job below) is set from the 5,000-file row
-  with 4–16x headroom for CI-runner variance, not the 30,000-file row — see the honest gap this
-  exposes, next.
-- **Real gap found, not hidden**: at 30,000 files, `smart_search` p50/p95 (393ms / 1,282ms)
-  already exceed even generous budgets built from the 5,000-file baseline. This is the numeric
-  motivation for steps 3.4 (`smart_search` limits/early-stop/hash cache) and 3.5 (O(N log N)
-  memory/CPU work) — 3.0's job was to produce this number honestly, not to fix it. Recorded here
+  with 4–5x headroom for CI-runner variance, not the 30,000-file row — see the honest gap this
+  exposes, next. The nightly job itself runs the *multi-root* generator default (`--services 8`),
+  which shards `smart_search` scope across per-service roots and so reports lower absolute
+  latencies than this single-root table (each call searches a fraction of the graph, not all of
+  it) — consistent release-over-release for regression detection, but not directly comparable to
+  the whole-tree numbers above. Both numbers come from the same `scale_bench.py`; the difference is
+  entirely how many `ValidatedScope` roots the workspace has, which is itself real, not a
+  measurement artifact.
+- **Real gap found, not hidden**: at 30,000 files, whole-tree `smart_search` p50/p95 (460ms /
+  1,264ms) already exceed even generous budgets built from the 5,000-file baseline. This is the
+  numeric motivation for steps 3.4 (`smart_search` limits/early-stop/hash cache) and 3.5 (O(N log
+  N) memory/CPU work) — 3.0's job was to produce this number honestly, not to fix it. Recorded here
   instead of quietly loosening the budget to make a larger synthetic size pass.
 - `.github/workflows/nightly-bench.yml` runs `gen_synthetic.py` (5,000 files) + `scale_bench.py`
   against `scripts/bench/budgets.json` once a day (`workflow_dispatch` also available for manual

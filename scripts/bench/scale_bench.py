@@ -19,6 +19,7 @@ given). Always prints one JSON line with the raw measurements to stdout.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -85,6 +86,81 @@ def find_a_generated_file(repo_dir):
     return None
 
 
+_ROOTS_LINE_RE = re.compile(r'^roots\s*=\s*\[(.*)\]', re.MULTILINE)
+
+
+# `ValidatedScope::resolve` (crates/mesh-core/src/security.rs) requires the
+# requested scope to canonicalize *inside one specific allowed root*, not
+# merely be an ancestor that happens to contain several roots. A workspace
+# with N discovered `services/svc-*` roots (see gen_synthetic.py) therefore
+# has no single scope value that covers "the whole repo" the way scope="."
+# does for a single-root config — each `tools/call` has to target one real
+# root. This reads the roots straight out of the generated
+# `.agents/mesh-mcp.toml` (the same roots `WorkspaceIndexer::resolve_roots`
+# would compute) instead of assuming ".".
+def discover_scopes(repo_dir, config_path):
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    m = _ROOTS_LINE_RE.search(open(config_path).read())
+    if not m:
+        return [repo_dir]
+    raw = [r.strip().strip('"') for r in m.group(1).split(",") if r.strip()]
+    scopes = []
+    for r in raw:
+        if "*" in r:
+            base = os.path.normpath(os.path.join(config_dir, r.replace("*", "")))
+            if os.path.isdir(base):
+                for entry in sorted(os.listdir(base)):
+                    full = os.path.join(base, entry)
+                    if os.path.isdir(full):
+                        scopes.append(full)
+        else:
+            full = os.path.normpath(os.path.join(config_dir, r))
+            if os.path.isdir(full):
+                scopes.append(full)
+    return scopes or [repo_dir]
+
+
+# `smart_search` -> `ContractGraph::search_symbols` only matches declared
+# symbol *names* (crates/mesh-core/src/contracts.rs, contains_ignore_ascii_case
+# over node.name) — it never greps raw file/comment text. So the reload probe
+# below has to append a real, syntactically valid declaration per language,
+# not a comment, or the marker can never be found regardless of how long we
+# poll.
+def append_symbol(path, marker):
+    if path.endswith(".py"):
+        snippet = f"\n\ndef {marker.lower()}():\n    pass\n"
+    elif path.endswith(".go"):
+        snippet = f"\n\nfunc {marker}() {{}}\n"
+    elif path.endswith(".ts"):
+        # `typescript.rs`'s extractor only turns `class_declaration` /
+        # `interface_declaration` nodes into indexed symbols — a bare
+        # top-level `export function` is never captured, so the reload probe
+        # would poll forever if it used one.
+        snippet = f"\n\nexport class {marker} {{}}\n"
+    elif path.endswith(".java"):
+        # A second, non-public top-level type is legal alongside the file's
+        # existing `public class HandlerN`.
+        snippet = f"\n\nclass {marker} {{\n    static void run() {{}}\n}}\n"
+    else:  # .rs
+        snippet = f"\n\npub fn {marker.lower()}() {{}}\n"
+    with open(path, "a") as f:
+        f.write(snippet)
+
+
+# `MarkdownFormatter::format_search_results` (crates/mesh-parsers/src/markdown.rs)
+# always echoes the query into the response header — "## Search Results for
+# `<query>` ... *Matches: N definitions found*" — even on zero matches. So a
+# naive `marker in payload` substring check is a false positive on the very
+# first poll, before the file watcher has done anything. Require the reported
+# match count to be > 0 instead.
+_MATCH_COUNT_RE = re.compile(r"Matches:\s*(\d+)\s*definitions found")
+
+
+def has_real_match(payload_text):
+    m = _MATCH_COUNT_RE.search(payload_text)
+    return bool(m) and int(m.group(1)) > 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("repo_dir")
@@ -137,39 +213,50 @@ def main():
         if resp.get("error"):
             raise RuntimeError(f"tools/list failed: {resp['error']}")
 
+        scopes = discover_scopes(args.repo_dir, args.config_path)
+        result["scopes_used"] = len(scopes)
+
         queries = ["Service", "Handler", "Worker", "Component", "handle", "new"]
         latencies = []
         max_rss = result["rss_after_boot_mb"] or 0
+        rss_samples_ok = 1 if result["rss_after_boot_mb"] is not None else 0
+        rss_samples_total = 1
         for i in range(args.queries):
             q = queries[i % len(queries)]
+            scope = scopes[i % len(scopes)]
             resp, ms = call(
                 proc, "tools/call",
-                {"name": "smart_search", "arguments": {"query": q, "scope": ".", "fuzzy": False}},
+                {"name": "smart_search", "arguments": {"query": q, "scope": scope, "fuzzy": False}},
                 100 + i,
             )
             if resp.get("error"):
                 raise RuntimeError(f"smart_search({q!r}) failed: {resp['error']}")
             latencies.append(ms)
+            rss_samples_total += 1
             sample = rss_mb(proc.pid)
-            if sample:
+            if sample is not None:
+                rss_samples_ok += 1
                 max_rss = max(max_rss, sample)
 
         result["search_p50_ms"] = round(percentile(latencies, 50), 1)
         result["search_p95_ms"] = round(percentile(latencies, 95), 1)
-        result["rss_peak_mb"] = round(max_rss, 1) if max_rss else None
+        # `ps` failing on every single sample (missing binary, sandboxed CI
+        # image, PID reuse) must not silently read as "0 MB, under budget" —
+        # that's a broken measurement, not a good one. Only report a peak (and
+        # let the budget check run) if at least one sample actually worked.
+        rss_measurement_failed = rss_samples_ok == 0
+        result["rss_peak_mb"] = round(max_rss, 1) if rss_samples_ok > 0 else None
 
         # Incremental reload: append a uniquely-named symbol to a generated
         # file, then poll smart_search until it's visible (FileWatcherService
-        # -> WorkspaceIndexer::reload_paths, debounced).
-        target = find_a_generated_file(args.repo_dir)
+        # -> WorkspaceIndexer::reload_paths, debounced). Scope must be the
+        # specific root the target file lives under (see discover_scopes).
+        reload_scope = scopes[0]
+        target = find_a_generated_file(reload_scope)
         reload_ms = None
         if target:
             marker = f"ScaleBenchMarker{int(time.time() * 1000)}"
-            with open(target, "a") as f:
-                if target.endswith(".py"):
-                    f.write(f"\n\ndef {marker.lower()}():\n    pass\n")
-                else:
-                    f.write(f"\n\n// {marker}\n")
+            append_symbol(target, marker)
             reload_t0 = time.monotonic()
             deadline = reload_t0 + 20
             req_id = 900
@@ -177,12 +264,12 @@ def main():
             while time.monotonic() < deadline:
                 resp, _ms = call(
                     proc, "tools/call",
-                    {"name": "smart_search", "arguments": {"query": marker, "scope": ".", "fuzzy": False}},
+                    {"name": "smart_search", "arguments": {"query": marker, "scope": reload_scope, "fuzzy": False}},
                     req_id,
                 )
                 req_id += 1
                 payload = json.dumps(resp.get("result", {}))
-                if marker in payload:
+                if has_real_match(payload):
                     found = True
                     break
                 time.sleep(0.2)
@@ -191,6 +278,8 @@ def main():
         result["reload_ms"] = reload_ms
 
         violations = []
+        if rss_measurement_failed:
+            violations.append(f"rss_peak_mb=unmeasurable ({rss_samples_total} `ps` samples all failed)")
         for key, budget in budgets.items():
             val = result.get(key)
             if val is not None and val > budget:

@@ -104,7 +104,7 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("file_count", type=int)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--services", type=int, default=8, help="top-level service/ dirs, to give init --auto real roots to find")
+    ap.add_argument("--services", type=int, default=8, help="services/svc-N/ dirs, so init --auto discovers ./services/* as a real multi-root workspace")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
@@ -115,7 +115,13 @@ def main():
 
     idx = 0
     for svc in range(args.services):
-        svc_dir = os.path.join(args.out_dir, f"service-{svc}", "src")
+        # `crates/mesh-server/src/cli/init.rs::run` only recognizes a
+        # top-level `services/` directory (`cur_dir.join("services").exists()`
+        # -> root `./services/*`); it does not scan for arbitrary
+        # `service-N/` names or a `marker.json` convention, so the layout has
+        # to be `services/svc-N/` for `init --auto` to actually discover each
+        # one as its own root instead of silently falling back to `.`.
+        svc_dir = os.path.join(args.out_dir, "services", f"svc-{svc}", "src")
         os.makedirs(svc_dir, exist_ok=True)
         for _ in range(per_service):
             lang = langs[idx % len(langs)]
@@ -124,12 +130,8 @@ def main():
             with open(fname, "w") as f:
                 f.write(TEMPLATES[lang].format(idx=idx))
             idx += 1
-        # one Cargo.toml / package.json style marker per service so
-        # `init --auto` recognizes each service dir as its own root.
-        with open(os.path.join(args.out_dir, f"service-{svc}", "marker.json"), "w") as f:
-            f.write('{"synthetic": true}\n')
 
-    print(f"generated {idx} files across {args.services} services under {args.out_dir}")
+    print(f"generated {idx} files across {args.services} services under {args.out_dir}/services/")
 
 
 if __name__ == "__main__":

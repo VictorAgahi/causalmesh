@@ -21,12 +21,24 @@ at 3.0.0 — there is no reconstructed history before it.
 - **`.github/workflows/nightly-bench.yml`**: runs the above at 5,000 synthetic files once a day,
   uploads the raw JSON as a build artifact. Not wired into per-PR CI — wall-clock budgets are
   noisy on shared runners, so gating every push on them would make the gate flaky, not meaningful.
-- **Real, honest baseline measured on this machine** (release build): 5,000 files boots in 184ms,
-  47MB peak RSS, `smart_search` p50/p95 58ms/176ms, reload 6ms. At 30,000 files, `smart_search`
-  p50/p95 grow to 393ms/1,282ms — already over generous budgets built from the 5,000-file
-  baseline. This gap is recorded in `docs/quality.md` as the numeric motivation for steps 3.4
-  (`smart_search` limits/early-stop) and 3.5 (memory/CPU at scale), not silently fixed by loosening
-  the budget or hidden by only ever benchmarking the size that passes.
+- `/code-review` on this branch caught three real bugs in the first version of the harness (all
+  fixed, see `docs/quality.md`): the reload probe's substring match was a false positive against
+  `smart_search`'s own "no results" header echo (originally reported 6ms/41ms reload numbers were
+  not real); the TypeScript symbol it injected (a bare function) is never indexed by
+  `typescript.rs`'s extractor, so a `.ts` target polled forever; and the generator's
+  `marker.json`-per-directory convention was never read by `init.rs`, so the claimed "multi-root"
+  workspace always silently fell back to a single root. Fixing the third finding (real
+  `services/svc-N/` layout, discovered by `init --auto`) surfaced a fourth issue in the harness
+  itself: `ValidatedScope::resolve` requires a query's scope to be inside one specific allowed
+  root, so a hardcoded `scope: "."` sandbox-escapes once there's more than one root — fixed by
+  reading real roots back out of the generated config and round-robining scope across them.
+- **Real, honest baseline measured on this machine** (release build, single-root workspace so
+  `smart_search` scope covers the whole tree): 5,000 files boots in 186ms, 47MB peak RSS,
+  `smart_search` p50/p95 65ms/176ms, reload 452ms. At 30,000 files: 1,097ms boot, 125MB peak RSS,
+  `smart_search` p50/p95 460ms/1,264ms — already over generous budgets built from the 5,000-file
+  baseline — and 842ms reload. This gap is recorded in `docs/quality.md` as the numeric motivation
+  for steps 3.4 (`smart_search` limits/early-stop) and 3.5 (memory/CPU at scale), not silently
+  fixed by loosening the budget or hidden by only ever benchmarking the size that passes.
 
 ## [5.0.0] — 2026-09-25
 

@@ -146,6 +146,53 @@ impl ExcludeMatcher {
 }
 
 impl FilesystemCrawler {
+    /// Whether one specific, already-known path under `root` would be excluded from
+    /// a `crawl_scope_with(root, matcher, ..)` walk — without re-walking the tree to
+    /// find out. Combines `matcher` (the compiled `exclude_patterns`, including
+    /// nested-root exclusion) with the same `.gitignore` semantics a full crawl
+    /// applies (`git_ignore(true)`), so a file-watcher-driven targeted reload can
+    /// reuse a full crawl's exact exclusion decision for one path in O(path depth)
+    /// stat calls instead of an O(repo size) walk.
+    ///
+    /// Only `root`'s own top-level `.gitignore` is honored. If any directory
+    /// strictly between `root` and `path` carries its *own* nested `.gitignore`,
+    /// this can't cheaply and correctly reproduce `ignore::WalkBuilder`'s
+    /// per-directory gitignore stacking (each nested file's patterns are scoped to
+    /// its own subtree, composing with every ancestor's) — rather than risk a
+    /// false "not excluded" for a file a full crawl would have pruned, this
+    /// returns `None` so the caller falls back to a full crawl. Nested `.gitignore`
+    /// files are real but comparatively rare next to a single root-level one; this
+    /// is a deliberate, documented scope limit, not a silent gap.
+    pub fn is_path_excluded(root: &Path, path: &Path, matcher: &ExcludeMatcher) -> Option<bool> {
+        let rel = path.strip_prefix(root).ok()?;
+        if matcher.is_excluded_with_root(rel, Some(root)) {
+            return Some(true);
+        }
+
+        let mut dir = path.parent()?.to_path_buf();
+        while dir != root {
+            if dir.join(".gitignore").is_file() {
+                return None;
+            }
+            if !dir.pop() {
+                // Walked off `root` without matching it by value — `path` wasn't
+                // really a descendant despite `strip_prefix` succeeding (e.g. a
+                // `..`-relative or otherwise unnormalized input path).
+                return None;
+            }
+        }
+
+        let gitignore_path = root.join(".gitignore");
+        if !gitignore_path.is_file() {
+            return Some(false);
+        }
+        let (gitignore, err) = ignore::gitignore::Gitignore::new(&gitignore_path);
+        if err.is_some() {
+            return None;
+        }
+        Some(gitignore.matched(path, path.is_dir()).is_ignore())
+    }
+
     /// Crawls a validated scope enforcing `follow_links(false)` and maximum depth limit.
     pub fn crawl_scope(
         scope: &ValidatedScope,
@@ -412,5 +459,70 @@ mod tests {
         let matcher = ExcludeMatcher::compile(&["${workspace_root}/docs/**".to_string()]);
         let rel = Path::new("docs/readme.md");
         assert!(matcher.is_excluded(rel));
+    }
+
+    #[test]
+    fn test_is_path_excluded_matches_exclude_matcher() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).expect("mkdir");
+        let path = root.join("node_modules/pkg/index.js");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&["node_modules".to_string()]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_root_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::write(root.join(".gitignore"), "*.generated.go\n").expect("write gitignore");
+        let path = root.join("client.generated.go");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "root .gitignore pattern must be honored without a full crawl"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_kept_file_is_some_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        let path = root.join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&path, "fn main() {}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_falls_back_on_nested_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("services/billing")).expect("mkdir");
+        // A .gitignore anywhere strictly between root and the file's own
+        // directory is a nested one this fast check can't safely resolve.
+        std::fs::write(root.join("services/.gitignore"), "*.tmp\n").expect("write");
+        let path = root.join("services/billing/Widget.java");
+        std::fs::write(&path, "class Widget {}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            None,
+            "a nested .gitignore between root and the file must force a fall back, not a false negative"
+        );
     }
 }

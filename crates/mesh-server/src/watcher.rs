@@ -15,7 +15,7 @@ impl FileWatcherService {
         state: Arc<AppState>,
         cancel_token: CancellationToken,
     ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
-        let reload: ReloadFn = Arc::new(WorkspaceIndexer::reload);
+        let reload: ReloadFn = Arc::new(WorkspaceIndexer::reload_paths);
         mesh_core::FileWatcherService::spawn(state, cancel_token, reload)
     }
 

@@ -7,7 +7,47 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 2 (P1): make inter-service joins precise, not just deterministic.
+Plan 3 (P2): scale. Step 3.1 — real incremental reload, driven by the watcher's own paths.
+
+### Added (P2 step 3.1 — real incremental reload from watcher paths)
+- **The file watcher no longer re-crawls the whole tree to find out what changed.**
+  `WorkspaceIndexer::reload` (used for the initial load and any caller without specific paths)
+  is unchanged, but the live file watcher now calls new `WorkspaceIndexer::reload_paths`, which
+  works directly from the watcher's own reported paths: each is resolved to its most specific
+  containing root (the same attribution `crawl_all`'s nested-root exclusion gives an overlapping
+  file) and checked against that root's `exclude_patterns`/`.gitignore` via new
+  `FilesystemCrawler::is_path_excluded` — one path in O(path depth) stat calls, not an O(repo
+  size) walk. `reload` and `reload_paths` now share one `apply_incremental` tail (VFS diff, scan,
+  graph patch, snapshot install) so the two paths can't silently drift apart.
+- **Two deliberate, documented fallbacks to the old full-crawl `reload`, not silent gaps**: (1) a
+  path under a nested `.gitignore` (any `.gitignore` strictly between the root and the file, not
+  the root's own top-level one) — `is_path_excluded` can't cheaply and correctly reproduce
+  `ignore::WalkBuilder`'s per-directory gitignore stacking for one path without walking, so rather
+  than risk a false "not excluded" it returns `None` and the caller falls back; (2) a
+  `.git/HEAD`/`.git/refs/*` change (checkout, rebase, branch switch), which can alter an arbitrary
+  number of tracked files without each one necessarily producing its own watcher event.
+- **`AppState` gains `pending_reload_paths`** so a burst of watcher events arriving while a reload
+  job is already queued or running still has its paths picked up by whichever job drains the
+  accumulator next, instead of being silently dropped by `reload_pending`'s existing
+  best-effort coalescing check (that check only ever decided whether to spawn a *second* Rayon
+  job, never whether the first job would see the second burst's paths — this closes that gap).
+- Verified: `cargo test --workspace` (341 passed, +10 new: `is_path_excluded`'s exclude/gitignore/
+  nested-gitignore-fallback cases, `reload_paths`'s edit+delete/create/exclude-pattern/git-ref-
+  fallback cases, and the watcher's path-delivery/accumulator cases), `cargo clippy --workspace
+  --all-targets -- -D warnings` (clean), `cargo fmt --all -- --check` (clean),
+  `scripts/golden/score.py online-boutique` (100%/100%, unaffected), `scripts/determinism.sh` on
+  all three fixtures ("1 fingerprint over 13 runs" each, unaffected — those exercise a fresh
+  `mesh-mcp graph` process per run, i.e. `build_snapshot`, not the live watcher's `reload_paths`
+  path; that path's correctness is what the new unit/integration tests above cover, plus the
+  pre-existing `test_file_watcher_live_reload` end-to-end test, unchanged and still green, which
+  now exercises `reload_paths` instead of `reload` under the hood).
+- Honest limitation: the nested-`.gitignore` fallback (above) means a targeted reload is not
+  strictly zero-crawl for every workspace shape — only for the common case of a single
+  root-level `.gitignore` (or none). A repo with per-service nested `.gitignore` files still gets
+  a full crawl on every reload of a file under one, same as before this change; closing that gap
+  would mean reproducing `ignore::WalkBuilder`'s directory-by-directory gitignore stack for a
+  single path, which this step deliberately did not attempt rather than risk a subtly wrong
+  exclusion decision.
 
 ### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
 - **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`

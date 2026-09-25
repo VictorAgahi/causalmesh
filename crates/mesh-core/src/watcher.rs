@@ -1,15 +1,18 @@
 use crate::state::AppState;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Reload routine invoked on the background pool after a relevant filesystem change.
-/// Kept as a callback because the concrete indexer lives in `mesh-parsers`, which
+/// Reload routine invoked on the background pool after a relevant filesystem change,
+/// given the specific paths the watcher observed change (coalesced across every
+/// burst folded into this one run — see `schedule_reload`) so it can index those
+/// paths directly instead of re-crawling the whole tree to rediscover them. Kept
+/// as a callback because the concrete indexer lives in `mesh-parsers`, which
 /// `mesh-core` cannot depend on.
-pub type ReloadFn = Arc<dyn Fn(&AppState) + Send + Sync>;
+pub type ReloadFn = Arc<dyn Fn(&AppState, &[PathBuf]) + Send + Sync>;
 
 /// In-kernel filesystem watcher service providing debounced change notifications
 /// and atomic snapshot reloading per RFC-001 Commandment 7.
@@ -55,14 +58,19 @@ impl FileWatcherService {
 
                     match rx.recv_timeout(Duration::from_millis(300)) {
                         Ok(Ok(events)) => {
-                            let relevant = events.iter().any(|ev| Self::is_relevant_path(&ev.path));
-                            if relevant {
+                            let relevant_paths: Vec<PathBuf> = events
+                                .iter()
+                                .map(|ev| ev.path.clone())
+                                .filter(|p| Self::is_relevant_path(p))
+                                .collect();
+                            if !relevant_paths.is_empty() {
                                 tracing::info!(
                                     target: "mesh::watcher",
-                                    "Detected filesystem mutations ({} events). Scheduling atomic graph rescan.",
+                                    "Detected filesystem mutations ({} relevant of {} events). Scheduling atomic graph rescan.",
+                                    relevant_paths.len(),
                                     events.len()
                                 );
-                                Self::schedule_reload(state.clone(), reload.clone());
+                                Self::schedule_reload(state.clone(), reload.clone(), &relevant_paths);
                             }
                         }
                         Ok(Err(errs)) => {
@@ -77,22 +85,43 @@ impl FileWatcherService {
         Ok(handle)
     }
 
-    /// Queues one reload on the QoS-throttled pool. Bursts arriving before any
-    /// worker has started are coalesced into it (a cheap, best-effort filter, not
-    /// how correctness is guaranteed); a request arriving *during* a run spawns a
-    /// second closure whose `reload` call (any implementation backed by
-    /// `WorkspaceIndexer::reload`) blocks on `AppState::reload_lock` until the
-    /// first pass finishes, then runs its own pass against then-current disk
-    /// state. See that lock's own doc for why at most one reload ever runs at a
-    /// time (idempotence invariant I2).
-    pub fn schedule_reload(state: Arc<AppState>, reload: ReloadFn) {
+    /// Queues one reload on the QoS-throttled pool, carrying `paths` for a
+    /// targeted, path-driven reload (`WorkspaceIndexer::reload_paths`) instead of
+    /// a full crawl. `paths` is appended to `AppState::pending_reload_paths`
+    /// *before* the coalescing check below, so a burst that arrives while a job
+    /// is already queued or running never has its paths silently dropped — it
+    /// still returns early (the queued/running job's `Rayon` slot is not
+    /// duplicated), but the paths it carried are picked up by whichever job
+    /// drains the accumulator next, this one or a subsequent one. That drain is
+    /// racy against a new job being spawned right as one finishes (see the
+    /// interleavings below), but each amounts to at most one redundant harmless
+    /// empty-`paths` reload — no path is ever silently lost, which is the actual
+    /// correctness requirement `reload_pending`'s "best-effort, not exclusive"
+    /// coalescing has always carried (see `reload_lock`'s own doc for why at
+    /// most one reload ever *installs a snapshot* at a time, idempotence
+    /// invariant I2 — unaffected by this).
+    pub fn schedule_reload(state: Arc<AppState>, reload: ReloadFn, paths: &[PathBuf]) {
+        {
+            let mut pending = state
+                .pending_reload_paths
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.extend(paths.iter().cloned());
+        }
         if state.reload_pending.swap(true, Ordering::AcqRel) {
             return;
         }
         let job_state = state.clone();
         drop(state.rescan.spawn(move || {
             job_state.reload_pending.store(false, Ordering::Release);
-            reload(&job_state);
+            let drained: Vec<PathBuf> = {
+                let mut pending = job_state
+                    .pending_reload_paths
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *pending)
+            };
+            reload(&job_state, &drained);
         }));
     }
 
@@ -179,5 +208,67 @@ mod tests {
         assert!(!FileWatcherService::is_relevant_path(Path::new(
             "src/main.rs.swp"
         )));
+    }
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = crate::Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n",
+        )
+        .expect("config");
+        let audit = Arc::new(crate::AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(crate::BackgroundRescanEngine::new().expect("rescan"));
+        Arc::new(AppState::new(cfg, vec![PathBuf::from(".")], audit, rescan))
+    }
+
+    /// `schedule_reload` must hand the exact paths it was given to the `ReloadFn`
+    /// it queues — the whole point of threading paths through at all is a
+    /// targeted reload that doesn't need to re-crawl to know what changed.
+    #[test]
+    fn schedule_reload_delivers_the_given_paths_to_the_reload_fn() {
+        let state = test_state();
+        let received: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let received_clone = received.clone();
+        let reload: ReloadFn = Arc::new(move |_state, paths| {
+            *received_clone.lock().unwrap() = Some(paths.to_vec());
+        });
+
+        let paths = vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")];
+        FileWatcherService::schedule_reload(state, reload, &paths);
+
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some(v) = received.lock().unwrap().clone() {
+                got = Some(v);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got, Some(paths));
+    }
+
+    /// A second burst arriving while a job is already queued/running must not
+    /// have its paths silently dropped — they must still reach some reload call,
+    /// even though `reload_pending` coalesces the two calls into fewer job spawns.
+    /// This exercises the accumulator directly (bypassing the timing-dependent
+    /// spawn race) by pushing to `pending_reload_paths` the same way
+    /// `schedule_reload` does, then draining it the same way the queued job does.
+    #[test]
+    fn pending_reload_paths_accumulates_across_coalesced_bursts() {
+        let state = test_state();
+        {
+            let mut pending = state.pending_reload_paths.lock().unwrap();
+            pending.extend([PathBuf::from("a.rs")]);
+        }
+        {
+            let mut pending = state.pending_reload_paths.lock().unwrap();
+            pending.extend([PathBuf::from("b.rs")]);
+        }
+        let drained: Vec<PathBuf> = {
+            let mut pending = state.pending_reload_paths.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+        assert_eq!(drained, vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
+        assert!(state.pending_reload_paths.lock().unwrap().is_empty());
     }
 }

@@ -111,6 +111,12 @@ pub struct AppState {
     /// an optimization — correctness (never two `WorkspaceIndexer::reload` calls
     /// running at once) comes from `reload_lock` below, not from this flag.
     pub reload_pending: AtomicBool,
+    /// Watcher-reported paths accumulated for the next reload job to drain — see
+    /// `FileWatcherService::schedule_reload`. A burst that arrives while
+    /// `reload_pending` is already set still appends here instead of being
+    /// dropped, so a path-driven targeted reload (`WorkspaceIndexer::reload_paths`)
+    /// never silently misses a change just because it coalesced with another.
+    pub pending_reload_paths: Mutex<Vec<PathBuf>>,
     /// Held for the full duration of one `WorkspaceIndexer::reload` call, entirely
     /// on the single Rayon-pool thread that acquired it (a `std::sync::MutexGuard`
     /// never crosses threads here). Two reload closures can still both get spawned
@@ -158,6 +164,7 @@ impl AppState {
             rescan,
             vfs: Mutex::new(DifferentialVfs::new()),
             reload_pending: AtomicBool::new(false),
+            pending_reload_paths: Mutex::new(Vec::new()),
             reload_lock: Mutex::new(()),
         }
     }

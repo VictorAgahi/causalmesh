@@ -384,20 +384,150 @@ impl WorkspaceIndexer {
         let config = &state.config;
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);
-        let patterns = Self::compiled_patterns(config);
-        let spring = SpringSettings::from_config(config);
-        let extract_cfg = Self::extract_config(config);
-        let toggles = Self::engine_toggles(config);
 
-        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Deleted: tracked by the VFS but no longer on disk.
+        let vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+        // Deleted: tracked by the VFS but no longer on disk. Only a full crawl's
+        // complete file surface can answer this by set difference — a targeted,
+        // path-driven reload (`reload_paths`) instead knows about a deletion
+        // directly, from a specific watcher-reported path that no longer stat()s.
         let present: HashSet<&Path> = files.iter().map(|(_, p)| p.as_path()).collect();
         let deleted: Vec<PathBuf> = vfs
             .tracked_paths()
             .filter(|p| !present.contains(p))
             .map(Path::to_path_buf)
             .collect();
+        drop(vfs);
+
+        Self::apply_incremental(state, "VFS differential", files, deleted);
+    }
+
+    /// Targeted reload driven directly by the file watcher's own reported paths —
+    /// no `crawl_all` walk of the whole tree to rediscover what might have
+    /// changed. Each path is resolved to the most specific containing root
+    /// (matching `crawl_all`'s own nested-root attribution) and checked against
+    /// that root's exclude patterns/`.gitignore` via
+    /// `FilesystemCrawler::is_path_excluded`; a path that check can't cheaply and
+    /// correctly resolve (see that function's doc comment — chiefly a nested
+    /// `.gitignore` between the root and the file) falls back to a full
+    /// `reload()` rather than risk a wrong answer. A `.git/HEAD` or `.git/refs/*`
+    /// change (checkout, rebase, branch switch) can likewise alter an arbitrary
+    /// number of tracked files without each one necessarily producing its own
+    /// watcher event, so that also falls back to `reload()`.
+    pub fn reload_paths(state: &AppState, changed_paths: &[PathBuf]) {
+        if changed_paths.is_empty() {
+            return;
+        }
+        if changed_paths.iter().any(|p| Self::is_git_ref_change(p)) {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "Targeted reload: .git ref change in event set, falling back to full reload."
+            );
+            return Self::reload(state);
+        }
+
+        let config = &state.config;
+        let roots = &state.allowed_roots;
+
+        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut candidates: Vec<(RepoId, PathBuf)> = Vec::new();
+        let mut deleted: Vec<PathBuf> = Vec::new();
+
+        for raw in changed_paths {
+            if !seen.insert(raw.as_path()) {
+                continue;
+            }
+            let Some((repo_id, root)) = Self::most_specific_root(raw, roots) else {
+                continue; // outside every allowed root — nothing to index
+            };
+            let exclusions =
+                Self::exclude_patterns_for_root(&config.workspace.exclude_patterns, roots, root);
+            let matcher = ExcludeMatcher::compile(&exclusions);
+            match FilesystemCrawler::is_path_excluded(root, raw, &matcher) {
+                Some(true) => continue,
+                None => {
+                    tracing::debug!(
+                        target: "mesh::watcher",
+                        "Targeted reload: could not cheaply resolve exclusion for {}, falling back to full reload.",
+                        raw.display()
+                    );
+                    return Self::reload(state);
+                }
+                Some(false) => {}
+            }
+            if std::fs::metadata(raw).is_ok() {
+                candidates.push((repo_id, raw.clone()));
+            } else {
+                deleted.push(raw.clone());
+            }
+        }
+
+        if candidates.is_empty() && deleted.is_empty() {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "Targeted reload: no relevant candidates survived exclusion in the watcher event set."
+            );
+            return;
+        }
+
+        // Acquired only now, after every fallback-to-`reload()` branch above has
+        // already returned — `reload()` takes this same lock itself, and
+        // `std::sync::Mutex` is not reentrant.
+        let _guard = state
+            .reload_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::apply_incremental(state, "Targeted", candidates, deleted);
+    }
+
+    /// The `root` in `roots` that most specifically contains `path` (the longest
+    /// matching prefix) — the same attribution `crawl_all` gives an overlapping
+    /// file via `exclude_patterns_for_root`'s nested-root exclusion, reproduced
+    /// here for a single path without crawling anything.
+    fn most_specific_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<(RepoId, &'a Path)> {
+        roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| path.starts_with(root.as_path()))
+            .max_by_key(|(_, root)| root.as_os_str().len())
+            .map(|(idx, root)| (idx as RepoId, root.as_path()))
+    }
+
+    /// `.git/HEAD` or `.git/refs/...` — a branch checkout/rebase/switch can alter
+    /// an arbitrary number of tracked files without each one necessarily firing
+    /// its own watcher event (e.g. switching to a branch whose only difference
+    /// upstream is a ref pointer). `changed_paths` is not a reliable transcript
+    /// of what changed on disk in that case.
+    fn is_git_ref_change(path: &Path) -> bool {
+        let mut components = path.components().map(|c| c.as_os_str());
+        while let Some(c) = components.next() {
+            if c == ".git" {
+                let next = components.next();
+                return next == Some(std::ffi::OsStr::new("HEAD"))
+                    || next == Some(std::ffi::OsStr::new("refs"));
+            }
+        }
+        false
+    }
+
+    /// Shared tail of both `reload` and `reload_paths`: scan whatever candidate
+    /// surface the caller resolved (a full crawl's file list, or one path-driven
+    /// targeted set), diff it against the VFS, and — if anything really
+    /// changed — fold it into a freshly installed snapshot. `label` only
+    /// distinguishes the two callers in logs.
+    fn apply_incremental(
+        state: &AppState,
+        label: &str,
+        files: Vec<(RepoId, PathBuf)>,
+        deleted: Vec<PathBuf>,
+    ) {
+        let config = &state.config;
+        let roots = &state.allowed_roots;
+        let patterns = Self::compiled_patterns(config);
+        let spring = SpringSettings::from_config(config);
+        let extract_cfg = Self::extract_config(config);
+        let toggles = Self::engine_toggles(config);
+
+        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
         // Candidates: new or stat-changed. The metadata call is parallelized over
         // Rayon threads to maximize OS kernel page-cache stat speed.
@@ -411,7 +541,7 @@ impl WorkspaceIndexer {
             .collect();
 
         if candidates.is_empty() && deleted.is_empty() {
-            tracing::debug!(target: "mesh::watcher", "VFS differential: 0 files changed, skipping reload.");
+            tracing::debug!(target: "mesh::watcher", "{label}: 0 files changed, skipping reload.");
             return;
         }
 
@@ -496,7 +626,7 @@ impl WorkspaceIndexer {
 
         tracing::info!(
             target: "mesh::watcher",
-            "Incremental reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
+            "{label} reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
             deleted.len()
         );
     }
@@ -829,6 +959,141 @@ mod tests {
         assert_eq!(view.contract_graph.node_count(), 3);
         assert!(view.contract_graph.search_symbols("B", None).is_empty());
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
+    }
+
+    /// The path-driven `reload_paths` must produce the exact same result as the
+    /// crawl-driven `reload` for the same edit+delete, without ever calling
+    /// `crawl_all` — proving the watcher's own event paths are enough.
+    #[test]
+    fn reload_paths_handles_edit_and_delete_without_a_full_crawl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let a_path = root.join("a.proto");
+        let b_path = root.join("b.proto");
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            &b_path,
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 4);
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); rpc Z (R) returns (S); }",
+        )
+        .expect("rewrite a");
+        std::fs::remove_file(&b_path).expect("rm b");
+
+        // Only the two paths the watcher actually reported change — a directory
+        // never crawled at all is proof this didn't fall back to a full scan.
+        WorkspaceIndexer::reload_paths(&state, &[a_path, b_path]);
+        let view = state.snapshot();
+        assert_eq!(view.generation, 2);
+        assert_eq!(
+            view.contract_graph.node_count(),
+            3,
+            "a: service + 2 rpcs; b gone"
+        );
+        assert!(view.contract_graph.search_symbols("B", None).is_empty());
+        assert_eq!(
+            state.vfs.lock().expect("vfs").len(),
+            1,
+            "only a.proto remains tracked"
+        );
+    }
+
+    /// A brand-new file the watcher reports (a `Create` event) must be indexed by
+    /// `reload_paths` even though it was never part of any prior crawl or VFS entry.
+    #[test]
+    fn reload_paths_indexes_a_newly_created_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        let c_path = root.join("c.proto");
+        std::fs::write(
+            &c_path,
+            "syntax = \"proto3\"; package c; service C { rpc Z (R) returns (S); }",
+        )
+        .expect("write c");
+
+        WorkspaceIndexer::reload_paths(&state, &[c_path]);
+        let view = state.snapshot();
+        assert_eq!(view.contract_graph.node_count(), 2, "service + 1 rpc");
+    }
+
+    /// `reload_paths` must not index a path that a real crawl would have pruned
+    /// via `exclude_patterns` — the same exclusion `crawl_all` applies, checked
+    /// here for one explicit path instead of by walking the tree.
+    #[test]
+    fn reload_paths_respects_exclude_patterns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\nexclude_patterns = [\"secrets/**\"]\n",
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        state.install_snapshot(MeshSnapshot::default());
+
+        std::fs::create_dir_all(root.join("secrets")).expect("mkdir");
+        let secret_path = root.join("secrets").join("leaked.proto");
+        std::fs::write(
+            &secret_path,
+            "syntax = \"proto3\"; package s; service Secret { rpc X (R) returns (S); }",
+        )
+        .expect("write");
+
+        WorkspaceIndexer::reload_paths(&state, &[secret_path]);
+        assert_eq!(
+            state.snapshot().contract_graph.node_count(),
+            0,
+            "an excluded path must not be indexed even when reported directly by the watcher"
+        );
+    }
+
+    /// A `.git/HEAD` change (branch checkout) can alter files without each one
+    /// necessarily producing its own watcher event, so `reload_paths` must fall
+    /// back to a full `reload` rather than trust the reported path set alone.
+    #[test]
+    fn reload_paths_falls_back_to_full_reload_on_git_ref_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        // No .proto path is in the event set at all — only a git ref path — yet
+        // the real on-disk file must still be picked up via the full-reload
+        // fallback, proving the fallback actually ran rather than silently
+        // no-oping on an event set with nothing indexable in it.
+        WorkspaceIndexer::reload_paths(&state, &[root.join(".git").join("HEAD")]);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 2);
     }
 
     /// `PropertyRegistry` provenance: deleting one of two properties files must remove

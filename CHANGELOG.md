@@ -9,6 +9,28 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.3 — proto imports)
+- **`.proto` files' `import "other.proto";` declarations are now recorded as dependencies.**
+  `ProtoExtractor` had no import extraction at all — a message field typed from another `.proto`
+  file's declaration (e.g. `google.type.Money`, or a shared `common.proto`) had no way to link
+  back to it via `find_dependents`. New `ProtoRelations::dependencies` records every import,
+  attributed to the file's own first declared node, the same `(node index, imported path)` shape
+  every other language extractor already uses. `ProtoExtractor::extract_with_parser`'s existing
+  signature is unchanged (delegates internally); only the new `extract_with_relations` and the
+  production dispatch in `languages/mod.rs` are affected.
+  - A first version attributed every import to *every* node in the file, on the reasoning that
+    any of them could rely on it — caught by ruthless review: `ContractGraph::reconcile_edges`
+    doesn't dedup `Imports` edges across different `importer_id`s, so that produced up to
+    N-imports × M-nodes real edges, and `find_dependents(import_path)` would return every node in
+    the file as a "dependent" even if only one actually used the import — false-positive fan-out,
+    not just extra bookkeeping. Determining which node *actually* uses which imported type would
+    need real cross-file type resolution (parsing the imported file too), out of scope here;
+    attributing to the file's first node instead keeps the import traceable without fabricating
+    usage this extractor has no evidence for.
+  - Also fixed: `extract_import_path` only stripped double quotes, but the protobuf grammar
+    allows single-quoted import paths too (`import 'other.proto';`) — its dependency key was left
+    as the literal `'other.proto'`, quotes included, which could never match a real file path.
+
 ### Added (P1 step 2.2 — manifest-declared service identity)
 - **`detect_service_package` now reads the service identity a manifest actually declares**, not
   just the directory it happens to sit in — `go.mod`'s `module` path, `package.json`'s `name`

@@ -321,8 +321,8 @@ impl PolyglotIndexer {
         match lang_kind {
             LanguageKind::Protobuf => {
                 if cfg.allows_proto_path(&path_str) {
-                    if let Some(nodes) = parsed!(|tree| {
-                        proto::ProtoExtractor::extract_with_parser(
+                    if let Some((nodes, relations)) = parsed!(|tree| {
+                        proto::ProtoExtractor::extract_with_relations(
                             file_path,
                             content,
                             repo_id,
@@ -331,6 +331,7 @@ impl PolyglotIndexer {
                         )
                     }) {
                         out.nodes = nodes;
+                        out.dependencies = relations.dependencies;
                     }
                 }
             }

@@ -9,6 +9,25 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.4 — Java gRPC client/server idioms)
+- **`JavaExtractor` now recognizes plain (non-Spring) grpc-java's own universal codegen
+  convention** (protoc-gen-grpc-java), not just Spring's `@GrpcService` annotation:
+  - Server: a class extending `<Service>Grpc.<Service>ImplBase` is tagged `GrpcService` — verified
+    against Online Boutique's real `AdServiceImpl extends AdServiceGrpc.AdServiceImplBase`.
+  - Client: `JavaExtractor` had **no client-side gRPC detection at all**, unlike every other
+    language extractor. `<Service>Grpc.newBlockingStub(channel)` / `.newStub(...)` /
+    `.newFutureStub(...)` is now recorded as an RPC call, the same signal Go/Python/TypeScript
+    already emit — verified end-to-end (a real `CallsRpc` edge forms) against a fresh scan of
+    Online Boutique's real `AdServiceClient.java`.
+  - `JavaExtractor::extract_relations`'s return type grew a fourth tuple element (`rpc_calls`),
+    matching the shape `languages::FileIndex` already expects.
+  - Hardened via ruthless review (see `docs/quality.md` for the full account): tightened the
+    server check to require both `"Grpc"` and `"ImplBase"` (not `"ImplBase"` alone, which any
+    unrelated non-gRPC `*ImplBase` convention would have matched); added detection inside
+    constructors, not just named methods — the PR's own real-world example builds its stub in a
+    constructor and was initially missed; fixed the candidate-suffix scan silently dropping
+    whichever stub wasn't checked first when a method builds two different services' stubs.
+
 ### Added (P1 step 2.3 — proto imports)
 - **`.proto` files' `import "other.proto";` declarations are now recorded as dependencies.**
   `ProtoExtractor` had no import extraction at all — a message field typed from another `.proto`

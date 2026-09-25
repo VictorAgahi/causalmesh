@@ -86,6 +86,56 @@ small manifest once per source file in its directory. A residual, accepted risk:
 this project's own `Config::load_from_file` already accepts for the same reason (no practical
 attack surface change from what's already tolerated elsewhere in this codebase).
 
+## Update (2026-09-25, step 2.3 — proto imports)
+
+`.proto` `import "other.proto";` declarations are now recorded as dependencies
+(`ProtoRelations::dependencies`), attributed to the file's own first declared node. A first
+version attributed every import to every node in the file; ruthless review caught that
+`reconcile_edges` doesn't dedup `Imports` edges across different `importer_id`s, so that produced
+real N-imports × M-nodes graph noise and false-positive `find_dependents` fan-out — fixed before
+merge. Also fixed: single-quoted import paths (`import 'other.proto';`, valid per the protobuf
+grammar) were left quoted in the dependency key, never matching a real file path.
+
+## Update (2026-09-25, step 2.4 — Java gRPC client/server idioms)
+
+`JavaExtractor` only recognized Spring's `@GrpcService` annotation for server-side classification,
+and had **no client-side gRPC detection at all**. Added both, using grpc-java's own universal
+codegen convention (protoc-gen-grpc-java, not Spring-specific):
+- Server: a class extending `<Service>Grpc.<Service>ImplBase` is now tagged `GrpcService` — e.g.
+  Online Boutique's real `AdServiceImpl extends AdServiceGrpc.AdServiceImplBase`, verified
+  correctly tagged after this fix (`mesh-mcp graph --format json` against the real repo).
+- Client: `<Service>Grpc.newBlockingStub(channel)` / `.newStub(...)` / `.newFutureStub(...)` — e.g.
+  Online Boutique's real `AdServiceClient.java`'s
+  `blockingStub = hipstershop.AdServiceGrpc.newBlockingStub(channel);` — is now recorded as an RPC
+  call to `AdService`, the same signal Go/Python/TypeScript already emit for their own client
+  conventions.
+
+`online-boutique` stays at 100%/100% (the affected edge was already resolved via the `.proto`
+declaration; this fix improves node classification and adds a correctly-labeled RPC-call signal).
+
+Ruthless review caught four real issues before merge, all fixed:
+- The `ImplBase` server check required only that substring, so an unrelated `*ImplBase` base class
+  from a non-gRPC framework using the same generic naming convention would have been mistagged.
+  Now requires both `"Grpc"` and `"ImplBase"` in the superclass reference — the real grpc-java
+  shape.
+- The client-stub scan only checked `method_declaration` bodies, but grpc-java's own convention
+  (and Online Boutique's real `AdServiceClient.java`) builds the stub in the class's own
+  *constructor* — the PR's own motivating example was, at first, not actually detected. Added
+  `constructor_declaration` handling, attributing to the enclosing class (constructors aren't
+  extracted as their own nodes).
+- The three candidate suffixes (`newBlockingStub`/`newStub`/`newFutureStub`) were checked in a
+  fixed order and returned on first match, so a method building two different services' stubs
+  could silently lose whichever wasn't checked first. Rewritten to return every stub construction
+  found, in source order.
+- A real, disclosed limitation (not fixed, deliberately): the server node is named after the impl
+  class (`AdServiceImpl`), which doesn't bare-match the client's Grpc-stripped target
+  (`AdService`) — self-resolution between this step's two new detectors alone, with no `.proto`
+  file present, doesn't work. Fixing this in `contracts.rs` by stripping a generic `Impl` suffix
+  was rejected as too risky (an extremely common OOP naming convention unrelated to gRPC, same
+  reasoning as step 2.1's reverted `Servicer`-suffix attempt) — every golden-corpus repo has a
+  real `.proto` declaration, which resolves correctly (verified above), so this is scoped as a
+  known gap for Plan 2's later "cross-signal identity" work, not silently claimed as solved.
+
 ## What's NOT measured yet
 
 - Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging

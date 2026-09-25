@@ -10,6 +10,37 @@ at 3.0.0 — there is no reconstructed history before it.
 Plan 1 (P0): make every answer reproducible and honest. This first step only
 *measures* determinism; nothing about indexing behaviour changes yet.
 
+### Fixed (P0 step 1.9 — reliable `init --auto`, secret hygiene)
+- **`init --auto`'s API Gateway detection no longer roots a nonexistent path.** It checked
+  `api-gateway/ || gateway/` but always pushed the literal string `./api-gateway` regardless of
+  which one actually existed — a repo with only a plain `gateway/` directory got a root that could
+  never match anything once the generated config was loaded. Now pushes whichever directory is
+  actually present.
+- **The architecture-docs root detection had the identical bug**, always pushing `./docs`
+  regardless of whether `docs/` or `architecture/` was the one that existed. Same fix.
+- **`protos/` (plural) is now detected as a proto root**, matching `proto/` and `proto-registry/`
+  — the roots-detection block only checked the singular and `-registry` forms, inconsistent with
+  the stop-rules block a few lines below it, which already checked all three.
+- **`smart_search` no longer returns a plaintext secret sitting next to a matched symbol.** Its
+  snippets are raw source lines, not resolved config properties, so a `.yaml`/`.env`-style line
+  like `POSTGRES_PASSWORD: accounts-pwd` right next to what the query matched came back to the
+  caller verbatim — the exact case the audit measured. Each returned line is now checked against
+  `PropertyRegistry::is_sensitive_key`'s existing patterns (the same ones already used to redact
+  *resolved* config values) and its value masked with the same `REDACTED_SECRET` placeholder if
+  the key looks sensitive.
+
+Default secret-file exclusions (`**/.env*`, `**/*.pem`, `**/*.key`, ...) were checked against this
+step's scope and found already in effect: `WorkspaceConfig::exclude_patterns`'s serde default
+applies them whenever a config (including every `init`-generated one, which never writes this
+field) doesn't set its own — no `init.rs` change was needed there.
+
+Content-based generated-code detection (masking `.pb.go`/`_pb2.py`-style generated files from
+tool output by default, per the roadmap) is deferred: those files are also where gRPC
+server/client stub extraction actually lives today, so hiding them outright would regress
+`analyze_grpc`/`find_dependents` rather than just improve hygiene — it needs a real per-file
+provenance tag surfaced at the *output* layer (Plan 2 territory), not a blanket skip at indexing
+time.
+
 ### Added (P0 step 1.8 — one `meshd` per workspace)
 - **`mesh_core::socket::workspace_id(base_dir)`**: the first 16 hex characters of
   SHA-256(canonical `base_dir` + `CARGO_PKG_VERSION`) — a short, stable identifier for one

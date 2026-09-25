@@ -263,27 +263,13 @@ impl WorkspaceIndexer {
     }
 
     /// Convenience for the CLI: graph only, using the global Rayon pool.
+    /// Delegates to [`Self::build_snapshot`] — one indexing path for the CLI, the
+    /// server and the daemon, instead of a second one (previously duplicated here)
+    /// that could silently drift out of sync with it.
     pub fn build_graph(config: &Config, roots: &[PathBuf]) -> (ContractGraph, usize) {
-        let files = Self::crawl_all(config, roots);
-        let patterns = Self::compiled_patterns(config);
-        let doc_template = Self::doc_index_for(config);
-        let spring = SpringSettings::from_config(config);
-        let extract_cfg = Self::extract_config(config);
-        let toggles = Self::engine_toggles(config);
-        let scan_cfg = ScanConfig {
-            patterns: &patterns,
-            doc_template: &doc_template,
-            spring: &spring,
-            extract_cfg: &extract_cfg,
-            toggles: &toggles,
-        };
-        let mut graph = ContractGraph::new();
-        let (fragments, _health) = Self::run_scan_pass(&files, roots, &scan_cfg, None);
-        for frag in fragments {
-            frag.code.apply(&mut graph);
-        }
-        graph.reconcile_edges();
-        (graph, files.len())
+        let snapshot = Self::build_snapshot(config, roots, None, None);
+        let file_count = snapshot.health.files_scanned;
+        (snapshot.contract_graph, file_count)
     }
 
     /// Runs `process_file` over `files` (optionally inside `pool`), returning the
@@ -378,7 +364,23 @@ impl WorkspaceIndexer {
     /// Differential reload driven by the state's VFS: only files whose stat or
     /// content hash changed are re-read and re-indexed; deleted files are purged.
     /// Installs one consistent snapshot at the end.
+    ///
+    /// Serialized on `state.reload_lock` for its entire body, regardless of caller
+    /// (`FileWatcherService::schedule_reload`, a direct test call, ...): two
+    /// overlapping reloads would each `snapshot_clone()` from the *same* prior
+    /// snapshot and then unconditionally `install_snapshot()` — whichever finishes
+    /// last wins outright, silently discarding the other's changes rather than
+    /// merging them. The lock is a plain `std::sync::Mutex`, acquired and released
+    /// on this same call stack (never held across an `.await` or moved to another
+    /// thread), so blocking here is exactly the intended backpressure: a second
+    /// caller simply waits its turn and then reloads against then-current disk
+    /// state, which already reflects whatever the first pass just did (idempotence
+    /// invariant I2).
     pub fn reload(state: &AppState) {
+        let _guard = state
+            .reload_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = &state.config;
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);

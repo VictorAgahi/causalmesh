@@ -92,6 +92,22 @@ async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
             let tools = ToolRegistry::list_tools();
             RpcResponse::success(id, json!({ "tools": tools }))
         }
+        "tools/call" if state.snapshot().generation == 0 => {
+            // `generation` starts at 0 and is only ever bumped by
+            // `install_snapshot`, which the initial ingestion task calls
+            // exactly once when its first scan completes — so 0 uniquely
+            // means "meshd hasn't finished indexing this workspace yet",
+            // never a legitimately empty one. Answering here explicitly
+            // instead of proceeding against the still-default empty
+            // snapshot is what lets the socket accept connections (and
+            // `initialize`/`ping` succeed) immediately, before ingestion
+            // finishes, rather than not existing at all until it does.
+            RpcResponse::error(
+                id,
+                -32000,
+                "meshd is still indexing this workspace; retry shortly",
+            )
+        }
         "tools/call" => {
             if let Some(params) = req.params {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -313,6 +329,7 @@ mod unix_tests {
     use super::unix_impl::run_uds_server;
     use crate::idle::ClientCounter;
     use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine, Config};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -326,7 +343,12 @@ mod unix_tests {
         .unwrap();
         let audit = Arc::new(AuditLogger::new(None).unwrap());
         let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
-        Arc::new(AppState::new(config, vec![], audit, rescan))
+        let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+        // Real meshd only starts serving `tools/call` once its initial ingestion
+        // installs a snapshot (generation > 0, see `dispatch`'s readiness check);
+        // these tests exercise post-ready behavior, so mark it ready up front.
+        state.install_snapshot(mesh_core::MeshSnapshot::default());
+        state
     }
 
     #[tokio::test]
@@ -439,6 +461,135 @@ mod unix_tests {
 
         assert_eq!(resp["id"], 42);
         assert!(resp["result"].is_object());
+
+        token.cancel();
+    }
+
+    /// Before the initial ingestion installs its first snapshot
+    /// (`generation == 0`), `tools/call` must report "still indexing" instead
+    /// of silently proceeding against the default, empty snapshot — a real
+    /// answer that happens to be empty must never be indistinguishable from
+    /// "not ready yet". `initialize`/`ping` are unaffected: only `tools/call`
+    /// itself depends on the workspace actually being indexed.
+    #[tokio::test]
+    async fn test_tools_call_reports_still_indexing_before_first_snapshot() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("test-meshd-not-ready.sock");
+
+        // Unlike `make_state()`, this state is never marked ready.
+        let config = Config::load_from_str(
+            "[workspace]\nname = \"test\"\nversion = \"2.9.0\"\nroots = [\".\"]\n",
+        )
+        .unwrap();
+        let audit = Arc::new(AuditLogger::new(None).unwrap());
+        let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+        let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+        assert_eq!(state.snapshot().generation, 0, "test setup: not yet ready");
+
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+
+        let sock_path_srv = sock_path.clone();
+        let state_srv = state.clone();
+        let token_srv = token.clone();
+        let counter_srv = counter.clone();
+        tokio::spawn(async move {
+            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+
+        // `initialize` succeeds even though ingestion hasn't finished.
+        let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        stream.write_all(init.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        assert!(
+            resp["result"].is_object(),
+            "initialize must not block on ingestion"
+        );
+
+        // `tools/call` reports "still indexing" instead of an empty result.
+        let call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"smart_search\",\"arguments\":{}}}\n";
+        stream.write_all(call.as_bytes()).await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        assert_eq!(resp["error"]["code"], -32000);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("indexing"));
+
+        token.cancel();
+    }
+
+    /// Two workspaces, each with its own `meshd` bound to its own
+    /// `socket_path_for(workspace_id(..))`, must never answer for each
+    /// other — a client connected to workspace A's socket must only ever
+    /// see workspace A's data, however similarly the two are named or
+    /// configured (idempotence invariant I7).
+    #[tokio::test]
+    async fn test_two_workspace_scoped_daemons_never_cross_talk() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let sock_a = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_a.path()));
+        let sock_b = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_b.path()));
+        assert_ne!(
+            sock_a, sock_b,
+            "two different workspaces must resolve to different sockets"
+        );
+
+        let mk = |name: &str| -> Arc<AppState> {
+            let config = Config::load_from_str(&format!(
+                "[workspace]\nname = \"{name}\"\nversion = \"2.9.0\"\nroots = [\".\"]\n"
+            ))
+            .unwrap();
+            let audit = Arc::new(AuditLogger::new(None).unwrap());
+            let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+            let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+            state.install_snapshot(mesh_core::MeshSnapshot::default());
+            state
+        };
+        let state_a = mk("workspace-a");
+        let state_b = mk("workspace-b");
+
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+        for (sock, state) in [(&sock_a, state_a), (&sock_b, state_b)] {
+            let sock = sock.clone();
+            let state = state.clone();
+            let token = token.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                run_uds_server(&sock, state, token, counter).await.unwrap();
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let query = |sock_path: PathBuf| async move {
+            let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+            let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"visualize_mesh\",\"arguments\":{\"format\":\"json\"}}}\n";
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        };
+
+        let resp_a = query(sock_a).await;
+        let resp_b = query(sock_b).await;
+
+        assert!(
+            resp_a.contains("workspace-a") && !resp_a.contains("workspace-b"),
+            "workspace A's socket must only ever answer with workspace A's data, got: {resp_a}"
+        );
+        assert!(
+            resp_b.contains("workspace-b") && !resp_b.contains("workspace-a"),
+            "workspace B's socket must only ever answer with workspace B's data, got: {resp_b}"
+        );
 
         token.cancel();
     }
@@ -654,7 +805,12 @@ mod windows_tests {
         .unwrap();
         let audit = Arc::new(AuditLogger::new(None).unwrap());
         let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
-        Arc::new(AppState::new(config, vec![], audit, rescan))
+        let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+        // Real meshd only starts serving `tools/call` once its initial ingestion
+        // installs a snapshot (generation > 0, see `dispatch`'s readiness check);
+        // these tests exercise post-ready behavior, so mark it ready up front.
+        state.install_snapshot(mesh_core::MeshSnapshot::default());
+        state
     }
 
     #[tokio::test]

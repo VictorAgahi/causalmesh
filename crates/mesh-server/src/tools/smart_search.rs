@@ -1,6 +1,9 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
-use mesh_core::{AppState, CompactStr, ContractNode, FilesystemCrawler, NodeKind, ValidatedScope};
+use mesh_core::{
+    AppState, CompactStr, ContractNode, FilesystemCrawler, NodeKind, PropertyRegistry,
+    ValidatedScope,
+};
 use mesh_parsers::{AstDecapitator, AstGuard, LanguageKind, MarkdownFormatter, SearchResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -267,11 +270,12 @@ impl SmartSearchTool {
         let snippet = window
             .iter()
             .map(|l| {
-                if l.len() > MAX_SNIPPET_LINE_BYTES {
-                    let cut = Self::floor_char_boundary(l, MAX_SNIPPET_LINE_BYTES - 3);
-                    format!("{}...", &l[..cut])
+                let redacted = Self::redact_sensitive_line(l);
+                if redacted.len() > MAX_SNIPPET_LINE_BYTES {
+                    let cut = Self::floor_char_boundary(&redacted, MAX_SNIPPET_LINE_BYTES - 3);
+                    format!("{}...", &redacted[..cut])
                 } else {
-                    (*l).to_string()
+                    redacted
                 }
             })
             .collect::<Vec<_>>()
@@ -294,6 +298,41 @@ impl SmartSearchTool {
         }
         i
     }
+
+    /// Masks a `key: value` / `key = value` / `key: "value"` line's value when
+    /// `key` matches [`PropertyRegistry::is_sensitive_key`]'s patterns (e.g.
+    /// `POSTGRES_PASSWORD`, `*_SECRET`, `*_TOKEN`). `smart_search` returns raw
+    /// source snippets, not resolved properties, so a plaintext secret sitting
+    /// right next to a matched symbol in a `.yaml`/`.env`/config file used to
+    /// come back to the caller verbatim — this is the same secret-masking
+    /// convention `PropertyRegistry` already applies to *resolved* config
+    /// values, applied here to raw snippet lines instead.
+    fn redact_sensitive_line(line: &str) -> String {
+        let sep_pos = line.find([':', '=']);
+        let Some(sep_pos) = sep_pos else {
+            return line.to_string();
+        };
+        let (key_part, rest) = line.split_at(sep_pos);
+        let key = key_part
+            .trim()
+            .trim_start_matches('-')
+            .trim_matches('"')
+            .trim_matches('\'');
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            // Not a plausible `key: value` line (e.g. a URL "https://host:port"
+            // or a comment) — leave it untouched rather than guess.
+            return line.to_string();
+        }
+        thread_local! {
+            static REGISTRY: PropertyRegistry = PropertyRegistry::new();
+        }
+        let is_sensitive = REGISTRY.with(|r| r.is_sensitive_key(key));
+        if !is_sensitive {
+            return line.to_string();
+        }
+        let sep = &rest[..1];
+        format!("{key_part}{sep} {}", PropertyRegistry::REDACTED_PLACEHOLDER)
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +351,37 @@ mod tests {
         let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
         let allowed_roots = vec![root.to_path_buf()];
         Arc::new(AppState::new(config, allowed_roots, audit, rescan))
+    }
+
+    /// `smart_search` returns raw source snippets, not resolved config
+    /// properties — a sensitive key sitting in a `.yaml`/`.env`-style line
+    /// right next to a matched symbol used to come back to the caller in
+    /// plaintext (the audit's own example: `POSTGRES_PASSWORD: accounts-pwd`).
+    #[test]
+    fn redact_sensitive_line_masks_secret_looking_keys() {
+        assert_eq!(
+            SmartSearchTool::redact_sensitive_line("POSTGRES_PASSWORD: accounts-pwd"),
+            format!(
+                "POSTGRES_PASSWORD: {}",
+                PropertyRegistry::REDACTED_PLACEHOLDER
+            )
+        );
+        assert_eq!(
+            SmartSearchTool::redact_sensitive_line("api_token = \"sk-live-abc123\""),
+            format!("api_token = {}", PropertyRegistry::REDACTED_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_line_leaves_ordinary_lines_untouched() {
+        let ordinary = "  const url = \"https://api.example.com:8080/health\";";
+        assert_eq!(SmartSearchTool::redact_sensitive_line(ordinary), ordinary);
+
+        let non_secret_kv = "app.name: billing-service";
+        assert_eq!(
+            SmartSearchTool::redact_sensitive_line(non_secret_kv),
+            non_secret_kv
+        );
     }
 
     fn args(scope: &str) -> SmartSearchArgs {

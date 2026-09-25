@@ -2,10 +2,10 @@
 //!
 //! Re-exports canonical implementation from `mesh_core::socket`.
 
-pub use mesh_core::socket::{cleanup_stale_socket, socket_path};
+pub use mesh_core::socket::{cleanup_stale_socket, socket_path_for, workspace_id};
 
 #[cfg(windows)]
-pub use mesh_core::socket::pipe_name;
+pub use mesh_core::socket::pipe_name_for;
 
 #[cfg(test)]
 mod tests {
@@ -13,10 +13,29 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_socket_path_env_override() {
+    fn test_socket_path_for_env_override() {
         std::env::set_var("MESH_SOCKET_PATH", "/tmp/test-mesh.sock");
-        assert_eq!(socket_path(), PathBuf::from("/tmp/test-mesh.sock"));
+        assert_eq!(
+            socket_path_for("deadbeef"),
+            PathBuf::from("/tmp/test-mesh.sock")
+        );
         std::env::remove_var("MESH_SOCKET_PATH");
+    }
+
+    #[test]
+    fn test_workspace_id_differs_by_base_dir_and_is_stable() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+
+        let id_a1 = workspace_id(dir_a.path());
+        let id_a2 = workspace_id(dir_a.path());
+        let id_b = workspace_id(dir_b.path());
+
+        assert_eq!(id_a1, id_a2, "same workspace must always yield the same id");
+        assert_ne!(
+            id_a1, id_b,
+            "two different workspaces must never share a socket"
+        );
     }
 
     #[test]

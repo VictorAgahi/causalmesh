@@ -60,17 +60,17 @@ jobs:
         run: cargo test --workspace --verbose
 
   # ============================================================================
-  # 2b. Determinism Gate (idempotence invariant I1)
+  # 2b. Determinism Gate (idempotence invariants I1-I3, P0 steps 1.1-1.5)
   # ============================================================================
   # Indexes each example workspace 5x sequentially and 8x concurrently and
   # requires a single content fingerprint per workspace (scripts/determinism.sh).
-  # Informational until P0 step 1.3 removes the 15 ms wall-clock parse timeout,
-  # which can still change results on a contended runner.
+  # Blocking: every measured workspace (examples, and — checked manually, not
+  # committed here — Bank of Anthos, the OpenTelemetry demo, Online Boutique) is
+  # fully deterministic as of P0 step 1.5. A regression here is a real bug.
   determinism:
     name: "Determinism Gate (${{ matrix.os }})"
     needs: test-suite
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

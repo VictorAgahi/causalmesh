@@ -939,12 +939,20 @@ impl ContractGraph {
         // before presenting this to a human/agent rather than treat it as a
         // single flat, disambiguated answer.
         if result.is_empty() {
-            for (pkg, node_ids) in &self.reverse_deps {
-                if pkg.contains(target) {
-                    for &id in node_ids {
-                        if let Some(node) = self.nodes.get(&id) {
-                            result.push(node);
-                        }
+            // `reverse_deps` is a `HashMap`: iterated directly, its per-process
+            // random hash seed would make this fallback return a different
+            // node order on every run for identical input, violating I5.
+            // Sorted by key first, so the order depends only on content.
+            let mut matching_pkgs: Vec<&CompactStr> = self
+                .reverse_deps
+                .keys()
+                .filter(|pkg| pkg.contains(target))
+                .collect();
+            matching_pkgs.sort();
+            for pkg in matching_pkgs {
+                for &id in &self.reverse_deps[pkg] {
+                    if let Some(node) = self.nodes.get(&id) {
+                        result.push(node);
                     }
                 }
             }
@@ -1060,17 +1068,31 @@ impl ContractGraph {
         let mut downstream_consumers = Vec::new();
         let mut related_sagas = Vec::new();
 
-        // 1. Check topic registry
-        for (topic_name, producer_ids) in &self.topic_producers {
+        // 1. Check topic registry. `topic_producers`/`topic_consumers` are
+        // `HashMap`s: iterated directly, their per-process random hash seed
+        // would reorder `upstream_producers`/`downstream_consumers` on every
+        // run for identical input, violating I5. Sorted by topic name first.
+        let mut producer_topics: Vec<&CompactStr> = self.topic_producers.keys().collect();
+        producer_topics.sort();
+        for topic_name in producer_topics {
             if topic_name.contains(norm_target.as_str()) {
-                upstream_producers.extend(producer_ids.iter().filter_map(|id| self.nodes.get(id)));
+                upstream_producers.extend(
+                    self.topic_producers[topic_name]
+                        .iter()
+                        .filter_map(|id| self.nodes.get(id)),
+                );
             }
         }
 
-        for (topic_name, consumer_ids) in &self.topic_consumers {
+        let mut consumer_topics: Vec<&CompactStr> = self.topic_consumers.keys().collect();
+        consumer_topics.sort();
+        for topic_name in consumer_topics {
             if topic_name.contains(norm_target.as_str()) {
-                downstream_consumers
-                    .extend(consumer_ids.iter().filter_map(|id| self.nodes.get(id)));
+                downstream_consumers.extend(
+                    self.topic_consumers[topic_name]
+                        .iter()
+                        .filter_map(|id| self.nodes.get(id)),
+                );
             }
         }
 
@@ -1123,11 +1145,17 @@ impl ContractGraph {
         }
 
         // Substring path: walk only the files inside the scope instead of every node.
-        let in_scope = self
+        // `file_to_nodes` is a `HashMap`: sorted by path first, so this walk's
+        // order depends only on content, not the per-process hash seed (I5).
+        let mut in_scope_paths: Vec<&FilePath> = self
             .file_to_nodes
-            .iter()
-            .filter(|(path, _)| scope_filter.is_none_or(|s| path.starts_with(s)))
-            .flat_map(|(_, ids)| ids.iter());
+            .keys()
+            .filter(|path| scope_filter.is_none_or(|s| path.starts_with(s)))
+            .collect();
+        in_scope_paths.sort();
+        let in_scope = in_scope_paths
+            .into_iter()
+            .flat_map(|path| self.file_to_nodes[path].iter());
         for id in in_scope {
             if seen.contains(id) {
                 continue;
@@ -1651,6 +1679,90 @@ mod tests {
             "results from unrelated services sharing a locally-aliased \
              package name must retain distinct repo_id so a caller can \
              group them instead of treating this as one disambiguated match"
+        );
+    }
+
+    /// The substring fallback in `find_dependents` (step 3, no exact/symbol/edge
+    /// match found) used to iterate `reverse_deps` — a `HashMap` — directly,
+    /// so the returned node order depended on the process's random hash seed
+    /// instead of on the workspace's content (idempotence invariant I5). It
+    /// must come back sorted by the matched package name, deterministically,
+    /// regardless of node/registration order.
+    #[test]
+    fn find_dependents_substring_fallback_is_ordered_by_matched_package() {
+        let mut graph = ContractGraph::new();
+        // Registered in an order that does not match the expected (sorted)
+        // output order, so a HashMap-order regression would be caught.
+        for (pkg, name, path) in [
+            ("zzz-genproto-shared", "zCaller", "z.go"),
+            ("aaa-genproto-shared", "aCaller", "a.go"),
+            ("mmm-genproto-shared", "mCaller", "m.go"),
+        ] {
+            let id = graph.add_node(ContractNode {
+                id: 0,
+                name: CompactStr::new(name),
+                kind: NodeKind::ServiceClass,
+                file_path: Path::new(path).into(),
+                line_start: 1,
+                line_end: 1,
+                package: CompactStr::new(pkg),
+                repo_id: 0,
+                signature: None,
+                docstring: None,
+            });
+            graph.add_dependency(id, pkg);
+        }
+
+        let dependents = graph.find_dependents("genproto");
+        let packages: Vec<&str> = dependents.iter().map(|n| n.package.as_str()).collect();
+        assert_eq!(
+            packages,
+            vec![
+                "aaa-genproto-shared",
+                "mmm-genproto-shared",
+                "zzz-genproto-shared"
+            ],
+            "substring fallback must be sorted by matched package name, not HashMap order"
+        );
+    }
+
+    /// `analyze_impact`'s topic-registry pass used to iterate `topic_producers`/
+    /// `topic_consumers` — both `HashMap`s — directly, so which producer/
+    /// consumer topic matched first (and thus its node order in the result)
+    /// depended on the process's random hash seed rather than content (I5).
+    #[test]
+    fn analyze_impact_orders_producers_by_matched_topic_name() {
+        let mut graph = ContractGraph::new();
+        for (topic, name, path) in [
+            ("orders.zzz", "zProducer", "z.go"),
+            ("orders.aaa", "aProducer", "a.go"),
+            ("orders.mmm", "mProducer", "m.go"),
+        ] {
+            let id = graph.add_node(ContractNode {
+                id: 0,
+                name: CompactStr::new(name),
+                kind: NodeKind::ServiceClass,
+                file_path: Path::new(path).into(),
+                line_start: 1,
+                line_end: 1,
+                package: CompactStr::new("shop"),
+                repo_id: 0,
+                signature: None,
+                docstring: None,
+            });
+            graph.add_producer(id, topic);
+        }
+
+        let flow = graph.analyze_impact("orders");
+        let names: Vec<&str> = flow
+            .upstream_producers
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["aProducer", "mProducer", "zProducer"],
+            "producers must be ordered by their matched topic name, not HashMap order"
         );
     }
 

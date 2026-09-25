@@ -243,18 +243,26 @@ printf '%s\n' \
 
 ### Daemon vs standalone
 
-`mesh-mcp run` (default) connects to a shared `meshd` daemon over a Unix socket, auto-spawning
-it if needed. Several IDE windows then share one index. The daemon exits on its own once idle.
+`mesh-mcp run` (default) connects to a `meshd` daemon over a Unix socket scoped to *this
+workspace* (a hash of its canonical path + the binary version), auto-spawning it if needed.
+Several IDE windows open on the *same* repo then share one index; a different repo always gets
+its own daemon and socket — they never mix, even if both happen to be running at once. The
+daemon exits on its own once idle.
 
 `mesh-mcp run --standalone` keeps everything in one process — use it in containers, in CI, or
 anywhere a Unix socket isn't available.
 
-To manage the daemon explicitly:
+To manage a workspace's daemon explicitly:
 
 ```bash
-meshd --idle-timeout-minutes 30    # foreground
-pkill meshd                        # stop it; the next run respawns it
+meshd --idle-timeout-minutes 30    # foreground, indexes the cwd's workspace
+pkill meshd                        # stop all daemons; the next `mesh-mcp run` respawns per-workspace
 ```
+
+If you're upgrading from a version before P0 step 1.8 and see more than one `meshd` process, or
+a socket at the old shared path (`~/.cache/mesh/meshd.sock`), it's safe to `pkill meshd` once —
+every `mesh-mcp run` afterward resolves and (re)spawns the correct per-workspace daemon on its
+own.
 
 ---
 

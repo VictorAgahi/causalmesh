@@ -622,14 +622,27 @@ impl GoExtractor {
         if let Some(resolved) = bare_name.and_then(|name| string_consts.get(name)) {
             return Some(resolved.clone());
         }
-        // Constant, config lookup, or `&topicVar` we couldn't resolve: still
-        // emit something rather than silently dropping it.
-        value
-            .utf8_text(source)
-            .ok()
-            .map(|t| CompactStr::new(t.trim_start_matches('&').trim()))
+        // A constant declared in another file/package (`kafka.Topic`, resolved
+        // only against this *file's* `string_consts`), a runtime config
+        // lookup, or an unresolved `&topicVar`: none of these have a value
+        // available here. This used to fall back to the raw expression text
+        // itself (`"kafka.Topic"`, the qualified reference, not a topic name)
+        // — exactly the class of fabricated value P0 step 1.7 eliminated
+        // everywhere else; recording nothing is correct here too.
+        None
     }
 
+    /// Collects every plain string literal under `node` — but never descends
+    /// into a *named* struct literal (`kafka.Message{...}`,
+    /// `sarama.ProducerMessage{...}`), only into anonymous ones like
+    /// `[]string{"orders"}`. A call like `producer.Produce(&kafka.Message{
+    /// Value: []byte("payload") })` used to have this walk straight through
+    /// the whole argument tree and pick up `"payload"` — a completely
+    /// unrelated field's literal — as if it were the topic, because nothing
+    /// stopped the recursion at the struct literal's boundary. Named struct
+    /// literals have their own dedicated, field-aware extraction
+    /// (`handle_composite_literal`/`extract_topic_field`); this generic walk
+    /// is only for simple positional/slice-literal call arguments.
     fn collect_string_literals(node: Node, source: &[u8], out: &mut Vec<String>, depth: usize) {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
             return;
@@ -642,6 +655,14 @@ impl GoExtractor {
                 }
             }
             return;
+        }
+        if node.kind() == "composite_literal" {
+            let is_named_struct = node
+                .child_by_field_name("type")
+                .is_some_and(|t| matches!(t.kind(), "qualified_type" | "type_identifier"));
+            if is_named_struct {
+                return;
+            }
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -1143,8 +1164,13 @@ func Emit() {
         );
     }
 
+    /// `Topic: &topic` — an unresolved local variable, not a `var Topic =
+    /// "literal"` this extractor can look up — must record no topic at all.
+    /// This used to fall back to the identifier's own name ("topic"), which
+    /// is the variable's name, not its value (the same class of fabrication
+    /// P0 step 1.7 eliminated in every other producer/consumer call shape).
     #[test]
-    fn confluent_kafka_topic_partition_struct_resolves_topic() {
+    fn confluent_kafka_topic_partition_with_unresolved_variable_records_nothing() {
         let code = r#"
 package kafka
 
@@ -1160,22 +1186,24 @@ func Emit() {
         let (_, relations) =
             GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
-            relations
-                .producers
-                .iter()
-                .any(|(_, topic)| topic.as_str() == "topic"),
-            "expected confluent TopicPartition topic, got: {:?}",
+            relations.producers.is_empty(),
+            "expected no fabricated topic from an unresolved variable, got: {:?}",
             relations.producers
         );
     }
 
-    /// Documents the explicit non-goal: a topic resolved through a function
-    /// call's return value (not a direct `var X = "literal"`) is NOT
-    /// resolved — that would require real control-flow interpretation. Must
-    /// still fall back to raw expression text rather than silently dropping
-    /// the producer signal entirely.
+    /// A topic resolved through a function call's return value (not a direct
+    /// `var X = "literal"`), or a constant declared in another file/package
+    /// (`kafka.Topic`, resolved only against *this file's* `var`/`const`
+    /// declarations) has no value available here — real control-flow
+    /// interpretation or cross-file resolution would be needed, neither of
+    /// which this extractor does. It must record no topic at all rather than
+    /// the raw expression text (`"kafka.Topic"`) it used to fall back to —
+    /// caught empirically indexing the OpenTelemetry demo, where
+    /// `checkout/main.go`'s `Topic: kafka.Topic` (a cross-package reference)
+    /// produced exactly this fabricated node.
     #[test]
-    fn sarama_topic_referencing_a_function_call_falls_back_to_raw_text() {
+    fn sarama_topic_referencing_an_unresolvable_expression_records_nothing() {
         let code = r#"
 package kafka
 
@@ -1200,18 +1228,14 @@ func Emit() {
         let (_, relations) =
             GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
-            relations
-                .producers
-                .iter()
-                .any(|(_, topic)| topic.as_str() == "kafka.Topic"),
-            "a function-call-resolved const is an explicit non-goal — must \
-             still fall back to raw expression text, got: {:?}",
+            relations.producers.is_empty(),
+            "expected no fabricated topic from an unresolvable expression, got: {:?}",
             relations.producers
         );
     }
 
     #[test]
-    fn non_literal_topic_emits_variable_name_instead_of_dropping() {
+    fn non_literal_topic_variable_records_nothing() {
         let code = r#"
 package consumer
 
@@ -1227,11 +1251,8 @@ func Consume() {
         let (_, relations) =
             GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 1, &tree);
         assert!(
-            relations
-                .consumers
-                .iter()
-                .any(|(_, topic)| topic.as_str() == "topicVar"),
-            "expected the non-literal topic variable name to surface, got: {:?}",
+            relations.consumers.is_empty(),
+            "expected no fabricated topic from an unresolved variable, got: {:?}",
             relations.consumers
         );
     }

@@ -1167,37 +1167,44 @@ impl ContractGraph {
 
             // Every topic a node in the current frontier produces onto, in
             // stable edge-insertion order (not `HashSet` order) so the result
-            // stays deterministic across runs (I5).
+            // stays deterministic across runs (I5). A single pass over
+            // `self.edges` — not one pass per frontier node — keeps one hop
+            // O(|edges|) regardless of how wide the frontier is.
             let mut new_topics: Vec<NodeId> = Vec::new();
+            let mut new_topics_set: HashSet<NodeId> = HashSet::new();
             for edge in &self.edges {
                 if edge.kind == EdgeKind::Produces
                     && frontier.contains(&edge.from)
                     && visited_topics.insert(edge.to)
                 {
                     new_topics.push(edge.to);
+                    new_topics_set.insert(edge.to);
+                }
+            }
+            for topic_id in &new_topics {
+                if let Some(topic_node) = self.nodes.get(topic_id) {
+                    flow.topics.push(topic_node);
                 }
             }
 
+            // Consumers of *any* newly-discovered topic, again in one pass
+            // over `self.edges` rather than one pass per topic — keeps this
+            // hop O(|edges|) too instead of O(new_topics × |edges|).
             let mut next_frontier: HashSet<NodeId> = HashSet::new();
-            for topic_id in new_topics {
-                if let Some(topic_node) = self.nodes.get(&topic_id) {
-                    flow.topics.push(topic_node);
+            for edge in &self.edges {
+                if edge.kind != EdgeKind::Consumes
+                    || !new_topics_set.contains(&edge.to)
+                    || !visited_nodes.insert(edge.from)
+                {
+                    continue;
                 }
-                for edge in &self.edges {
-                    if edge.kind != EdgeKind::Consumes
-                        || edge.to != topic_id
-                        || !visited_nodes.insert(edge.from)
-                    {
-                        continue;
-                    }
-                    let Some(consumer) = self.nodes.get(&edge.from) else {
-                        continue;
-                    };
-                    next_frontier.insert(edge.from);
-                    match consumer.kind {
-                        NodeKind::Saga => flow.related_sagas.push(consumer),
-                        _ => flow.downstream_consumers.push(consumer),
-                    }
+                let Some(consumer) = self.nodes.get(&edge.from) else {
+                    continue;
+                };
+                next_frontier.insert(edge.from);
+                match consumer.kind {
+                    NodeKind::Saga => flow.related_sagas.push(consumer),
+                    _ => flow.downstream_consumers.push(consumer),
                 }
             }
             frontier = next_frontier;

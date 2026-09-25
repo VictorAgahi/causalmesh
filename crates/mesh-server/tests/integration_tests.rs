@@ -151,6 +151,42 @@ async fn test_find_dependents_success() {
     assert!(text.contains("AuthController"));
 }
 
+/// An unrecognized `granularity` (typo, wrong case, invented value) must be a
+/// JSON-RPC -32602 error, not a silent fallback to symbol-level output — a
+/// silent fallback would look like a successful narrower query while quietly
+/// returning the full, undeduplicated result set.
+#[tokio::test]
+async fn test_find_dependents_rejects_unknown_granularity() {
+    let (state, _temp) = setup_test_environment();
+
+    let args = json!({
+        "target": "UserAuthRequest",
+        "granularity": "Package"
+    });
+
+    let res = ToolRegistry::call_tool("find_dependents", args, state).await;
+    assert!(res.is_err());
+    let (code, msg) = res.unwrap_err();
+    assert_eq!(code, -32602);
+    assert!(msg.contains("Package"));
+}
+
+#[tokio::test]
+async fn test_find_dependents_package_granularity_is_accepted() {
+    let (state, _temp) = setup_test_environment();
+
+    let args = json!({
+        "target": "UserAuthRequest",
+        "granularity": "package"
+    });
+
+    let res = ToolRegistry::call_tool("find_dependents", args, state).await;
+    assert!(res.is_ok());
+    let val = res.unwrap();
+    let text = val["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("AuthController"));
+}
+
 #[tokio::test]
 async fn test_smart_search_on_guarded_scope_allowed() {
     let (state, _temp) = setup_test_environment();
@@ -312,13 +348,78 @@ async fn test_analyze_impact_success() {
         "target": "user.created"
     });
 
-    let res = ToolRegistry::call_tool("analyze_impact", args, state).await;
+    let res = ToolRegistry::call_tool("analyze_impact", args, state.clone()).await;
     assert!(res.is_ok());
     let val = res.unwrap();
     let text = val["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Asynchronous Causal Impact Analysis for `user.created`"));
     assert!(text.contains("UserRegistrationService"));
     assert!(text.contains("WelcomeEmailConsumer"));
+
+    // `depth: 2` must follow WelcomeEmailConsumer's own onward Produces edge
+    // to a second topic and pick up that topic's consumer too — a real
+    // second-hop dependency `depth: 1` (or the omitted default) must not see.
+    let mut snapshot = state.snapshot_clone();
+    let graph = &mut snapshot.contract_graph;
+    let retry_topic = graph.add_node(ContractNode {
+        id: 0,
+        name: "email.retry".into(),
+        kind: NodeKind::KafkaTopic,
+        file_path: std::path::Path::new("proto-registry/events.proto").into(),
+        line_start: 12,
+        line_end: 12,
+        package: "events.v1".into(),
+        repo_id: 0,
+        signature: None,
+        docstring: None,
+    });
+    let retry_consumer = graph.add_node(ContractNode {
+        id: 0,
+        name: "EmailRetryWorker".into(),
+        kind: NodeKind::ServiceClass,
+        file_path: std::path::Path::new("services/notifications/RetryWorker.ts").into(),
+        line_start: 5,
+        line_end: 20,
+        package: "notifications".into(),
+        repo_id: 3,
+        signature: None,
+        docstring: None,
+    });
+    graph.add_edge(mesh_core::ContractEdge {
+        from: consumer_node,
+        to: retry_topic,
+        kind: mesh_core::EdgeKind::Produces,
+        metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
+    });
+    graph.add_edge(mesh_core::ContractEdge {
+        from: retry_consumer,
+        to: retry_topic,
+        kind: mesh_core::EdgeKind::Consumes,
+        metadata: None,
+        confidence: mesh_core::EdgeConfidence::Exact,
+    });
+    state.install_snapshot(snapshot);
+
+    let direct_args = json!({"target": "user.created"});
+    let direct_res = ToolRegistry::call_tool("analyze_impact", direct_args, state.clone())
+        .await
+        .unwrap();
+    let direct_text = direct_res["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !direct_text.contains("EmailRetryWorker"),
+        "default depth (1) must not see the second-hop consumer"
+    );
+
+    let deep_args = json!({"target": "user.created", "depth": 2});
+    let deep_res = ToolRegistry::call_tool("analyze_impact", deep_args, state)
+        .await
+        .unwrap();
+    let deep_text = deep_res["content"][0]["text"].as_str().unwrap();
+    assert!(
+        deep_text.contains("EmailRetryWorker"),
+        "depth: 2 must follow the transitive Produces/Consumes edge to the second-hop consumer"
+    );
 }
 
 #[tokio::test]

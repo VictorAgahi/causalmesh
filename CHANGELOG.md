@@ -43,6 +43,14 @@ Plan 2 (P1): make inter-service joins precise, not just deterministic.
 - Honest limitation: the `depth > 1` traversal is covered by a synthetic regression test (a
   `topic -> handler -> topic -> handler` chain with a cycle back to the origin topic), not yet
   against a real multi-hop async chain in the corpus. See `docs/quality.md`.
+- Hardened via ruthless review: an unrecognized `granularity` (a typo like `"Package"`, or any
+  invented value) used to silently fall back to full symbol-level output with no signal to the
+  caller — the exact opposite of this step's "explicit semantics" goal — fixed to return a
+  JSON-RPC -32602 error instead. `truncation_hint` recomputed `find_dependents` without applying
+  the `"package"` dedup, so a truncated response's appended note could cite the pre-dedup symbol
+  count; fixed to dedupe identically via a shared helper. The `depth > 1` BFS rescanned the full
+  edge list once per newly-discovered topic per hop (`O(new_topics × |edges|)`); fixed to a single
+  edge-list pass per hop (`O(|edges|)`) for both the `Produces` and `Consumes` steps.
 
 ### Added (P1 step 2.6 — Flask/FastAPI route path and method)
 - **A Python HTTP route decorator's actual path/method is now surfaced.** `@app.route('/users',

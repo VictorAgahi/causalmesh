@@ -132,7 +132,7 @@ Reverse dependency search across repository and microservice boundaries. Identif
     },
     "granularity": {
       "type": "string",
-      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol."
+      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a JSON-RPC -32602 error, not a silent fallback to 'symbol'."
     }
   },
   "additionalProperties": false

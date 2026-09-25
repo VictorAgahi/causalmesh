@@ -1,0 +1,63 @@
+# Ground truth for the Online Boutique demo (GoogleCloudPlatform/microservices-demo),
+# pinned at the commit in scripts/golden/repos.txt. Written by hand from the
+# real source (protos/demo.proto's service list, grep for `New*ServiceClient`/
+# `*ServiceStub(` construction sites in each caller), not derived from
+# mesh-mcp's own output — that would make the "ground truth" circular.
+#
+# Scoring (scripts/golden/score.py) computes precision/recall of
+# `mesh-mcp graph --format json`'s gRPC edges against `grpc_edges` below.
+repo: online-boutique
+commit: 38e7348eb289eb5b87c0c6e8cb19ced0449dc389
+
+# One entry per service declared in protos/demo.proto, plus the language its
+# server implementation is written in — used to break precision/recall down
+# per language, not just overall.
+grpc_services:
+  - name: CartService
+    language: csharp
+  - name: RecommendationService
+    language: python
+  - name: ProductCatalogService
+    language: go
+  - name: ShippingService
+    language: go
+  - name: CurrencyService
+    language: typescript
+  - name: PaymentService
+    language: typescript
+  - name: EmailService
+    language: python
+  - name: CheckoutService
+    language: go
+  - name: AdService
+    language: java
+
+# Real caller -> callee edges, confirmed by grepping each caller for the
+# generated client's construction (`New<Service>Client(...)` in Go,
+# `<Service>Stub(...)` in Python, etc.). `from` is the calling service's
+# directory name under src/, not a proto service name — frontend and
+# loadgenerator have no .proto service of their own but are real gRPC
+# clients.
+grpc_edges:
+  # src/frontend/*.go
+  - {from: frontend, to: AdService}
+  - {from: frontend, to: CartService}
+  - {from: frontend, to: CheckoutService}
+  - {from: frontend, to: CurrencyService}
+  - {from: frontend, to: ProductCatalogService}
+  - {from: frontend, to: RecommendationService}
+  - {from: frontend, to: ShippingService}
+  # src/checkoutservice/main.go
+  - {from: CheckoutService, to: ShippingService}
+  - {from: CheckoutService, to: CartService}
+  - {from: CheckoutService, to: ProductCatalogService}
+  - {from: CheckoutService, to: CurrencyService}
+  - {from: CheckoutService, to: PaymentService}
+  - {from: CheckoutService, to: EmailService}
+  # src/recommendationservice/recommendation_server.py
+  - {from: RecommendationService, to: ProductCatalogService}
+
+# No Kafka/Pub-Sub topics in this demo — it is pure synchronous gRPC only.
+# An empty list here is itself part of the ground truth: a scorer must not
+# invent a topic/queue finding against this repo.
+topics: []

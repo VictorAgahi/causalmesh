@@ -7,7 +7,23 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Nothing yet — Plan 2 (P1, precision) work starts here.
+Plan 2 (P1): make inter-service joins precise, not just deterministic.
+
+### Added (P1 step 2.0 — golden corpus and precision/recall baseline)
+- **`scripts/golden/{repos.txt,fetch.sh}`**: pins the Plan 2 corpus (`online-boutique`, `otel-demo`,
+  `bank-of-anthos`) to exact commits and clones/checks them out reproducibly, distinct from
+  `scripts/bench/repos.txt`'s shallow latest-commit clones for scale testing.
+- **`tests/golden/online-boutique.expected.yaml`**: hand-written ground truth (from the repo's own
+  `.proto` service list and each caller's real client-construction call sites, not derived from
+  mesh-mcp's own output) for its 14 real gRPC service-to-service edges.
+- **`scripts/golden/score.py`**: runs `mesh-mcp graph --format json` against a golden-corpus repo
+  and computes precision/recall of its gRPC edges against the golden file, with optional
+  `--fail-under-precision`/`--fail-under-recall` for a future CI ratchet.
+- **`docs/quality.md`**: the baseline this step measured — `online-boutique` scores **100%
+  precision / 92.9% recall** (one miss: a Python `ServiceStub(channel)` construction site,
+  `recommendationservice -> productcatalogservice`, not yet a recognized gRPC client idiom).
+  `otel-demo` and `bank-of-anthos` golden files are not yet written — noted as pending, not
+  fabricated under time pressure.
 
 ## [4.0.0] — 2026-09-25
 

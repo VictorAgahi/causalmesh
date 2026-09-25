@@ -9,6 +9,26 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.2 — manifest-declared service identity)
+- **`detect_service_package` now reads the service identity a manifest actually declares**, not
+  just the directory it happens to sit in — `go.mod`'s `module` path, `package.json`'s `name`
+  (npm-scope stripped), `Cargo.toml`'s `[package].name`, `pyproject.toml`'s
+  `[project].name`/`[tool.poetry].name`. A folder named `svc` whose `go.mod` declares `module
+  github.com/acme/billing-service` is now identified as `billing-service`, not `svc`. Falls back to
+  the directory name exactly as before when a manifest has none of these fields or fails to parse.
+  Measured effect on Bank of Anthos: resolved edges 49 → **81** (node count 358 → 365, duplicates
+  still exactly 0) — more accurate package identities let more callers disambiguate to a real
+  match. `online-boutique` stays at 100% precision / 100% recall.
+
+### Fixed (P1 step 2.2)
+- **A relative path with no real manifest anywhere in its own ancestry could silently read *this
+  crate's own* `Cargo.toml`.** `Path::parent()` eventually yields the empty path as its final
+  ancestor, and `"".join("Cargo.toml")` resolves against the process's actual cwd — inside this
+  workspace, always a real file. The pre-existing directory-name-only code never surfaced this (an
+  empty path has no `file_name()` to return), but reading real manifest *content* (added by this
+  step) would have leaked it for any synthetic or filesystem-less path. `detect_service_package`'s
+  upward walk now stops at the empty path, the same way it already stops at its depth cap.
+
 ### Added (P1 step 2.1 — Python gRPC client detection)
 - **`PythonExtractor` now detects gRPC client call sites.** It had server-side (`*Servicer`
   subclass) detection but *no* client-side detection at all — every other language extractor

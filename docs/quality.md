@@ -52,6 +52,40 @@ distinguish a real generated client from a hand-written test double coincidental
 `if __name__ == "__main__":`, as Online Boutique's own recommendationservice does) is attributed
 to a lazily-created module-level node instead of being dropped or mis-attributed.
 
+## Update (2026-09-25, step 2.2 — manifest-declared service identity)
+
+`ContractNode::package` (used for `pick_or_ambiguous_by_package`'s caller disambiguation, among
+other things) came from `detect_service_package`, which used the *directory name* a manifest was
+found in, not what that manifest actually declares — a folder named `svc` whose `go.mod` declares
+`module github.com/acme/billing-service` was identified as `svc`, not `billing-service`.
+`detect_service_package` now reads the real declared name first (`go.mod`'s `module` path,
+`package.json`'s `name`, `Cargo.toml`'s `[package].name`, `pyproject.toml`'s
+`[project]`/`[tool.poetry].name`), falling back to the directory name exactly as before when a
+manifest has none or fails to parse.
+
+Effect measured on Bank of Anthos: resolved edges went from 49 to **81** (node count 358 → 365,
+duplicates still exactly 0) — more accurate package identities let more callers disambiguate to a
+real match instead of falling into an `Ambiguous` tie or missing a package-scoped resolution
+entirely. `online-boutique` stays at 100%/100%.
+
+A real, pre-existing footgun was found and fixed while adding this: `Path::parent()` on a relative
+path eventually yields the empty path as its own final ancestor, and `"".join("Cargo.toml")`
+resolves against the *process's actual cwd* — inside this workspace, always a real `Cargo.toml`.
+The original directory-name-only code never surfaced this (an empty path has no `file_name()` to
+return), but reading real manifest *content* would have silently leaked this crate's own
+`Cargo.toml` (name `"mesh-core"`) for any synthetic/filesystem-less path with no real manifest in
+its own ancestry. Fixed by stopping the walk at the empty path, same as the existing depth cap.
+
+A ruthless review pass also flagged that reading manifest content has no size cap in front of it,
+unlike every other file this pipeline touches (`AstGuard`'s 384 KB budget) — `mesh-core` can't
+depend on `mesh-parsers`, which owns that guard, so a local `MAX_MANIFEST_SIZE_BYTES` (64 KB,
+generous for a real manifest) is checked directly before any read. This also bounds the accepted
+(and explicitly not cached — see the field's own doc comment on why) cost of re-reading the same
+small manifest once per source file in its directory. A residual, accepted risk: `serde_json`/
+`toml`'s recursive-descent parsers have no depth guard against adversarially deep nesting, same as
+this project's own `Config::load_from_file` already accepts for the same reason (no practical
+attack surface change from what's already tolerated elsewhere in this codebase).
+
 ## What's NOT measured yet
 
 - Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging

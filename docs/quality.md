@@ -22,8 +22,8 @@ regression gate live.
 | Repo | Golden edges | Precision | Recall | Notes |
 | :--- | :---: | :---: | :---: | :--- |
 | `online-boutique` | 14 | **100%** | **92.9%** | Original P0 baseline; superseded by step 2.1 below. |
-| `otel-demo` | — | — | — | Golden file not yet written (pending). |
-| `bank-of-anthos` | — | — | — | Golden file not yet written (pending); this repo is mostly HTTP/REST internally, not gRPC — its golden file should score `http_routes`, not `grpc_edges`, once step 2.6 lands a comparable extraction for those. |
+| `otel-demo` | 13 | 87.5% | 53.8% | Golden file written 2026-09-25 (see below); real gap found in the same run. |
+| `bank-of-anthos` | 0 (gRPC) | 100% | 100% | Golden file written 2026-09-25 — this repo is genuinely gRPC-free; its `http_routes` ground truth (18 Flask routes) has no `score.py` mode yet (see below). |
 
 **How to reproduce:**
 ```bash
@@ -223,18 +223,62 @@ fingerprint over 13 runs") were re-run after this change and are unaffected, sin
 existing default path changed. No real-repo blast-radius chain in the current corpus is deep
 enough to hand-verify `depth > 1` against ground truth the way `online-boutique`'s gRPC edges
 are — that verification is honestly a synthetic regression test, not a real-repo empirical check;
-flagged for `otel-demo`'s golden file (§ below) since its Kafka checkout → email/fraud-detection
-chain is the corpus's first real multi-hop async blast radius.
+flagged for `otel-demo`'s golden file (§ below) since its Kafka checkout → accounting/
+fraud-detection chain is the corpus's first real multi-hop async blast radius.
+
+## Update (2026-09-25, golden corpus — `otel-demo` and `bank-of-anthos` golden files)
+
+Both remaining corpus repos now have a hand-written `tests/golden/<repo>.expected.yaml`, read
+from their real source exactly as `online-boutique`'s was (see Methodology above) — never from
+mesh-mcp's own output.
+
+- **`otel-demo`**: 13 gRPC edges (frontend → 6 services, checkout → 6, recommendation → 1) plus
+  its Kafka `orders` topic (`checkout` produces, `accounting` and `fraud-detection` consume —
+  the corpus's first real async multi-hop chain, not yet scored by `score.py`). Running
+  `scripts/golden/score.py otel-demo` against it landed **87.5% precision / 53.8% recall**, not
+  the 100%/100% online-boutique gets, and the gap is a genuine, newly-found extraction hole, not
+  a golden-file mistake: all 7 Go/Python edges (`checkout → *`, `recommendation →
+  ProductCatalogService`) matched exactly, but all 6 `frontend → *` edges were missed. Unlike
+  online-boutique (frontend in Go), otel-demo's frontend is TypeScript, calling services via raw
+  `@grpc/grpc-js` client construction (`new AdServiceClient(AD_ADDR,
+  ChannelCredentials.createInsecure())` in `src/frontend/gateways/rpc/*.gateway.ts`) — a pattern
+  `typescript.rs`'s extractor does not recognize; it only detects NestJS's
+  `ClientGrpc.getService<XServiceClient>(...)` idiom. One spurious extra edge
+  (`checkout -> health`, the gRPC health-check service import) also showed up, not filtered as a
+  self/infra edge. Neither is fixed here — this task was writing the golden file and running the
+  existing scorer honestly against it, not extending the TypeScript extractor; both gaps are
+  recorded as new, real findings rather than adjusting the golden file to hide them.
+  - Directory-naming note for future golden files: `score.py` infers a caller's name from its
+    `src/<name>/` path, and otel-demo's directories drop the `service` suffix online-boutique's
+    have (`src/checkout`, not `src/checkoutservice`) — the golden file's `from:` values had to
+    match that real spelling, not the `.proto` service name, for the comparison to line up.
+- **`bank-of-anthos`**: genuinely gRPC-free (`score.py bank-of-anthos` correctly reports a
+  vacuous 100%/100% on 0 golden edges — no gRPC edge is fabricated by the extractor either). Its
+  real ground truth is 18 Flask HTTP routes across its three Python services (`userservice`,
+  `contacts`, `frontend`), written by hand from `@app.route(...)` decorators the same way step
+  2.6's `extract_flask_route` reads them — including `/` and `/home`, which declare no
+  `methods=` kwarg (Flask's own default of GET-only). The repo's other three services
+  (`balancereader`, `ledgerwriter`, `transactionhistory`) are Java/Spring MVC
+  (`@RestController`/`@GetMapping`/...), a different framework step 2.6 does not extract —
+  flagged honestly in the golden file rather than fabricated as Flask routes or silently
+  dropped. No `score.py` mode consumes `http_routes` yet (see below).
 
 ## What's NOT measured yet
 
-- Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging
-  synchronously enough to hand-verify cheaply — `otel-demo`'s golden file should cover this once
-  written).
-- HTTP route extraction (needs `bank-of-anthos`'s golden file plus a comparable `score.py` mode).
-- `analyze_impact_with_depth`'s `depth > 1` traversal against a *real* multi-hop async chain (see
-  step 2.7 above) — verified so far only against a synthetic graph, pending `otel-demo`'s golden
-  file.
+- Kafka/Pub-Sub topic resolution has real ground truth now (`otel-demo`'s `orders` topic, above)
+  but no `score.py` mode reads it yet.
+- HTTP route extraction has real ground truth now (`bank-of-anthos`'s 18 Flask routes, above) but
+  no comparable `score.py` mode exists yet; nor is there ground truth for its three Java/Spring
+  services, a different framework step 2.6 does not extract.
+- The TypeScript gRPC-client-construction gap found above (`new XServiceClient(...)` from
+  `@grpc/grpc-js`, distinct from the already-covered NestJS `getService<XServiceClient>(...)`
+  idiom) — real, unfixed, first observed against `otel-demo`'s frontend.
+- The `checkout -> health` spurious edge found above — the gRPC health-check service import
+  resolving as if it were a real service dependency.
+- `analyze_impact_with_depth`'s `depth > 1` traversal against a *real* multi-hop async chain — the
+  ground truth for one now exists (`otel-demo`'s `orders` topic chain, above), but no
+  `score.py`-style transitive-impact scorer has been run against it yet; verified so far only
+  against the synthetic cycle-detection regression test in step 2.7.
 
 ## Ratchet policy
 

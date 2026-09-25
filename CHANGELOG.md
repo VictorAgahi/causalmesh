@@ -9,6 +9,24 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
+- **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`
+  topic (`checkout` → `accounting`/`fraud-detection`), the corpus's first real async multi-hop
+  chain. Running `scripts/golden/score.py otel-demo` against it: **87.5% precision / 53.8%
+  recall** — a genuine, newly-found gap, not a golden-file error: otel-demo's frontend is
+  TypeScript using raw `@grpc/grpc-js` client construction (`new XServiceClient(...)`), a pattern
+  distinct from the already-covered NestJS `getService<XServiceClient>(...)` idiom and not yet
+  recognized by `typescript.rs`. A spurious `checkout -> health` edge (the gRPC health-check
+  import) was also found. Neither is fixed in this change — documented honestly in
+  `docs/quality.md` as new findings.
+- **`tests/golden/bank-of-anthos.expected.yaml`**: confirmed genuinely gRPC-free
+  (`score.py bank-of-anthos` reports a correct vacuous 100%/100% on 0 golden edges) plus 18
+  hand-verified Flask HTTP routes across its three Python services. Its three Java/Spring MVC
+  services are flagged as out of scope for step 2.6's Flask/FastAPI extraction, not silently
+  represented as Flask routes.
+- No `score.py` mode consumes `topics` or `http_routes` yet — both sections are ground truth
+  recorded ahead of that scorer landing, per `docs/quality.md`'s "What's NOT measured yet".
+
 ### Added (P1 step 2.7 — explicit result-shape controls: `granularity`, `depth`)
 - **`find_dependents` gains `granularity: "symbol" | "package"`** (default: `"symbol"`, unchanged
   behavior). `"package"` collapses results to one entry per distinct `(repo, package)` pair — see

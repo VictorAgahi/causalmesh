@@ -189,13 +189,52 @@ join every declared method; and Flask's legitimate `@app.route(rule='/x')` keywo
 signature despite the node still being tagged `HttpEndpoint` — fixed to also check a `rule=`
 keyword argument when no positional string is present.
 
+## Update (2026-09-25, step 2.7 — explicit result-shape controls: `granularity`, `depth`)
+
+Two MCP tools used to return exactly one shape no matter how the caller wanted to slice the
+question, silently forcing the agent to post-filter a wall of results itself:
+
+- **`find_dependents`** always returned one result per declaring *symbol*. Asking "which
+  services depend on this contract" against a package with a dozen small handler symbols meant
+  wading through a dozen near-duplicate entries to see three distinct services. New
+  `granularity: "package"` collapses the same result set to one entry per distinct `(repo,
+  package)` pair before formatting — a pure post-filter over the existing reverse-dependency
+  query, so `granularity: "symbol"` (the default, and anything unrecognized) is byte-for-byte
+  the prior behavior.
+- **`analyze_impact`** only ever reported the *direct* producers/topics/consumers matching the
+  target substring — a real second-order blast radius (a consumer that itself re-publishes onto
+  another topic) required the caller to notice that and re-query manually. New
+  `analyze_impact_with_depth(target, depth)` walks the real `Produces`/`Consumes` edges the graph
+  already carries, not another substring pass: a transitive consumer's own outbound `Produces`
+  edge is followed to the topic it feeds, and that topic's consumers are pulled in too, up to
+  `depth` hops (clamped to 5). Two `HashSet<NodeId>` visited-sets (topics, nodes) bound the walk
+  against a causal cycle — a saga re-producing onto a topic upstream of it — so the traversal
+  always terminates instead of looping; covered by a regression test with an explicit
+  `topic -> handler -> topic -> handler -> (cycle back to the first topic)` graph, asserting
+  depth 1 matches the pre-existing direct-only result, depth 2 picks up exactly the one new hop,
+  and depth 5 / an over-cap depth of 200 both terminate at the same result as depth 2 (the cycle
+  closes the frontier). `depth` defaults to 1 (`analyze_impact`'s unchanged direct-only
+  behavior), so every existing caller (including the seven `analyze_impact("...")` call sites in
+  the language-parser test suites) is untouched.
+
+Both are additive, opt-in parameters — the golden-corpus (`online-boutique`, 100%/100%) and
+determinism suites (`polyglot-shop`, `volontariapp-fixture`, `determinism` fixture, all still "1
+fingerprint over 13 runs") were re-run after this change and are unaffected, since neither
+existing default path changed. No real-repo blast-radius chain in the current corpus is deep
+enough to hand-verify `depth > 1` against ground truth the way `online-boutique`'s gRPC edges
+are — that verification is honestly a synthetic regression test, not a real-repo empirical check;
+flagged for `otel-demo`'s golden file (§ below) since its Kafka checkout → email/fraud-detection
+chain is the corpus's first real multi-hop async blast radius.
+
 ## What's NOT measured yet
 
 - Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging
   synchronously enough to hand-verify cheaply — `otel-demo`'s golden file should cover this once
   written).
 - HTTP route extraction (needs `bank-of-anthos`'s golden file plus a comparable `score.py` mode).
-- Anything below the service level (`granularity: "package"` vs per-symbol — step 2.7).
+- `analyze_impact_with_depth`'s `depth > 1` traversal against a *real* multi-hop async chain (see
+  step 2.7 above) — verified so far only against a synthetic graph, pending `otel-demo`'s golden
+  file.
 
 ## Ratchet policy
 

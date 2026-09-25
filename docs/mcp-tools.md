@@ -116,7 +116,7 @@ func (h *BillingHandler) ProcessPayment(ctx context.Context, req *pb.PaymentRequ
 ### Tool 2: `find_dependents`
 
 #### Description
-Reverse dependency search across repository and microservice boundaries. Identifies all upstream callers, client classes, and consumer services that depend on a given contract, class, or gRPC method.
+Reverse dependency search across repository and microservice boundaries. Identifies all upstream callers, client classes, and consumer services that depend on a given contract, class, or gRPC method — at symbol granularity by default, or one result per `(repo, package)` with `granularity: "package"`.
 
 **Negative Constraints**: DO NOT USE to search freeform text or method signatures (use smart_search).
 
@@ -129,6 +129,10 @@ Reverse dependency search across repository and microservice boundaries. Identif
     "target": {
       "type": "string",
       "description": "Target contract name (ex: 'UserAuthRequest') or package identifier (ex: '@volontariapp/domain-user') to trace reverse dependencies for."
+    },
+    "granularity": {
+      "type": "string",
+      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol."
     }
   },
   "additionalProperties": false
@@ -197,7 +201,7 @@ Comprehensive end-to-end tracing for gRPC service architectures. Correlates Prot
 ### Tool 4: `analyze_impact`
 
 #### Description
-Maps asynchronous events, Kafka topics, queues, post-processors, and sagas.
+Maps asynchronous events, Kafka topics, queues, post-processors, and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges.
 
 **Negative Constraints**: DO NOT USE for synchronous direct HTTP/gRPC RPC calls (use analyze_grpc).
 
@@ -210,6 +214,10 @@ Maps asynchronous events, Kafka topics, queues, post-processors, and sagas.
     "target": {
       "type": "string",
       "description": "Name of event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga to analyze."
+    },
+    "depth": {
+      "type": "integer",
+      "description": "How many causal hops to traverse past the direct producers/consumers/topics of `target` (default: 1, direct only). Each extra hop follows a real graph edge — a transitive consumer that itself produces onto another topic pulls in that topic's own consumers too — not another text search. Clamped to 5."
     }
   },
   "additionalProperties": false

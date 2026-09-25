@@ -9,6 +9,23 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.7 — explicit result-shape controls: `granularity`, `depth`)
+- **`find_dependents` gains `granularity: "symbol" | "package"`** (default: `"symbol"`, unchanged
+  behavior). `"package"` collapses results to one entry per distinct `(repo, package)` pair — see
+  which *services* depend on a target without a wall of individual caller symbols.
+- **`analyze_impact` gains `depth` (default: 1, clamped to 5)**. New
+  `ContractGraph::analyze_impact_with_depth` performs a real BFS over `Produces`/`Consumes`
+  edges — a transitive consumer that itself produces onto another topic pulls in that topic's own
+  consumers too — with cycle detection via visited-node/visited-topic sets, not another substring
+  pass. `depth <= 1` is byte-for-byte `analyze_impact`'s existing direct-only result.
+- Verified: `cargo test --workspace` (329 passed), `cargo clippy --workspace --all-targets -- -D
+  warnings` (clean), `cargo fmt --all -- --check` (clean), `scripts/golden/score.py
+  online-boutique` (100%/100%, unaffected), `scripts/determinism.sh` on all three fixtures ("1
+  fingerprint over 13 runs" each, unaffected) — both changes are additive/opt-in.
+- Honest limitation: the `depth > 1` traversal is covered by a synthetic regression test (a
+  `topic -> handler -> topic -> handler` chain with a cycle back to the origin topic), not yet
+  against a real multi-hop async chain in the corpus. See `docs/quality.md`.
+
 ### Added (P1 step 2.6 — Flask/FastAPI route path and method)
 - **A Python HTTP route decorator's actual path/method is now surfaced.** `@app.route('/users',
   methods=['POST'])` / `@router.get("/health")` used to be discarded entirely — only the Python

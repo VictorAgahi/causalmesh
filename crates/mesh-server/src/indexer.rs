@@ -903,10 +903,8 @@ impl WorkspaceIndexer {
             patterns,
             doc_template,
             spring,
-            extract_cfg,
             toggles,
-            cache,
-            config_fingerprint,
+            ..
         } = *cfg;
         let metadata = std::fs::metadata(path).map_err(|_| RejectKind::ReadError)?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
@@ -966,10 +964,8 @@ impl WorkspaceIndexer {
                         path,
                         content,
                         repo_id,
-                        extract_cfg,
                         &frag.signature.content_hash,
-                        cache,
-                        config_fingerprint,
+                        cfg,
                     );
                     frag.code = code;
                     frag.cache_write = cache_write;
@@ -981,10 +977,8 @@ impl WorkspaceIndexer {
                         path,
                         content,
                         repo_id,
-                        extract_cfg,
                         &frag.signature.content_hash,
-                        cache,
-                        config_fingerprint,
+                        cfg,
                     );
                     frag.code = code;
                     frag.cache_write = cache_write;
@@ -1009,23 +1003,22 @@ impl WorkspaceIndexer {
     /// (`code.parse_failed`, retried by the caller — see `run_scan_pass`'s doc comment; caching
     /// a failed parse would wrongly persist "no facts" past the retry), serializes the result
     /// for `run_scan_pass` to batch-write once the whole parallel pass is done.
-    #[allow(clippy::too_many_arguments)]
     fn extract_with_cache(
         path: &Path,
         content: &str,
         repo_id: RepoId,
-        extract_cfg: &ExtractConfig,
         content_hash: &[u8; 32],
-        cache: Option<&PersistentIndexCache>,
-        config_fingerprint: [u8; 32],
+        cfg: &ScanConfig,
     ) -> (FileIndex, Option<CacheEntry>) {
-        let Some(cache) = cache else {
+        let extract_cfg = cfg.extract_cfg;
+        let Some(cache) = cfg.cache else {
             return (
                 PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg),
                 None,
             );
         };
-        let key = PersistentIndexCache::key_for(path, content_hash, repo_id, &config_fingerprint);
+        let key =
+            PersistentIndexCache::key_for(path, content_hash, repo_id, &cfg.config_fingerprint);
         if let Some(bytes) = cache.get(&key) {
             if let Ok(cached) = serde_json::from_slice::<FileIndex>(&bytes) {
                 return (cached, None);
@@ -1145,6 +1138,47 @@ mod tests {
         assert_eq!(view.contract_graph.node_count(), 3);
         assert!(view.contract_graph.search_symbols("B", None).is_empty());
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
+    }
+
+    /// A cache-hit `build_snapshot` must produce byte-identical results to a cache-miss one:
+    /// this is the whole safety condition step 3.2 relies on (`fold`'s `NodeId` assignment
+    /// depends only on crawl order, never on whether a file's `FileIndex` came from a fresh
+    /// parse or a deserialized cache entry). Guards against a future change to `FileIndex`'s
+    /// serde shape, or to `extract_with_cache`'s plumbing, silently making a cache hit diverge
+    /// from a fresh parse.
+    #[test]
+    fn warm_cache_produces_identical_snapshot_to_cold_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("b.proto"),
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+        std::fs::write(root.join("doc.md"), "# Title\nsome text").expect("write md");
+
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+
+        let cold = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(cold.contract_graph.node_count(), 4);
+        assert_eq!(cold.doc_index.section_count(), 1);
+
+        // Second build over the exact same files/config, now served entirely from the cache
+        // this same `PersistentIndexCache` instance just populated.
+        let warm = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+
+        assert_eq!(cold.fingerprint(), warm.fingerprint());
+        assert_eq!(warm.contract_graph.node_count(), 4);
+        assert_eq!(warm.doc_index.section_count(), 1);
     }
 
     /// The path-driven `reload_paths` must produce the exact same result as the

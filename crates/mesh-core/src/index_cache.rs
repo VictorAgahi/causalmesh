@@ -54,6 +54,13 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Content-hash-keyed cache of one blob per (path, content hash, repo, config) tuple.
+///
+/// `conn` is a single `Mutex<Connection>`, so every `get()` from every parallel scan thread
+/// serializes on one lock — deliberately not a connection pool. A read this cheap (one indexed
+/// lookup) is still far faster serialized than a tree-sitter parse run in parallel, which is
+/// the comparison that matters for step 3.2's goal; sharding reads across a connection pool
+/// would only be worth the added complexity if lock contention itself became the bottleneck,
+/// which the measured boot-time wins (`docs/quality.md`) show it currently is not.
 pub struct PersistentIndexCache {
     conn: Mutex<Connection>,
 }
@@ -71,7 +78,12 @@ impl PersistentIndexCache {
     }
 
     /// Opens (creating if absent) the cache database at `path`, or `default_db_path()` when
-    /// `None`. Mirrors `AuditLogger::new`'s WAL/permissions setup (Commandment 7).
+    /// `None`. Deliberately duplicates (rather than shares) `AuditLogger::new`'s WAL/permissions
+    /// setup (Commandment 7): the two are independent databases with independent lifecycles —
+    /// this one is a disposable performance cache safe to delete any time, the audit log is a
+    /// cryptographically chained record that must never be — and factoring the setup into a
+    /// shared helper now would couple their futures (e.g. a WAL-corruption workaround needed by
+    /// one but not the other) for a few dozen lines saved today.
     pub fn open(path: Option<PathBuf>) -> Result<Self, IndexCacheError> {
         let db_path = path.unwrap_or_else(Self::default_db_path);
 
@@ -150,13 +162,25 @@ impl PersistentIndexCache {
 
     pub fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row(
-            "SELECT payload FROM file_index_cache WHERE cache_key = ?1",
-            params![key.as_slice()],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap_or(None)
+        match conn
+            .query_row(
+                "SELECT payload FROM file_index_cache WHERE cache_key = ?1",
+                params![key.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(payload) => payload,
+            // A genuine SQLite error (locked past `busy_timeout`, corrupted db, ...) is not
+            // the same as a normal cache miss: `.optional()` already turned "no rows" into
+            // `Ok(None)`, so anything reaching here is worth surfacing — silently returning
+            // `None` on every lookup forever, indistinguishable from a merely cold cache,
+            // would otherwise hide a real regression (see `put_batch`, which already logs).
+            Err(e) => {
+                tracing::warn!(target: "mesh::index_cache", "Cache lookup failed: {e}");
+                None
+            }
+        }
     }
 
     /// One transaction for every cache miss this scan produced. Called once after a full

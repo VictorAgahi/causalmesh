@@ -15,7 +15,7 @@ use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
 };
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Crawl depth used for every full workspace scan.
@@ -408,11 +408,13 @@ impl WorkspaceIndexer {
     /// that root's exclude patterns/`.gitignore` via
     /// `FilesystemCrawler::is_path_excluded`; a path that check can't cheaply and
     /// correctly resolve (see that function's doc comment — chiefly a nested
-    /// `.gitignore` between the root and the file) falls back to a full
+    /// ignore file between the root and the file) falls back to a full
     /// `reload()` rather than risk a wrong answer. A `.git/HEAD` or `.git/refs/*`
-    /// change (checkout, rebase, branch switch) can likewise alter an arbitrary
-    /// number of tracked files without each one necessarily producing its own
-    /// watcher event, so that also falls back to `reload()`.
+    /// change (checkout, rebase, branch switch), or a path whose parent
+    /// directory is *also* gone (a `rm -rf` on a directory can coalesce into
+    /// fewer watcher events than one per contained file), can likewise alter an
+    /// arbitrary number of tracked files without each one necessarily producing
+    /// its own watcher event, so those also fall back to `reload()`.
     pub fn reload_paths(state: &AppState, changed_paths: &[PathBuf]) {
         if changed_paths.is_empty() {
             return;
@@ -428,37 +430,80 @@ impl WorkspaceIndexer {
         let config = &state.config;
         let roots = &state.allowed_roots;
 
-        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut candidates: Vec<(RepoId, PathBuf)> = Vec::new();
         let mut deleted: Vec<PathBuf> = Vec::new();
+        // Compiling an `ExcludeMatcher` (and, inside `is_path_excluded`, parsing
+        // a root's ignore files) is not free; `schedule_reload` deliberately
+        // coalesces a whole debounce burst into one call here, so a batch of
+        // many paths under the same root must not redo that work per path.
+        let mut matcher_cache: HashMap<RepoId, ExcludeMatcher> = HashMap::new();
 
         for raw in changed_paths {
-            if !seen.insert(raw.as_path()) {
+            // Canonicalize before resolving a root, so a symlink is matched (and,
+            // below, indexed) by where it actually points, not by the raw watched
+            // path — a symlink created inside a watched root pointing outside
+            // every allowed root must never be followed into indexing its
+            // target's content (RFC-001 Commandment 4: never follow symlinks
+            // out of the sandbox). A path that no longer exists can't be
+            // canonicalized; a deletion only needs to identify *that* a change
+            // happened under some watched root, never a symlink target, so it
+            // falls back to matching the raw reported path.
+            let canonical = dunce::canonicalize(raw);
+            let match_path: &Path = canonical.as_deref().unwrap_or(raw.as_path());
+            if !seen.insert(match_path.to_path_buf()) {
                 continue;
             }
-            let Some((repo_id, root)) = Self::most_specific_root(raw, roots) else {
-                continue; // outside every allowed root — nothing to index
+
+            let Some((repo_id, root)) = Self::most_specific_root(match_path, roots) else {
+                tracing::debug!(
+                    target: "mesh::watcher",
+                    "Targeted reload: {} (resolved: {}) is outside every allowed root, dropping.",
+                    raw.display(),
+                    match_path.display()
+                );
+                continue;
             };
-            let exclusions =
-                Self::exclude_patterns_for_root(&config.workspace.exclude_patterns, roots, root);
-            let matcher = ExcludeMatcher::compile(&exclusions);
-            match FilesystemCrawler::is_path_excluded(root, raw, &matcher) {
+            let matcher = matcher_cache.entry(repo_id).or_insert_with(|| {
+                let exclusions = Self::exclude_patterns_for_root(
+                    &config.workspace.exclude_patterns,
+                    roots,
+                    root,
+                );
+                ExcludeMatcher::compile(&exclusions)
+            });
+            match FilesystemCrawler::is_path_excluded(root, match_path, matcher) {
                 Some(true) => continue,
                 None => {
                     tracing::debug!(
                         target: "mesh::watcher",
                         "Targeted reload: could not cheaply resolve exclusion for {}, falling back to full reload.",
-                        raw.display()
+                        match_path.display()
                     );
                     return Self::reload(state);
                 }
                 Some(false) => {}
             }
-            if std::fs::metadata(raw).is_ok() {
-                candidates.push((repo_id, raw.clone()));
-            } else {
-                deleted.push(raw.clone());
+            if canonical.is_ok() {
+                candidates.push((repo_id, match_path.to_path_buf()));
+                continue;
             }
+            // `raw` doesn't exist (canonicalize failed above). If its parent
+            // directory is *also* gone, a whole subtree likely vanished in one
+            // `rm -rf` and sibling files under it may never have reported their
+            // own deletion event — a plain per-path removal here would leave
+            // their VFS/graph entries stale until an unrelated future change
+            // happened to touch the same path again. Fall back to a full
+            // reload's crawl-vs-VFS set-difference sweep instead of guessing.
+            if raw.parent().is_some_and(|p| !p.exists()) {
+                tracing::debug!(
+                    target: "mesh::watcher",
+                    "Targeted reload: {}'s parent directory is also gone, falling back to full reload.",
+                    raw.display()
+                );
+                return Self::reload(state);
+            }
+            deleted.push(raw.clone());
         }
 
         if candidates.is_empty() && deleted.is_empty() {
@@ -531,7 +576,7 @@ impl WorkspaceIndexer {
 
         // Candidates: new or stat-changed. The metadata call is parallelized over
         // Rayon threads to maximize OS kernel page-cache stat speed.
-        let candidates: Vec<(RepoId, PathBuf)> = files
+        let mut candidates: Vec<(RepoId, PathBuf)> = files
             .par_iter()
             .filter(|(_, p)| match std::fs::metadata(p) {
                 Ok(m) => !vfs.is_unchanged_fast(p, &m),
@@ -539,6 +584,25 @@ impl WorkspaceIndexer {
             })
             .map(|(r, p)| (*r, p.clone()))
             .collect();
+
+        // `reload_paths` classifies a path as `deleted` from a `stat` taken
+        // before `reload_lock` was acquired (its own caller can't hold the lock
+        // and still call `reload()` as a fallback without deadlocking — see that
+        // function's own comment). A file briefly absent in that window (an
+        // editor's atomic save, or a fast delete-then-recreate) can legitimately
+        // exist again by now; re-verified here, one last time, while `vfs` is
+        // still locked. One that exists again is treated as an ordinary
+        // candidate instead of a deletion — removing it from the graph would be
+        // wrong, and since it wouldn't be in `candidates` either, permanently
+        // wrong until some unrelated future change happened to touch it again.
+        let (deleted, resurrected): (Vec<PathBuf>, Vec<PathBuf>) = deleted
+            .into_iter()
+            .partition(|p| std::fs::metadata(p).is_err());
+        for p in resurrected {
+            if let Some((repo_id, _)) = Self::most_specific_root(&p, roots) {
+                candidates.push((repo_id, p));
+            }
+        }
 
         if candidates.is_empty() && deleted.is_empty() {
             tracing::debug!(target: "mesh::watcher", "{label}: 0 files changed, skipping reload.");
@@ -1041,6 +1105,50 @@ mod tests {
         assert_eq!(view.contract_graph.node_count(), 2, "service + 1 rpc");
     }
 
+    /// `reload_paths` stats a path *before* `reload_lock` is acquired (it must
+    /// return, not block, before falling back to `reload()`). If the file is
+    /// briefly absent at that moment (an editor's atomic save, or a fast
+    /// delete-then-recreate) but exists again by the time `apply_incremental`
+    /// actually runs under the lock, it must be re-indexed, not removed from
+    /// the graph and left stale.
+    #[test]
+    fn apply_incremental_reindexes_a_path_that_resurrected_before_the_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let a_path = root.join("a.proto");
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 2);
+
+        // Simulate the race directly: `apply_incremental` is handed `a_path` as
+        // already-deleted (as `reload_paths` would if its earlier stat had
+        // raced a delete), but the file is actually back on disk by the time
+        // this runs — exactly as it would be after a real resurrection.
+        WorkspaceIndexer::apply_incremental(&state, "Test", Vec::new(), vec![a_path]);
+
+        let view = state.snapshot();
+        assert_eq!(
+            view.contract_graph.node_count(),
+            2,
+            "a resurrected path must be re-indexed, not silently dropped from the graph"
+        );
+    }
+
     /// `reload_paths` must not index a path that a real crawl would have pruned
     /// via `exclude_patterns` — the same exclusion `crawl_all` applies, checked
     /// here for one explicit path instead of by walking the tree.
@@ -1094,6 +1202,85 @@ mod tests {
         // no-oping on an event set with nothing indexable in it.
         WorkspaceIndexer::reload_paths(&state, &[root.join(".git").join("HEAD")]);
         assert_eq!(state.snapshot().contract_graph.node_count(), 2);
+    }
+
+    /// A symlink created inside a watched root pointing at a file *outside*
+    /// every allowed root must never have its target indexed — reload_paths
+    /// canonicalizes before resolving a root specifically so this can't happen
+    /// (RFC-001 Commandment 4: never follow a symlink out of the sandbox).
+    #[cfg(unix)]
+    #[test]
+    fn reload_paths_never_indexes_a_symlink_escaping_every_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        let outside = base.join("outside.proto");
+        std::fs::write(
+            &outside,
+            "syntax = \"proto3\"; package secret; service Leaked { rpc X (R) returns (S); }",
+        )
+        .expect("write outside");
+        let link = root.join("leak.proto");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        WorkspaceIndexer::reload_paths(&state, &[link]);
+        assert_eq!(
+            state.snapshot().contract_graph.node_count(),
+            0,
+            "a symlink resolving outside every allowed root must never be indexed"
+        );
+    }
+
+    /// A directory-level delete (`rm -rf service/`) can coalesce into fewer
+    /// watcher events than one per contained file. `reload_paths` detects this
+    /// via the deleted path's parent also being gone and falls back to a full
+    /// reload, which correctly sweeps every now-missing tracked file — not just
+    /// the one path the watcher happened to report.
+    #[test]
+    fn reload_paths_falls_back_to_full_reload_when_parent_directory_is_also_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("service")).expect("mkdir");
+        std::fs::write(
+            root.join("service/a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("service/b.proto"),
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 4);
+
+        // The whole directory is removed, but only `a.proto`'s deletion is in
+        // the reported event set — `b.proto`'s own event was "lost" (exactly
+        // what a coalesced directory-level delete can look like).
+        std::fs::remove_dir_all(root.join("service")).expect("rm -rf service");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("service/a.proto")]);
+
+        let view = state.snapshot();
+        assert_eq!(
+            view.contract_graph.node_count(),
+            0,
+            "the full-reload fallback must clean up b.proto's nodes too, not just a.proto's"
+        );
     }
 
     /// `PropertyRegistry` provenance: deleting one of two properties files must remove

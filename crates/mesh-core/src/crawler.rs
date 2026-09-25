@@ -154,42 +154,75 @@ impl FilesystemCrawler {
     /// reuse a full crawl's exact exclusion decision for one path in O(path depth)
     /// stat calls instead of an O(repo size) walk.
     ///
-    /// Only `root`'s own top-level `.gitignore` is honored. If any directory
-    /// strictly between `root` and `path` carries its *own* nested `.gitignore`,
-    /// this can't cheaply and correctly reproduce `ignore::WalkBuilder`'s
-    /// per-directory gitignore stacking (each nested file's patterns are scoped to
-    /// its own subtree, composing with every ancestor's) — rather than risk a
-    /// false "not excluded" for a file a full crawl would have pruned, this
-    /// returns `None` so the caller falls back to a full crawl. Nested `.gitignore`
-    /// files are real but comparatively rare next to a single root-level one; this
-    /// is a deliberate, documented scope limit, not a silent gap.
+    /// Only `root`'s own top-level `.gitignore`/`.ignore`/`.git/info/exclude` are
+    /// honored. If any directory strictly between `root` and `path` carries its
+    /// *own* nested `.gitignore` or `.ignore`, this can't cheaply and correctly
+    /// reproduce `ignore::WalkBuilder`'s per-directory gitignore stacking (each
+    /// nested file's patterns are scoped to its own subtree, composing with every
+    /// ancestor's) — rather than risk a false "not excluded" for a file a full
+    /// crawl would have pruned, this returns `None` so the caller falls back to a
+    /// full crawl. Nested ignore files are real but comparatively rare next to a
+    /// single root-level one; this is a deliberate, documented scope limit, not a
+    /// silent gap. A user's *global* `core.excludesFile` (outside this repo
+    /// entirely) is not consulted at all — detecting its configured path would
+    /// mean reading git config, which this deliberately does not attempt; a path
+    /// excluded only by a global excludesfile is a known, narrower gap than the
+    /// nested-ignore-file fallback above (no signal this function can cheaply
+    /// check for forces a fallback for it).
     pub fn is_path_excluded(root: &Path, path: &Path, matcher: &ExcludeMatcher) -> Option<bool> {
         let rel = path.strip_prefix(root).ok()?;
         if matcher.is_excluded_with_root(rel, Some(root)) {
             return Some(true);
         }
+        // `path == root` (e.g. a coalesced watcher event landing on the root
+        // directory itself) has no ancestor strictly between it and `root` to
+        // walk — and no parent to start that walk from without leaving `root`.
+        if rel.as_os_str().is_empty() {
+            return Some(false);
+        }
 
         let mut dir = path.parent()?.to_path_buf();
         while dir != root {
-            if dir.join(".gitignore").is_file() {
+            if !dir.starts_with(root) {
+                // Walked off `root` without matching it by value — `path` wasn't
+                // really a descendant despite `strip_prefix` succeeding (e.g. a
+                // `..`-relative or otherwise unnormalized input path). Bail out
+                // rather than stat directories outside the workspace jail.
+                return None;
+            }
+            if dir.join(".gitignore").is_file() || dir.join(".ignore").is_file() {
                 return None;
             }
             if !dir.pop() {
-                // Walked off `root` without matching it by value — `path` wasn't
-                // really a descendant despite `strip_prefix` succeeding (e.g. a
-                // `..`-relative or otherwise unnormalized input path).
                 return None;
             }
         }
 
-        let gitignore_path = root.join(".gitignore");
-        if !gitignore_path.is_file() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let mut had_source = false;
+        for name in [".gitignore", ".ignore"] {
+            let p = root.join(name);
+            if p.is_file() {
+                if builder.add(&p).is_some() {
+                    return None; // unparseable ignore file — don't guess
+                }
+                had_source = true;
+            }
+        }
+        let git_exclude = root.join(".git").join("info").join("exclude");
+        if git_exclude.is_file() {
+            if builder.add(&git_exclude).is_some() {
+                return None;
+            }
+            had_source = true;
+        }
+        if !had_source {
             return Some(false);
         }
-        let (gitignore, err) = ignore::gitignore::Gitignore::new(&gitignore_path);
-        if err.is_some() {
-            return None;
-        }
+        let gitignore = match builder.build() {
+            Ok(gi) => gi,
+            Err(_) => return None,
+        };
         Some(gitignore.matched(path, path.is_dir()).is_ignore())
     }
 
@@ -523,6 +556,51 @@ mod tests {
             FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
             None,
             "a nested .gitignore between root and the file must force a fall back, not a false negative"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_root_ignore_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::write(root.join(".ignore"), "*.local.json\n").expect("write .ignore");
+        let path = root.join("config.local.json");
+        std::fs::write(&path, "{}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "root .ignore pattern must be honored, matching ignore::WalkBuilder's default ignore(true)"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_git_info_exclude() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join(".git/info")).expect("mkdir");
+        std::fs::write(root.join(".git/info/exclude"), "*.scratch\n").expect("write");
+        let path = root.join("notes.scratch");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "a repo-local .git/info/exclude pattern must be honored"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_root_itself_is_not_excluded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &root, &matcher),
+            Some(false),
+            "path == root must short-circuit instead of walking a parent outside root"
         );
     }
 }

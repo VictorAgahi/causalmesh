@@ -48,6 +48,44 @@ Plan 3 (P2): scale. Step 3.1 — real incremental reload, driven by the watcher'
   would mean reproducing `ignore::WalkBuilder`'s directory-by-directory gitignore stack for a
   single path, which this step deliberately did not attempt rather than risk a subtly wrong
   exclusion decision.
+- Hardened via ruthless review — seven real findings, all fixed:
+  - **Sandbox escape via symlink** (Commandment 4): `reload_paths` used to check
+    `std::fs::metadata(raw).is_ok()` on the *raw* watched path, which follows symlinks — a symlink
+    created inside a watched root pointing outside every allowed root would have its *target's*
+    content read and indexed. Fixed: every path is `dunce::canonicalize`d before root-resolution
+    and indexing now use the *canonical* path; one that resolves outside every allowed root is
+    dropped (logged), never indexed.
+  - **Silent, unlogged path drop on a root-match miss**: an uncanonicalized watched path (e.g.
+    macOS FSEvents reporting `/tmp/...` against a `/private/tmp/...`-canonicalized allowed root)
+    could fail `most_specific_root` and be dropped with zero log output and no fallback — silently
+    defeating the whole reload for that path. The same canonicalize-before-matching fix above
+    closes this (canonical paths compare equal to the canonicalized `allowed_roots`), plus a debug
+    log line on every drop.
+  - **`is_path_excluded` only checked root-level `.gitignore`**, missing `.ignore` files and
+    `.git/info/exclude` that `ignore::WalkBuilder` also honors by default. Fixed: both are now
+    folded into the same `GitignoreBuilder`, and a nested `.ignore` (not just `.gitignore`) also
+    forces the documented fallback. A user's *global* `core.excludesFile` remains an explicit,
+    documented gap (detecting it would mean reading git config).
+  - **TOCTOU on a "deleted" path**: `reload_paths` stats a path before `reload_lock` is acquired
+    (it must return, not block, before its fallback-to-`reload()` branches); a file briefly absent
+    in that window (an editor's atomic save, a fast delete-then-recreate) would be purged from the
+    graph and never re-added. Fixed: `apply_incremental` re-verifies every `deleted` path
+    immediately before acting on it, re-indexing one that resurrected instead of dropping it.
+  - **Coalesced directory-level delete**: `rm -rf a_service/` can produce fewer watcher events
+    than one per contained file; `reload_paths` only ever removed the specific paths reported,
+    leaving siblings' graph nodes stale. Fixed: a deleted path whose parent directory is *also*
+    gone now falls back to a full `reload()`'s crawl-vs-VFS sweep instead of guessing.
+  - **Matcher/gitignore recompiled per path**: `schedule_reload` deliberately coalesces a whole
+    debounce burst into one `reload_paths` call, but the exclude matcher (and, inside
+    `is_path_excluded`, the parsed ignore files) were rebuilt from scratch for every path in that
+    batch. Fixed: cached per root for the duration of one call.
+  - **`is_path_excluded`'s nested-ignore-file walk could stat directories above `root`** for an
+    unnormalized or non-descendant path (or `path == root` itself), reading outside the intended
+    scope. Fixed: an explicit `path == root` short-circuit, plus a `starts_with(root)` guard on
+    every step of the ancestor walk.
+  - Verified again after all seven fixes: `cargo test --workspace` (347 passed, +6 more:
+    symlink-escape, parent-directory-gone fallback, TOCTOU resurrection, root-level `.ignore`,
+    `.git/info/exclude`, and `path == root` cases), clippy/fmt clean, golden/determinism unaffected.
 
 ### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
 - **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`

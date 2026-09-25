@@ -3,7 +3,7 @@ use crate::guard::AstGuard;
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
 pub struct ProtoExtractor;
 
@@ -15,6 +15,11 @@ impl ProtoExtractor {
 
     /// Extracts with configurable RPC method projection:
     /// `canonical_fqcn_projection = true` yields `Service.Method`, `false` yields bare method name.
+    /// Test/ad-hoc entry point: parses `content` itself, at the query-time budget.
+    /// Production indexing goes through [`Self::extract_with_parser`] via
+    /// `PolyglotIndexer`, which parses once with `AstGuard::parse_with` at the (much
+    /// larger) indexing budget, so a parse failure is visible instead of silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
     pub fn extract_with_config(
         file_path: &Path,
         content: &str,
@@ -22,32 +27,32 @@ impl ProtoExtractor {
         canonical_fqcn_projection: bool,
     ) -> Vec<ContractNode> {
         AstGuard::with_parser(LanguageKind::Protobuf, |parser| {
-            Self::extract_with_parser(
-                file_path,
-                content,
-                repo_id,
-                canonical_fqcn_projection,
-                parser,
-            )
+            parser
+                .parse(content, None)
+                .map(|tree| {
+                    Self::extract_with_parser(
+                        file_path,
+                        content,
+                        repo_id,
+                        canonical_fqcn_projection,
+                        &tree,
+                    )
+                })
+                .unwrap_or_default()
         })
         .unwrap_or_default()
     }
 
-    /// Extracts protobuf contract nodes using an existing tree-sitter parser instance.
+    /// Extracts protobuf contract nodes from an already-parsed tree.
     pub fn extract_with_parser(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         canonical_fqcn_projection: bool,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
-
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return nodes,
-        };
 
         let source = content.as_bytes();
         let root = tree.root_node();

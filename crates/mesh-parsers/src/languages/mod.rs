@@ -16,7 +16,7 @@ pub mod typescript;
 pub use ts_config::TsConfigResolver;
 
 use crate::decapitate::LanguageKind;
-use crate::guard::AstGuard;
+use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
     CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, NodeKind,
     PatternKind, RepoId,
@@ -164,6 +164,14 @@ pub struct FileIndex {
     pub consumers: Vec<(usize, CompactStr)>,
     /// (local node index, target rpc)
     pub rpc_calls: Vec<(usize, CompactStr)>,
+    /// Set when this file's tree-sitter parse itself failed or exceeded its budget
+    /// (`AstGuard::ParseOutcome::ParseFailed`) — as opposed to `nodes` legitimately
+    /// being empty (a blank file, one with no top-level declarations, ...). Callers
+    /// must not treat this file as "indexed with zero facts": `WorkspaceIndexer` gives
+    /// it one sequential retry outside the contended parallel pool on a full build,
+    /// and on an incremental reload keeps its last known-good facts and retries on the
+    /// next change, rather than wiping them (idempotence invariant I6).
+    pub parse_failed: bool,
 }
 
 impl FileIndex {
@@ -184,6 +192,7 @@ impl FileIndex {
             .extend(other.consumers.into_iter().map(|(i, t)| (i + offset, t)));
         self.rpc_calls
             .extend(other.rpc_calls.into_iter().map(|(i, t)| (i + offset, t)));
+        self.parse_failed |= other.parse_failed;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -286,16 +295,39 @@ impl PolyglotIndexer {
         let lang_kind = LanguageKind::from_path(&path_str);
         let mut out = FileIndex::default();
 
+        // Parses `content` once for `lang_kind` at the indexing budget
+        // (`AstGuard::INDEX_PARSE_TIMEOUT_MICROS`) and marks `out.parse_failed` on a
+        // real failure — as opposed to `AstGuard::with_parser`'s bare `Option`, which
+        // made "the parse failed" and "this language has no grammar" indistinguishable
+        // from "it parsed and produced nothing" at every one of these call sites.
+        macro_rules! parsed {
+            ($f:expr) => {
+                match AstGuard::parse_with(
+                    lang_kind,
+                    content,
+                    AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
+                    $f,
+                ) {
+                    ParseOutcome::Parsed(r) => Some(r),
+                    ParseOutcome::ParseFailed => {
+                        out.parse_failed = true;
+                        None
+                    }
+                    ParseOutcome::NoGrammar => None,
+                }
+            };
+        }
+
         match lang_kind {
             LanguageKind::Protobuf => {
                 if cfg.allows_proto_path(&path_str) {
-                    if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
+                    if let Some(nodes) = parsed!(|tree| {
                         proto::ProtoExtractor::extract_with_parser(
                             file_path,
                             content,
                             repo_id,
                             cfg.canonical_fqcn_projection,
-                            parser,
+                            tree,
                         )
                     }) {
                         out.nodes = nodes;
@@ -304,11 +336,9 @@ impl PolyglotIndexer {
             }
 
             LanguageKind::Java => {
-                if let Some((nodes, dependencies, producers)) =
-                    AstGuard::with_parser(lang_kind, |parser| {
-                        java::JavaExtractor::extract_relations(file_path, content, repo_id, parser)
-                    })
-                {
+                if let Some((nodes, dependencies, producers)) = parsed!(|tree| {
+                    java::JavaExtractor::extract_relations(file_path, content, repo_id, tree)
+                }) {
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
@@ -320,8 +350,8 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Go => {
-                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
-                    go::GoExtractor::extract_with_relations(file_path, content, repo_id, parser)
+                if let Some((nodes, relations)) = parsed!(|tree| {
+                    go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree)
                 }) {
                     out.nodes = nodes;
                     out.dependencies = relations.dependencies;
@@ -331,9 +361,9 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Python => {
-                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                if let Some((nodes, relations)) = parsed!(|tree| {
                     python::PythonExtractor::extract_with_relations(
-                        file_path, content, repo_id, parser,
+                        file_path, content, repo_id, tree,
                     )
                 }) {
                     out.nodes = nodes;
@@ -345,12 +375,12 @@ impl PolyglotIndexer {
             LanguageKind::TypeScript => {
                 let mut imports = Vec::new();
                 let mut rpc_calls = Vec::new();
-                let nodes = AstGuard::with_parser(lang_kind, |parser| {
+                let nodes = parsed!(|tree| {
                     typescript::TypeScriptExtractor::extract_with_config(
                         file_path,
                         content,
                         repo_id,
-                        parser,
+                        tree,
                         &mut imports,
                         &mut rpc_calls,
                         &cfg.controller_annotations,
@@ -383,23 +413,23 @@ impl PolyglotIndexer {
                 out.nodes = nodes;
             }
             LanguageKind::Rust => {
-                if let Some(index) = AstGuard::with_parser(lang_kind, |parser| {
-                    rust_lang::RustExtractor::extract_index(file_path, content, repo_id, parser)
+                if let Some(index) = parsed!(|tree| {
+                    rust_lang::RustExtractor::extract_index(file_path, content, repo_id, tree)
                 }) {
                     out.merge(index);
                 }
             }
             LanguageKind::Cpp => {
-                if let Some(index) = AstGuard::with_parser(lang_kind, |parser| {
-                    cpp::CppExtractor::extract_file_index(file_path, content, repo_id, parser)
+                if let Some(index) = parsed!(|tree| {
+                    cpp::CppExtractor::extract_file_index(file_path, content, repo_id, tree)
                 }) {
                     out.merge(index);
                 }
             }
             LanguageKind::Kotlin => {
-                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                if let Some((nodes, relations)) = parsed!(|tree| {
                     kotlin::KotlinExtractor::extract_with_relations(
-                        file_path, content, repo_id, parser,
+                        file_path, content, repo_id, tree,
                     )
                 }) {
                     for (i, node) in nodes.iter().enumerate() {
@@ -417,9 +447,9 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::CSharp => {
-                if let Some((nodes, relations)) = AstGuard::with_parser(lang_kind, |parser| {
+                if let Some((nodes, relations)) = parsed!(|tree| {
                     csharp::CSharpExtractor::extract_with_relations(
-                        file_path, content, repo_id, parser,
+                        file_path, content, repo_id, tree,
                     )
                 }) {
                     for (i, topic) in relations.producers {
@@ -432,29 +462,29 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Ruby => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    ruby::RubyExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(nodes) = parsed!(|tree| {
+                    ruby::RubyExtractor::extract(file_path, content, repo_id, tree)
                 }) {
                     out.nodes = nodes;
                 }
             }
             LanguageKind::Php => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    php::PhpExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(nodes) = parsed!(|tree| {
+                    php::PhpExtractor::extract(file_path, content, repo_id, tree)
                 }) {
                     out.nodes = nodes;
                 }
             }
             LanguageKind::Swift => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    swift::SwiftExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(nodes) = parsed!(|tree| {
+                    swift::SwiftExtractor::extract(file_path, content, repo_id, tree)
                 }) {
                     out.nodes = nodes;
                 }
             }
             LanguageKind::Scala => {
-                if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-                    scala::ScalaExtractor::extract(file_path, content, repo_id, parser)
+                if let Some(nodes) = parsed!(|tree| {
+                    scala::ScalaExtractor::extract(file_path, content, repo_id, tree)
                 }) {
                     out.nodes = nodes;
                 }

@@ -60,6 +60,13 @@ pub struct ContractGraph {
 }
 
 impl ContractGraph {
+    /// Hard ceiling on `analyze_impact_with_depth`'s hop count. Bounds the BFS
+    /// walk independent of cycle detection — a caller passing an inflated depth
+    /// on a very connected mesh should not turn "impact analysis" into "flood
+    /// the payload budget", mirroring the other bounded-traversal caps in this
+    /// crate (AST nesting depth, query cursor step limit).
+    const MAX_IMPACT_DEPTH: usize = 5;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1125,6 +1132,87 @@ impl ContractGraph {
         }
     }
 
+    /// Same causal blast-radius report as [`Self::analyze_impact`], extended with
+    /// real graph traversal (BFS over `Produces`/`Consumes` edges, not another
+    /// substring pass) for every hop past the first: a transitive consumer that
+    /// itself produces onto another topic pulls in *that* topic's consumers too,
+    /// up to `depth` hops. `depth <= 1` is exactly `analyze_impact`'s direct-only
+    /// result, unchanged.
+    ///
+    /// `visited_topics`/`visited_nodes` bound the walk against cycles (a saga that
+    /// re-produces onto a topic upstream of it) — each node and topic is expanded
+    /// at most once, so the traversal always terminates even on a graph with a
+    /// causal loop, matching the cycle-detection requirement for bounded C-FFI/AST
+    /// walks elsewhere in this crate (see `AstGuard`).
+    pub fn analyze_impact_with_depth(&self, target: &str, depth: usize) -> ImpactFlow<'_> {
+        let mut flow = self.analyze_impact(target);
+        let depth = depth.clamp(1, Self::MAX_IMPACT_DEPTH);
+        if depth <= 1 {
+            return flow;
+        }
+
+        let mut visited_topics: HashSet<NodeId> = flow.topics.iter().map(|n| n.id).collect();
+        let mut visited_nodes: HashSet<NodeId> = flow
+            .downstream_consumers
+            .iter()
+            .chain(flow.related_sagas.iter())
+            .map(|n| n.id)
+            .collect();
+        let mut frontier: HashSet<NodeId> = visited_nodes.clone();
+
+        for _hop in 2..=depth {
+            if frontier.is_empty() {
+                break;
+            }
+
+            // Every topic a node in the current frontier produces onto, in
+            // stable edge-insertion order (not `HashSet` order) so the result
+            // stays deterministic across runs (I5). A single pass over
+            // `self.edges` — not one pass per frontier node — keeps one hop
+            // O(|edges|) regardless of how wide the frontier is.
+            let mut new_topics: Vec<NodeId> = Vec::new();
+            let mut new_topics_set: HashSet<NodeId> = HashSet::new();
+            for edge in &self.edges {
+                if edge.kind == EdgeKind::Produces
+                    && frontier.contains(&edge.from)
+                    && visited_topics.insert(edge.to)
+                {
+                    new_topics.push(edge.to);
+                    new_topics_set.insert(edge.to);
+                }
+            }
+            for topic_id in &new_topics {
+                if let Some(topic_node) = self.nodes.get(topic_id) {
+                    flow.topics.push(topic_node);
+                }
+            }
+
+            // Consumers of *any* newly-discovered topic, again in one pass
+            // over `self.edges` rather than one pass per topic — keeps this
+            // hop O(|edges|) too instead of O(new_topics × |edges|).
+            let mut next_frontier: HashSet<NodeId> = HashSet::new();
+            for edge in &self.edges {
+                if edge.kind != EdgeKind::Consumes
+                    || !new_topics_set.contains(&edge.to)
+                    || !visited_nodes.insert(edge.from)
+                {
+                    continue;
+                }
+                let Some(consumer) = self.nodes.get(&edge.from) else {
+                    continue;
+                };
+                next_frontier.insert(edge.from);
+                match consumer.kind {
+                    NodeKind::Saga => flow.related_sagas.push(consumer),
+                    _ => flow.downstream_consumers.push(consumer),
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        flow
+    }
+
     /// Case-insensitive substring search over symbol declarations, restricted to
     /// files under `scope_filter` when given. Exact-name hits come first.
     pub fn search_symbols(&self, query: &str, scope_filter: Option<&Path>) -> Vec<&ContractNode> {
@@ -1763,6 +1851,150 @@ mod tests {
             names,
             vec!["aProducer", "mProducer", "zProducer"],
             "producers must be ordered by their matched topic name, not HashMap order"
+        );
+    }
+
+    /// Builds `orders.created` -[Consumes]-> `billingHandler` -[Produces]-> `payment.settled`
+    /// -[Consumes]-> `ledgerHandler`, so a depth-1 query only ever sees `billingHandler`
+    /// while depth-2 pulls in `payment.settled` and `ledgerHandler` too — proving the
+    /// traversal follows real edges rather than re-running the substring pass.
+    #[test]
+    fn analyze_impact_with_depth_follows_produces_consumes_edges_transitively() {
+        let mut graph = ContractGraph::new();
+        let topic_orders = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("orders.created"),
+            kind: NodeKind::KafkaTopic,
+            file_path: Path::new("infra/topics.yaml").into(),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new(""),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        });
+        let billing_handler = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("billingHandler"),
+            kind: NodeKind::PostProcessor,
+            file_path: Path::new("services/billing/handler.go").into(),
+            line_start: 10,
+            line_end: 20,
+            package: CompactStr::new("billing"),
+            repo_id: 1,
+            signature: None,
+            docstring: None,
+        });
+        let topic_settled = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("payment.settled"),
+            kind: NodeKind::KafkaTopic,
+            file_path: Path::new("infra/topics.yaml").into(),
+            line_start: 2,
+            line_end: 2,
+            package: CompactStr::new(""),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        });
+        let ledger_handler = graph.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new("ledgerHandler"),
+            kind: NodeKind::PostProcessor,
+            file_path: Path::new("services/ledger/handler.go").into(),
+            line_start: 5,
+            line_end: 15,
+            package: CompactStr::new("ledger"),
+            repo_id: 2,
+            signature: None,
+            docstring: None,
+        });
+
+        graph.add_edge(ContractEdge {
+            from: billing_handler,
+            to: topic_orders,
+            kind: EdgeKind::Consumes,
+            metadata: None,
+            confidence: EdgeConfidence::Exact,
+        });
+        graph.add_edge(ContractEdge {
+            from: billing_handler,
+            to: topic_settled,
+            kind: EdgeKind::Produces,
+            metadata: None,
+            confidence: EdgeConfidence::Exact,
+        });
+        graph.add_edge(ContractEdge {
+            from: ledger_handler,
+            to: topic_settled,
+            kind: EdgeKind::Consumes,
+            metadata: None,
+            confidence: EdgeConfidence::Exact,
+        });
+        // Cycle: the ledger handler re-produces onto the original topic. Without
+        // visited-set cycle detection this would loop forever re-discovering
+        // `billingHandler`/`topic_settled` at every hop.
+        graph.add_edge(ContractEdge {
+            from: ledger_handler,
+            to: topic_orders,
+            kind: EdgeKind::Produces,
+            metadata: None,
+            confidence: EdgeConfidence::Exact,
+        });
+
+        let direct = graph.analyze_impact_with_depth("orders.created", 1);
+        let direct_names: HashSet<&str> = direct
+            .downstream_consumers
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            direct_names,
+            HashSet::from(["billingHandler"]),
+            "depth 1 must match plain analyze_impact: direct consumers only"
+        );
+        assert!(
+            direct
+                .topics
+                .iter()
+                .all(|t| t.name.as_str() != "payment.settled"),
+            "depth 1 must not pull in a topic two hops away"
+        );
+
+        let transitive = graph.analyze_impact_with_depth("orders.created", 2);
+        let transitive_names: HashSet<&str> = transitive
+            .downstream_consumers
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            transitive_names,
+            HashSet::from(["billingHandler", "ledgerHandler"]),
+            "depth 2 must include the consumer of the topic billingHandler produces onto"
+        );
+        assert!(
+            transitive
+                .topics
+                .iter()
+                .any(|t| t.name.as_str() == "payment.settled"),
+            "depth 2 must surface the transitively-produced topic"
+        );
+
+        // The cycle back to `orders.created` must not re-add it as a "new"
+        // downstream discovery, and higher depths must terminate rather than
+        // looping forever rediscovering the same two nodes.
+        let deep = graph.analyze_impact_with_depth("orders.created", 5);
+        assert_eq!(
+            deep.downstream_consumers.len(),
+            transitive.downstream_consumers.len(),
+            "cycle back to the origin topic must not manufacture duplicate consumers at higher depth"
+        );
+
+        let over_cap = graph.analyze_impact_with_depth("orders.created", 200);
+        assert_eq!(
+            over_cap.downstream_consumers.len(),
+            deep.downstream_consumers.len(),
+            "requested depth must be clamped to MAX_IMPACT_DEPTH, not iterate 200 hops"
         );
     }
 

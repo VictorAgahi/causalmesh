@@ -7,8 +7,205 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 1 (P0): make every answer reproducible and honest. This first step only
-*measures* determinism; nothing about indexing behaviour changes yet.
+Nothing yet — Plan 2 (P1, precision) work starts here.
+
+## [4.0.0] — 2026-09-25
+
+**Plan 1 (P0) complete: every answer is now reproducible and honest.** Ten steps landed as one
+PR apiece (#7–#16), each green on `cargo fmt`/`clippy -D warnings`/`cargo test --workspace` and,
+from step 1.1 onward, `scripts/determinism.sh`. IDs, file paths, and several tool output shapes
+changed across this range — hence the major version bump — so anything that parsed
+`graph --format json` output or depended on `NodeId` values being small sequential integers needs
+to re-check those assumptions.
+
+Closing out the plan meant re-running its own original audit scenarios against real workspaces
+(`~/bench-repos-micro/{bank-of-anthos,otel-demo,online-boutique}`), not just the synthetic
+fixtures each step's own tests used — which is exactly what caught the one gap step 1.7 left open
+(below). Every finding the audit raised is now closed:
+- **0 duplicate nodes** on an overlapping-roots workspace (Bank of Anthos: 532 → 358 nodes, the
+  174 duplicates the audit measured gone entirely, confirmed again here byte-for-byte) — step 1.2.
+- **A real v1/v2 service-name homonym resolves stably and fans out to both candidates**, tagged
+  `ambiguous`, instead of arbitrarily picking one depending on `HashMap`/thread order — step 1.4.
+- **No invented topic/queue names** (`"database is down"`, `"unknown.topic"`, a bare Kafka
+  variable's own name, a cross-package constant reference's raw text, ...) survive in any of the
+  six extractors the audit flagged, confirmed by re-scanning Bank of Anthos, the OpenTelemetry
+  demo, and Online Boutique and inspecting every resulting topic/queue node name by hand — steps
+  1.7 and, for one residual case the first pass missed, this step (below).
+- **Daemons are isolated per workspace**: two repos open at once never share or race for the same
+  socket — step 1.8.
+- **No plaintext secret** returned in a `smart_search` snippet sitting next to a matched symbol —
+  step 1.9.
+- Every measured workspace (`examples/*`, the determinism fixture, and the three real repos above)
+  produces exactly one content fingerprint across repeated sequential and concurrent
+  `mesh-mcp graph --format fingerprint` runs.
+
+Plan 2 (P1, precision of inter-service joins) and Plan 3 (P2, scale) remain, per the original
+three-phase roadmap, and have not started.
+
+### Fixed (end-of-Plan-1 verification, step 1.7 follow-up)
+- **A Go composite-literal struct's `Topic` field referencing an unresolvable expression
+  (`kafka.Message{Topic: kafka.Topic, ...}`, a cross-package/cross-file constant this extractor
+  can't reach) no longer falls back to the raw expression text.** This is the one instance of
+  step 1.7's "zero invented values" goal the first pass missed — caught only by indexing the real
+  OpenTelemetry demo rather than a synthetic fixture, where `checkout/main.go`'s
+  `Topic: kafka.Topic` produced a literal `kafka.topic` node. `extract_topic_value_text` now
+  records nothing instead, matching the convention every other language's extractor already
+  follows.
+- **The same file's generic producer/consumer call detection (`producer.Produce(&kafka.Message{
+  ...})`) no longer recurses into a named struct literal's *other* fields looking for any string
+  it can find.** `collect_string_literals` walked the entire argument tree indiscriminately, so a
+  call like `producer.Produce(&kafka.Message{Value: []byte("payload")})` (no resolvable topic at
+  all) picked up `"payload"` — the `Value` field's own literal, an entirely unrelated field — as
+  if it were the topic. It now stops descending at any *named* struct literal's boundary (an
+  anonymous one like `[]string{"orders"}` is still walked, since that shape has no dedicated
+  field-aware extraction of its own).
+
+### Fixed (P0 step 1.9 — reliable `init --auto`, secret hygiene)
+- **`init --auto`'s API Gateway detection no longer roots a nonexistent path.** It checked
+  `api-gateway/ || gateway/` but always pushed the literal string `./api-gateway` regardless of
+  which one actually existed — a repo with only a plain `gateway/` directory got a root that could
+  never match anything once the generated config was loaded. Now pushes whichever directory is
+  actually present.
+- **The architecture-docs root detection had the identical bug**, always pushing `./docs`
+  regardless of whether `docs/` or `architecture/` was the one that existed. Same fix.
+- **`protos/` (plural) is now detected as a proto root**, matching `proto/` and `proto-registry/`
+  — the roots-detection block only checked the singular and `-registry` forms, inconsistent with
+  the stop-rules block a few lines below it, which already checked all three.
+- **`smart_search` no longer returns a plaintext secret sitting next to a matched symbol.** Its
+  snippets are raw source lines, not resolved config properties, so a `.yaml`/`.env`-style line
+  like `POSTGRES_PASSWORD: accounts-pwd` right next to what the query matched came back to the
+  caller verbatim — the exact case the audit measured. Each returned line is now checked against
+  `PropertyRegistry::is_sensitive_key`'s existing patterns (the same ones already used to redact
+  *resolved* config values) and its value masked with the same `REDACTED_SECRET` placeholder if
+  the key looks sensitive.
+
+Default secret-file exclusions (`**/.env*`, `**/*.pem`, `**/*.key`, ...) were checked against this
+step's scope and found already in effect: `WorkspaceConfig::exclude_patterns`'s serde default
+applies them whenever a config (including every `init`-generated one, which never writes this
+field) doesn't set its own — no `init.rs` change was needed there.
+
+Content-based generated-code detection (masking `.pb.go`/`_pb2.py`-style generated files from
+tool output by default, per the roadmap) is deferred: those files are also where gRPC
+server/client stub extraction actually lives today, so hiding them outright would regress
+`analyze_grpc`/`find_dependents` rather than just improve hygiene — it needs a real per-file
+provenance tag surfaced at the *output* layer (Plan 2 territory), not a blanket skip at indexing
+time.
+
+### Added (P0 step 1.8 — one `meshd` per workspace)
+- **`mesh_core::socket::workspace_id(base_dir)`**: the first 16 hex characters of
+  SHA-256(canonical `base_dir` + `CARGO_PKG_VERSION`) — a short, stable identifier for one
+  workspace at one binary version.
+- **`socket_path_for(workspace_id)`** / **`pipe_name_for(workspace_id)`**: workspace-scoped
+  socket/pipe resolution, alongside the existing workspace-agnostic `socket_path()`/`pipe_name()`
+  (kept for `MESH_SOCKET_PATH`-style overrides and standalone/test use).
+
+### Fixed (P0 step 1.8)
+- **Two unrelated workspaces can no longer share (or race to bind) the same daemon.** Before this
+  fix, every `meshd` on a machine bound the same one-per-user socket
+  (`~/.cache/mesh/meshd.sock`) regardless of which workspace it indexed — opening two different
+  repos in two IDE windows raced to bind it, and whichever lost silently had its `mesh-mcp`
+  sessions served by the *other* repo's daemon and data (idempotence invariant I7). `mesh-mcp run`
+  now discovers its config first, derives `workspace_id`, and resolves its daemon at
+  `socket_path_for(workspace_id)`; when spawning `meshd`, it passes `--socket <that path>` and
+  `.current_dir(<canonical base>)` explicitly instead of relying on inherited cwd/environment to
+  land on the right workspace. Upgrading the binary changes `workspace_id` too, so a stale daemon
+  from before an upgrade is simply never found again rather than serving newer clients against an
+  outdated snapshot format.
+- **`meshd` opens its socket before ingesting, not after.** Initial ingestion used to run
+  synchronously before the socket bound at all, so on a large workspace a client polling for the
+  daemon to come up (`mesh-mcp`'s `ensure_daemon_running`, 500ms budget) would reliably time out
+  and fall back to standalone mode — spinning up a second, redundant in-process index right as
+  the daemon it gave up on finished its own (the "double indexing" the roadmap called out).
+  Ingestion now runs in the background (under `AppState::reload_lock`, the same lock every later
+  `reload` takes, so a filesystem event racing the initial scan still can't install a stale
+  snapshot over it — invariant I2); the socket accepts connections immediately, and `initialize`/
+  `ping` succeed right away. A `tools/call` made before that first scan installs its snapshot
+  (`generation == 0`, a state a legitimately-indexed-and-empty workspace can never be in — it
+  always reaches generation 1) now gets an explicit "still indexing this workspace; retry
+  shortly" error instead of an answer computed against the still-default empty snapshot.
+
+Regression tests: `workspace_id` differs by base dir and is stable for the same one;
+`tools/call` reports "still indexing" before the first snapshot installs but `initialize`
+doesn't wait on it; two `meshd`s bound to two different workspace-scoped sockets never answer
+for each other, even with intentionally similar workspace names/config.
+
+### Fixed (P0 step 1.7 — zero invented values)
+Six language extractors had a fallback path that turned an arbitrary expression — a
+variable's own name, an unrelated statement's string literal, one named param's value
+mistaken for another's — into a fabricated topic/queue name instead of recording nothing.
+Every one of these now records no topic at all when it can't resolve to a genuine literal
+(or, for Kotlin/Java's `@KafkaListener`, falls back to the function's own name — an existing,
+already-used convention — instead of inventing a value):
+
+- **Go**: `WriteMessages`/`SendMessage`/`Produce`/`ReadMessage`/etc. calls with no
+  string-literal argument used to record the *receiver's own identifier* as the topic
+  (`reader.ReadMessage(ctx)` recorded a topic named `"reader"`).
+- **Kotlin**: `extract_annotation_param` returned the fabricated literal `"unknown.topic"`
+  when `@KafkaListener`'s `topics` param wasn't a plain string; `extract_single_topic_arg`
+  emitted a raw `identifier` or `navigation_expression`'s text verbatim. An identifier is
+  still resolved against `string_defaults` (a real `val topic = "..."` in the same file) —
+  only a *variable* with no resolvable value now drops the signal, instead of falling back
+  to using the variable's own name.
+- **C#**: `extract_topic_arg`/`extract_single_topic_arg` had the same bare-`identifier`
+  fallback as Kotlin's, but with no constant-propagation pass to resolve it against — removed
+  outright rather than given a resolution path.
+- **TypeScript**: `extract_value_text` returned the raw source text of any non-string
+  argument (an identifier, a member expression like `config.topic`, a template literal with
+  interpolation) as if it were the topic/queue name.
+- **Java**: `extract_annotation_param`'s positional-literal fallback used to search from the
+  *first* `(` to the *last* `)` across the whole concatenated multi-annotation blob on a
+  method, so a preceding, unrelated annotation's string argument could be picked up as the
+  Kafka topic; a new `extract_annotation_text` isolates just `@KafkaListener(...)`'s own
+  balanced parens first, and the fallback itself no longer fires when the annotation body has
+  a named parameter (e.g. `groupId = "..."`) that isn't the one being looked for.
+  `extract_kafka_producer_topic` used to search for the first `"` anywhere in the *rest of the
+  method text* after `.send(`, unbounded by that call's own closing paren — an unrelated
+  string literal in a later statement (a log message, say) could be picked up as the topic;
+  now bounded to the call's own argument list, first-argument position only.
+- **Python**: `find_assignment_in_root` called `string_literal_value` on an assignment's
+  right-hand side without checking it was actually a string node first. `string_literal_value`
+  finds the first and last quote characters in a node's *raw source text* — so
+  `TOPIC = os.getenv('KAFKA_TOPIC')` (a call, not a string) had its text scanned regardless,
+  finding the quotes around `getenv`'s own argument and returning `"KAFKA_TOPIC"` — the
+  *environment variable's key* — as if it were the resolved topic value.
+
+Also: `MarkdownFormatter::format_dependents` no longer claims "O(1) in-memory resolution" —
+`find_dependents` includes a linear substring-fallback scan (see the step 1.6 fixes above),
+so the claim was never accurate.
+
+Regression tests were added for every fix above, each constructing the exact non-literal shape
+that used to be silently accepted as a real value.
+
+### Fixed (P0 step 1.6)
+- **`ContractGraph::find_dependents`'s substring fallback (step 3) is now sorted by matched
+  package name.** It used to iterate `reverse_deps` — a `HashMap` — directly, so the returned
+  node order depended on the process's random hash seed instead of workspace content, silently
+  violating idempotence invariant I5 (same query on the same snapshot ⇒ byte-identical output)
+  every time this fallback path was hit.
+- **`ContractGraph::analyze_impact`'s topic-registry pass is now sorted by matched topic name.**
+  Same root cause: `topic_producers`/`topic_consumers` are `HashMap`s, iterated directly, so
+  `upstream_producers`/`downstream_consumers` order was randomized per process run.
+- **`ContractGraph::search_symbols`'s substring path is now sorted by file path.** It walked
+  `file_to_nodes` — a `HashMap` — directly to restrict the scan to in-scope files; sorted the
+  paths first instead.
+- **`WebGraphPayload` (JSON/Mermaid graph export) nodes are now sorted by `(file_path,
+  line_start, name)`** instead of left in internal `NodeId` order. `NodeId` is a content hash
+  (P0 step 1.4): stable across runs of the *same* workspace, but this export would still have
+  silently reordered itself if the hashing scheme ever changed, even though nothing about the
+  workspace did.
+- **`MarkdownFormatter::extract_sub_scope` no longer emits a bogus scope like `/Users`** for an
+  absolute path. It counted `Path::components()` positionally, so an absolute path's leading
+  `RootDir` component (the `/` itself) counted as "component 0," pushing the real top-level
+  directory out of the truncation-guidance scope label entirely. Only `Normal` components are
+  counted now.
+- **Tied sub-scopes in `MarkdownFormatter`'s truncation guidance are now ordered by name.**
+  `build_truncated_search_output` sorted scopes by match count only
+  (`sort_by_key(Reverse(count))`); ties fell back to `HashMap` iteration order, another
+  per-process-random ordering, for what should be a fully reproducible ranking.
+- **`DocIndex::search` now tie-breaks explicitly by `(file_path, start_line)`** instead of
+  relying on `sort_by_key`'s stability to preserve `self.sections`'s insertion order — a
+  deterministic result should not depend on an incidental property of the sort algorithm rather
+  than an explicit, documented rule.
 
 ### Added
 - **Content fingerprint of the index.** `ContractGraph::canonical_lines()` /

@@ -9,6 +9,105 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (golden corpus — `otel-demo` and `bank-of-anthos` golden files)
+- **`tests/golden/otel-demo.expected.yaml`**: 13 hand-verified gRPC edges plus its Kafka `orders`
+  topic (`checkout` → `accounting`/`fraud-detection`), the corpus's first real async multi-hop
+  chain. Running `scripts/golden/score.py otel-demo` against it: **87.5% precision / 53.8%
+  recall** — a genuine, newly-found gap, not a golden-file error: otel-demo's frontend is
+  TypeScript using raw `@grpc/grpc-js` client construction (`new XServiceClient(...)`), a pattern
+  distinct from the already-covered NestJS `getService<XServiceClient>(...)` idiom and not yet
+  recognized by `typescript.rs`. A spurious `checkout -> health` edge (the gRPC health-check
+  import) was also found. Neither is fixed in this change — documented honestly in
+  `docs/quality.md` as new findings.
+- **`tests/golden/bank-of-anthos.expected.yaml`**: confirmed genuinely gRPC-free
+  (`score.py bank-of-anthos` reports a correct vacuous 100%/100% on 0 golden edges) plus 18
+  hand-verified Flask HTTP routes across its three Python services. Its three Java/Spring MVC
+  services are flagged as out of scope for step 2.6's Flask/FastAPI extraction, not silently
+  represented as Flask routes.
+- No `score.py` mode consumes `topics` or `http_routes` yet — both sections are ground truth
+  recorded ahead of that scorer landing, per `docs/quality.md`'s "What's NOT measured yet".
+
+### Added (P1 step 2.7 — explicit result-shape controls: `granularity`, `depth`)
+- **`find_dependents` gains `granularity: "symbol" | "package"`** (default: `"symbol"`, unchanged
+  behavior). `"package"` collapses results to one entry per distinct `(repo, package)` pair — see
+  which *services* depend on a target without a wall of individual caller symbols.
+- **`analyze_impact` gains `depth` (default: 1, clamped to 5)**. New
+  `ContractGraph::analyze_impact_with_depth` performs a real BFS over `Produces`/`Consumes`
+  edges — a transitive consumer that itself produces onto another topic pulls in that topic's own
+  consumers too — with cycle detection via visited-node/visited-topic sets, not another substring
+  pass. `depth <= 1` is byte-for-byte `analyze_impact`'s existing direct-only result.
+- Verified: `cargo test --workspace` (329 passed), `cargo clippy --workspace --all-targets -- -D
+  warnings` (clean), `cargo fmt --all -- --check` (clean), `scripts/golden/score.py
+  online-boutique` (100%/100%, unaffected), `scripts/determinism.sh` on all three fixtures ("1
+  fingerprint over 13 runs" each, unaffected) — both changes are additive/opt-in.
+- Honest limitation: the `depth > 1` traversal is covered by a synthetic regression test (a
+  `topic -> handler -> topic -> handler` chain with a cycle back to the origin topic), not yet
+  against a real multi-hop async chain in the corpus. See `docs/quality.md`.
+- Hardened via ruthless review: an unrecognized `granularity` (a typo like `"Package"`, or any
+  invented value) used to silently fall back to full symbol-level output with no signal to the
+  caller — the exact opposite of this step's "explicit semantics" goal — fixed to return a
+  JSON-RPC -32602 error instead. `truncation_hint` recomputed `find_dependents` without applying
+  the `"package"` dedup, so a truncated response's appended note could cite the pre-dedup symbol
+  count; fixed to dedupe identically via a shared helper. The `depth > 1` BFS rescanned the full
+  edge list once per newly-discovered topic per hop (`O(new_topics × |edges|)`); fixed to a single
+  edge-list pass per hop (`O(|edges|)`) for both the `Produces` and `Consumes` steps.
+
+### Added (P1 step 2.6 — Flask/FastAPI route path and method)
+- **A Python HTTP route decorator's actual path/method is now surfaced.** `@app.route('/users',
+  methods=['POST'])` / `@router.get("/health")` used to be discarded entirely — only the Python
+  function name was kept, with no record anywhere of the real HTTP contract it serves. New
+  `extract_flask_route` surfaces `"<METHOD> <path>"` in `signature` (not `name`, so existing
+  symbol-name lookups are unaffected) for both Flask's `@app.route(path, methods=[...])` and
+  FastAPI/`APIRouter`-style `@router.<verb>(path)`. Verified against a fresh scan of the real Bank
+  of Anthos userservice.
+  - Hardened via ruthless review: a multi-method route (`methods=['GET', 'POST']`) only kept the
+    first method — fixed to join every declared one. Flask's legitimate `@app.route(rule='/x')`
+    keyword-only path form was silently unrecognized — fixed to also check a `rule=` keyword
+    argument when no positional string argument is present.
+
+### Added (P1 step 2.5 — env-var-with-default topic resolution)
+- **`var Topic = getTopic()`, where `getTopic` reads an env var and falls back to a literal
+  default, is now resolved to that fallback.** P0 step 1.7 correctly treated this as an explicit
+  non-goal (real control-flow interpretation would be needed in general) and recorded nothing
+  rather than fabricating a value. New `collect_getenv_default_consts` (Go) recognizes the
+  *specific* idiom — an `os.Getenv`/`os.LookupEnv` read followed by a literal fallback `return` —
+  rather than "any function that returns a string somewhere," which would reopen the same
+  invented-value risk P0 closed.
+- **Honest limitation, found trying to verify this against its own motivating case**: the
+  OpenTelemetry demo's real `checkout/kafka/producer.go` declares `Topic` this way, but the actual
+  producer call site referencing it (`Topic: kafka.Topic`) is in a *different file*,
+  `checkout/main.go` — a cross-file/cross-package reference this (file-scoped, like every other
+  const-resolution mechanism in this codebase) fix does not close. Documented in `docs/quality.md`
+  rather than silently claimed as solved; a synthetic single-file reproduction of the same idiom
+  resolves correctly and is covered by a real regression test.
+- **Hardened via ruthless review**: the first version scanned the function's raw source *text* for
+  the last `return "literal"` substring — fooled by an intermediate conditional branch's literal
+  when the real, unconditional fallback was dynamically computed (a **wrong** resolved value,
+  worse than leaving it unresolved), by a `return "..."` inside a `//` comment, and by one inside a
+  nested closure. Rewritten to require the literal be the function's own last AST statement in its
+  own body block. Also found while fixing that: tree-sitter-go's grammar keeps `comment` as a
+  genuine named sibling statement inside a block, so "last named child" alone still landed on a
+  trailing comment — skips over any trailing comment nodes first.
+
+### Added (P1 step 2.4 — Java gRPC client/server idioms)
+- **`JavaExtractor` now recognizes plain (non-Spring) grpc-java's own universal codegen
+  convention** (protoc-gen-grpc-java), not just Spring's `@GrpcService` annotation:
+  - Server: a class extending `<Service>Grpc.<Service>ImplBase` is tagged `GrpcService` — verified
+    against Online Boutique's real `AdServiceImpl extends AdServiceGrpc.AdServiceImplBase`.
+  - Client: `JavaExtractor` had **no client-side gRPC detection at all**, unlike every other
+    language extractor. `<Service>Grpc.newBlockingStub(channel)` / `.newStub(...)` /
+    `.newFutureStub(...)` is now recorded as an RPC call, the same signal Go/Python/TypeScript
+    already emit — verified end-to-end (a real `CallsRpc` edge forms) against a fresh scan of
+    Online Boutique's real `AdServiceClient.java`.
+  - `JavaExtractor::extract_relations`'s return type grew a fourth tuple element (`rpc_calls`),
+    matching the shape `languages::FileIndex` already expects.
+  - Hardened via ruthless review (see `docs/quality.md` for the full account): tightened the
+    server check to require both `"Grpc"` and `"ImplBase"` (not `"ImplBase"` alone, which any
+    unrelated non-gRPC `*ImplBase` convention would have matched); added detection inside
+    constructors, not just named methods — the PR's own real-world example builds its stub in a
+    constructor and was initially missed; fixed the candidate-suffix scan silently dropping
+    whichever stub wasn't checked first when a method builds two different services' stubs.
+
 ### Added (P1 step 2.3 — proto imports)
 - **`.proto` files' `import "other.proto";` declarations are now recorded as dependencies.**
   `ProtoExtractor` had no import extraction at all — a message field typed from another `.proto`

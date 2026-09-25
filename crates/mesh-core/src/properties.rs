@@ -73,6 +73,16 @@ impl PropertySourceMatcher {
 /// full rebuild (or touching the surviving file) re-establishes it.
 #[derive(Debug, Clone)]
 pub struct PropertyRegistry {
+    /// The literal value as ingested — before secret redaction and before
+    /// `${...}` placeholder resolution. This is the raw fact; `flat_properties`
+    /// is purely derived from it. Keeping the two separate is what lets
+    /// `resolve_all_placeholders` be re-run after some *other* key it depends on
+    /// changes (an incremental reload of a different file) and still produce the
+    /// same result a full rebuild would: once a value is resolved in place, its
+    /// own `${...}` template is gone, and there is nothing left to re-resolve
+    /// against a new dependency value on a later call (idempotence invariants
+    /// I2/I3).
+    raw_values: HashMap<CompactStr, CompactStr>,
     flat_properties: HashMap<CompactStr, CompactStr>,
     sources: HashMap<CompactStr, PathBuf>,
     redact_secrets: bool,
@@ -107,6 +117,7 @@ impl PropertyRegistry {
 
     pub fn new() -> Self {
         Self {
+            raw_values: HashMap::new(),
             flat_properties: HashMap::new(),
             sources: HashMap::new(),
             redact_secrets: true,
@@ -130,6 +141,7 @@ impl PropertyRegistry {
         for key in other.flat_properties.keys() {
             self.sources.insert(key.clone(), source.to_path_buf());
         }
+        self.raw_values.extend(other.raw_values);
         self.flat_properties.extend(other.flat_properties);
     }
 
@@ -144,30 +156,36 @@ impl PropertyRegistry {
             .collect();
         for key in stale {
             self.flat_properties.remove(&key);
+            self.raw_values.remove(&key);
             self.sources.remove(&key);
         }
     }
 
-    /// Resolves every `${key}` / `${key:default}` placeholder value in the registry in place,
-    /// using the registry's own keys for lookups. Wired to
+    /// Resolves every `${key}` / `${key:default}` placeholder value into `flat_properties`,
+    /// derived fresh from `raw_values` every time rather than mutating the previous result in
+    /// place — the latter would, once a key resolved once, permanently discard its own
+    /// `${...}` template and make it impossible to notice a *different* key it depends on
+    /// changing on a later incremental reload (see the type-level doc). Wired to
     /// `[engines.contracts.spring].resolve_placeholders`; callers skip this when the flag is
     /// off, leaving raw `${...}` values in the map. Single pass — a value that itself resolves
     /// to another placeholder is not re-resolved.
     pub fn resolve_all_placeholders(&mut self) {
-        let updates: Vec<(CompactStr, CompactStr)> = self
-            .flat_properties
-            .iter()
-            .filter_map(|(k, v)| {
-                let resolved = self.resolve_placeholder(v.as_str());
-                if resolved.as_ref() != v.as_str() {
-                    Some((k.clone(), CompactStr::new(resolved.as_ref())))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (key, value) in updates {
-            self.flat_properties.insert(key, value);
+        let keys: Vec<CompactStr> = self.raw_values.keys().cloned().collect();
+        for key in keys {
+            // Redaction already happened correctly at ingestion time
+            // (`insert_sanitized`, using that scan's own `auto_redact_secrets`
+            // setting) — never peek at a sensitive key's raw value here, or a
+            // secret redacted once could leak back out on a later reload.
+            if self.flat_properties.get(&key).map(CompactStr::as_str)
+                == Some(Self::REDACTED_PLACEHOLDER)
+            {
+                continue;
+            }
+            let Some(raw) = self.raw_values.get(&key).cloned() else {
+                continue;
+            };
+            let resolved = self.resolve_placeholder(raw.as_str()).into_owned();
+            self.flat_properties.insert(key, CompactStr::new(resolved));
         }
     }
 
@@ -291,6 +309,8 @@ impl PropertyRegistry {
             CompactStr::new(raw_val)
         };
 
+        self.raw_values
+            .insert(CompactStr::new(key), CompactStr::new(raw_val));
         self.flat_properties
             .insert(CompactStr::new(key), sanitized_value);
     }

@@ -30,7 +30,7 @@ graph TD
 
     subgraph Parser Engine mesh-parsers
         Router --> AstGuard[AstGuard Limits & Timeouts]
-        AstGuard --> TreeSitter[Tree-sitter C-FFI 15ms Timeout]
+        AstGuard --> TreeSitter[Tree-sitter C-FFI budget-specific timeout]
         TreeSitter --> Decapitator[Polyglot Decapitator]
         Decapitator --> Markdown[Dense Markdown 48KB Formatter]
     end
@@ -157,13 +157,28 @@ Before passing any file to a Tree-sitter parser:
 4. **Nesting Depth Check**: Quick lexical scanner checks brace/parenthesis nesting depth. Files with depth > 64 are rejected to prevent C stack exhaustion.
 
 ### 5.2 C-FFI Timeout
-MeshMCP configures a hardware timeout for every parse session:
-```rust
-unsafe {
-    tree_sitter::ffi::ts_parser_set_timeout_micros(parser, 15_000); // 15 milliseconds
-}
-```
-If a complex file causes parsing to loop, Tree-sitter aborts cleanly and returns an error without stalling the agent.
+The timeout is budget-specific, not one constant shared everywhere — the two call sites want
+opposite things from it:
+
+- **Indexing** (`AstGuard::parse_with`, used by `PolyglotIndexer` for every full scan and
+  incremental reload) sets `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` — **2 seconds**. This used to
+  be 15ms, measured against an uncontended parse; under real load (multiple Rayon workers
+  competing for CPU), that budget tripped on ordinary files, and *which* files tripped it
+  depended on scheduling — a source of the index-determinism failures `scripts/determinism.sh`
+  now guards against. 2s is a hang guard, not a performance target: the lexical pre-checks in
+  §5.1 already reject anything that could make a real parse run long, so reaching this budget
+  means a genuine parser bug or a pathological file that slipped past them, either way worth
+  surfacing rather than silently swallowing.
+- **On-demand decapitation** (`AstGuard::with_parser`, used by `smart_search`'s
+  `include_body: false` path) keeps `AstGuard::QUERY_PARSE_TIMEOUT_MICROS` — **500ms** — since it
+  runs synchronously on an agent's request and must stay responsive even against a pathological
+  file; failure here falls back to `AstDecapitator::BOUNDED_ERROR_STUB`, unrelated to indexing.
+
+A parse failure during indexing does not silently produce an empty result: `FileIndex::parse_failed`
+is set, `WorkspaceIndexer` retries once, sequentially, outside the contended parallel pool (a
+transient timeout under CPU contention rarely recurs alone), and a still-failing file is counted
+in `IndexHealth` — surfaced by `mesh-mcp doctor` and any tool output whose scan wasn't fully
+healthy — instead of being indistinguishable from a file that is legitimately empty.
 
 ### 5.3 Streaming ReDoS Limits
 AST query matches are executed with a hard step counter:
@@ -231,6 +246,31 @@ MeshMCP schedules Tier-2 background rescans on a dedicated Rayon thread pool con
 The daemon transport itself is also platform-specific: a Unix domain socket on macOS/Linux, a
 named pipe (`\\.\pipe\mesh-mcp-<user>`) on Windows, so `meshd` sharing across IDE windows works
 on every supported OS, not only Unix.
+
+### 8.1 One `meshd` per workspace (P0 step 1.8)
+
+Before P0 step 1.8, every `meshd` on a machine bound the same one-per-user socket
+(`~/.cache/mesh/meshd.sock`) regardless of which workspace it was indexing — two unrelated
+repos open in two IDE windows would race to bind it, and whichever lost would have its
+`mesh-mcp` sessions silently served by the *other* repo's daemon (idempotence invariant I7: a
+response must always concern the workspace of the session that asked, never someone else's).
+
+Each `mesh-mcp run` invocation now discovers its config first, derives a `workspace_id` — the
+first 16 hex characters of SHA-256(canonical base directory + `CARGO_PKG_VERSION`) — and resolves
+its daemon at a socket scoped to that id: `~/.cache/mesh/meshd-<workspace_id>.sock` (or
+`\\.\pipe\mesh-mcp-<user>-<workspace_id>` on Windows). If no daemon is listening there yet,
+`mesh-mcp` spawns one with `--socket <that path>` and `.current_dir(<canonical base>)` explicitly
+— it never relies on inherited environment or an ambient default to land on the right workspace.
+Upgrading the binary changes `workspace_id` too, so a stale daemon from a previous version is
+simply never found again rather than serving newer clients against an outdated snapshot format.
+
+`meshd` also no longer waits for its first full scan to finish before opening that socket: the
+socket accepts connections (and `initialize`/`ping` succeed) immediately, while the initial
+ingestion runs in the background. A `tools/call` made before that first scan installs its
+snapshot gets an explicit "still indexing" error instead of an answer computed against the
+still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket to appear is no
+longer a race against a large repo's indexing time, since the socket now exists independently of
+how long that indexing takes.
 
 ---
 

@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
 /// PHP extractor covering plain classes/interfaces plus the two dominant
 /// framework conventions: Symfony `#[Route(...)]` attributes and Laravel's
@@ -9,19 +9,18 @@ use tree_sitter::{Node, Parser};
 pub struct PhpExtractor;
 
 impl PhpExtractor {
+    /// Extracts from an already-parsed tree. `PolyglotIndexer` (production
+    /// indexing) parses once via `AstGuard::parse_with`, so a parse failure is
+    /// visible instead of silently producing an empty result indistinguishable
+    /// from a legitimately empty file; tests parse `content` themselves first.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return nodes,
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
@@ -232,6 +231,7 @@ impl PhpExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Parser;
 
     fn parser() -> Parser {
         let mut parser = Parser::new();
@@ -252,11 +252,12 @@ class UserController extends AbstractController {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let nodes = PhpExtractor::extract(
             Path::new("src/Controller/UserController.php"),
             code,
             1,
-            &mut p,
+            &tree,
         );
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
         assert_eq!(find("UserController").unwrap().kind, NodeKind::ServiceClass);
@@ -268,7 +269,8 @@ class UserController extends AbstractController {
     fn test_php_extractor_interface() {
         let code = "<?php\ninterface Foo { public function bar($x); }\n";
         let mut p = parser();
-        let nodes = PhpExtractor::extract(Path::new("Foo.php"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let nodes = PhpExtractor::extract(Path::new("Foo.php"), code, 0, &tree);
         assert_eq!(
             nodes.iter().find(|n| n.name == "Foo").unwrap().kind,
             NodeKind::Interface
@@ -286,7 +288,8 @@ class UserController extends AbstractController {
 }
 "#;
         let mut p = parser();
-        let nodes = PhpExtractor::extract(Path::new("UserController.php"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let nodes = PhpExtractor::extract(Path::new("UserController.php"), code, 0, &tree);
         assert!(nodes
             .iter()
             .any(|n| n.name == "/users" && n.kind == NodeKind::HttpEndpoint));
@@ -296,7 +299,8 @@ class UserController extends AbstractController {
     fn test_php_extractor_laravel_route() {
         let code = "<?php\nRoute::get('/users', [UserController::class, 'index']);\n";
         let mut p = parser();
-        let nodes = PhpExtractor::extract(Path::new("routes/web.php"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let nodes = PhpExtractor::extract(Path::new("routes/web.php"), code, 0, &tree);
         assert!(nodes
             .iter()
             .any(|n| n.name == "GET /users" && n.kind == NodeKind::HttpEndpoint));

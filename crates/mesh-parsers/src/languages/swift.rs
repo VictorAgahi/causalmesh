@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
 /// Swift extractor. `class_declaration` covers `class`/`struct`/`extension` in
 /// this grammar (all map to `ServiceClass`), `protocol_declaration` maps to
@@ -10,19 +10,18 @@ use tree_sitter::{Node, Parser};
 pub struct SwiftExtractor;
 
 impl SwiftExtractor {
+    /// Extracts from an already-parsed tree. `PolyglotIndexer` (production
+    /// indexing) parses once via `AstGuard::parse_with`, so a parse failure is
+    /// visible instead of silently producing an empty result indistinguishable
+    /// from a legitimately empty file; tests parse `content` themselves first.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> Vec<ContractNode> {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return nodes,
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
@@ -191,6 +190,7 @@ impl SwiftExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Parser;
 
     fn parser() -> Parser {
         let mut parser = Parser::new();
@@ -217,11 +217,12 @@ struct Invoice {
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let nodes = SwiftExtractor::extract(
             Path::new("Sources/App/PaymentService.swift"),
             code,
             4,
-            &mut p,
+            &tree,
         );
         let find = |name: &str| nodes.iter().find(|n| n.name == name);
         assert_eq!(find("Payable").unwrap().kind, NodeKind::Interface);
@@ -241,7 +242,8 @@ func routes(_ app: Application) throws {
 }
 "#;
         let mut p = parser();
-        let nodes = SwiftExtractor::extract(Path::new("Sources/App/routes.swift"), code, 0, &mut p);
+        let tree = p.parse(code, None).expect("parse");
+        let nodes = SwiftExtractor::extract(Path::new("Sources/App/routes.swift"), code, 0, &tree);
         assert!(nodes
             .iter()
             .any(|n| n.name == "GET users" && n.kind == NodeKind::HttpEndpoint));

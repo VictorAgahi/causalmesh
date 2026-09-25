@@ -1,7 +1,7 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Default)]
 pub struct CSharpRelations {
@@ -20,29 +20,32 @@ struct RawKafkaCall {
 pub struct CSharpExtractor;
 
 impl CSharpExtractor {
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_with_relations`] via `PolyglotIndexer`, which parses
+    /// once with `AstGuard::parse_with` so a parse failure is visible instead of
+    /// silently producing an empty result indistinguishable from a legitimately
+    /// empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_with_relations(file_path, content, repo_id, parser).0
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_with_relations(file_path, content, repo_id, &tree).0
     }
 
     pub fn extract_with_relations(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> (Vec<ContractNode>, CSharpRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut relations = CSharpRelations::default();
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (nodes, relations),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = mesh_core::detect_service_package(&file_path, None);
@@ -84,6 +87,12 @@ impl CSharpExtractor {
         }
     }
 
+    /// Only a genuine string literal (or a `TopicPartition("...")` wrapping
+    /// one) counts as a topic. A bare `identifier` argument used to be
+    /// emitted verbatim as the "topic" — e.g. `producer.Produce(topic, ...)`
+    /// recorded the literal string `"topic"`, which is the variable's name,
+    /// not its value, and this extractor has no constant-propagation pass to
+    /// resolve it against (unlike Kotlin's `string_defaults`).
     fn extract_topic_arg(args_node: Node, source: &[u8]) -> Option<CompactStr> {
         let mut cursor = args_node.walk();
         for child in args_node.named_children(&mut cursor) {
@@ -118,11 +127,6 @@ impl CSharpExtractor {
                     }
                 }
             }
-            if expr.kind() == "identifier" {
-                if let Ok(text) = expr.utf8_text(source) {
-                    return Some(CompactStr::new(text));
-                }
-            }
         }
         None
     }
@@ -139,10 +143,6 @@ impl CSharpExtractor {
             if !unquoted.is_empty() {
                 return Some(CompactStr::new(unquoted));
             }
-        }
-        if unwrapped.kind() == "identifier" {
-            let text = unwrapped.utf8_text(source).ok()?;
-            return Some(CompactStr::new(text));
         }
         None
     }
@@ -429,11 +429,12 @@ public class OrderEventService
 }
 "#;
         let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
         let (nodes, relations) = CSharpExtractor::extract_with_relations(
             Path::new("OrderEventService.cs"),
             code,
             0,
-            &mut p,
+            &tree,
         );
 
         assert_eq!(nodes.len(), 3); // Class + 2 methods
@@ -459,6 +460,39 @@ public class OrderEventService
         assert_eq!(
             nodes[relations.consumers[0].0].name.as_str(),
             "StartListening"
+        );
+    }
+
+    /// A `Produce`/`Subscribe` call whose topic argument is a variable, not a
+    /// string literal, must not record any topic at all. It used to fall
+    /// back to the identifier's own name (`topic` on `_producer.Produce(topic,
+    /// ...)`), fabricating a "topic" that was really the variable's name —
+    /// this extractor has no constant-propagation pass to resolve it against.
+    #[test]
+    fn kafka_call_with_identifier_topic_records_nothing() {
+        let code = r#"
+namespace Mesh.Orders;
+
+public class OrderEventService
+{
+    public async Task EmitOrderCreated(string topic, Order order)
+    {
+        await _producer.ProduceAsync(topic, new Message<string, string> { Value = order.Id });
+    }
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) = CSharpExtractor::extract_with_relations(
+            Path::new("OrderEventService.cs"),
+            code,
+            0,
+            &tree,
+        );
+        assert!(
+            relations.producers.is_empty(),
+            "expected no fabricated topic from an identifier argument, got: {:?}",
+            relations.producers
         );
     }
 }

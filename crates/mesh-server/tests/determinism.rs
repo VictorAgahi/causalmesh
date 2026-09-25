@@ -214,7 +214,6 @@ fn apply_edit(base: &Path, op: usize, step: usize) {
 // ── I1: same input ⇒ same snapshot ─────────────────────────────────────────
 
 #[test]
-#[ignore = "P0 steps 1.3/1.4: the 15 ms wall-clock parse timeout and HashMap-order RPC resolution make builds load- and run-dependent"]
 fn same_fingerprint_across_pool_sizes_and_runs() {
     for fixture in fixtures() {
         let (_tmp, base) = workspace_copy(&fixture);
@@ -235,7 +234,6 @@ fn same_fingerprint_across_pool_sizes_and_runs() {
 }
 
 #[test]
-#[ignore = "P0 step 1.4: import and RPC resolution keep the first candidate in insertion order"]
 fn shuffled_file_order_same_fingerprint() {
     for fixture in fixtures() {
         let (_tmp, base) = workspace_copy(&fixture);
@@ -259,7 +257,6 @@ fn shuffled_file_order_same_fingerprint() {
 }
 
 #[test]
-#[ignore = "P0 step 1.4: a client naming only `AdminService` is linked to whichever homonym a HashMap iterates first"]
 fn homonym_resolution_is_stable() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let config = config(&["."]);
@@ -298,7 +295,6 @@ fn reconcile_is_idempotent() {
 // ── I4: one file, one set of facts ─────────────────────────────────────────
 
 #[test]
-#[ignore = "P0 step 1.2: a file under two overlapping roots is indexed once per root"]
 fn overlapping_roots_index_each_file_once() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let config = config(&[".", "./services/*"]);
@@ -334,7 +330,6 @@ fn overlapping_roots_index_each_file_once() {
 // ── I2: incremental == full ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "P0 steps 1.4/1.5: resolution follows HashMap order, and edges into re-indexed files or cross-file placeholder values are not rebuilt on reload"]
 fn incremental_equals_full() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let state = indexed_state(config(&["."]), resolved_roots(&config(&["."]), &base));
@@ -356,7 +351,6 @@ fn incremental_equals_full() {
 }
 
 #[test]
-#[ignore = "P0 step 1.5: overlapping reloads can install a snapshot computed from a stale base"]
 fn concurrent_reloads_converge_to_full_build() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let state = indexed_state(config(&["."]), resolved_roots(&config(&["."]), &base));

@@ -24,6 +24,40 @@ pub struct BoundedMatch<'tree> {
     pub captures: Vec<QueryCapture<'tree>>,
 }
 
+/// Result of [`AstGuard::parse_with`]. Three states, never collapsed into a bare
+/// `Option`, because "this language has no tree-sitter grammar" (permanent, e.g.
+/// YAML/Markdown), "the parse itself failed or timed out" (transient, worth a retry
+/// and a count in `IndexHealth`) and "it parsed and `f` legitimately produced an empty
+/// result" (a blank file) all need different handling from a caller, and used to be
+/// indistinguishable.
+#[derive(Debug)]
+pub enum ParseOutcome<R> {
+    /// `lang_kind` has no tree-sitter grammar (e.g. YAML, Markdown, Unknown).
+    NoGrammar,
+    /// A grammar exists, but tree-sitter returned no tree — malformed input past what
+    /// the lexical pre-checks in `AstGuard::should_parse_path` catch, or (extremely
+    /// rarely, given the 2s budget) a genuine timeout.
+    ParseFailed,
+    /// Parsed successfully; `R` is whatever `f` computed from the tree.
+    Parsed(R),
+}
+
+impl<R> ParseOutcome<R> {
+    /// `Some(r)` for `Parsed(r)`, `None` for anything else — for callers that only need
+    /// to distinguish "produced a value" from "did not", not why.
+    pub fn into_option(self) -> Option<R> {
+        match self {
+            ParseOutcome::Parsed(r) => Some(r),
+            ParseOutcome::NoGrammar | ParseOutcome::ParseFailed => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_parse_failed(&self) -> bool {
+        matches!(self, ParseOutcome::ParseFailed)
+    }
+}
+
 /// Hardened Tree-sitter C-FFI bounded guards and lexical pre-checks per RFC-001 Commandment 2
 pub struct AstGuard;
 
@@ -33,7 +67,26 @@ impl AstGuard {
     pub const BINARY_SNIFF_LEN: usize = 4096;
     pub const MAX_LINE_LEN_BYTES: usize = 1024;
     pub const MAX_NESTING_DEPTH: usize = 64;
-    pub const PARSER_TIMEOUT_MICROS: u64 = 15_000; // 15ms C-FFI timeout
+    /// C-FFI timeout for parsing during indexing (full scan, incremental reload, and
+    /// the one sequential retry pass `WorkspaceIndexer::build_snapshot` runs on files
+    /// that time out under load). Was 15ms — a wall-clock budget measured against a
+    /// worker thread genuinely competing for CPU with 3 other Rayon workers, not
+    /// against how long real source actually takes to parse. Under contention that
+    /// 15ms budget tripped on ordinary files, and which files tripped it depended on
+    /// scheduling — the exact cause of the nondeterminism `scripts/determinism.sh`
+    /// measures (idempotence invariant I1). 2s is enormous headroom for any real
+    /// source file (the lexical pre-checks in `should_parse_path` already reject the
+    /// pathological inputs — 384KB/1.5MB size cap, 1024-byte line cap, depth-64 nesting
+    /// cap — that could otherwise make tree-sitter itself run long), so it is reached
+    /// only by a genuine parser bug or a file that slipped past those pre-checks, both
+    /// worth surfacing as `IndexHealth::files_parse_failed` rather than silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
+    pub const INDEX_PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
+    /// C-FFI timeout for on-demand decapitation (`smart_search`'s `include_body: false`
+    /// path), which runs synchronously on an agent's request and must stay responsive
+    /// even if a pathological file reaches it. Failure here already falls back to
+    /// `AstDecapitator::BOUNDED_ERROR_STUB` — it is not part of `IndexHealth`.
+    pub const QUERY_PARSE_TIMEOUT_MICROS: u64 = 500_000;
     pub const QUERY_MATCH_LIMIT: u32 = 500;
     pub const MAX_QUERY_STEPS: usize = 10_000; // Anti-ReDoS step limit
 
@@ -254,22 +307,29 @@ impl AstGuard {
             && Self::create_bounded_parser(&tree_sitter_proto::LANGUAGE.into()).is_ok()
     }
 
-    /// Initializes a bounded tree-sitter parser with a strict 15ms C-FFI timeout
+    /// Initializes a bounded tree-sitter parser, defaulting its C-FFI timeout to the
+    /// query-time budget ([`Self::QUERY_PARSE_TIMEOUT_MICROS`]) — the only production
+    /// caller that uses a parser without immediately overriding the timeout for its own
+    /// purpose is `verify_all_parsers()`, which never calls `.parse()` at all.
     pub fn create_bounded_parser(lang: &Language) -> Result<Parser, ParserError> {
         let mut parser = Parser::new();
         parser
             .set_language(lang)
             .map_err(|e| ParserError::LanguageError(e.to_string()))?;
-        parser.set_timeout_micros(Self::PARSER_TIMEOUT_MICROS);
+        parser.set_timeout_micros(Self::QUERY_PARSE_TIMEOUT_MICROS);
         Ok(parser)
     }
 
-    /// Runs `f` with a thread-local bounded parser for `lang_kind`, creating it on first use.
+    /// Runs `f` with a thread-local bounded parser for `lang_kind`, timed out at
+    /// [`Self::QUERY_PARSE_TIMEOUT_MICROS`] — the on-demand decapitation budget.
+    /// Creates the parser on first use per thread: `Parser::new` + `set_language` are
+    /// not free (C-FFI allocation and grammar binding), and recreating one per file on
+    /// a 20k-file workspace is pure overhead. Returns `None` for languages without a
+    /// tree-sitter grammar.
     ///
-    /// `Parser::new` + `set_language` are not free (C-FFI allocation and grammar binding);
-    /// recreating one per file on a 20k-file workspace is pure overhead. Rayon workers and
-    /// the tokio blocking pool each keep their own instance, so no locking is needed.
-    /// Returns `None` for languages without a tree-sitter grammar.
+    /// Indexing does **not** use this: see [`Self::parse_with`], which runs at the much
+    /// larger [`Self::INDEX_PARSE_TIMEOUT_MICROS`] budget and reports a real parse
+    /// failure distinctly from a legitimately empty result.
     pub fn with_parser<R>(lang_kind: LanguageKind, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
         thread_local! {
             static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
@@ -299,6 +359,70 @@ impl AstGuard {
             // A timed-out parse leaves the parser mid-state; reset so the next file starts clean.
             parser.reset();
             Some(out)
+        })
+    }
+
+    /// Parses `content` for `lang_kind` with a thread-local parser (its own cache,
+    /// separate from [`Self::with_parser`]'s — indexing and on-demand decapitation run
+    /// on different thread pools in practice, so this never contends with query-time
+    /// work) at `timeout_micros`, then hands the resulting tree to `f`.
+    ///
+    /// Unlike [`Self::with_parser`], a parse failure is a distinct, reported outcome
+    /// ([`ParseOutcome::ParseFailed`]) rather than a silent `None` — callers must not
+    /// treat it the same as "this language has no grammar"
+    /// ([`ParseOutcome::NoGrammar`]) or as "the file legitimately produced nothing" (a
+    /// `Parsed(R)` whose `R` happens to be empty). This is what lets
+    /// `WorkspaceIndexer` retry a transient failure, keep a reloaded file's last
+    /// known-good facts instead of wiping them, and count real failures into
+    /// `IndexHealth` instead of masking them as empty files (idempotence invariant I6).
+    pub fn parse_with<R>(
+        lang_kind: LanguageKind,
+        content: &str,
+        timeout_micros: u64,
+        f: impl FnOnce(&tree_sitter::Tree) -> R,
+    ) -> ParseOutcome<R> {
+        thread_local! {
+            static INDEX_PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
+                const {
+                    RefCell::new([
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    ])
+                };
+        }
+
+        let Some(slot) = lang_kind.tree_sitter_slot() else {
+            return ParseOutcome::NoGrammar;
+        };
+        let Some(language) = lang_kind.language() else {
+            return ParseOutcome::NoGrammar;
+        };
+
+        INDEX_PARSERS.with(|cell| {
+            let mut parsers = cell.borrow_mut();
+            let parser = match &mut parsers[slot] {
+                Some(p) => p,
+                empty => match Self::create_bounded_parser(&language) {
+                    Ok(p) => empty.insert(p),
+                    Err(e) => {
+                        tracing::error!(target: "mesh::parser", "Cannot initialize parser: {e}");
+                        return ParseOutcome::ParseFailed;
+                    }
+                },
+            };
+            parser.set_timeout_micros(timeout_micros);
+            let outcome = match parser.parse(content, None) {
+                Some(tree) => ParseOutcome::Parsed(f(&tree)),
+                None => {
+                    tracing::warn!(
+                        target: "mesh::parser",
+                        "Tree-sitter parse failed or exceeded its {timeout_micros}\u{b5}s budget for {lang_kind:?}"
+                    );
+                    ParseOutcome::ParseFailed
+                }
+            };
+            // A timed-out parse leaves the parser mid-state; reset so the next file starts clean.
+            parser.reset();
+            outcome
         })
     }
 

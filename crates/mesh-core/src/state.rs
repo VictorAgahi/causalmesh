@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
+use crate::health::IndexHealth;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::vfs::DifferentialVfs;
@@ -23,6 +24,13 @@ pub struct MeshSnapshot {
     pub property_registry: PropertyRegistry,
     /// Monotonic counter bumped on every install; lets callers detect a reload.
     pub generation: u64,
+    /// Counts of what happened to every file since the last full rebuild.
+    /// Diagnostic, not content: excluded from `fingerprint()` for the same
+    /// reason `generation` is — it describes this build's run, not what it
+    /// found — but a tool footer or `mesh-mcp doctor` should surface it
+    /// whenever `!health.is_healthy()`, so a file that didn't make it into the
+    /// graph is never silently indistinguishable from a legitimately empty one.
+    pub health: IndexHealth,
 }
 
 /// Content fingerprint of a [`MeshSnapshot`]: one SHA-256 per index plus a
@@ -99,8 +107,19 @@ pub struct AppState {
     /// so two `AppState`s in one process (tests) don't share signatures.
     pub vfs: Mutex<DifferentialVfs>,
     /// Set while a reload is queued or running; coalesces bursts of watcher events
-    /// into one rescan instead of piling identical jobs on the Rayon pool.
+    /// into one rescan instead of piling identical jobs on the Rayon pool. Purely
+    /// an optimization — correctness (never two `WorkspaceIndexer::reload` calls
+    /// running at once) comes from `reload_lock` below, not from this flag.
     pub reload_pending: AtomicBool,
+    /// Held for the full duration of one `WorkspaceIndexer::reload` call, entirely
+    /// on the single Rayon-pool thread that acquired it (a `std::sync::MutexGuard`
+    /// never crosses threads here). Two reload closures can still both get spawned
+    /// (`reload_pending`'s coalescing check is best-effort, not exclusive), but the
+    /// second one simply blocks here until the first finishes and then runs its own
+    /// pass against then-current disk state — at most one reload ever mutates the
+    /// snapshot at a time, so a slower first pass can never install a snapshot that
+    /// clobbers a second, newer one that finished first (idempotence invariant I2).
+    pub reload_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -139,6 +158,7 @@ impl AppState {
             rescan,
             vfs: Mutex::new(DifferentialVfs::new()),
             reload_pending: AtomicBool::new(false),
+            reload_lock: Mutex::new(()),
         }
     }
 

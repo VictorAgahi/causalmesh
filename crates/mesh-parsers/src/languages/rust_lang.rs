@@ -1,22 +1,27 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use super::FileIndex;
 
 pub struct RustExtractor;
 
 impl RustExtractor {
-    /// Extracts contract nodes only. Kept for callers that don't need dependency /
-    /// producer / consumer edges (`extract_index` is the richer entry point).
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_index`] via `PolyglotIndexer`, which parses once with
+    /// `AstGuard::parse_with` so a parse failure is visible instead of silently
+    /// producing an empty result indistinguishable from a legitimately empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_index(file_path, content, repo_id, parser).nodes
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_index(file_path, content, repo_id, &tree).nodes
     }
 
     /// Extracts contract nodes plus `use`/`extern crate` dependencies and native
@@ -25,17 +30,11 @@ impl RustExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> FileIndex {
         let file_path: FilePath = Arc::from(file_path);
         let mut out = FileIndex::default();
         let mut imports: Vec<(String, String)> = Vec::new();
-
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return out,
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
@@ -725,10 +724,17 @@ pub fn make() -> Widget {
 }
 "#;
 
-        RustExtractor::extract_index(Path::new("src/widget.rs"), producer_code, 1, &mut parser)
+        let producer_tree = parser.parse(producer_code, None).expect("parse");
+        RustExtractor::extract_index(Path::new("src/widget.rs"), producer_code, 1, &producer_tree)
             .apply(&mut graph);
-        RustExtractor::extract_index(Path::new("src/consumer.rs"), consumer_code, 1, &mut parser)
-            .apply(&mut graph);
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
+        RustExtractor::extract_index(
+            Path::new("src/consumer.rs"),
+            consumer_code,
+            1,
+            &consumer_tree,
+        )
+        .apply(&mut graph);
 
         let dependents = graph.find_dependents("Widget");
         assert!(
@@ -748,7 +754,8 @@ fn uses_both() {
     D::new();
 }
 "#;
-        let idx = RustExtractor::extract_index(Path::new("src/lib.rs"), code, 1, &mut parser);
+        let tree = parser.parse(code, None).expect("parse");
+        let idx = RustExtractor::extract_index(Path::new("src/lib.rs"), code, 1, &tree);
         let dep_targets: Vec<&str> = idx.dependencies.iter().map(|(_, t)| t.as_str()).collect();
         assert!(dep_targets.contains(&"a::b"));
         assert!(dep_targets.contains(&"a::c::D"));
@@ -766,7 +773,8 @@ fn parse() {
     serde_json::from_str("{}").unwrap();
 }
 "#;
-        let idx = RustExtractor::extract_index(Path::new("src/lib.rs"), code, 1, &mut parser);
+        let tree = parser.parse(code, None).expect("parse");
+        let idx = RustExtractor::extract_index(Path::new("src/lib.rs"), code, 1, &tree);
         assert!(idx
             .dependencies
             .iter()
@@ -793,10 +801,22 @@ pub async fn consume_orders(consumer: &StreamConsumer) {
 }
 "#;
 
-        RustExtractor::extract_index(Path::new("src/producer.rs"), producer_code, 1, &mut parser)
-            .apply(&mut graph);
-        RustExtractor::extract_index(Path::new("src/consumer.rs"), consumer_code, 1, &mut parser)
-            .apply(&mut graph);
+        let producer_tree = parser.parse(producer_code, None).expect("parse");
+        RustExtractor::extract_index(
+            Path::new("src/producer.rs"),
+            producer_code,
+            1,
+            &producer_tree,
+        )
+        .apply(&mut graph);
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
+        RustExtractor::extract_index(
+            Path::new("src/consumer.rs"),
+            consumer_code,
+            1,
+            &consumer_tree,
+        )
+        .apply(&mut graph);
 
         let impact = graph.analyze_impact("orders.created");
         assert!(

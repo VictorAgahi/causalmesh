@@ -77,9 +77,14 @@ impl FileWatcherService {
         Ok(handle)
     }
 
-    /// Queues one reload on the QoS-throttled pool. Bursts arriving before the queued
-    /// job starts are coalesced into it; events arriving *during* a run queue exactly
-    /// one follow-up, which the differential VFS keeps cheap.
+    /// Queues one reload on the QoS-throttled pool. Bursts arriving before any
+    /// worker has started are coalesced into it (a cheap, best-effort filter, not
+    /// how correctness is guaranteed); a request arriving *during* a run spawns a
+    /// second closure whose `reload` call (any implementation backed by
+    /// `WorkspaceIndexer::reload`) blocks on `AppState::reload_lock` until the
+    /// first pass finishes, then runs its own pass against then-current disk
+    /// state. See that lock's own doc for why at most one reload ever runs at a
+    /// time (idempotence invariant I2).
     pub fn schedule_reload(state: Arc<AppState>, reload: ReloadFn) {
         if state.reload_pending.swap(true, Ordering::AcqRel) {
             return;

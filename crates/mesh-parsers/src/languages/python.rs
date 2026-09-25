@@ -2,7 +2,7 @@ use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 /// A single native import reference found while walking the tree.
 ///
@@ -36,13 +36,21 @@ pub struct PythonRelations {
 pub struct PythonExtractor;
 
 impl PythonExtractor {
+    /// Test/ad-hoc entry point: parses `content` itself. Production indexing goes
+    /// through [`Self::extract_with_relations`] via `PolyglotIndexer`, which parses
+    /// once with `AstGuard::parse_with` so a parse failure is visible instead of
+    /// silently producing an empty result indistinguishable from a legitimately
+    /// empty file.
     pub fn extract(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
     ) -> Vec<ContractNode> {
-        Self::extract_with_relations(file_path, content, repo_id, parser).0
+        let Some(tree) = parser.parse(content, None) else {
+            return Vec::new();
+        };
+        Self::extract_with_relations(file_path, content, repo_id, &tree).0
     }
 
     /// Same nodes as `extract`, plus native import dependencies (`import x`,
@@ -53,18 +61,12 @@ impl PythonExtractor {
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
-        parser: &mut Parser,
+        tree: &Tree,
     ) -> (Vec<ContractNode>, PythonRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut imports: Vec<ImportRef> = Vec::new();
         let mut relations = PythonRelations::default();
-
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (nodes, relations),
-        };
-
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
@@ -555,7 +557,7 @@ impl PythonExtractor {
                         let left = assign.child_by_field_name("left")?;
                         let right = assign.child_by_field_name("right")?;
                         let left_name = left.utf8_text(source).ok()?.trim();
-                        if left_name == target_name {
+                        if left_name == target_name && right.kind() == "string" {
                             return Self::string_literal_value(right, source);
                         }
                     }
@@ -564,7 +566,7 @@ impl PythonExtractor {
                 let left = child.child_by_field_name("left")?;
                 let right = child.child_by_field_name("right")?;
                 let left_name = left.utf8_text(source).ok()?.trim();
-                if left_name == target_name {
+                if left_name == target_name && right.kind() == "string" {
                     return Self::string_literal_value(right, source);
                 }
             }
@@ -699,11 +701,12 @@ def process():
             graph.add_node(node);
         }
 
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, relations) = PythonExtractor::extract_with_relations(
             Path::new("services/main.py"),
             consumer_code,
             1,
-            &mut parser,
+            &consumer_tree,
         );
         let ids: Vec<_> = consumer_nodes
             .into_iter()
@@ -751,11 +754,12 @@ def process():
             graph.add_node(node);
         }
 
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, relations) = PythonExtractor::extract_with_relations(
             Path::new("services/main.py"),
             consumer_code,
             1,
-            &mut parser,
+            &consumer_tree,
         );
         let ids: Vec<_> = consumer_nodes
             .into_iter()
@@ -797,11 +801,12 @@ def run_consumer_loop():
         let mut graph = ContractGraph::default();
         let mut parser = make_parser();
 
+        let producer_tree = parser.parse(producer_code, None).expect("parse");
         let (producer_nodes, producer_relations) = PythonExtractor::extract_with_relations(
             Path::new("services/producer.py"),
             producer_code,
             1,
-            &mut parser,
+            &producer_tree,
         );
         let producer_ids: Vec<_> = producer_nodes
             .into_iter()
@@ -811,11 +816,12 @@ def run_consumer_loop():
             graph.add_producer(producer_ids[i], topic.as_str());
         }
 
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, consumer_relations) = PythonExtractor::extract_with_relations(
             Path::new("services/consumer.py"),
             consumer_code,
             1,
-            &mut parser,
+            &consumer_tree,
         );
         let consumer_ids: Vec<_> = consumer_nodes
             .into_iter()
@@ -855,11 +861,12 @@ def process_order(order_id):
         let mut graph = ContractGraph::default();
         let mut parser = make_parser();
 
+        let producer_tree = parser.parse(producer_code, None).expect("parse");
         let (producer_nodes, producer_relations) = PythonExtractor::extract_with_relations(
             Path::new("services/client.py"),
             producer_code,
             1,
-            &mut parser,
+            &producer_tree,
         );
         let producer_ids: Vec<_> = producer_nodes
             .into_iter()
@@ -869,11 +876,12 @@ def process_order(order_id):
             graph.add_producer(producer_ids[i], task.as_str());
         }
 
+        let consumer_tree = parser.parse(consumer_code, None).expect("parse");
         let (consumer_nodes, consumer_relations) = PythonExtractor::extract_with_relations(
             Path::new("services/tasks.py"),
             consumer_code,
             1,
-            &mut parser,
+            &consumer_tree,
         );
         let consumer_ids: Vec<_> = consumer_nodes
             .into_iter()
@@ -908,11 +916,12 @@ def send_event():
     producer.produce(TOPIC, b"data")
 "#;
         let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
         let (nodes, relations) = PythonExtractor::extract_with_relations(
             Path::new("services/producer.py"),
             code,
             1,
-            &mut parser,
+            &tree,
         );
         let idx = nodes
             .iter()
@@ -929,6 +938,39 @@ def send_event():
         );
     }
 
+    /// A variable resolved via `find_assignment_in_root` must only count when
+    /// its assignment is a genuine string literal. `string_literal_value`
+    /// finds the *first and last quote characters* in a node's raw text —
+    /// for a non-string right-hand side like `os.getenv('KAFKA_TOPIC')`,
+    /// that raw text still contains quotes, so it used to extract
+    /// "KAFKA_TOPIC" (the *env var's key*, from `getenv`'s own argument) as
+    /// if it were the resolved topic value, which it never was.
+    #[test]
+    fn test_python_topic_variable_assigned_from_non_literal_records_nothing() {
+        let code = r#"
+from confluent_kafka import Producer
+
+TOPIC = os.getenv('KAFKA_TOPIC')
+
+def send_event():
+    producer = Producer({})
+    producer.produce(TOPIC, b"data")
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (_, relations) = PythonExtractor::extract_with_relations(
+            Path::new("services/producer.py"),
+            code,
+            1,
+            &tree,
+        );
+        assert!(
+            relations.producers.is_empty(),
+            "expected no fabricated topic from a non-literal assignment, got: {:?}",
+            relations.producers
+        );
+    }
+
     #[test]
     fn test_python_script_file_imports() {
         let script_code = r#"
@@ -938,11 +980,12 @@ producer = kafka.KafkaProducer(bootstrap_servers='localhost:9092')
 "#;
         let mut graph = ContractGraph::default();
         let mut parser = make_parser();
+        let tree = parser.parse(script_code, None).expect("parse");
         let (nodes, relations) = PythonExtractor::extract_with_relations(
             Path::new("services/producer_script.py"),
             script_code,
             1,
-            &mut parser,
+            &tree,
         );
         assert_eq!(nodes.len(), 1, "expected 1 module node for script file");
         assert_eq!(nodes[0].name.as_str(), "producer_script");
@@ -972,12 +1015,9 @@ def get_items():
     pass
 "#;
         let mut parser = make_parser();
-        let (nodes, _) = PythonExtractor::extract_with_relations(
-            Path::new("app/routes.py"),
-            code,
-            0,
-            &mut parser,
-        );
+        let tree = parser.parse(code, None).expect("parse");
+        let (nodes, _) =
+            PythonExtractor::extract_with_relations(Path::new("app/routes.py"), code, 0, &tree);
         let endpoint = nodes
             .iter()
             .find(|n| n.name == "get_items")

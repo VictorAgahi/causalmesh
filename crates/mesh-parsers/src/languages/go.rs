@@ -92,6 +92,11 @@ impl GoExtractor {
         Self::collect_grpc_server_types(root, source_bytes, &mut grpc_server_types, 0);
 
         let mut string_consts: HashMap<String, CompactStr> = HashMap::new();
+        // Pass 2: `var Topic = getTopic()`-style env-var-with-default idioms,
+        // resolved to their fallback literal before the main walk needs them
+        // (a composite literal like `kafka.Message{Topic: Topic}`, visited
+        // below, looks `Topic` up in this same map).
+        Self::collect_getenv_default_consts(root, source_bytes, root, &mut string_consts, 0);
         let mut raw_imports: Vec<RawImport> = Vec::new();
         let mut raw_events: Vec<RawEvent> = Vec::new();
         let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
@@ -829,6 +834,158 @@ impl GoExtractor {
         }
     }
 
+    /// A real, common Go idiom this repo's own extraction previously refused
+    /// to resolve at all: `var Topic = getTopic()`, where `getTopic` reads an
+    /// env var and falls back to a literal default —
+    /// `if v := os.Getenv("KAFKA_TOPIC"); v != "" { return v }; return "orders"`
+    /// (verbatim from the real OpenTelemetry demo's `checkout/kafka/producer.go`).
+    /// Resolves `Topic` to that fallback literal — the only statically-known
+    /// value; the real runtime value may come from the environment instead,
+    /// but the literal fallback is what a deployment overwhelmingly runs
+    /// with, and it's the best static signal available without actually
+    /// running the program. A function whose body has no `os.Getenv`/
+    /// `os.LookupEnv` call at all is left alone entirely: this is
+    /// deliberately narrow (an env-var-with-default idiom specifically),
+    /// not "resolve any function that happens to return a string literal
+    /// somewhere" — the general case is a P0-step-1.7-style invented-value
+    /// risk, this specific shape is not.
+    fn collect_getenv_default_consts(
+        node: Node,
+        source: &[u8],
+        root: Node,
+        out: &mut HashMap<String, CompactStr>,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+        if node.kind() == "var_spec" || node.kind() == "const_spec" {
+            Self::resolve_var_spec_getenv_default(node, root, source, out);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_getenv_default_consts(child, source, root, out, depth + 1);
+        }
+    }
+
+    fn resolve_var_spec_getenv_default(
+        spec: Node,
+        root: Node,
+        source: &[u8],
+        out: &mut HashMap<String, CompactStr>,
+    ) {
+        let Some(value_list) = spec.child_by_field_name("value") else {
+            return;
+        };
+        let mut name_cursor = spec.walk();
+        let names: Vec<&str> = spec
+            .children_by_field_name("name", &mut name_cursor)
+            .filter_map(|n| n.utf8_text(source).ok())
+            .collect();
+        let values: Vec<Node> = value_list.named_children(&mut value_list.walk()).collect();
+
+        for (name, value_node) in names.into_iter().zip(values) {
+            if out.contains_key(name) {
+                continue; // a genuine literal already resolved this name
+            }
+            if value_node.kind() != "call_expression" {
+                continue;
+            }
+            let Some(func) = value_node.child_by_field_name("function") else {
+                continue;
+            };
+            if func.kind() != "identifier" {
+                continue; // only a bare zero-arg local function call, e.g. `getTopic()`
+            }
+            let Some(args) = value_node.child_by_field_name("arguments") else {
+                continue;
+            };
+            if args.named_child_count() != 0 {
+                continue;
+            }
+            let Ok(func_name) = func.utf8_text(source) else {
+                continue;
+            };
+            if let Some(func_node) = Self::find_function_by_name(root, source, func_name) {
+                if let Some(default) = Self::extract_getenv_fallback_literal(func_node, source) {
+                    out.insert(name.to_string(), CompactStr::new(default));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::manual_find)]
+    fn find_function_by_name<'a>(root: Node<'a>, source: &[u8], name: &str) -> Option<Node<'a>> {
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            let is_match = child.kind() == "function_declaration"
+                && child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    == Some(name);
+            if is_match {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    /// `func_node`'s body must contain a genuine `os.Getenv`/`os.LookupEnv`
+    /// call (the whole point of this idiom) before its last `return
+    /// "literal"` is trusted as the env-var's fallback default — otherwise
+    /// this would just be "the last string literal returned by any
+    /// function," an unrelated and much weaker signal.
+    /// The function's own final statement, in its own body block, must be an
+    /// unconditional `return "literal"` — not merely the *last occurring*
+    /// `return "..."` text found anywhere in the function's source (the
+    /// first version of this check did that, and a ruthless review found it
+    /// could be fooled by an earlier conditional branch returning an
+    /// unrelated literal before falling through to a real, dynamically
+    /// computed default; by a `return "..."` sitting inside a `//` comment;
+    /// or by one inside a nested closure/goroutine literal). Requiring the
+    /// literal to be the function's own last top-level AST statement means
+    /// none of those can be mistaken for the real, unconditionally-reached
+    /// fallback — a conditional branch's return is never the *last*
+    /// statement, a comment isn't in the AST at all, and a nested closure's
+    /// body is a separate node this function's own `named_child` list never
+    /// descends into.
+    fn extract_getenv_fallback_literal(func_node: Node, source: &[u8]) -> Option<String> {
+        let text = func_node.utf8_text(source).ok()?;
+        if !text.contains("os.Getenv(") && !text.contains("os.LookupEnv(") {
+            return None;
+        }
+        let body = func_node.child_by_field_name("body")?;
+        // tree-sitter-go's grammar keeps `comment` as a genuine *named*
+        // sibling statement inside a block, so the literal last named child
+        // can be a trailing `// comment` rather than the real last
+        // statement — skip over any.
+        let mut cursor = body.walk();
+        let last_stmt = body
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() != "comment")
+            .last()?;
+        if last_stmt.kind() != "return_statement" {
+            return None;
+        }
+        // `return "x"`'s value sits inside the statement's own
+        // `expression_list`, not directly as the statement's child.
+        let expr_list = last_stmt.named_child(0)?;
+        let expr = if expr_list.kind() == "expression_list" {
+            expr_list.named_child(0)?
+        } else {
+            expr_list
+        };
+        if !matches!(
+            expr.kind(),
+            "interpreted_string_literal" | "raw_string_literal"
+        ) {
+            return None;
+        }
+        let raw = expr.utf8_text(source).ok()?;
+        let unquoted = raw.trim_matches(|c: char| c == '"' || c == '`');
+        (!unquoted.is_empty()).then(|| unquoted.to_string())
+    }
+
     fn extract_receiver_type_name(node: Node, source: &[u8]) -> Option<String> {
         match node.kind() {
             "unary_expression" => node
@@ -1203,7 +1360,15 @@ func Emit() {
     /// `checkout/main.go`'s `Topic: kafka.Topic` (a cross-package reference)
     /// produced exactly this fabricated node.
     #[test]
-    fn sarama_topic_referencing_an_unresolvable_expression_records_nothing() {
+    fn sarama_topic_referencing_a_getenv_default_resolves_to_the_fallback_literal() {
+        // Verbatim (renamed identifiers aside) from the real OpenTelemetry
+        // demo's checkout/kafka/producer.go. P0 step 1.7 correctly refused to
+        // fabricate a value here (this exact shape used to record the raw
+        // expression text `"kafka.Topic"` as the "topic" — the invented-value
+        // bug that step fixed); P1 step 2.5 now resolves it properly instead
+        // of leaving the signal dropped, recognizing the specific
+        // env-var-with-literal-fallback idiom rather than "any function that
+        // happens to return a string."
         let code = r#"
 package kafka
 
@@ -1228,8 +1393,125 @@ func Emit() {
         let (_, relations) =
             GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
         assert!(
+            relations
+                .producers
+                .iter()
+                .any(|(_, topic)| topic.as_str() == "orders"),
+            "expected the getenv fallback literal 'orders' to be resolved, got: {:?}",
+            relations.producers
+        );
+    }
+
+    /// A function with no `os.Getenv`/`os.LookupEnv` call at all must not
+    /// have its trailing return value treated as an env-var fallback — that
+    /// would just be "the last string literal any function returns," an
+    /// unrelated and much weaker signal than the specific idiom this feature
+    /// targets, and exactly the kind of fabrication P0 step 1.7 eliminated.
+    #[test]
+    fn function_call_without_getenv_is_not_resolved_as_a_fallback() {
+        let code = r#"
+package kafka
+
+var Topic = computeTopic()
+
+func computeTopic() string {
+    return "orders"
+}
+
+func Emit() {
+    producer.SendMessage(&sarama.ProducerMessage{
+        Topic: kafka.Topic,
+    })
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
+        assert!(
             relations.producers.is_empty(),
-            "expected no fabricated topic from an unresolvable expression, got: {:?}",
+            "a function with no getenv call must not be treated as an env-var default, got: {:?}",
+            relations.producers
+        );
+    }
+
+    /// The unconditional fallback must be the function's own LAST statement
+    /// — not merely the last `return "literal"` text found anywhere in its
+    /// source. A ruthless review caught the first (text-scanning) version of
+    /// this feature resolving to an unrelated *conditional* branch's literal
+    /// when the function's real, unconditional fallback was a dynamically
+    /// computed value — worse than P0 step 1.7's "leave it unresolved"
+    /// baseline, since it silently produces a *wrong* topic instead of none.
+    #[test]
+    fn getenv_function_whose_real_fallback_is_dynamic_is_not_resolved() {
+        let code = r#"
+package kafka
+
+var Topic = getTopic()
+
+func getTopic() string {
+    if v := os.Getenv("TOPIC"); v != "" {
+        return v
+    }
+    if legacy := os.Getenv("LEGACY_TOPIC"); legacy != "" {
+        return "legacy-orders"
+    }
+    return computeTopicFromConfig()
+}
+
+func Emit() {
+    producer.SendMessage(&sarama.ProducerMessage{
+        Topic: kafka.Topic,
+    })
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
+        assert!(
+            relations.producers.is_empty(),
+            "the function's real unconditional fallback is dynamic (computeTopicFromConfig()), \
+             not the intermediate 'legacy-orders' branch — must not resolve to it, got: {:?}",
+            relations.producers
+        );
+    }
+
+    /// A `return "literal"` sitting in a `//` comment after the function's
+    /// real last statement must never be picked up — comments aren't part
+    /// of the AST at all, unlike a raw text scan which can't tell the
+    /// difference.
+    #[test]
+    fn getenv_function_with_return_literal_in_trailing_comment_is_unaffected() {
+        let code = r#"
+package kafka
+
+var Topic = getTopic()
+
+func getTopic() string {
+    if v := os.Getenv("TOPIC"); v != "" {
+        return v
+    }
+    return "orders"
+    // TODO: consider return "staging-topic" later
+}
+
+func Emit() {
+    producer.SendMessage(&sarama.ProducerMessage{
+        Topic: kafka.Topic,
+    })
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("producer.go"), code, 1, &tree);
+        assert!(
+            relations
+                .producers
+                .iter()
+                .any(|(_, topic)| topic.as_str() == "orders"),
+            "a commented-out return must not shadow the real fallback 'orders', got: {:?}",
             relations.producers
         );
     }

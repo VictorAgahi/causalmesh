@@ -479,11 +479,14 @@ impl GoExtractor {
             }
         }
 
-        // kafka-go / sarama / confluent-kafka-go producer/consumer calls. Topic
-        // literals are extracted when present (e.g. `ConsumePartition("orders", ...)`,
-        // `SubscribeTopics([]string{"orders"})`); otherwise the receiver's
-        // identifier is emitted so the agent can still see a topic is used here,
-        // rather than silently dropping the signal (RFC roadmap item 3).
+        // kafka-go / sarama / confluent-kafka-go producer/consumer calls. Only a
+        // genuine string-literal topic argument is recorded (e.g.
+        // `ConsumePartition("orders", ...)`, `SubscribeTopics([]string{"orders"})`).
+        // A call with no literal argument (the topic is held in a variable) records
+        // nothing — the receiver's own identifier used to be emitted as a stand-in
+        // "topic" (e.g. `reader.ReadMessage(...)` recording the topic "reader"),
+        // which is not a topic name at all, just the name of the variable calling
+        // the method.
         let is_producer_call = matches!(method, "WriteMessages" | "SendMessage" | "Produce");
         let is_consumer_call = matches!(
             method,
@@ -496,32 +499,13 @@ impl GoExtractor {
             }
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
-            if literals.is_empty() {
-                let receiver = func
-                    .child_by_field_name("operand")
-                    .and_then(|o| o.utf8_text(source).ok())
-                    .unwrap_or("event");
-                const GENERIC_IDENTIFIERS: &[&str] = &[
-                    "c", "s", "r", "w", "p", "ch", "ws", "conn", "client", "reader", "writer",
-                    "sub", "pub", "event", "ctx", "err",
-                ];
-                if !GENERIC_IDENTIFIERS.contains(&receiver) {
-                    raw_events.push(RawEvent {
-                        line_start,
-                        line_end,
-                        topic: CompactStr::new(receiver),
-                        is_producer: is_producer_call,
-                    });
-                }
-            } else {
-                for lit in literals {
-                    raw_events.push(RawEvent {
-                        line_start,
-                        line_end,
-                        topic: CompactStr::new(lit.as_str()),
-                        is_producer: is_producer_call,
-                    });
-                }
+            for lit in literals {
+                raw_events.push(RawEvent {
+                    line_start,
+                    line_end,
+                    topic: CompactStr::new(lit.as_str()),
+                    is_producer: is_producer_call,
+                });
             }
         }
     }
@@ -875,6 +859,50 @@ func (s *Server) AuthenticateUser(ctx context.Context, req *AuthRequest) (*AuthR
         let nodes = GoExtractor::extract(Path::new("server.go"), code, 2, &mut parser);
         assert!(nodes.iter().any(|n| n.name == "Server"));
         assert!(nodes.iter().any(|n| n.name == "AuthenticateUser"));
+    }
+
+    /// A kafka-go/sarama-style call with no string-literal topic argument
+    /// (the topic is held in a variable) must not record any topic at all.
+    /// It used to fall back to the receiver's own identifier (`reader` on
+    /// `reader.ReadMessage(ctx)`), fabricating a "topic" that was really just
+    /// the name of the local variable calling the method.
+    #[test]
+    fn kafka_call_without_literal_topic_records_nothing() {
+        let code = r#"
+package consumer
+
+func run(reader *kafka.Reader) {
+    msg, _ := reader.ReadMessage(ctx)
+    _ = msg
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 0, &tree);
+        assert!(
+            relations.consumers.is_empty(),
+            "expected no fabricated topic from the receiver's own name, got: {:?}",
+            relations.consumers
+        );
+    }
+
+    /// A genuine string-literal topic argument is still extracted correctly.
+    #[test]
+    fn kafka_call_with_literal_topic_is_extracted() {
+        let code = r#"
+package consumer
+
+func run(reader *kafka.Reader) {
+    reader.SubscribeTopics([]string{"orders"})
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            GoExtractor::extract_with_relations(Path::new("consumer.go"), code, 0, &tree);
+        assert_eq!(relations.consumers.len(), 1);
+        assert_eq!(relations.consumers[0].1.as_str(), "orders");
     }
     // Import dependency wiring tests
 

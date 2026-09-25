@@ -10,6 +10,53 @@ at 3.0.0 — there is no reconstructed history before it.
 Plan 1 (P0): make every answer reproducible and honest. This first step only
 *measures* determinism; nothing about indexing behaviour changes yet.
 
+### Fixed (P0 step 1.7 — zero invented values)
+Six language extractors had a fallback path that turned an arbitrary expression — a
+variable's own name, an unrelated statement's string literal, one named param's value
+mistaken for another's — into a fabricated topic/queue name instead of recording nothing.
+Every one of these now records no topic at all when it can't resolve to a genuine literal
+(or, for Kotlin/Java's `@KafkaListener`, falls back to the function's own name — an existing,
+already-used convention — instead of inventing a value):
+
+- **Go**: `WriteMessages`/`SendMessage`/`Produce`/`ReadMessage`/etc. calls with no
+  string-literal argument used to record the *receiver's own identifier* as the topic
+  (`reader.ReadMessage(ctx)` recorded a topic named `"reader"`).
+- **Kotlin**: `extract_annotation_param` returned the fabricated literal `"unknown.topic"`
+  when `@KafkaListener`'s `topics` param wasn't a plain string; `extract_single_topic_arg`
+  emitted a raw `identifier` or `navigation_expression`'s text verbatim. An identifier is
+  still resolved against `string_defaults` (a real `val topic = "..."` in the same file) —
+  only a *variable* with no resolvable value now drops the signal, instead of falling back
+  to using the variable's own name.
+- **C#**: `extract_topic_arg`/`extract_single_topic_arg` had the same bare-`identifier`
+  fallback as Kotlin's, but with no constant-propagation pass to resolve it against — removed
+  outright rather than given a resolution path.
+- **TypeScript**: `extract_value_text` returned the raw source text of any non-string
+  argument (an identifier, a member expression like `config.topic`, a template literal with
+  interpolation) as if it were the topic/queue name.
+- **Java**: `extract_annotation_param`'s positional-literal fallback used to search from the
+  *first* `(` to the *last* `)` across the whole concatenated multi-annotation blob on a
+  method, so a preceding, unrelated annotation's string argument could be picked up as the
+  Kafka topic; a new `extract_annotation_text` isolates just `@KafkaListener(...)`'s own
+  balanced parens first, and the fallback itself no longer fires when the annotation body has
+  a named parameter (e.g. `groupId = "..."`) that isn't the one being looked for.
+  `extract_kafka_producer_topic` used to search for the first `"` anywhere in the *rest of the
+  method text* after `.send(`, unbounded by that call's own closing paren — an unrelated
+  string literal in a later statement (a log message, say) could be picked up as the topic;
+  now bounded to the call's own argument list, first-argument position only.
+- **Python**: `find_assignment_in_root` called `string_literal_value` on an assignment's
+  right-hand side without checking it was actually a string node first. `string_literal_value`
+  finds the first and last quote characters in a node's *raw source text* — so
+  `TOPIC = os.getenv('KAFKA_TOPIC')` (a call, not a string) had its text scanned regardless,
+  finding the quotes around `getenv`'s own argument and returning `"KAFKA_TOPIC"` — the
+  *environment variable's key* — as if it were the resolved topic value.
+
+Also: `MarkdownFormatter::format_dependents` no longer claims "O(1) in-memory resolution" —
+`find_dependents` includes a linear substring-fallback scan (see the step 1.6 fixes above),
+so the claim was never accurate.
+
+Regression tests were added for every fix above, each constructing the exact non-literal shape
+that used to be silently accepted as a real value.
+
 ### Fixed (P0 step 1.6)
 - **`ContractGraph::find_dependents`'s substring fallback (step 3) is now sorted by matched
   package name.** It used to iterate `reverse_deps` — a `HashMap` — directly, so the returned

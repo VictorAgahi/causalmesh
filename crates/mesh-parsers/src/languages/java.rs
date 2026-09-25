@@ -145,6 +145,13 @@ impl JavaExtractor {
 
     /// Finds `<kafkaIdent>.send(<topic>, ...)` call sites within `text`, returning
     /// the first topic literal found (Spring's `KafkaTemplate.send` producer API).
+    /// Finds `<kafkaIdent>.send(<topic>, ...)` and returns `<topic>` only
+    /// when it's a genuine string literal in first-argument position. The
+    /// search used to look for the first `"` anywhere in the *rest of the
+    /// method text* after `.send(` with no bound on the call's own closing
+    /// paren — so `kafkaTemplate.send(topicVar, msg); logger.info("...")`
+    /// could walk straight past the call and pick up an unrelated string
+    /// literal from a completely different statement as the "topic".
     fn extract_kafka_producer_topic(text: &str) -> Option<String> {
         let lower = text.to_lowercase();
         let mut search_start = 0;
@@ -156,15 +163,37 @@ impl JavaExtractor {
                 .map(|p| p + 1)
                 .unwrap_or(0);
             let receiver = &before[ident_start..idx];
+            let call_start = idx + ".send(".len();
             if receiver.to_lowercase().contains("kafka") {
-                let after = &text[idx + ".send(".len()..];
-                if let Some(q1) = after.find('"') {
-                    if let Some(q2) = after[q1 + 1..].find('"') {
-                        return Some(after[q1 + 1..q1 + 1 + q2].to_string());
+                // Bound the search to this call's own argument list by
+                // matching balanced parens from the '(' already consumed.
+                let mut depth = 1i32;
+                let mut call_end = None;
+                for (i, c) in text[call_start..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                call_end = Some(call_start + i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(call_end) = call_end {
+                    let args = text[call_start..call_end].trim_start();
+                    // Only a literal in first-argument position counts —
+                    // not any quote found later among the other arguments.
+                    if let Some(rest) = args.strip_prefix('"') {
+                        if let Some(q_end) = rest.find('"') {
+                            return Some(rest[..q_end].to_string());
+                        }
                     }
                 }
             }
-            search_start = idx + ".send(".len();
+            search_start = call_start;
         }
         None
     }
@@ -250,10 +279,9 @@ impl JavaExtractor {
                 }
 
                 if Self::has_annotation(&full_anno, "KafkaListener") {
-                    if let Some(topic) = Self::extract_annotation_param(&full_anno, "topics") {
-                        kind = NodeKind::KafkaTopic;
-                        topic_target = Some(topic);
-                    }
+                    kind = NodeKind::KafkaTopic;
+                    topic_target = Self::extract_annotation_text(&full_anno, "KafkaListener")
+                        .and_then(|scoped| Self::extract_annotation_param(scoped, "topics"));
                 } else if Self::has_annotation(&full_anno, "GetMapping")
                     || Self::has_annotation(&full_anno, "PostMapping")
                     || Self::has_annotation(&full_anno, "PutMapping")
@@ -350,6 +378,40 @@ impl JavaExtractor {
         false
     }
 
+    /// Isolates just `@name(...)`'s own parenthesized text out of `full_anno`
+    /// — which may hold several concatenated annotations on the same method
+    /// (`@Transactional("x") @KafkaListener(groupId = "g1")`) — by matching
+    /// balanced parens starting at `@name`'s own `(`. Without this,
+    /// `extract_annotation_param`'s fallback used to search from the *first*
+    /// `(` in the whole blob to the *last* `)`, which can span straight
+    /// through an unrelated annotation and pick up its argument instead.
+    fn extract_annotation_text<'a>(full_anno: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("@{name}");
+        let at = full_anno.find(&needle)?;
+        let rest = &full_anno[at + needle.len()..];
+        let open_rel = rest.find('(')?;
+        // Must be only whitespace between the annotation name and '(' —
+        // otherwise this "@name" match is a prefix of a longer identifier
+        // that `has_annotation`'s stricter boundary check would reject.
+        if !rest[..open_rel].chars().all(char::is_whitespace) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices().skip(open_rel) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[open_rel..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn extract_annotation_param(annotation: &str, param: &str) -> Option<String> {
         if let Some(idx) = annotation.find(param) {
             let rest = annotation[idx + param.len()..].trim_start();
@@ -367,10 +429,20 @@ impl JavaExtractor {
                 }
             }
         }
-        // Fallback: check inside parentheses for direct string literal: @KafkaListener("orders.created")
+        // Fallback: a direct positional string literal, e.g.
+        // `@KafkaListener("orders.created")` — with no named parameter at
+        // all. `annotation` must already be scoped to just this one
+        // annotation's own parens (see `extract_annotation_text`). If the
+        // body instead holds a named param unrelated to `param` (e.g.
+        // `@KafkaListener(groupId = "billing-group")`, and `param` is
+        // "topics"), that value is not a topic and must not be picked up
+        // just because it's the only quoted string present.
         if let Some(p_start) = annotation.find('(') {
             if let Some(p_end) = annotation.rfind(')') {
                 let inside = &annotation[p_start + 1..p_end];
+                if inside.contains('=') {
+                    return None;
+                }
                 if let Some(q_start) = inside.find('"') {
                     if let Some(q_end) = inside[q_start + 1..].find('"') {
                         let val = &inside[q_start + 1..q_start + 1 + q_end];
@@ -426,6 +498,59 @@ public class BillingController {
         assert!(nodes
             .iter()
             .any(|n| n.name == "billing.events" && n.kind == NodeKind::KafkaTopic));
+    }
+
+    /// `@KafkaListener`'s topic fallback must never reach across into a
+    /// *different* annotation on the same method. It used to search from the
+    /// first `(` to the last `)` across the whole concatenated annotation
+    /// blob, so a preceding `@Transactional("payments-tx")` (unrelated to
+    /// Kafka) could be picked up as the topic when `@KafkaListener` itself
+    /// carries no bare string literal — only a named, non-topic param.
+    #[test]
+    fn kafka_listener_fallback_does_not_cross_into_unrelated_annotation() {
+        let code = r#"
+package com.mesh.billing;
+
+public class BillingListener {
+    @Transactional("payments-tx")
+    @KafkaListener(groupId = "billing-group")
+    public void onEvent(String msg) {}
+}
+"#;
+        let mut parser = parser();
+        let nodes = JavaExtractor::extract(Path::new("BillingListener.java"), code, 0, &mut parser);
+        let node = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::KafkaTopic)
+            .expect("kafka topic node");
+        assert_eq!(
+            node.name.as_str(),
+            "onEvent",
+            "with no resolvable `topics` value, must fall back to the method name — \
+             never an unrelated annotation's argument like \"payments-tx\" or the \
+             groupId \"billing-group\""
+        );
+    }
+
+    /// `extract_kafka_producer_topic` must only accept a string literal in
+    /// the `.send(...)` call's own first-argument position, bounded by that
+    /// call's own closing paren. It used to search for the first `"` in the
+    /// *rest of the method text* with no such bound, so a variable-held
+    /// topic followed by an unrelated logging statement could have that
+    /// statement's string picked up as the "topic" instead.
+    #[test]
+    fn kafka_producer_topic_does_not_cross_into_later_statement() {
+        let code = r#"kafkaTemplate.send(topicVar, payload); logger.info("database is down");"#;
+        assert_eq!(JavaExtractor::extract_kafka_producer_topic(code), None);
+    }
+
+    #[test]
+    fn kafka_producer_topic_extracts_literal_first_argument() {
+        let code = r#"kafkaTemplate.send("orders.created", payload);"#;
+        assert_eq!(
+            JavaExtractor::extract_kafka_producer_topic(code),
+            Some("orders.created".to_string())
+        );
     }
 
     // --- Item 2: Java import extraction -----------------------------------

@@ -557,7 +557,7 @@ impl PythonExtractor {
                         let left = assign.child_by_field_name("left")?;
                         let right = assign.child_by_field_name("right")?;
                         let left_name = left.utf8_text(source).ok()?.trim();
-                        if left_name == target_name {
+                        if left_name == target_name && right.kind() == "string" {
                             return Self::string_literal_value(right, source);
                         }
                     }
@@ -566,7 +566,7 @@ impl PythonExtractor {
                 let left = child.child_by_field_name("left")?;
                 let right = child.child_by_field_name("right")?;
                 let left_name = left.utf8_text(source).ok()?.trim();
-                if left_name == target_name {
+                if left_name == target_name && right.kind() == "string" {
                     return Self::string_literal_value(right, source);
                 }
             }
@@ -934,6 +934,39 @@ def send_event():
                 .iter()
                 .any(|(i, topic)| *i == idx && topic.as_str() == "orders"),
             "expected the resolved constant value 'orders' to be emitted, got: {:?}",
+            relations.producers
+        );
+    }
+
+    /// A variable resolved via `find_assignment_in_root` must only count when
+    /// its assignment is a genuine string literal. `string_literal_value`
+    /// finds the *first and last quote characters* in a node's raw text —
+    /// for a non-string right-hand side like `os.getenv('KAFKA_TOPIC')`,
+    /// that raw text still contains quotes, so it used to extract
+    /// "KAFKA_TOPIC" (the *env var's key*, from `getenv`'s own argument) as
+    /// if it were the resolved topic value, which it never was.
+    #[test]
+    fn test_python_topic_variable_assigned_from_non_literal_records_nothing() {
+        let code = r#"
+from confluent_kafka import Producer
+
+TOPIC = os.getenv('KAFKA_TOPIC')
+
+def send_event():
+    producer = Producer({})
+    producer.produce(TOPIC, b"data")
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(code, None).expect("parse");
+        let (_, relations) = PythonExtractor::extract_with_relations(
+            Path::new("services/producer.py"),
+            code,
+            1,
+            &tree,
+        );
+        assert!(
+            relations.producers.is_empty(),
+            "expected no fabricated topic from a non-literal assignment, got: {:?}",
             relations.producers
         );
     }

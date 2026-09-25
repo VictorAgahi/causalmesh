@@ -9,6 +9,30 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.5 — env-var-with-default topic resolution)
+- **`var Topic = getTopic()`, where `getTopic` reads an env var and falls back to a literal
+  default, is now resolved to that fallback.** P0 step 1.7 correctly treated this as an explicit
+  non-goal (real control-flow interpretation would be needed in general) and recorded nothing
+  rather than fabricating a value. New `collect_getenv_default_consts` (Go) recognizes the
+  *specific* idiom — an `os.Getenv`/`os.LookupEnv` read followed by a literal fallback `return` —
+  rather than "any function that returns a string somewhere," which would reopen the same
+  invented-value risk P0 closed.
+- **Honest limitation, found trying to verify this against its own motivating case**: the
+  OpenTelemetry demo's real `checkout/kafka/producer.go` declares `Topic` this way, but the actual
+  producer call site referencing it (`Topic: kafka.Topic`) is in a *different file*,
+  `checkout/main.go` — a cross-file/cross-package reference this (file-scoped, like every other
+  const-resolution mechanism in this codebase) fix does not close. Documented in `docs/quality.md`
+  rather than silently claimed as solved; a synthetic single-file reproduction of the same idiom
+  resolves correctly and is covered by a real regression test.
+- **Hardened via ruthless review**: the first version scanned the function's raw source *text* for
+  the last `return "literal"` substring — fooled by an intermediate conditional branch's literal
+  when the real, unconditional fallback was dynamically computed (a **wrong** resolved value,
+  worse than leaving it unresolved), by a `return "..."` inside a `//` comment, and by one inside a
+  nested closure. Rewritten to require the literal be the function's own last AST statement in its
+  own body block. Also found while fixing that: tree-sitter-go's grammar keeps `comment` as a
+  genuine named sibling statement inside a block, so "last named child" alone still landed on a
+  trailing comment — skips over any trailing comment nodes first.
+
 ### Added (P1 step 2.4 — Java gRPC client/server idioms)
 - **`JavaExtractor` now recognizes plain (non-Spring) grpc-java's own universal codegen
   convention** (protoc-gen-grpc-java), not just Spring's `@GrpcService` annotation:

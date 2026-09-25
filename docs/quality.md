@@ -136,6 +136,41 @@ Ruthless review caught four real issues before merge, all fixed:
   real `.proto` declaration, which resolves correctly (verified above), so this is scoped as a
   known gap for Plan 2's later "cross-signal identity" work, not silently claimed as solved.
 
+## Update (2026-09-25, step 2.5 — env-var-with-default topic resolution)
+
+Go's `var Topic = getTopic()` where `getTopic` reads an env var and falls back to a literal
+default — `if v := os.Getenv("KAFKA_TOPIC"); v != "" { return v }; return "orders"` — used to be an
+explicit non-goal (P0 step 1.7's own test named it exactly that): resolving it would need real
+control-flow interpretation, so it correctly recorded nothing rather than fabricating a value.
+`collect_getenv_default_consts` now recognizes this *specific* idiom (an env-var read followed by
+a literal fallback return — not "any function that happens to return a string somewhere", which
+would reopen the same invented-value risk P0 closed) and resolves the variable to its fallback
+literal, the best static signal available without running the program.
+
+**Honest limitation, found while trying to verify this against its own motivating case**: the
+real target — the OpenTelemetry demo's `checkout/kafka/producer.go` declares `Topic`, but the
+actual producer call site (`Topic: kafka.Topic`) is in a *different file*, `checkout/main.go`,
+referencing it across a package boundary. Every const-resolution mechanism in this codebase
+(this one included) is scoped to one file's own declarations — this genuinely needs real
+cross-file/cross-package resolution, the same "out of scope, would need to parse another file too"
+limitation already noted for step 2.3's proto imports. A synthetic single-file reproduction of the
+same idiom (the shape this step actually implements) resolves correctly and is covered by a real
+regression test; a repo-wide fix is deferred rather than half-solved or overclaimed. `otel-demo`
+still has no golden file, so this isn't reflected in a regression number yet — the finding stands
+regardless of that gap.
+
+Ruthless review caught that the first version scanned the function's raw *source text* for the
+last `return "literal"` substring — fooled by an intermediate conditional branch's literal when
+the real, unconditional fallback was dynamically computed (a **wrong** resolved value, worse than
+P0's "leave it unresolved"), by a `return "..."` sitting in a `//` comment, and by one inside a
+nested closure. Rewritten to require the literal be the function's own **last AST statement** in
+its own body block — not text found anywhere — which a conditional branch's return can never be, a
+comment isn't part of the AST at all, and a nested closure's statements aren't part of the outer
+function's own `named_children`. One more real bug surfaced fixing this: tree-sitter-go's grammar
+keeps `comment` as a genuine *named* sibling statement inside a block, so "last named child" alone
+still landed on a trailing comment instead of the real last statement — the final version skips
+over any trailing comment nodes first.
+
 ## What's NOT measured yet
 
 - Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging

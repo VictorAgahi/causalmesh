@@ -288,6 +288,7 @@ impl DocIndex {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.file_path.cmp(&b.1.file_path))
                 .then_with(|| a.1.start_line.cmp(&b.1.start_line))
+                .then_with(|| a.1.title.cmp(&b.1.title))
         });
         scored
             .into_iter()

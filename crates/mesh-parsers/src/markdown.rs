@@ -70,18 +70,17 @@ impl MarkdownFormatter {
     /// (the leading `/` treated as its own component) instead of the
     /// workspace-relative directory the caller actually cares about.
     fn extract_sub_scope(path: &str) -> String {
-        let p = Path::new(path);
-        let components: Vec<_> = p
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        match components.len() {
-            0 => "root".to_string(),
-            1 => components[0].clone(),
-            _ => format!("{}/{}", components[0], components[1]),
+        // Borrows each component as `&str` (falling back to the lossy path
+        // only for the rare non-UTF-8 one) instead of allocating a `String`
+        // per component up front — only the first one or two are ever used.
+        let mut components = Path::new(path).components().filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_str().unwrap_or("?")),
+            _ => None,
+        });
+        match (components.next(), components.next()) {
+            (None, _) => "root".to_string(),
+            (Some(first), None) => first.to_string(),
+            (Some(first), Some(second)) => format!("{first}/{second}"),
         }
     }
 

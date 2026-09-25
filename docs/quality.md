@@ -21,7 +21,7 @@ regression gate live.
 
 | Repo | Golden edges | Precision | Recall | Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| `online-boutique` | 14 | **100%** | **92.9%** | 1 miss: `recommendationservice -> productcatalogservice` (Python gRPC stub construction, `demo_pb2_grpc.ProductCatalogServiceStub(channel)`, not yet a recognized idiom — step 2.4). |
+| `online-boutique` | 14 | **100%** | **92.9%** | Original P0 baseline; superseded by step 2.1 below. |
 | `otel-demo` | — | — | — | Golden file not yet written (pending). |
 | `bank-of-anthos` | — | — | — | Golden file not yet written (pending); this repo is mostly HTTP/REST internally, not gRPC — its golden file should score `http_routes`, not `grpc_edges`, once step 2.6 lands a comparable extraction for those. |
 
@@ -31,6 +31,26 @@ scripts/golden/fetch.sh
 mesh-mcp init --auto   # run once inside ~/.cache/mesh-golden/<repo>, or point --config at it
 scripts/golden/score.py online-boutique
 ```
+
+## Update (2026-09-25, step 2.1 — Python gRPC client stubs)
+
+`online-boutique` now scores **100% precision / 100% recall** (up from 92.9% recall). The one
+miss above — `recommendationservice -> productcatalogservice`, a Python
+`demo_pb2_grpc.ProductCatalogServiceStub(channel)` construction site — is now recognized:
+`PythonExtractor` had **no gRPC client-side detection at all** (only server-side `*Servicer`
+subclasses), unlike every other language extractor. `PythonRelations::rpc_calls` (new) records a
+`<Service>Stub(...)` construction site the same way Go's `New<Service>Client(conn)` already did.
+
+`scripts/golden/score.py online-boutique --fail-under-precision 1.0 --fail-under-recall 1.0` now
+passes and is the ratchet floor for this repo going forward.
+
+Detection is scoped to the qualified `<x>_pb2_grpc.<Service>Stub(...)` attribute-call shape only
+(both generic `grpc_tools.protoc` conventions, not tied to this repo) — a bare `<Service>Stub(...)`
+with no `_pb2_grpc`-module qualifier is intentionally not accepted, since nothing would then
+distinguish a real generated client from a hand-written test double coincidentally named
+`<Something>Stub`. A stub construction with no enclosing function/class (a script wired up inside
+`if __name__ == "__main__":`, as Online Boutique's own recommendationservice does) is attributed
+to a lazily-created module-level node instead of being dropped or mis-attributed.
 
 ## What's NOT measured yet
 

@@ -9,6 +9,24 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.1 — Python gRPC client detection)
+- **`PythonExtractor` now detects gRPC client call sites.** It had server-side (`*Servicer`
+  subclass) detection but *no* client-side detection at all — every other language extractor
+  (Go's `New<Service>Client(conn)`, TypeScript/C#/Kotlin's client constructions) already emitted
+  an RPC-call signal for `find_dependents`/`analyze_grpc`, but a Python gRPC client was invisible.
+  New `PythonRelations::rpc_calls` records a `grpc_tools.protoc`-generated
+  `<x>_pb2_grpc.<Service>Stub(channel)` construction site, mirroring the same generated-stub
+  convention the other languages rely on. Scoped to that qualified attribute-call shape only — a
+  bare `<Service>Stub(...)` with no `_pb2_grpc`-module qualifier is deliberately not accepted,
+  since a hand-written test double coincidentally named `<Something>Stub` would otherwise
+  fabricate an RPC-call edge. A construction with no enclosing function/class (real-world example:
+  Online Boutique's recommendationservice wires its client up directly inside
+  `if __name__ == "__main__":`) is attributed to a lazily-created module-level node instead of
+  being dropped or mis-attributed to whichever `ContractNode` happened to be declared first.
+  `online-boutique`'s measured score (`docs/quality.md`) went from 92.9% to **100% recall** on
+  its real gRPC edges — the fix closes the exact gap step 2.0's baseline measured, verified against
+  the real repo (not just synthetic fixtures) both before and after two rounds of ruthless review.
+
 ### Added (P1 step 2.0 — golden corpus and precision/recall baseline)
 - **`scripts/golden/{repos.txt,fetch.sh}`**: pins the Plan 2 corpus (`online-boutique`, `otel-demo`,
   `bank-of-anthos`) to exact commits and clones/checks them out reproducibly, distinct from

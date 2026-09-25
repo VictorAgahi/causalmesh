@@ -370,6 +370,7 @@ impl PolyglotIndexer {
                     out.dependencies = relations.dependencies;
                     out.producers = relations.producers;
                     out.consumers = relations.consumers;
+                    out.rpc_calls = relations.rpc_calls;
                 }
             }
             LanguageKind::TypeScript => {

@@ -9,6 +9,19 @@ at 3.0.0 — there is no reconstructed history before it.
 
 Plan 2 (P1): make inter-service joins precise, not just deterministic.
 
+### Added (P1 step 2.6 — Flask/FastAPI route path and method)
+- **A Python HTTP route decorator's actual path/method is now surfaced.** `@app.route('/users',
+  methods=['POST'])` / `@router.get("/health")` used to be discarded entirely — only the Python
+  function name was kept, with no record anywhere of the real HTTP contract it serves. New
+  `extract_flask_route` surfaces `"<METHOD> <path>"` in `signature` (not `name`, so existing
+  symbol-name lookups are unaffected) for both Flask's `@app.route(path, methods=[...])` and
+  FastAPI/`APIRouter`-style `@router.<verb>(path)`. Verified against a fresh scan of the real Bank
+  of Anthos userservice.
+  - Hardened via ruthless review: a multi-method route (`methods=['GET', 'POST']`) only kept the
+    first method — fixed to join every declared one. Flask's legitimate `@app.route(rule='/x')`
+    keyword-only path form was silently unrecognized — fixed to also check a `rule=` keyword
+    argument when no positional string argument is present.
+
 ### Added (P1 step 2.5 — env-var-with-default topic resolution)
 - **`var Topic = getTopic()`, where `getTopic` reads an env var and falls back to a literal
   default, is now resolved to that fallback.** P0 step 1.7 correctly treated this as an explicit

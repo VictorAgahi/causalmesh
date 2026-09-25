@@ -171,6 +171,24 @@ keeps `comment` as a genuine *named* sibling statement inside a block, so "last 
 still landed on a trailing comment instead of the real last statement — the final version skips
 over any trailing comment nodes first.
 
+## Update (2026-09-25, step 2.6 — Flask/FastAPI route path and method)
+
+A Python HTTP route decorator's actual path/method (`@app.route('/users', methods=['POST'])`,
+`@router.get("/health")`) used to be discarded entirely — only the Python function name was kept
+as `signature`, with no record anywhere of the real HTTP contract it serves. New
+`extract_flask_route` surfaces `"<METHOD> <path>"` in `signature` (not `name`, so existing
+symbol-name lookups are unaffected) for both real shapes sharing the pre-existing `@app.`/
+`@router.` gate: Flask's `@app.route(path, methods=[...])` and FastAPI/`APIRouter`-style
+`@router.<verb>(path)`. Verified against a fresh scan of the real Bank of Anthos userservice:
+`create_user -> POST /users`, `version -> GET /version`, `login -> GET /login`.
+
+Ruthless review caught two real gaps before merge: only the *first* declared HTTP method was kept
+for a multi-method route (`methods=['GET', 'POST']` misreported as just `"GET /users"`) — fixed to
+join every declared method; and Flask's legitimate `@app.route(rule='/x')` keyword-only path form
+(not just the positional argument) was silently unrecognized, falling back to the plain function
+signature despite the node still being tagged `HttpEndpoint` — fixed to also check a `rule=`
+keyword argument when no positional string is present.
+
 ## What's NOT measured yet
 
 - Kafka/Pub-Sub topic resolution (no golden-corpus repo in the current set uses async messaging

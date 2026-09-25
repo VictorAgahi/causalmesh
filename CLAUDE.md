@@ -54,7 +54,16 @@ Claude Code must strictly enforce these invariants on every edit:
    - Files > 384 KB or lines > 1,024 bytes must be rejected.
    - Null-byte sniffing over first 4,096 bytes.
    - AST nesting depth <= 64 (pre-check before C-FFI parser).
-   - C-FFI timeout: `ts_parser_set_timeout_micros(15_000)` (15ms).
+   - C-FFI timeout is budget-specific, not a single constant: indexing uses
+     `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` (2s — a hang guard, not a performance
+     budget; a short wall-clock timeout here made indexing outcomes depend on CPU
+     contention, which is the P0 step 1.3 idempotence fix), on-demand decapitation
+     (`smart_search`) uses `AstGuard::QUERY_PARSE_TIMEOUT_MICROS` (500ms, since it
+     runs on an agent's synchronous request path). Never share one timeout constant
+     between the two again.
+   - A parse failure during indexing is a counted `IndexHealth` event
+     (`FileIndex::parse_failed`), retried once sequentially outside the contended
+     pool — never silently folded as if the file were empty.
    - Query cursor match limit: 10,000 steps.
 3. **Stdio Isolation & Affordance Truncation**:
    - `stdout` is reserved exclusively for the `StdioFramingActor` via `BufWriter<Stdout>`.
@@ -95,4 +104,3 @@ Claude Code must strictly enforce these invariants on every edit:
 - Developer & Tree-sitter guide: [`docs/development.md`](docs/development.md)
 - Governance & RSAH: [`docs/governance-rsah.md`](docs/governance-rsah.md)
 - Performance & Token benchmarks: [`docs/benchmarks.md`](docs/benchmarks.md)
-- Authoritative Specification: [`RFC-001-CAUSAL-MCP.md`](RFC-001-CAUSAL-MCP.md)

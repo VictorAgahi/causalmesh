@@ -8,8 +8,8 @@
 
 use mesh_core::{
     expand_roots, AppState, BackgroundRescanEngine, Config, ContractGraph, DifferentialVfs,
-    DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, MeshSnapshot, PropertyRegistry,
-    PropertySourceMatcher, RepoId, ValidatedScope,
+    DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth, MeshSnapshot,
+    PropertyRegistry, PropertySourceMatcher, RepoId, ValidatedScope,
 };
 use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
@@ -20,6 +20,20 @@ use std::path::{Path, PathBuf};
 
 /// Crawl depth used for every full workspace scan.
 pub const SCAN_DEPTH: usize = 10;
+
+/// Why `process_file` never produced a fragment for a file — a deliberate,
+/// counted policy rejection (see `IndexHealth`), distinct from
+/// `FileIndex::parse_failed`, which means the file passed every one of these
+/// and still failed inside the parser.
+#[derive(Debug, Clone, Copy)]
+enum RejectKind {
+    /// Over the 384KB/1.5MB size budget — rejected before the file was even read.
+    Oversized,
+    /// Failed a lexical pre-check (binary sniff, line length, nesting depth).
+    GuardRejected,
+    /// Could not be read (permissions, vanished mid-scan) or was not valid UTF-8.
+    ReadError,
+}
 
 /// Output of processing one file on the pool.
 struct FileFragment {
@@ -184,6 +198,19 @@ impl WorkspaceIndexer {
         vfs: Option<&mut DifferentialVfs>,
     ) -> MeshSnapshot {
         let files = Self::crawl_all(config, roots);
+        Self::build_snapshot_from_files(config, roots, &files, pool, vfs)
+    }
+
+    /// [`Self::build_snapshot`] over an explicit `(RepoId, path)` list instead of
+    /// a fresh crawl. The determinism tests use it to feed the same files in a
+    /// different order and check the snapshot fingerprint does not move.
+    pub fn build_snapshot_from_files(
+        config: &Config,
+        roots: &[PathBuf],
+        files: &[(RepoId, PathBuf)],
+        pool: Option<&BackgroundRescanEngine>,
+        vfs: Option<&mut DifferentialVfs>,
+    ) -> MeshSnapshot {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
@@ -197,24 +224,11 @@ impl WorkspaceIndexer {
             toggles: &toggles,
         };
 
-        let work = || {
-            files
-                .par_iter()
-                .filter_map(|(repo_id, path)| {
-                    let root = roots
-                        .get(*repo_id as usize)
-                        .map_or(path.as_path(), |r| r.as_path());
-                    Self::process_file(path, *repo_id, root, &scan_cfg)
-                })
-                .collect::<Vec<_>>()
-        };
-        let fragments = match pool {
-            Some(engine) => engine.install(work),
-            None => work(),
-        };
+        let (fragments, health) = Self::run_scan_pass(files, roots, &scan_cfg, pool);
 
         let mut snapshot = MeshSnapshot {
             doc_index: Self::doc_index_for(config),
+            health,
             ..MeshSnapshot::default()
         };
         let mut vfs = vfs;
@@ -237,39 +251,112 @@ impl WorkspaceIndexer {
             snapshot.contract_graph.edge_count(),
             snapshot.doc_index.section_count()
         );
+        if !snapshot.health.is_healthy() {
+            tracing::warn!(
+                target: "mesh::indexer",
+                "Index health: {} file(s) failed to parse, {} file(s) unreadable — see `mesh-mcp doctor`.",
+                snapshot.health.files_parse_failed,
+                snapshot.health.files_read_error
+            );
+        }
         snapshot
     }
 
     /// Convenience for the CLI: graph only, using the global Rayon pool.
+    /// Delegates to [`Self::build_snapshot`] — one indexing path for the CLI, the
+    /// server and the daemon, instead of a second one (previously duplicated here)
+    /// that could silently drift out of sync with it.
     pub fn build_graph(config: &Config, roots: &[PathBuf]) -> (ContractGraph, usize) {
-        let files = Self::crawl_all(config, roots);
-        let patterns = Self::compiled_patterns(config);
-        let doc_template = Self::doc_index_for(config);
-        let spring = SpringSettings::from_config(config);
-        let extract_cfg = Self::extract_config(config);
-        let toggles = Self::engine_toggles(config);
-        let scan_cfg = ScanConfig {
-            patterns: &patterns,
-            doc_template: &doc_template,
-            spring: &spring,
-            extract_cfg: &extract_cfg,
-            toggles: &toggles,
+        let snapshot = Self::build_snapshot(config, roots, None, None);
+        let file_count = snapshot.health.files_scanned;
+        (snapshot.contract_graph, file_count)
+    }
+
+    /// Runs `process_file` over `files` (optionally inside `pool`), returning the
+    /// resulting fragments plus this pass's `IndexHealth`. A file whose tree-sitter
+    /// parse fails on the (possibly contended) parallel pass gets exactly one retry,
+    /// alone on the calling thread: the wall-clock budget that used to make this
+    /// outcome depend on scheduling is gone (`AstGuard::INDEX_PARSE_TIMEOUT_MICROS`
+    /// is 2s), so a transient failure under load is expected to clear on a retry with
+    /// nothing else competing for the CPU (idempotence invariants I1 and I6). A
+    /// fragment that still has `code.parse_failed == true` after this returns is a
+    /// genuine, counted failure — the caller must not fold it as if the file were
+    /// simply empty.
+    fn run_scan_pass(
+        files: &[(RepoId, PathBuf)],
+        roots: &[PathBuf],
+        scan_cfg: &ScanConfig,
+        pool: Option<&BackgroundRescanEngine>,
+    ) -> (Vec<FileFragment>, IndexHealth) {
+        let work = || {
+            files
+                .par_iter()
+                .map(|(repo_id, path)| {
+                    let root = roots
+                        .get(*repo_id as usize)
+                        .map_or(path.as_path(), |r| r.as_path());
+                    (
+                        *repo_id,
+                        path.clone(),
+                        Self::process_file(path, *repo_id, root, scan_cfg),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-        let mut graph = ContractGraph::new();
-        let fragments: Vec<_> = files
-            .par_iter()
-            .filter_map(|(repo_id, path)| {
-                let root = roots
-                    .get(*repo_id as usize)
-                    .map_or(path.as_path(), |r| r.as_path());
-                Self::process_file(path, *repo_id, root, &scan_cfg)
-            })
-            .collect();
-        for frag in fragments {
-            frag.code.apply(&mut graph);
+        let results = match pool {
+            Some(engine) => engine.install(work),
+            None => work(),
+        };
+
+        let mut health = IndexHealth::default();
+        health.record_scanned(results.len());
+        let mut fragments = Vec::with_capacity(results.len());
+        let mut needs_retry: Vec<(RepoId, PathBuf)> = Vec::new();
+        for (repo_id, path, outcome) in results {
+            match outcome {
+                Ok(frag) if frag.code.parse_failed => needs_retry.push((repo_id, path)),
+                Ok(frag) => {
+                    health.record_indexed();
+                    fragments.push(frag);
+                }
+                Err(reason) => Self::record_rejection(&mut health, reason),
+            }
         }
-        graph.reconcile_edges();
-        (graph, files.len())
+
+        for (repo_id, path) in needs_retry {
+            let root = roots
+                .get(repo_id as usize)
+                .map_or(path.as_path(), |r| r.as_path());
+            match Self::process_file(&path, repo_id, root, scan_cfg) {
+                Ok(frag) if !frag.code.parse_failed => {
+                    health.record_indexed();
+                    fragments.push(frag);
+                }
+                Ok(frag) => {
+                    tracing::warn!(
+                        target: "mesh::indexer",
+                        "{}: tree-sitter parse failed twice (once under load, once retried alone) \
+                         — indexed with no facts for this file",
+                        path.display()
+                    );
+                    health.record_indexed();
+                    health.record_parse_failed();
+                    fragments.push(frag);
+                }
+                Err(reason) => Self::record_rejection(&mut health, reason),
+            }
+        }
+
+        (fragments, health)
+    }
+
+    #[inline]
+    fn record_rejection(health: &mut IndexHealth, reason: RejectKind) {
+        match reason {
+            RejectKind::Oversized => health.record_oversized(),
+            RejectKind::GuardRejected => health.record_guard_rejected(),
+            RejectKind::ReadError => health.record_read_error(),
+        }
     }
 
     // ── Incremental reload ──────────────────────────────────────────────────
@@ -277,7 +364,23 @@ impl WorkspaceIndexer {
     /// Differential reload driven by the state's VFS: only files whose stat or
     /// content hash changed are re-read and re-indexed; deleted files are purged.
     /// Installs one consistent snapshot at the end.
+    ///
+    /// Serialized on `state.reload_lock` for its entire body, regardless of caller
+    /// (`FileWatcherService::schedule_reload`, a direct test call, ...): two
+    /// overlapping reloads would each `snapshot_clone()` from the *same* prior
+    /// snapshot and then unconditionally `install_snapshot()` — whichever finishes
+    /// last wins outright, silently discarding the other's changes rather than
+    /// merging them. The lock is a plain `std::sync::Mutex`, acquired and released
+    /// on this same call stack (never held across an `.await` or moved to another
+    /// thread), so blocking here is exactly the intended backpressure: a second
+    /// caller simply waits its turn and then reloads against then-current disk
+    /// state, which already reflects whatever the first pass just did (idempotence
+    /// invariant I2).
     pub fn reload(state: &AppState) {
+        let _guard = state
+            .reload_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = &state.config;
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);
@@ -298,13 +401,13 @@ impl WorkspaceIndexer {
 
         // Candidates: new or stat-changed. The metadata call is parallelized over
         // Rayon threads to maximize OS kernel page-cache stat speed.
-        let candidates: Vec<(RepoId, &PathBuf)> = files
+        let candidates: Vec<(RepoId, PathBuf)> = files
             .par_iter()
             .filter(|(_, p)| match std::fs::metadata(p) {
                 Ok(m) => !vfs.is_unchanged_fast(p, &m),
                 Err(_) => false,
             })
-            .map(|(r, p)| (*r, p))
+            .map(|(r, p)| (*r, p.clone()))
             .collect();
 
         if candidates.is_empty() && deleted.is_empty() {
@@ -320,17 +423,29 @@ impl WorkspaceIndexer {
             extract_cfg: &extract_cfg,
             toggles: &toggles,
         };
-        let fragments: Vec<FileFragment> = state.rescan.install(|| {
-            candidates
-                .par_iter()
-                .filter_map(|(repo_id, path)| {
-                    let root = roots
-                        .get(*repo_id as usize)
-                        .map_or(path.as_path(), |r| r.as_path());
-                    Self::process_file(path, *repo_id, root, &scan_cfg)
-                })
-                .collect()
-        });
+        let (fragments, pass_health) =
+            Self::run_scan_pass(&candidates, roots, &scan_cfg, Some(&state.rescan));
+
+        // A file whose parse still fails after `run_scan_pass`'s retry keeps its last
+        // known-good facts: it is excluded here, *before* the VFS is touched, so its
+        // signature is never updated and the next reload (triggered by any change
+        // anywhere) sees it as still-changed and retries it again — rather than the
+        // pre-1.3 behaviour of wiping its facts to empty and marking it seen
+        // (idempotence invariant I6).
+        let (still_failed, fragments): (Vec<_>, Vec<_>) =
+            fragments.into_iter().partition(|f| f.code.parse_failed);
+        if !still_failed.is_empty() {
+            tracing::warn!(
+                target: "mesh::watcher",
+                "{} file(s) still failed to parse after retry; keeping last known-good facts, \
+                 will retry on the next reload: {:?}",
+                still_failed.len(),
+                still_failed
+                    .iter()
+                    .map(|f| f.path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
 
         // Bare `touch`es hash identical and are dropped here.
         let changed: Vec<FileFragment> = fragments
@@ -354,6 +469,7 @@ impl WorkspaceIndexer {
         }
 
         let mut snapshot = state.snapshot_clone();
+        snapshot.health.merge(&pass_health);
         let stale = changed
             .iter()
             .map(|f| f.path.as_path())
@@ -446,8 +562,21 @@ impl WorkspaceIndexer {
         }
     }
 
-    /// Crawls all roots, tagging each file with the `RepoId` of its root.
-    fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
+    /// Crawls all roots, tagging each file with the `RepoId` of its **most specific**
+    /// containing root — the deepest one, when roots nest (e.g. `roots = [".",
+    /// "./services/*"]`, the common `[workspace] roots = [..., "./x/*"]` shape `init
+    /// --auto` and hand-written configs both produce). `expand_roots` only dedupes
+    /// *identical* canonical paths, so an enclosing root and its own subdirectories can
+    /// both be configured roots; without this, every file under the more specific root
+    /// would be indexed twice, once per root, as two nodes with different `repo_id`s
+    /// that `canonical_lines()` cannot tell apart from a real duplicate declaration
+    /// (idempotence invariant I4).
+    ///
+    /// Implemented by excluding each nested root's subtree from every one of its
+    /// ancestors' crawls — one file, one crawl, one `RepoId` — rather than crawling
+    /// everything and deduplicating after the fact, which would double the I/O on any
+    /// workspace using this shape.
+    pub fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
         if roots.len() > RepoId::MAX as usize {
             tracing::error!(
                 target: "mesh::indexer",
@@ -465,11 +594,14 @@ impl WorkspaceIndexer {
                 &config.workspace.mount_aliases,
             ) {
                 Ok(scope) => {
-                    let files = FilesystemCrawler::crawl_scope(
-                        &scope,
+                    let exclusions = Self::exclude_patterns_for_root(
                         &config.workspace.exclude_patterns,
-                        Some(SCAN_DEPTH),
+                        roots,
+                        root,
                     );
+                    let matcher = ExcludeMatcher::compile(&exclusions);
+                    let files =
+                        FilesystemCrawler::crawl_scope_with(&scope, &matcher, Some(SCAN_DEPTH));
                     out.extend(files.into_iter().map(|f| (repo_id, f)));
                 }
                 Err(e) => {
@@ -477,16 +609,55 @@ impl WorkspaceIndexer {
                 }
             }
         }
+        // Deterministic order regardless of `roots`' order or the OS's directory
+        // iteration order — `canonical_lines()` doesn't need it, but every other
+        // consumer of this list (the differential VFS, `doctor`'s dead-config
+        // reporting) benefits from a stable, reviewable file order.
+        out.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
         out
     }
 
+    /// `exclude_patterns` plus one `<relative>/**` glob per *other* configured root
+    /// that is a strict descendant of `root` — so `root`'s own crawl never descends
+    /// into a subtree a more specific root already owns. `roots` must already be the
+    /// canonicalized, deduplicated list `expand_roots` produces (equal paths never
+    /// occur twice, so "strict descendant" is the only overlap `PathBuf` prefixing can
+    /// mean here).
+    fn exclude_patterns_for_root(
+        exclude_patterns: &[String],
+        roots: &[PathBuf],
+        root: &Path,
+    ) -> Vec<String> {
+        let mut patterns = exclude_patterns.to_vec();
+        for other in roots {
+            if other == root || !other.starts_with(root) {
+                continue;
+            }
+            let Ok(rel) = other.strip_prefix(root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            patterns.push(format!("{}/**", rel.to_string_lossy().replace('\\', "/")));
+        }
+        patterns
+    }
+
     /// Reads, guards and extracts one file. Runs on the pool; touches no shared state.
+    ///
+    /// The `Err` side is a deliberate, logged policy rejection (size/lexical guard,
+    /// unreadable, not UTF-8) — every one of these is counted into `IndexHealth` by
+    /// the caller, never silently dropped. A successful `Ok(frag)` can still carry
+    /// `frag.code.parse_failed == true`: the file passed every guard but its
+    /// tree-sitter parse itself failed (see `AstGuard::parse_with`), which the caller
+    /// retries sequentially rather than folding as an empty file.
     fn process_file(
         path: &Path,
         repo_id: RepoId,
         root: &Path,
         cfg: &ScanConfig,
-    ) -> Option<FileFragment> {
+    ) -> Result<FileFragment, RejectKind> {
         let ScanConfig {
             patterns,
             doc_template,
@@ -494,13 +665,13 @@ impl WorkspaceIndexer {
             extract_cfg,
             toggles,
         } = *cfg;
-        let metadata = std::fs::metadata(path).ok()?;
+        let metadata = std::fs::metadata(path).map_err(|_| RejectKind::ReadError)?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
         // never costs its full read.
         if !AstGuard::within_size_budget(path, &metadata) {
-            return None;
+            return Err(RejectKind::Oversized);
         }
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = std::fs::read(path).map_err(|_| RejectKind::ReadError)?;
         let path_str = path.to_string_lossy();
         let lang = LanguageKind::from_path(&path_str);
 
@@ -513,9 +684,9 @@ impl WorkspaceIndexer {
             !AstGuard::looks_binary(&bytes)
         };
         if !passes {
-            return None;
+            return Err(RejectKind::GuardRejected);
         }
-        let content = std::str::from_utf8(&bytes).ok()?;
+        let content = std::str::from_utf8(&bytes).map_err(|_| RejectKind::ReadError)?;
         let signature = DifferentialVfs::compute_signature(&metadata, &bytes);
 
         let mut frag = FileFragment {
@@ -564,7 +735,7 @@ impl WorkspaceIndexer {
             ));
         }
 
-        Some(frag)
+        Ok(frag)
     }
 
     /// `paths` is empty (default) → no restriction. Otherwise the file's path,
@@ -843,5 +1014,73 @@ resolve_placeholders = true
             1,
             "docs/** expanded from ${{workspace_root}}/docs/** should be indexed"
         );
+    }
+
+    /// A file under a root nested inside another configured root (the common
+    /// `roots = [".", "./services/*"]` shape) is indexed exactly once, attributed to
+    /// the more specific (nested) root — not to both.
+    #[test]
+    fn crawl_all_attributes_overlapping_files_to_the_most_specific_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(base.join("services/billing")).expect("mkdir");
+        std::fs::write(base.join("services/billing/Widget.java"), "class Widget {}")
+            .expect("write");
+        std::fs::write(base.join("README.md"), "# root file").expect("write");
+
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\", \"./services/*\"]\n",
+        )
+        .expect("config");
+        let roots = vec![base.clone(), base.join("services/billing")];
+
+        let files = WorkspaceIndexer::crawl_all(&cfg, &roots);
+        let widget_hits: Vec<RepoId> = files
+            .iter()
+            .filter(|(_, p)| p.ends_with("Widget.java"))
+            .map(|(repo_id, _)| *repo_id)
+            .collect();
+        assert_eq!(
+            widget_hits,
+            vec![1],
+            "Widget.java must be crawled exactly once, attributed to the more specific \
+             root (repo_id 1 = services/billing), got: {widget_hits:?}"
+        );
+
+        let readme_hits = files
+            .iter()
+            .filter(|(_, p)| p.ends_with("README.md"))
+            .count();
+        assert_eq!(
+            readme_hits, 1,
+            "README.md (only under the enclosing root) must still be crawled once"
+        );
+    }
+
+    /// `exclude_patterns_for_root` must add a `<relative>/**` exclusion for every
+    /// strict descendant root and nothing for a disjoint or non-nested one.
+    #[test]
+    fn exclude_patterns_for_root_only_excludes_strict_descendants() {
+        let base = PathBuf::from("/ws");
+        let roots = vec![
+            base.clone(),
+            base.join("services/billing"),
+            base.join("services/checkout"),
+            PathBuf::from("/other/ws"),
+        ];
+        let patterns =
+            WorkspaceIndexer::exclude_patterns_for_root(&["**/*.pem".to_string()], &roots, &base);
+        assert_eq!(
+            patterns,
+            vec![
+                "**/*.pem".to_string(),
+                "services/billing/**".to_string(),
+                "services/checkout/**".to_string(),
+            ]
+        );
+
+        // The most specific root has no descendants to exclude among its siblings.
+        let nested = WorkspaceIndexer::exclude_patterns_for_root(&[], &roots, &roots[1]);
+        assert!(nested.is_empty());
     }
 }

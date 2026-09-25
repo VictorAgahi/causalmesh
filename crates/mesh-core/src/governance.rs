@@ -108,15 +108,19 @@ impl GovernanceEngine {
         None
     }
 
-    /// True if `segment` appears as a whole `/`-delimited path component of
-    /// `haystack` — not merely as a substring straddling a component boundary
-    /// (e.g. `"proto"` must match `"proto-registry/x.proto"` and
-    /// `"src/proto/x"`, but not `"internal/prototype/test.go"`).
+    /// True if `segment` appears as a whole path component of `haystack` —
+    /// not merely as a substring straddling a component boundary (e.g.
+    /// `"proto"` must match `"proto-registry/x.proto"` and `"src/proto/x"`,
+    /// but not `"internal/prototype/test.go"`). Splits on both `/` and `\`:
+    /// `target_or_scope` here is often a `PathBuf::to_str()` result, which on
+    /// Windows uses `\` as its separator, so splitting on `/` alone made
+    /// every guarded path silently unmatchable there — this rule (and the
+    /// RSAH refusal it guards) never fired on Windows at all.
     fn has_path_segment(haystack: &str, segment: &str) -> bool {
         if segment.is_empty() {
             return false;
         }
-        haystack.split('/').any(|part| part == segment)
+        haystack.split(['/', '\\']).any(|part| part == segment)
     }
 
     fn build_rsah_response(guarded_key: &str, rule_description: &str) -> RsahResponse {
@@ -297,5 +301,33 @@ mod tests {
             engine.evaluate_guard("cmd/redeploy/main.go").is_none(),
             "redeploy/ must not trip a 'deploy' guard's substring"
         );
+    }
+
+    /// `target_or_scope` is often a `PathBuf::to_str()` result, which on
+    /// Windows uses `\` as its path separator — `has_path_segment` must
+    /// recognize a guarded segment there too, not just in `/`-delimited
+    /// paths, or the RSAH refusal this guard exists for never fires at all
+    /// on that platform.
+    #[test]
+    fn evaluate_guard_matches_a_windows_style_backslash_path() {
+        let mut rules = HashMap::new();
+        rules.insert(
+            CompactStr::new("proto-registry"),
+            "Contract boundary".to_string(),
+        );
+        let engine = GovernanceEngine::new(rules, HashMap::new(), ReadGovernanceMode::AllowAll);
+
+        assert!(
+            engine
+                .evaluate_guard(r"C:\Users\dev\workspace\proto-registry")
+                .is_some(),
+            "a backslash-separated Windows path must still match a guarded segment"
+        );
+        assert!(engine
+            .evaluate_guard(r"C:\Users\dev\workspace\proto-registry\auth.proto")
+            .is_some());
+        assert!(engine
+            .evaluate_guard(r"C:\Users\dev\workspace\other-service")
+            .is_none());
     }
 }

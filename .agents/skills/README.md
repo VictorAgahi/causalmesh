@@ -8,7 +8,7 @@ Each skill is `<name>/SKILL.md` with YAML frontmatter (`name`, `description`) an
 describes. Some carry a `DEEPENING.md` for the mechanics you only need when debugging.
 
 Authoritative law lives elsewhere and is not restated here: the 7 Commandments in
-[`CLAUDE.md`](../../CLAUDE.md) and the spec in [`RFC-001-CAUSAL-MCP.md`](../../RFC-001-CAUSAL-MCP.md).
+[`CLAUDE.md`](../../CLAUDE.md).
 
 ## Index
 

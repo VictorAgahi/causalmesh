@@ -60,6 +60,38 @@ jobs:
         run: cargo test --workspace --verbose
 
   # ============================================================================
+  # 2b. Determinism Gate (idempotence invariants I1-I3, P0 steps 1.1-1.5)
+  # ============================================================================
+  # Indexes each example workspace 5x sequentially and 8x concurrently and
+  # requires a single content fingerprint per workspace (scripts/determinism.sh).
+  # Blocking: every measured workspace (examples, and — checked manually, not
+  # committed here — Bank of Anthos, the OpenTelemetry demo, Online Boutique) is
+  # fully deterministic as of P0 step 1.5. A regression here is a real bug.
+  determinism:
+    name: "Determinism Gate (${{ matrix.os }})"
+    needs: test-suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Rust stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Rust Cache"
+        uses: Swatinem/rust-cache@v2
+
+      - name: "Compile Release Binary"
+        run: cargo build --release -p mesh-server
+
+      - name: "One fingerprint per workspace across sequential and concurrent runs"
+        run: scripts/determinism.sh
+
+  # ============================================================================
   # 3. Production Release Build & Smoke Test
   # ============================================================================
   release-smoke-test:

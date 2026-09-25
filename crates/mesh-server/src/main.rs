@@ -65,7 +65,8 @@ enum Commands {
 
     /// Generate and view an interactive architecture graph of services, contracts, and topics
     Graph {
-        /// Format of the output: html, mermaid, or json
+        /// Format of the output: html, mermaid, json, or fingerprint (content hash of the
+        /// full index, for comparing two runs)
         #[arg(short, long, default_value = "html")]
         format: String,
 
@@ -126,16 +127,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Commands::Run { standalone } => {
+            // Discovered once, up front, for every mode below: the workspace
+            // this session concerns determines which daemon it may talk to
+            // (idempotence invariant I7 — a response always concerns the
+            // workspace of the session that asked). Falling back to
+            // standalone on a discovery error would silently index the wrong
+            // (default, cwd-relative) workspace instead.
+            let (_, base_dir) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
+            let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
+            let workspace_id = mesh_core::workspace_id(&canonical_base);
+
             #[cfg(unix)]
             if !standalone {
                 // ── UDS Proxy Mode ────────────────────────────────────────────
-                let sock_path = mesh_core::socket_path();
-                match ensure_daemon_running(&sock_path).await {
+                let sock_path = mesh_core::socket_path_for(&workspace_id);
+                match ensure_daemon_running(&sock_path, &canonical_base, cli.config.as_deref())
+                    .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             target: "mesh::proxy",
-                            "Connecting to meshd at {}",
-                            sock_path.display()
+                            "Connecting to meshd at {} (workspace {})",
+                            sock_path.display(),
+                            workspace_id
                         );
                         return run_proxy_mode(&sock_path).await;
                     }
@@ -152,13 +166,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(windows)]
             if !standalone {
                 // ── Named Pipe Proxy Mode ──────────────────────────────────────
-                let pipe_name = mesh_core::pipe_name();
-                match ensure_daemon_running_windows(&pipe_name).await {
+                let pipe_name = mesh_core::pipe_name_for(&workspace_id);
+                match ensure_daemon_running_windows(
+                    &pipe_name,
+                    &canonical_base,
+                    cli.config.as_deref(),
+                )
+                .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             target: "mesh::proxy",
-                            "Connecting to meshd at {}",
-                            pipe_name
+                            "Connecting to meshd at {} (workspace {})",
+                            pipe_name,
+                            workspace_id
                         );
                         return run_proxy_mode_windows(&pipe_name).await;
                     }
@@ -173,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             #[cfg(not(any(unix, windows)))]
-            let _ = standalone;
+            let _ = (standalone, workspace_id);
 
             // ── Standalone Mode (in-process fallback) ─────────────────────────
             run_standalone(cli.config.as_deref()).await?;
@@ -185,16 +206,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
-/// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
+/// Checks if this workspace's meshd is alive at `sock_path`. If not, spawns
+/// it — with `--socket sock_path` and `.current_dir(base_dir)` (plus
+/// `--config` when the caller passed an explicit one) so the daemon binds
+/// exactly the socket this proxy is about to connect to and indexes exactly
+/// this workspace, never whichever config its own cwd-based discovery might
+/// otherwise land on — then waits up to 500ms for it to bind.
+///
+/// That 500ms budget used to race a real risk: `meshd` indexed its whole
+/// workspace *before* opening its socket, so on a large repo this would
+/// reliably time out and fall back to standalone mode — spinning up a
+/// second, redundant in-process index right as the daemon it gave up on
+/// finished its own. Since P0 step 1.8, `meshd` opens its socket first and
+/// ingests in the background, so binding it back is now independent of
+/// workspace size and this budget is comfortably generous rather than a race.
 #[cfg(unix)]
 async fn ensure_daemon_running(
     sock_path: &Path,
+    base_dir: &Path,
+    explicit_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
         return Ok(());
     }
 
-    tracing::info!(target: "mesh::proxy", "meshd not found. Attempting auto-spawn…");
+    tracing::info!(target: "mesh::proxy", "meshd not found for this workspace. Attempting auto-spawn…");
 
     let meshd_path = std::env::current_exe()?
         .parent()
@@ -205,11 +241,18 @@ async fn ensure_daemon_running(
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
 
-    std::process::Command::new(&meshd_path)
+    let mut cmd = std::process::Command::new(&meshd_path);
+    cmd.current_dir(base_dir)
+        .arg("--socket")
+        .arg(sock_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if let Some(config) = explicit_config {
+        let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+        cmd.arg("--config").arg(canonical_config);
+    }
+    cmd.spawn()
         .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
 
     // Poll up to 500ms for socket to appear
@@ -265,10 +308,15 @@ async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Erro
 // meshd has no Unix Domain Socket on Windows, so `mesh-mcp run` shares the
 // daemon over a named pipe instead, mirroring the UDS proxy helpers above.
 
-/// Checks if meshd is alive. If not, auto-spawns it and waits up to 500ms.
+/// Checks if this workspace's meshd is alive at `pipe_name`. If not, spawns
+/// it scoped to this workspace — mirroring the Unix `ensure_daemon_running`
+/// above (see its doc for why `--socket`/`.current_dir` matter and why the
+/// 500ms budget is no longer a race since P0 step 1.8).
 #[cfg(windows)]
 async fn ensure_daemon_running_windows(
     pipe_name: &str,
+    base_dir: &Path,
+    explicit_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
@@ -276,7 +324,7 @@ async fn ensure_daemon_running_windows(
         return Ok(());
     }
 
-    tracing::info!(target: "mesh::proxy", "meshd not found. Attempting auto-spawn…");
+    tracing::info!(target: "mesh::proxy", "meshd not found for this workspace. Attempting auto-spawn…");
 
     let meshd_path = std::env::current_exe()?
         .parent()
@@ -287,11 +335,18 @@ async fn ensure_daemon_running_windows(
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
 
-    std::process::Command::new(&meshd_path)
+    let mut cmd = std::process::Command::new(&meshd_path);
+    cmd.current_dir(base_dir)
+        .arg("--socket")
+        .arg(pipe_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if let Some(config) = explicit_config {
+        let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+        cmd.arg("--config").arg(canonical_config);
+    }
+    cmd.spawn()
         .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
 
     // Poll up to 500ms for the pipe to appear

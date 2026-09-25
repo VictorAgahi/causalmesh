@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package users.v1;
+
+service AdminService {
+  rpc Ban (BanRequest) returns (BanResponse);
+  rpc GetStatus (StatusRequest) returns (StatusResponse);
+}
+
+message BanRequest {}
+message BanResponse {}
+message StatusRequest {}
+message StatusResponse {}

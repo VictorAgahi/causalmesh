@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
+use crate::health::IndexHealth;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::vfs::DifferentialVfs;
@@ -23,6 +24,72 @@ pub struct MeshSnapshot {
     pub property_registry: PropertyRegistry,
     /// Monotonic counter bumped on every install; lets callers detect a reload.
     pub generation: u64,
+    /// Counts of what happened to every file since the last full rebuild.
+    /// Diagnostic, not content: excluded from `fingerprint()` for the same
+    /// reason `generation` is — it describes this build's run, not what it
+    /// found — but a tool footer or `mesh-mcp doctor` should surface it
+    /// whenever `!health.is_healthy()`, so a file that didn't make it into the
+    /// graph is never silently indistinguishable from a legitimately empty one.
+    pub health: IndexHealth,
+}
+
+/// Content fingerprint of a [`MeshSnapshot`]: one SHA-256 per index plus a
+/// combined hash. Two snapshots built from the same workspace state must have
+/// equal fingerprints (idempotence invariants I1–I3); `generation` is a reload
+/// counter, not content, and is deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFingerprint {
+    pub combined: String,
+    pub graph: String,
+    pub docs: String,
+    pub properties: String,
+    pub nodes: usize,
+    pub edges: usize,
+    pub doc_sections: usize,
+    pub property_keys: usize,
+}
+
+impl std::fmt::Display for SnapshotFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "fingerprint: {}", self.combined)?;
+        writeln!(
+            f,
+            "graph:       {} ({} nodes, {} edges)",
+            self.graph, self.nodes, self.edges
+        )?;
+        writeln!(
+            f,
+            "docs:        {} ({} sections)",
+            self.docs, self.doc_sections
+        )?;
+        write!(
+            f,
+            "properties:  {} ({} keys)",
+            self.properties, self.property_keys
+        )
+    }
+}
+
+impl MeshSnapshot {
+    /// Fingerprints the three indices from their canonical forms.
+    pub fn fingerprint(&self) -> SnapshotFingerprint {
+        let sha = |lines: &[String]| AuditLogger::compute_sha256(lines.join("\n").as_bytes());
+        let graph = sha(&self.contract_graph.canonical_lines());
+        let docs = sha(&self.doc_index.canonical_lines());
+        let properties = sha(&self.property_registry.canonical_lines());
+        let combined =
+            AuditLogger::compute_sha256(format!("{graph}\n{docs}\n{properties}").as_bytes());
+        SnapshotFingerprint {
+            combined,
+            graph,
+            docs,
+            properties,
+            nodes: self.contract_graph.node_count(),
+            edges: self.contract_graph.edge_count(),
+            doc_sections: self.doc_index.section_count(),
+            property_keys: self.property_registry.len(),
+        }
+    }
 }
 
 /// Central application state per RFC-001 Commandment 1.
@@ -40,8 +107,19 @@ pub struct AppState {
     /// so two `AppState`s in one process (tests) don't share signatures.
     pub vfs: Mutex<DifferentialVfs>,
     /// Set while a reload is queued or running; coalesces bursts of watcher events
-    /// into one rescan instead of piling identical jobs on the Rayon pool.
+    /// into one rescan instead of piling identical jobs on the Rayon pool. Purely
+    /// an optimization — correctness (never two `WorkspaceIndexer::reload` calls
+    /// running at once) comes from `reload_lock` below, not from this flag.
     pub reload_pending: AtomicBool,
+    /// Held for the full duration of one `WorkspaceIndexer::reload` call, entirely
+    /// on the single Rayon-pool thread that acquired it (a `std::sync::MutexGuard`
+    /// never crosses threads here). Two reload closures can still both get spawned
+    /// (`reload_pending`'s coalescing check is best-effort, not exclusive), but the
+    /// second one simply blocks here until the first finishes and then runs its own
+    /// pass against then-current disk state — at most one reload ever mutates the
+    /// snapshot at a time, so a slower first pass can never install a snapshot that
+    /// clobbers a second, newer one that finished first (idempotence invariant I2).
+    pub reload_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -80,6 +158,7 @@ impl AppState {
             rescan,
             vfs: Mutex::new(DifferentialVfs::new()),
             reload_pending: AtomicBool::new(false),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -209,5 +288,27 @@ roots = ["."]
         assert_eq!(view.generation, 1);
         assert_eq!(view.contract_graph.node_count(), 1);
         assert_eq!(view.doc_index.section_count(), 1);
+    }
+
+    #[test]
+    fn fingerprint_ignores_generation_but_tracks_every_index() {
+        let st = state();
+        let mut snap = st.snapshot_clone();
+        let before = snap.fingerprint();
+
+        snap.generation = 42;
+        assert_eq!(
+            snap.fingerprint(),
+            before,
+            "generation is a reload counter, not content"
+        );
+
+        snap.doc_index
+            .index_markdown_file(std::path::Path::new("d.md"), "# T\nbody");
+        let with_doc = snap.fingerprint();
+        assert_ne!(with_doc.docs, before.docs);
+        assert_eq!(with_doc.graph, before.graph);
+        assert_eq!(with_doc.properties, before.properties);
+        assert_ne!(with_doc.combined, before.combined);
     }
 }

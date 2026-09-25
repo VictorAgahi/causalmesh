@@ -6,6 +6,7 @@ pub mod contracts;
 pub mod crawler;
 pub mod docs;
 pub mod governance;
+pub mod health;
 pub mod properties;
 pub mod rescan;
 pub mod security;
@@ -26,13 +27,14 @@ pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
+pub use health::IndexHealth;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
 pub use security::{SecurityError, ValidatedScope};
+pub use socket::{cleanup_stale_socket, socket_path, socket_path_for, workspace_id};
 #[cfg(windows)]
-pub use socket::pipe_name;
-pub use socket::{cleanup_stale_socket, socket_path};
-pub use state::{AppState, MeshSnapshot};
+pub use socket::{pipe_name, pipe_name_for};
+pub use state::{AppState, MeshSnapshot, SnapshotFingerprint};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
     ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState,

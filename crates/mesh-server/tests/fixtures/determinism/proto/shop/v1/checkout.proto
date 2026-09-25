@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package shop.v1;
+
+service CheckoutService {
+  rpc PlaceOrder (PlaceOrderRequest) returns (PlaceOrderResponse);
+}
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+}
+
+message PlaceOrderRequest {
+  string user_id = 1;
+  Money total = 2;
+}
+
+message PlaceOrderResponse {
+  string order_id = 1;
+}

@@ -61,8 +61,22 @@ impl GraphRenderer {
         workspace_name: &str,
         repo_names: &[String],
     ) -> WebGraphPayload {
-        let nodes: Vec<WebNode> = graph
-            .all_nodes()
+        // Sorted by (path, line, name) rather than left in internal `NodeId`
+        // order: `NodeId` is a content hash, so this output would otherwise
+        // reorder itself whenever the hashing scheme changes even though the
+        // workspace didn't (idempotence invariant I5 — same query, same
+        // snapshot, byte-identical output).
+        let mut sorted_nodes: Vec<_> = graph.all_nodes().collect();
+        sorted_nodes.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let nodes: Vec<WebNode> = sorted_nodes
+            .into_iter()
             .map(|n| WebNode {
                 id: n.id,
                 name: n.name.to_string(),
@@ -152,13 +166,20 @@ impl GraphRenderer {
             let mut sorted_packages: Vec<_> = packages.into_iter().collect();
             sorted_packages.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for (pkg_name, nodes) in sorted_packages {
+            for (pkg_name, mut nodes) in sorted_packages {
                 let clean_subgraph_id =
                     format!("{clean_repo_id}_{pkg_name}").replace(['-', '.', '/', '@'], "_");
                 out.push_str(&format!(
                     "    subgraph sg_{clean_subgraph_id}[\"{pkg_name}\"]\n"
                 ));
 
+                nodes.sort_by(|a, b| {
+                    a.file_path
+                        .cmp(&b.file_path)
+                        .then_with(|| a.line_start.cmp(&b.line_start))
+                        .then_with(|| a.name.cmp(&b.name))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
                 for node in nodes {
                     let node_id = format!("n_{}", node.id);
                     let label = Self::sanitize_mermaid_label(node.name.as_str());
@@ -196,11 +217,12 @@ impl GraphRenderer {
                     EdgeKind::Imports => "Imports",
                     EdgeKind::DispatchesTo => "Dispatches",
                 };
-                // Only flag `Heuristic` edges — marking every edge (including
-                // the structural `Exact` majority) would make the tag
-                // decorative noise instead of a real signal.
+                // Only flag `Heuristic`/`Ambiguous` edges — marking every edge
+                // (including the structural `Exact` majority) would make the
+                // tag decorative noise instead of a real signal.
                 let label = match edge.confidence {
                     EdgeConfidence::Heuristic => format!("{label} (heuristic)"),
+                    EdgeConfidence::Ambiguous => format!("{label} (ambiguous)"),
                     EdgeConfidence::Exact => label.to_string(),
                 };
                 let arrow = match edge.kind {

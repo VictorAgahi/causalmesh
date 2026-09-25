@@ -10,6 +10,44 @@ at 3.0.0 — there is no reconstructed history before it.
 Plan 1 (P0): make every answer reproducible and honest. This first step only
 *measures* determinism; nothing about indexing behaviour changes yet.
 
+### Added (P0 step 1.8 — one `meshd` per workspace)
+- **`mesh_core::socket::workspace_id(base_dir)`**: the first 16 hex characters of
+  SHA-256(canonical `base_dir` + `CARGO_PKG_VERSION`) — a short, stable identifier for one
+  workspace at one binary version.
+- **`socket_path_for(workspace_id)`** / **`pipe_name_for(workspace_id)`**: workspace-scoped
+  socket/pipe resolution, alongside the existing workspace-agnostic `socket_path()`/`pipe_name()`
+  (kept for `MESH_SOCKET_PATH`-style overrides and standalone/test use).
+
+### Fixed (P0 step 1.8)
+- **Two unrelated workspaces can no longer share (or race to bind) the same daemon.** Before this
+  fix, every `meshd` on a machine bound the same one-per-user socket
+  (`~/.cache/mesh/meshd.sock`) regardless of which workspace it indexed — opening two different
+  repos in two IDE windows raced to bind it, and whichever lost silently had its `mesh-mcp`
+  sessions served by the *other* repo's daemon and data (idempotence invariant I7). `mesh-mcp run`
+  now discovers its config first, derives `workspace_id`, and resolves its daemon at
+  `socket_path_for(workspace_id)`; when spawning `meshd`, it passes `--socket <that path>` and
+  `.current_dir(<canonical base>)` explicitly instead of relying on inherited cwd/environment to
+  land on the right workspace. Upgrading the binary changes `workspace_id` too, so a stale daemon
+  from before an upgrade is simply never found again rather than serving newer clients against an
+  outdated snapshot format.
+- **`meshd` opens its socket before ingesting, not after.** Initial ingestion used to run
+  synchronously before the socket bound at all, so on a large workspace a client polling for the
+  daemon to come up (`mesh-mcp`'s `ensure_daemon_running`, 500ms budget) would reliably time out
+  and fall back to standalone mode — spinning up a second, redundant in-process index right as
+  the daemon it gave up on finished its own (the "double indexing" the roadmap called out).
+  Ingestion now runs in the background (under `AppState::reload_lock`, the same lock every later
+  `reload` takes, so a filesystem event racing the initial scan still can't install a stale
+  snapshot over it — invariant I2); the socket accepts connections immediately, and `initialize`/
+  `ping` succeed right away. A `tools/call` made before that first scan installs its snapshot
+  (`generation == 0`, a state a legitimately-indexed-and-empty workspace can never be in — it
+  always reaches generation 1) now gets an explicit "still indexing this workspace; retry
+  shortly" error instead of an answer computed against the still-default empty snapshot.
+
+Regression tests: `workspace_id` differs by base dir and is stable for the same one;
+`tools/call` reports "still indexing" before the first snapshot installs but `initialize`
+doesn't wait on it; two `meshd`s bound to two different workspace-scoped sockets never answer
+for each other, even with intentionally similar workspace names/config.
+
 ### Fixed (P0 step 1.7 — zero invented values)
 Six language extractors had a fallback path that turned an arbitrary expression — a
 variable's own name, an unrelated statement's string literal, one named param's value

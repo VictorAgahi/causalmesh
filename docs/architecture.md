@@ -247,6 +247,31 @@ The daemon transport itself is also platform-specific: a Unix domain socket on m
 named pipe (`\\.\pipe\mesh-mcp-<user>`) on Windows, so `meshd` sharing across IDE windows works
 on every supported OS, not only Unix.
 
+### 8.1 One `meshd` per workspace (P0 step 1.8)
+
+Before P0 step 1.8, every `meshd` on a machine bound the same one-per-user socket
+(`~/.cache/mesh/meshd.sock`) regardless of which workspace it was indexing — two unrelated
+repos open in two IDE windows would race to bind it, and whichever lost would have its
+`mesh-mcp` sessions silently served by the *other* repo's daemon (idempotence invariant I7: a
+response must always concern the workspace of the session that asked, never someone else's).
+
+Each `mesh-mcp run` invocation now discovers its config first, derives a `workspace_id` — the
+first 16 hex characters of SHA-256(canonical base directory + `CARGO_PKG_VERSION`) — and resolves
+its daemon at a socket scoped to that id: `~/.cache/mesh/meshd-<workspace_id>.sock` (or
+`\\.\pipe\mesh-mcp-<user>-<workspace_id>` on Windows). If no daemon is listening there yet,
+`mesh-mcp` spawns one with `--socket <that path>` and `.current_dir(<canonical base>)` explicitly
+— it never relies on inherited environment or an ambient default to land on the right workspace.
+Upgrading the binary changes `workspace_id` too, so a stale daemon from a previous version is
+simply never found again rather than serving newer clients against an outdated snapshot format.
+
+`meshd` also no longer waits for its first full scan to finish before opening that socket: the
+socket accepts connections (and `initialize`/`ping` succeed) immediately, while the initial
+ingestion runs in the background. A `tools/call` made before that first scan installs its
+snapshot gets an explicit "still indexing" error instead of an answer computed against the
+still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket to appear is no
+longer a race against a large repo's indexing time, since the socket now exists independently of
+how long that indexing takes.
+
 ---
 
 ## 9. Cryptographic Audit Trail (SOC2 & EU AI Act)

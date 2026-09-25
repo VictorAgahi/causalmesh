@@ -567,22 +567,24 @@ impl TypeScriptExtractor {
         None
     }
 
-    /// Unquotes a string-literal node's text; for anything else (identifier,
-    /// member expression, ...) returns the raw expression text — this is the
-    /// "not a literal" escape hatch so a variable/config-lookup topic name is
-    /// still surfaced instead of silently dropped.
+    /// Unquotes a string-literal node's text. Anything else (an identifier, a
+    /// member expression like `config.topic`, a template literal with
+    /// interpolation, ...) returns `None` instead of the raw expression
+    /// text: this extractor has no constant-propagation pass to resolve a
+    /// variable/config-lookup against, so its source text — `"config.topic"`
+    /// or `` "`orders-${env}`" `` verbatim — is not a topic name, just
+    /// whatever expression happened to be written at that call site.
     fn extract_value_text(value_node: Node, source: &[u8]) -> Option<String> {
-        let text = value_node.utf8_text(source).ok()?;
-        if value_node.kind() == "string" {
-            Some(
-                text.trim_matches('\'')
-                    .trim_matches('"')
-                    .trim_matches('`')
-                    .to_string(),
-            )
-        } else {
-            Some(text.trim().to_string())
+        if value_node.kind() != "string" {
+            return None;
         }
+        let text = value_node.utf8_text(source).ok()?;
+        Some(
+            text.trim_matches('\'')
+                .trim_matches('"')
+                .trim_matches('`')
+                .to_string(),
+        )
     }
 }
 
@@ -740,7 +742,7 @@ async function run() {
     }
 
     #[test]
-    fn test_kafkajs_non_literal_topic_emits_variable_name() {
+    fn test_kafkajs_non_literal_topic_records_nothing() {
         let code = r#"
 async function run() {
     await consumer.subscribe({ topic: TOPIC_NAME });
@@ -748,9 +750,14 @@ async function run() {
 "#;
         let (nodes, _) = parse(code);
 
-        assert!(nodes
-            .iter()
-            .any(|n| n.name == "TOPIC_NAME" && n.kind == NodeKind::KafkaTopic));
+        // `TOPIC_NAME` is a variable, not the topic value; this extractor has
+        // no constant-propagation pass to resolve it against, so it used to
+        // fabricate a KafkaTopic node named after the variable itself.
+        assert!(
+            !nodes.iter().any(|n| n.kind == NodeKind::KafkaTopic),
+            "a non-literal topic argument must not fabricate a KafkaTopic node, got: {:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -788,15 +795,19 @@ const emailQueue = new Queue('email-queue');
     }
 
     #[test]
-    fn test_bullmq_new_queue_non_literal_name() {
+    fn test_bullmq_new_queue_non_literal_name_records_nothing() {
         let code = r#"
 const emailQueue = new Queue(QUEUE_NAME);
 "#;
         let (nodes, _) = parse(code);
 
-        assert!(nodes
-            .iter()
-            .any(|n| n.name == "QUEUE_NAME" && n.kind == NodeKind::Queue));
+        // `QUEUE_NAME` is a variable, not the queue's name; used to fabricate
+        // a Queue node named after the variable itself.
+        assert!(
+            !nodes.iter().any(|n| n.kind == NodeKind::Queue),
+            "a non-literal queue name must not fabricate a Queue node, got: {:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
     }
 
     /// Definition-of-done test: a kafkajs producer and consumer for the same

@@ -169,8 +169,11 @@ impl KotlinExtractor {
     }
 
     /// Finds the topic argument: checks ProducerRecord/listOf wrapper first,
-    /// then direct argument, falling back to string literal search.
-    fn find_topic_arg(node: Node, source: &[u8]) -> Option<CompactStr> {
+    /// then the direct first argument. The returned `bool` is `true` when the
+    /// text is a genuine string literal, `false` when it's an identifier that
+    /// still needs resolving against `string_defaults` — the caller must not
+    /// use the identifier's own name as the topic if that resolution fails.
+    fn find_topic_arg(node: Node, source: &[u8]) -> Option<(CompactStr, bool)> {
         // 1. Check if arguments contain a ProducerRecord(...) or listOf(...) call
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -201,19 +204,18 @@ impl KotlinExtractor {
             }
         }
 
-        // 3. Fallback to literal search
-        let mut literals = Vec::new();
-        Self::collect_kinds(node, source, "string_literal", &mut literals, 0);
-        if let Some(first) = literals.into_iter().next() {
-            let unquoted = first.trim_matches('"');
-            if !unquoted.is_empty() {
-                return Some(CompactStr::new(unquoted));
-            }
-        }
         None
     }
 
-    fn extract_single_topic_arg(node: Node, source: &[u8]) -> Option<CompactStr> {
+    /// A string literal resolves directly (`is_literal = true`). An
+    /// `identifier` argument (a variable possibly holding the topic name) is
+    /// returned too, but tagged `is_literal = false`, so the caller can try
+    /// `string_defaults` and drop the signal entirely if that lookup fails,
+    /// instead of recording the variable's own name as if it were the topic.
+    /// A `navigation_expression` (e.g. `Constants.TOPIC`) has no resolution
+    /// path here at all and is not returned — inventing its last segment as a
+    /// topic was never anything but a guess.
+    fn extract_single_topic_arg(node: Node, source: &[u8]) -> Option<(CompactStr, bool)> {
         let unwrapped = if node.kind() == "value_argument" {
             node.named_child(0).unwrap_or(node)
         } else {
@@ -223,37 +225,14 @@ impl KotlinExtractor {
             let text = unwrapped.utf8_text(source).ok()?;
             let unquoted = text.trim_matches('"');
             if !unquoted.is_empty() {
-                return Some(CompactStr::new(unquoted));
+                return Some((CompactStr::new(unquoted), true));
             }
         }
         if unwrapped.kind() == "identifier" {
             let text = unwrapped.utf8_text(source).ok()?;
-            return Some(CompactStr::new(text));
-        }
-        if unwrapped.kind() == "navigation_expression" {
-            if let Some(last) = unwrapped.named_child(1) {
-                if let Ok(text) = last.utf8_text(source) {
-                    return Some(CompactStr::new(text));
-                }
-            }
+            return Some((CompactStr::new(text), false));
         }
         None
-    }
-
-    fn collect_kinds(node: Node, source: &[u8], kind: &str, out: &mut Vec<String>, depth: usize) {
-        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
-            return;
-        }
-        if node.kind() == kind {
-            if let Ok(text) = node.utf8_text(source) {
-                out.push(text.to_string());
-            }
-            return;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            Self::collect_kinds(child, source, kind, out, depth + 1);
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,8 +330,7 @@ impl KotlinExtractor {
 
                     if modifiers_text.contains("@KafkaListener") {
                         kind = NodeKind::KafkaTopic;
-                        topic_target =
-                            Some(Self::extract_annotation_param(modifiers_text, "topics"));
+                        topic_target = Self::extract_annotation_param(modifiers_text, "topics");
                     } else if modifiers_text.contains("@GetMapping")
                         || modifiers_text.contains("@PostMapping")
                         || modifiers_text.contains("@PutMapping")
@@ -433,11 +411,16 @@ impl KotlinExtractor {
                 };
                 if let Some(is_producer) = is_producer {
                     if let Some(args) = node.named_child(1) {
-                        if let Some(topic_text) = Self::find_topic_arg(args, source) {
-                            let topic = string_defaults
-                                .get(topic_text.as_str())
-                                .cloned()
-                                .unwrap_or(topic_text);
+                        // A literal is used as-is; an identifier must resolve via
+                        // `string_defaults` (a `val topic = "..."` in this file) —
+                        // if it doesn't, the variable's own name is not a topic
+                        // and the signal is dropped rather than fabricated.
+                        let resolved = match Self::find_topic_arg(args, source) {
+                            Some((text, true)) => Some(text),
+                            Some((text, false)) => string_defaults.get(text.as_str()).cloned(),
+                            None => None,
+                        };
+                        if let Some(topic) = resolved {
                             raw_kafka_calls.push(RawKafkaCall {
                                 line_start: node.start_position().row + 1,
                                 line_end: node.end_position().row + 1,
@@ -467,16 +450,18 @@ impl KotlinExtractor {
         }
     }
 
-    fn extract_annotation_param(annotation: &str, param: &str) -> String {
-        if let Some(idx) = annotation.find(param) {
-            let rest = &annotation[idx + param.len()..];
-            if let Some(quote_start) = rest.find('"') {
-                if let Some(quote_end) = rest[quote_start + 1..].find('"') {
-                    return rest[quote_start + 1..quote_start + 1 + quote_end].to_string();
-                }
-            }
-        }
-        "unknown.topic".to_string()
+    /// Returns `None` — rather than the fabricated literal `"unknown.topic"`
+    /// — when `param`'s value isn't a plain string literal (e.g. it's a
+    /// `${...}` property placeholder or an array of topics); the caller
+    /// falls back to labeling the node with the function's own name instead
+    /// of inventing a topic that was never actually declared.
+    fn extract_annotation_param(annotation: &str, param: &str) -> Option<String> {
+        let idx = annotation.find(param)?;
+        let rest = &annotation[idx + param.len()..];
+        let quote_start = rest.find('"')?;
+        let quote_end = rest[quote_start + 1..].find('"')?;
+        let val = &rest[quote_start + 1..quote_start + 1 + quote_end];
+        (!val.is_empty()).then(|| val.to_string())
     }
 
     fn first_line(node: Node, source: &[u8], fallback: &str) -> String {
@@ -496,6 +481,56 @@ mod tests {
         let lang = tree_sitter_kotlin_ng::LANGUAGE.into();
         parser.set_language(&lang).unwrap();
         parser
+    }
+
+    /// `@KafkaListener` with a non-literal `topics` value (a variable
+    /// reference, not a quoted string, here) must fall back to the
+    /// function's own name, not the fabricated literal `"unknown.topic"`.
+    #[test]
+    fn kafka_listener_with_unresolvable_topics_falls_back_to_function_name() {
+        let code = r#"
+package com.mesh.billing
+
+class BillingListener {
+    @KafkaListener(topics = [BILLING_TOPIC])
+    fun onEvent(msg: String) {
+    }
+}
+"#;
+        let mut p = parser();
+        let nodes = KotlinExtractor::extract(Path::new("BillingListener.kt"), code, 0, &mut p);
+        let node = nodes.iter().find(|n| n.kind == NodeKind::KafkaTopic);
+        assert_eq!(
+            node.expect("kafka topic node").name.as_str(),
+            "onEvent",
+            "an unresolvable topics value must fall back to the function name, \
+             never a fabricated placeholder like \"unknown.topic\""
+        );
+    }
+
+    /// `producer.send(topic, ...)` where `topic` is a variable with no
+    /// resolvable string default anywhere in the file must not record any
+    /// topic at all — the variable's own name is not a topic.
+    #[test]
+    fn kafka_send_with_unresolvable_identifier_records_nothing() {
+        let code = r#"
+package com.mesh.order
+
+class OrderService {
+    fun emit(topic: String) {
+        kafkaProducer.send(ProducerRecord(topic, "message payload"))
+    }
+}
+"#;
+        let mut p = parser();
+        let tree = p.parse(code, None).expect("parse");
+        let (_, relations) =
+            KotlinExtractor::extract_with_relations(Path::new("OrderService.kt"), code, 0, &tree);
+        assert!(
+            relations.producers.is_empty(),
+            "expected no fabricated topic from an unresolvable identifier, got: {:?}",
+            relations.producers
+        );
     }
 
     #[test]

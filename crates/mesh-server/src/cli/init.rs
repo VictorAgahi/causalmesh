@@ -10,14 +10,24 @@ impl InitCommand {
         let mut roots = Vec::new();
         let cur_dir = std::env::current_dir()?;
 
-        if cur_dir.join("proto-registry").exists() || cur_dir.join("proto").exists() {
+        if cur_dir.join("proto-registry").exists()
+            || cur_dir.join("proto").exists()
+            || cur_dir.join("protos").exists()
+        {
             eprintln!("  Found: Protobuf schemas");
             roots.push("./proto*".to_string());
         }
 
-        if cur_dir.join("api-gateway").exists() || cur_dir.join("gateway").exists() {
+        // Whichever of these actually exists is the root pushed — a repo with
+        // a plain `gateway/` directory (no `api-gateway/`) used to still push
+        // the literal, nonexistent path `./api-gateway`, which would never
+        // match anything once the generated config was loaded.
+        if let Some(gateway_dir) = ["api-gateway", "gateway"]
+            .into_iter()
+            .find(|d| cur_dir.join(d).exists())
+        {
             eprintln!("  Found: API Gateway");
-            roots.push("./api-gateway".to_string());
+            roots.push(format!("./{gateway_dir}"));
         }
 
         if cur_dir.join("services").exists() {
@@ -105,9 +115,16 @@ impl InitCommand {
             roots.push("./deploy*".to_string());
         }
 
-        if cur_dir.join("docs").exists() || cur_dir.join("architecture").exists() {
+        // Same "push whichever literal string won the ||, regardless of which
+        // directory actually exists" bug as the gateway detection above: a
+        // repo with only `architecture/` (no `docs/`) used to get a `./docs`
+        // root that could never match anything.
+        if let Some(docs_dir) = ["docs", "architecture"]
+            .into_iter()
+            .find(|d| cur_dir.join(d).exists())
+        {
             eprintln!("  Found: Architecture docs");
-            roots.push("./docs".to_string());
+            roots.push(format!("./{docs_dir}"));
         }
 
         if roots.is_empty() {
@@ -459,6 +476,58 @@ mod tests {
             !roots.iter().any(|r| r == "../src/*"),
             "an ordinary src/ with no nested language markers must not be \
              treated as a polyglot service container, got: {roots:?}"
+        );
+    }
+
+    /// A repo with a plain `gateway/` directory (no `api-gateway/`) used to
+    /// still get the literal, nonexistent root `./api-gateway`, which could
+    /// never match anything once the config was loaded.
+    #[test]
+    fn plain_gateway_dir_roots_itself_not_the_nonexistent_api_gateway_path() {
+        let roots = roots_for(&["gateway/main.go"]);
+        assert!(
+            roots.contains(&"../gateway".to_string()),
+            "a plain gateway/ dir must root itself, got: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&"../api-gateway".to_string()),
+            "must not root the nonexistent api-gateway path, got: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn api_gateway_dir_is_still_detected_when_it_exists() {
+        let roots = roots_for(&["api-gateway/main.go"]);
+        assert!(
+            roots.contains(&"../api-gateway".to_string()),
+            "an actual api-gateway/ dir must still be rooted, got: {roots:?}"
+        );
+    }
+
+    /// Same literal-path bug as the gateway case, for the docs/architecture
+    /// detection: a repo with only `architecture/` (no `docs/`) used to get
+    /// the nonexistent root `./docs`.
+    #[test]
+    fn plain_architecture_dir_roots_itself_not_the_nonexistent_docs_path() {
+        let roots = roots_for(&["architecture/overview.md"]);
+        assert!(
+            roots.contains(&"../architecture".to_string()),
+            "an architecture/ dir with no docs/ must root itself, got: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&"../docs".to_string()),
+            "must not root the nonexistent docs path, got: {roots:?}"
+        );
+    }
+
+    /// `protos/` (plural) must be detected the same way `proto/` and
+    /// `proto-registry/` already are.
+    #[test]
+    fn protos_plural_dir_is_detected_as_a_proto_root() {
+        let roots = roots_for(&["protos/billing.proto"]);
+        assert!(
+            roots.contains(&"../proto*".to_string()),
+            "a protos/ (plural) dir must be detected as a proto root, got: {roots:?}"
         );
     }
 

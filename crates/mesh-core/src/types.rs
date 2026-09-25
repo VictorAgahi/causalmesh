@@ -122,6 +122,15 @@ pub enum EdgeConfidence {
     /// normalization, or substring search — i.e. a heuristic that can
     /// collide across unrelated symbols that merely share a name.
     Heuristic,
+    /// Multiple candidates tied and the graph could not break the tie on its
+    /// own identity (same repo/package, or none of them matching the
+    /// importer's) — a real homonym (e.g. two proto packages each declaring
+    /// their own `AdminService`), not a resolved link. One edge is emitted per
+    /// tied candidate, all tagged `Ambiguous`, rather than the graph silently
+    /// picking whichever one a `HashMap` or file-processing order happened to
+    /// list first (idempotence invariant I1 — that pick used to vary between
+    /// otherwise-identical runs).
+    Ambiguous,
 }
 
 impl EdgeConfidence {
@@ -131,6 +140,7 @@ impl EdgeConfidence {
         match self {
             EdgeConfidence::Exact => "exact",
             EdgeConfidence::Heuristic => "heuristic",
+            EdgeConfidence::Ambiguous => "ambiguous",
         }
     }
 }

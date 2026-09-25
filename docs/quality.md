@@ -263,8 +263,66 @@ mesh-mcp's own output.
   flagged honestly in the golden file rather than fabricated as Flask routes or silently
   dropped. No `score.py` mode consumes `http_routes` yet (see below).
 
+## Update (2026-09-25, step 3.0 — scale bench: synthetic generator, boot/reload/RSS/p50/p95, nightly budgets)
+
+Plan 3 (P2) starts from a scale-bench harness rather than an optimization, on the theory that you
+can't validate later scale work (3.2 persistent index, 3.4 `smart_search` limits, 3.5 memory/CPU)
+without a repeatable, numeric baseline first.
+
+- `scripts/bench/gen_synthetic.py <out_dir> <file_count> [--seed N] [--services N]` generates a
+  deterministic multi-root workspace (Rust/Go/Python/TypeScript/Java files split across N
+  `service-*/` directories, each with a `marker.json` so `init --auto` finds them as real roots).
+  Fixed seed by default — reproducible across runs and machines, unlike a clone of `linux` or
+  `kubernetes` whose HEAD moves. `scripts/bench/repos.txt`'s real large repos (`linux`,
+  `kubernetes`, `vscode`, `grpc`, ...) remain useful for functional smoke testing
+  (`scripts/bench/bench.sh`) but are not used for the numeric scale budgets below — too slow to
+  clone and not reproducible enough to gate CI on.
+- `scripts/bench/scale_bench.py <repo_dir> <config_path> [--queries N] [--budget-json path]`
+  launches `mesh-mcp run --standalone` (the same code path `main.rs::run_standalone` uses in
+  production: `build_snapshot` runs to completion before the JSON-RPC loop starts, and
+  `FileWatcherService::spawn` really runs), then measures:
+  - `boot_ms` — wall clock from process spawn to a successful `initialize` response.
+  - `rss_peak_mb` — max RSS sampled via `ps -o rss=` across the whole run, not just at boot.
+  - `search_p50_ms` / `search_p95_ms` — percentiles over `--queries` (default 30) real
+    `smart_search` calls, not a single sample (a single `tools/call` timing, as in the older
+    `scripts/bench/mcp_client.py` functional smoke test, hides tail latency entirely).
+  - `reload_ms` — end-to-end incremental-reload latency: appends a uniquely-named symbol to a
+    generated file on disk, then polls `smart_search` for that exact symbol until it's visible or
+    a 20s deadline, through the real `notify`/`FileWatcherService` → `reload_paths` path (step
+    3.1), not a synthetic call into `reload_paths()` directly.
+  - Exits non-zero if any metric exceeds `scripts/bench/budgets.json` (or `DEFAULT_BUDGETS` if no
+    `--budget-json` given), and the violations are listed by name in the JSON output, not just a
+    pass/fail bit.
+- **Real measured baseline** (this machine, release build, synthetic workspace, 30 queries):
+
+  | file count | boot_ms | rss_peak_mb | search_p50_ms | search_p95_ms | reload_ms |
+  |---|---|---|---|---|---|
+  | 5,000  | 184  | 47  | 58   | 176   | 6  |
+  | 30,000 | 882  | 127 | 393  | 1,282 | 41 |
+
+  `scripts/bench/budgets.json` (used by the nightly CI job below) is set from the 5,000-file row
+  with 4–16x headroom for CI-runner variance, not the 30,000-file row — see the honest gap this
+  exposes, next.
+- **Real gap found, not hidden**: at 30,000 files, `smart_search` p50/p95 (393ms / 1,282ms)
+  already exceed even generous budgets built from the 5,000-file baseline. This is the numeric
+  motivation for steps 3.4 (`smart_search` limits/early-stop/hash cache) and 3.5 (O(N log N)
+  memory/CPU work) — 3.0's job was to produce this number honestly, not to fix it. Recorded here
+  instead of quietly loosening the budget to make a larger synthetic size pass.
+- `.github/workflows/nightly-bench.yml` runs `gen_synthetic.py` (5,000 files) + `scale_bench.py`
+  against `scripts/bench/budgets.json` once a day (`workflow_dispatch` also available for manual
+  runs) and uploads the raw JSON result as a build artifact. It intentionally does not run on
+  every PR — wall-clock budgets are noisy on shared CI runners, and gating every push on them
+  would make the gate itself flaky rather than meaningful.
+
 ## What's NOT measured yet
 
+- The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*
+  large repo (`kubernetes`, `linux`) through the same `scale_bench.py` harness — only through the
+  synthetic generator so far. Real repos have deeper directory trees and larger individual files,
+  which may shift `boot_ms`/`rss_peak_mb` independently of raw file count.
+- `reload_ms` has only been measured for a single-file edit; a multi-file burst (e.g. a branch
+  checkout touching hundreds of files at once) exercises the debounce-coalescing path in
+  `FileWatcherService::schedule_reload` differently and is not yet in the harness.
 - Kafka/Pub-Sub topic resolution has real ground truth now (`otel-demo`'s `orders` topic, above)
   but no `score.py` mode reads it yet.
 - HTTP route extraction has real ground truth now (`bank-of-anthos`'s 18 Flask routes, above) but

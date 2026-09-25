@@ -7,6 +7,27 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
+### Added (P2 step 3.0 — scale bench: synthetic generator, boot/reload/RSS/p50/p95, nightly budgets)
+- **`scripts/bench/gen_synthetic.py`**: deterministic (fixed-seed) multi-root synthetic workspace
+  generator, so scale numbers are reproducible across machines and runs instead of depending on a
+  moving upstream HEAD like the existing real-repo corpus (`scripts/bench/repos.txt`).
+- **`scripts/bench/scale_bench.py`**: boots `mesh-mcp run --standalone` for real (same code path
+  as production, including the real `FileWatcherService`), then measures `boot_ms`, `rss_peak_mb`
+  (sampled via `ps` across the run, not just at boot), `search_p50_ms`/`search_p95_ms` over N real
+  `smart_search` calls, and end-to-end `reload_ms` (append a uniquely-named symbol to a tracked
+  file on disk, poll `smart_search` until it's visible through the real watcher → `reload_paths`
+  path). Exits non-zero and names each violation when a metric exceeds
+  `scripts/bench/budgets.json`.
+- **`.github/workflows/nightly-bench.yml`**: runs the above at 5,000 synthetic files once a day,
+  uploads the raw JSON as a build artifact. Not wired into per-PR CI — wall-clock budgets are
+  noisy on shared runners, so gating every push on them would make the gate flaky, not meaningful.
+- **Real, honest baseline measured on this machine** (release build): 5,000 files boots in 184ms,
+  47MB peak RSS, `smart_search` p50/p95 58ms/176ms, reload 6ms. At 30,000 files, `smart_search`
+  p50/p95 grow to 393ms/1,282ms — already over generous budgets built from the 5,000-file
+  baseline. This gap is recorded in `docs/quality.md` as the numeric motivation for steps 3.4
+  (`smart_search` limits/early-stop) and 3.5 (memory/CPU at scale), not silently fixed by loosening
+  the budget or hidden by only ever benchmarking the size that passes.
+
 ## [5.0.0] — 2026-09-25
 
 **Plan 2 (P1) complete: inter-service joins are precise, not just deterministic.** Eight steps

@@ -69,19 +69,13 @@ jobs:
   # committed here — Bank of Anthos, the OpenTelemetry demo, Online Boutique) is
   # fully deterministic as of P0 step 1.5. A regression here is a real bug.
   determinism:
-    name: "Determinism Gate (${{ matrix.os }} #${{ matrix.run }})"
+    name: "Determinism Gate (${{ matrix.os }})"
     needs: test-suite
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # TEMPORARY (4.12a): 20 independent macOS runs of the gate as exit proof;
-      # removed by the next commit of the same PR.
       matrix:
-        os: [macos-latest]
-        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-        include:
-          - os: ubuntu-latest
-            run: 1
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@v4

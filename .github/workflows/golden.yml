@@ -47,14 +47,23 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
           command -v mesh-mcp
           status=0
+          scored=0
           # repo  min-precision  min-recall
           while read -r repo precision recall; do
+            # stdin from /dev/null: score.py's `mesh-mcp` child inherits
+            # stdin, and anything reading it would swallow the remaining
+            # rows below — silently skipping corpora with a green exit.
             python3 scripts/golden/score.py "$repo" \
               --fail-under-precision "$precision" \
-              --fail-under-recall "$recall" || status=1
+              --fail-under-recall "$recall" </dev/null || status=1
+            scored=$((scored + 1))
           done <<'EOF'
           online-boutique 1.0 1.0
           bank-of-anthos  1.0 1.0
           otel-demo       1.0 1.0
           EOF
+          if [ "$scored" -ne 3 ]; then
+            echo "FAIL: scored $scored corpora, expected 3"
+            status=1
+          fi
           exit $status

@@ -829,13 +829,19 @@ impl ContractGraph {
             // A generated client names its service either way: ts-proto emits
             // `AdServiceClient` for `service AdService` but `AdClient` for
             // `service Ad`, and a caller may well spell the latter's target as
-            // `Ad` while the graph declares `AdService` (or vice versa). Tried
-            // only when the literal target resolves to nothing, and only
-            // against services/methods actually declared in the graph — never
-            // a way to invent an edge to an undeclared name.
+            // `Ad` while the graph declares `AdService`. One direction only
+            // (`<X>` -> `<X>Service`). Tried only when the literal target
+            // resolves to nothing, and only against services/methods actually
+            // declared in the graph — never a way to invent an edge to an
+            // undeclared name. Never for `Health`: that is the stock health
+            // client (`NewHealthClient`, `HealthClient`), which a repo's own
+            // `service HealthService` is not.
             if matches.is_empty() {
                 let bare = target_str.split('.').next_back().unwrap_or(target_str);
-                if !bare.is_empty() && !bare.to_ascii_lowercase().ends_with("service") {
+                if !bare.is_empty()
+                    && !bare.to_ascii_lowercase().ends_with("service")
+                    && !bare.eq_ignore_ascii_case("health")
+                {
                     let with_suffix = format!("{target_str}Service");
                     matches = Self::resolve_rpc_target(
                         &with_suffix,
@@ -3209,7 +3215,7 @@ mod tests {
 
     /// `<X>` resolves to a declared `<X>Service` when `<X>` itself is not
     /// declared (ts-proto's `AdClient` for `service Ad` vs. a caller naming
-    /// `AdService`, and the reverse), and never to an undeclared name.
+    /// `AdService`), and never to an undeclared name.
     #[test]
     fn rpc_target_falls_back_to_service_suffix_only_against_declared_services() {
         use NodeKind::{GrpcService, ServiceClass};
@@ -3265,5 +3271,37 @@ mod tests {
         assert_eq!(calls_rpc_targets(&g, c_cart), vec![cart]);
         assert!(calls_rpc_targets(&g, c_foo).is_empty());
         let _ = cart_svc;
+    }
+
+    /// The stock health client (`healthpb.NewHealthClient`, ts `HealthClient`)
+    /// names `Health`, never the repo's own `HealthService`: with no `Health`
+    /// in the graph (a client-only readiness probe, no `RegisterHealthServer`,
+    /// no vendored `health.proto`), the `<X>` -> `<X>Service` fallback must not
+    /// turn it into an edge to an unrelated `service HealthService`.
+    #[test]
+    fn stock_health_client_does_not_fall_back_to_a_health_service() {
+        use NodeKind::{GrpcService, ServiceClass};
+        let mut g = ContractGraph::new();
+        let _own = g.add_node(memo_node(
+            "HealthService",
+            "acme.clinic",
+            "proto/clinic.proto",
+            0,
+            GrpcService,
+        ));
+        let probe = g.add_node(memo_node(
+            "waitReady",
+            "ops",
+            "src/ops/ready.go",
+            0,
+            ServiceClass,
+        ));
+        g.add_rpc_call(probe, "Health");
+        g.reconcile_edges();
+        assert!(
+            calls_rpc_targets(&g, probe).is_empty(),
+            "stock health client linked to the repo's HealthService: {:?}",
+            g.all_edges()
+        );
     }
 }

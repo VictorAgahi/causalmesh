@@ -680,6 +680,42 @@ section left open, and eliminating an orphaned-daemon failure mode.
   search p50/p95 400-480 / 920-1,040 ms). The peak is dominated by the parallel parse phase and the
   resident graph, not by anything this step touched; it is not hidden by loosening the budgets.
 
+### Step 3.5 review corrections (PR #30)
+
+- **More quadratic passes the step missed** (measured with synthetic graphs, release, N = 4k → 16k):
+  - Import strategy 1 (`pkg.Name`) scanned the whole `Name` bucket once per *distinct* target, so
+    N packages each importing their own `pN.Constants` was O(N²) even with the (target, repo) memo:
+    0.53 s → 9.1 s. Now a per-bucket "first node of each package" map: 2 ms → 10 ms. Relative
+    imports (`./a/index`, `../b/index`, …) get the same per-(stem, repo) memo.
+  - `CallsRpc` disambiguated each call by scanning every same-named proto method for the caller's
+    package: N services each calling their own `Get` was 1.2 s → 11.3 s. Candidates are now grouped
+    by package once: 4 ms → 18 ms.
+  - Stale topic hubs were removed one at a time, each `retain`ing the `event-bus` file entry all
+    hubs share (O(k·H)); removal is now batched with `patch_files`' grouped-key logic.
+  - Reload (`WorkspaceIndexer::reload`) called `DocIndex::remove_file` and
+    `PropertyRegistry::remove_file` once per changed file, each a full pass (O(k·N) on a branch
+    switch); both are now one batched pass.
+  - `gen_synthetic.py --contracts` imported one single `com.acme.common.Shared` target, which the
+    memo reduced to one lookup and so could not show the first bug; imports now vary across the
+    `Shared` declarations.
+  - Opt-in guard: `reconcile_scales_linearly_on_hot_buckets` (`--ignored`).
+- **"Byte-identical" YAML was not**: a tagged key (`!Tag key:`) aborted the whole file (the tree
+  read it through the tag), and a repeated key ingested both values (the tree rejected the file,
+  as Spring does). Both fixed and checked against the `Value` tree itself. The AsyncAPI/OpenAPI
+  views likewise dropped tagged nodes and read a root *list* positionally as `channels`/`topics`;
+  fixed. The views still accept a duplicate key deep in a schema, which the tree rejected — kept on
+  purpose.
+- **Spec line recovery** gave up on a whole section at its first unlocatable key (every later
+  entry anchored at line 1). A miss now keeps the cursor; the seeker gives up only after 8 misses,
+  which still bounds a section to 9 passes.
+- **What "streaming under a memory budget" does and does not mean here**: no `serde_yaml::Value`
+  tree, but `serde_yaml` 0.9 still buffers one document's event list before the visitor runs; the
+  only memory bound on a YAML or Markdown file is the indexer's per-file size cap (384 KB, checked
+  before the read). **Markdown is not streamed at all**: files are read whole and every section's
+  content stays resident in `DocIndex`; the step only dropped the second, lowercased copy for ASCII
+  sections. There is no global memory budget for docs or properties. Spec item 1 is therefore
+  delivered for YAML's tree, not for Markdown, and not as a budget.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

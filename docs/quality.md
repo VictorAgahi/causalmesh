@@ -427,11 +427,11 @@ section left open, and eliminating an orphaned-daemon failure mode.
   `reload_paths`'s full-crawl fallback because a single incoming path can't cheaply reproduce the
   gitignore stacking a full walk gets right) for the common case: if the file was never watched,
   `reload_paths` is never even asked about it.
-- **Above `MAX_WATCHED_DIRS` (4096, combined across all roots)**: falls back to a `PollWatcher`
-  backend (`notify::PollWatcher`, polling every 2s) with one plain recursive watch per root —
-  `PollWatcher` re-scans the tree itself on its own interval, so it needs no per-directory
-  registration and isn't subject to the OS watch-descriptor ceiling (concretely, Linux's
-  `fs.inotify.max_user_watches`) the per-directory design exists to respect. The cap is
+- **Above `MAX_WATCHED_DIRS` (2048 on Linux/Windows, 200 on macOS, combined across all roots)**:
+  falls back to a `PollWatcher` backend (`notify::PollWatcher`, polling every 2s) with one plain
+  recursive watch per root — `PollWatcher` re-scans the tree itself on its own interval, so it needs
+  no per-directory registration and isn't subject to the OS watch-descriptor ceiling (concretely,
+  Linux's `fs.inotify.max_user_watches`) the per-directory design exists to respect. The cap is
   deliberately conservative rather than tuned to any one platform: macOS's FSEvents backend
   doesn't need per-directory registration to work correctly at all (see below), so this cap
   exists purely to protect the Linux case.
@@ -537,6 +537,58 @@ section left open, and eliminating an orphaned-daemon failure mode.
   `scripts/determinism.sh` on both fixtures re-run after the fixes (unaffected, same fingerprints
   as before this step).
 
+### A second `/code-review high` round found the fixes above needed fixes of their own
+
+- **The severity-1 finding**: initial per-directory registration calls `.watch()` once per
+  planned directory *sequentially* — not just the dynamic re-registration path finding #3
+  originally measured. On macOS, every `.watch()` call after the first stops and restarts the
+  whole FSEvents stream (the ~11s-under-load cost already documented), so a workspace with
+  hundreds of watchable directories would make `spawn()` itself take minutes, not just the
+  post-startup dynamic case. Fixed: `MAX_WATCHED_DIRS` is now platform-specific —
+  `#[cfg(target_os = "macos")]` uses 200 (chosen to bound worst-case startup cost, not tuned to
+  any OS watch-descriptor ceiling, which doesn't apply to FSEvents at all), other platforms use
+  2048 (providing safe headroom below typical inotify defaults like 8192 without risking descriptor starvation).
+- **`run_standalone` wasn't wrapped in `spawn_blocking`** the way `meshd`'s equivalent call was —
+  on macOS, the same slow synchronous setup would have frozen the whole stdio/MCP proxy during
+  standalone-mode startup instead of just delaying watcher readiness. Fixed: wrapped identically.
+- **The `spawn_blocking` fix reintroduced a race, fire-and-forget with nothing to catch up**: once
+  watches are live (Ok from `spawn`), a file changed during the registration window above had no
+  mechanism to ever be noticed — `reload`/`reload_paths` are purely event-driven, so a missed
+  change would silently persist until the next restart, undermining the very "return-before-
+  events-are-missed" contract `spawn()` itself preserves. Fixed: both call sites now trigger one
+  `FileWatcherService::execute_reload_sync` right after a successful `spawn()`, inside the same
+  blocking-pool closure — it acquires `reload_lock` the same as initial ingestion, so it safely
+  queues behind ingestion if that's still running, then does one cheap differential VFS diff
+  against whatever changed on disk during setup, closing the gap definitively rather than leaving
+  it to chance.
+- **Polling fallback's single-root failure aborted the whole `spawn()` call** (`?` on one root's
+  `.watch()`, unlike the native path's per-directory resilience a few lines below) — one missing/
+  unreadable root in a huge multi-root workspace (the only case that reaches this fallback) would
+  silently disable watching for *every* root. Fixed: logged and skipped per-root, matching the
+  native path.
+- **Stale doc comment**: a test's own comment said dynamic registration was "deferred onto
+  `state.rescan`'s background pool" — the opposite of finding #4 above, which moved it off that
+  pool specifically to avoid starving it. Fixed the comment.
+- **Silent `continue` on a capped dynamic subtree**: unlike every other degraded/capped path in
+  this file, a subtree alone exceeding the remaining watch budget logged nothing. Fixed: added
+  the missing `tracing::warn!`.
+- **Accepted, not fixed**: nothing bounds how many detached registration threads can be *in
+  flight* at once — they only serialize against each other via a shared mutex, not a queue. A
+  workload creating new directories across many separate debounce windows in rapid succession
+  could accumulate more blocked threads (each holding a stack) than drain. A single dedicated
+  worker thread with an internal queue would close this properly; not built given how narrow a
+  burst pattern needs to be to matter in practice, and the platform-aware cap above already
+  reduces how often the native (non-polling) path is reached at all on macOS.
+- **Live-verified on this repo** (`meshd` built from this branch against causalmesh's own 6
+  configured roots, ~40 total directories — comfortably under the 200 cap): native per-directory
+  mode engaged correctly, per-root "watching N directories" log lines appeared, full ingestion +
+  watch registration completed in well under 100ms with the machine otherwise idle (consistent
+  with the "under load" qualifier on the ~11s FSEvents figure — that cost is real but
+  contention-dependent, not a fixed per-call tax).
+- Verified again after all seven of these fixes: `cargo test --workspace` (369 passed, 1 ignored,
+  stable across three consecutive runs), clippy/fmt clean, `scripts/determinism.sh` unaffected
+  (same fingerprints).
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*
@@ -567,7 +619,7 @@ section left open, and eliminating an orphaned-daemon failure mode.
 - `FileWatcherService`'s `MAX_WATCHED_DIRS` cap (step 3.3) has not been measured against a real
   200,000+ file repository to confirm the `PollWatcher` fallback actually engages and stays
   responsive at that scale — only proven at the unit level (`plan_watch_dirs_reports_capped_
-  without_a_partial_list`) with a synthetic 10-directory tree well under the 4096 threshold.
+  without_a_partial_list`) with a synthetic 10-directory tree well under the `MAX_WATCHED_DIRS` threshold.
   Similarly, the dynamic-registration path's real ~11s-per-call FSEvents cost on macOS under load
   (see step 3.3's section above) has not been characterized on Linux (inotify) or Windows
   (ReadDirectoryChangesW) — only asserted to be cheaper by architecture, not measured.

@@ -48,12 +48,27 @@ impl FileWatcherService {
 
     /// Above this many individually watchable directories across all roots, `spawn` gives up
     /// on per-directory native registration and falls back to `POLL_FALLBACK_INTERVAL` polling
-    /// instead (P2 step 3.3). Deliberately conservative: some CI/container images and older
-    /// Linux defaults leave `fs.inotify.max_user_watches` far below the 8192+ many desktop
-    /// distros now ship, and macOS's FSEvents backend doesn't need per-directory registration
-    /// to work correctly at all (see `plan_watch_dirs`'s use here), so this cap exists purely
-    /// to protect the Linux case rather than being tuned to any single platform's true limit.
-    pub const MAX_WATCHED_DIRS: usize = 4096;
+    /// instead (P2 step 3.3).
+    ///
+    /// Platform-specific, not a single tuned-for-everyone number, because the *cost of a single
+    /// `.watch()` call* differs by orders of magnitude across backends, not just the OS-level
+    /// ceiling on how many are allowed:
+    /// - Linux (inotify): `inotify_add_watch` is a cheap syscall; the cap here exists purely to
+    ///   protect against `fs.inotify.max_user_watches`, which some CI/container images and older
+    ///   distro defaults leave far below the 8192+ many desktop distros now ship.
+    /// - macOS (FSEvents, `notify`'s backend): every single `.watch()` call after the first stops
+    ///   and restarts the *entire* event stream (`FsEventWatcher::stop()`'s busy-wait for the
+    ///   stream's background runloop to go idle — see `spawn`'s own doc), measured on this
+    ///   machine at over 11 seconds *per call* under load. That cost is paid once per directory
+    ///   at startup, not just for the dynamic re-registration path this was first measured
+    ///   against — a workspace with hundreds of watchable directories would otherwise make
+    ///   `spawn()` itself take minutes. A much lower cap here means such a workspace falls back
+    ///   to polling (cheap, no per-directory registration at all) well before that happens,
+    ///   trading registration-time exclusion filtering for a bounded, predictable startup cost.
+    #[cfg(target_os = "macos")]
+    pub const MAX_WATCHED_DIRS: usize = 200;
+    #[cfg(not(target_os = "macos"))]
+    pub const MAX_WATCHED_DIRS: usize = 2048;
 
     /// Poll interval used only in the capped fallback above. Coarser than
     /// `DEBOUNCE_INTERVAL` on purpose: polling a huge tree (the only workspaces that ever
@@ -188,7 +203,14 @@ impl FileWatcherService {
             // fallback exists.
             for root in state.allowed_roots.iter() {
                 if root.exists() {
-                    debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+                    // A `?` here would abort the whole `spawn()` call — and thus register zero
+                    // watches for *every* root — over one root failing (permissions, deleted
+                    // between the `exists()` check above and this call). Logged and skipped
+                    // instead, matching the native per-directory path's own per-item resilience.
+                    if let Err(e) = debouncer.watcher().watch(root, RecursiveMode::Recursive) {
+                        tracing::warn!(target: "mesh::watcher", "Failed to watch root {}: {e}", root.display());
+                        continue;
+                    }
                     tracing::info!(target: "mesh::watcher", "FileWatcher (polling) watching root: {}", root.display());
                 }
             }
@@ -301,6 +323,13 @@ impl FileWatcherService {
                                     // deferred `.watch()` calls below have run.
                                     let plan = Self::plan_root(&ev.path, root, &matcher, budget);
                                     if plan.capped {
+                                        tracing::warn!(
+                                            target: "mesh::watcher",
+                                            "New subtree under {} alone exceeds the remaining \
+                                             watch budget ({budget}); none of it will be \
+                                             individually watched until the next restart.",
+                                            ev.path.display()
+                                        );
                                         continue;
                                     }
                                     let new_dirs: Vec<PathBuf> = plan
@@ -331,6 +360,18 @@ impl FileWatcherService {
                                     // spawned thread is short-lived (a handful of `.watch()`
                                     // calls, then exit), so an unbounded thread per burst is an
                                     // acceptable trade against reusing a pool sized for other work.
+                                    //
+                                    // Honest limitation, not fixed further here: nothing bounds
+                                    // how many of these threads can be *in flight* at once — they
+                                    // only serialize against each other via `debouncer_keepalive`'s
+                                    // mutex, not a queue. A workload that creates new directories
+                                    // across many separate debounce windows in rapid succession
+                                    // (e.g. a script generating many service directories one at a
+                                    // time) could accumulate more blocked threads than drain,
+                                    // each holding a stack, faster than a bounded worker would. A
+                                    // single dedicated worker thread with an internal queue would
+                                    // close this properly; not built here given how rare a burst
+                                    // pattern this narrow needs to be to matter in practice.
                                     let debouncer_for_task = debouncer_keepalive.clone();
                                     std::thread::spawn(move || {
                                         let mut guard = debouncer_for_task

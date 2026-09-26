@@ -260,10 +260,12 @@ roots = ["."]
         let new_dir = allowed_root.join("new_service");
         std::fs::create_dir_all(&new_dir).expect("mkdir new_service");
 
-        // Dynamic registration is deliberately deferred onto `state.rescan`'s background pool
-        // (see `FileWatcherService::spawn`'s doc) precisely because a native watcher's `.watch()`
-        // call is not cheap on every platform: macOS's FSEvents backend stops and restarts its
-        // whole event stream per call, measured on this machine at 11+ seconds under load. A
+        // Dynamic registration is deliberately deferred onto a detached background thread (see
+        // `FileWatcherService::spawn`'s doc — NOT `state.rescan`'s pool, which is intentionally
+        // avoided since it also runs real reload jobs) precisely because a native watcher's
+        // `.watch()` call is not cheap on every platform: macOS's FSEvents backend stops and
+        // restarts its whole event stream per call, measured on this machine at 11+ seconds
+        // under load. A
         // write made before that registration lands is permanently missed (no retroactive
         // delivery), so this test keeps writing until either the watch catches up and the write
         // is observed, or a generous budget elapses — proving eventual coverage, not instant

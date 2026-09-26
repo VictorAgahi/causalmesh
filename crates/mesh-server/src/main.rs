@@ -546,9 +546,28 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
         cancel_sig.cancel();
     });
 
-    if let Err(e) = mesh_server::FileWatcherService::spawn(state.clone(), cancel_token.clone()) {
-        tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
-    }
+    // `spawn_blocking`, not called inline: `FileWatcherService::spawn`'s setup (the per-root
+    // directory walk and initial OS watch registration) runs synchronously before returning —
+    // deliberately, so watches are guaranteed live the instant it returns (see its own doc). On
+    // macOS that setup can take real time (`MAX_WATCHED_DIRS`'s doc), so running it on this
+    // process's single async task would freeze the whole stdio/MCP proxy during startup instead
+    // of just delaying watcher readiness, exactly like `meshd`'s equivalent call.
+    let watcher_state = state.clone();
+    let watcher_cancel = cancel_token.clone();
+    tokio::task::spawn_blocking(move || {
+        match mesh_server::FileWatcherService::spawn(watcher_state.clone(), watcher_cancel) {
+            Ok(_handle) => {
+                // Closes the gap between "watches are live" and "the snapshot installed above
+                // was already stale by the time that happened" — see `meshd`'s identical fix for
+                // the full reasoning (a file changed during `spawn`'s registration window has no
+                // other mechanism to ever be noticed afterward).
+                mesh_server::FileWatcherService::execute_reload_sync(&watcher_state);
+            }
+            Err(e) => {
+                tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
+            }
+        }
+    });
 
     run_server(state, cancel_token).await?;
     Ok(())

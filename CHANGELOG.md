@@ -21,11 +21,12 @@ reload, driven by the watcher's own paths.
   gitignored build output, ...) never gets a watch at all — closing the nested-`.gitignore` gap
   step 3.1 documented in `docs/quality.md` for the common case, rather than reactively filtering
   events downstream.
-- **Watch-count cap with a transparent polling fallback**: above `MAX_WATCHED_DIRS` (4096,
-  combined across all roots), `spawn` falls back to a `notify::PollWatcher` backend (2s interval,
-  one plain recursive watch per root) instead of per-directory native registration — protects
-  Linux's `fs.inotify.max_user_watches` ceiling on very large workspaces without needing
-  gitignore-aware enumeration at all, since `PollWatcher` re-scans the tree itself.
+- **Watch-count cap with a transparent polling fallback**: above `MAX_WATCHED_DIRS` (2048 on
+  Linux/Windows, 200 on macOS, combined across all roots), `spawn` falls back to a
+  `notify::PollWatcher` backend (2s interval, one plain recursive watch per root) instead of
+  per-directory native registration — protects Linux's `fs.inotify.max_user_watches` ceiling on
+  very large workspaces without needing gitignore-aware enumeration at all, since `PollWatcher`
+  re-scans the tree itself.
 - **New directories created after startup are still watched**: per-directory registration doesn't
   automatically track new subdirectories the way the old single-recursive-watch design did. The
   event loop detects a newly-created, non-excluded directory and registers it (plus any of its own
@@ -67,6 +68,22 @@ reload, driven by the watcher's own paths.
   --all -- --check` (clean), `scripts/determinism.sh` on both fixtures re-confirmed (unaffected).
   See `docs/quality.md` for the full reasoning, the honest limitations (no measurement yet at real
   200k+-file scale or on Linux/Windows watch backends), and the live-smoke-test confirmation.
+- **A second `/code-review high` round found the fixes above needed fixes of their own**: the
+  severity-1 finding was that initial (startup) per-directory registration pays macOS's
+  per-`.watch()`-call FSEvents restart cost sequentially for every planned directory, not just the
+  dynamic re-registration path originally measured — fixed with a platform-specific
+  `MAX_WATCHED_DIRS` (200 on macOS, 2048 elsewhere, since inotify/ReadDirectoryChangesW
+  have no equivalent per-call cost). `run_standalone` wasn't wrapped in `spawn_blocking` the way
+  `meshd`'s call was, fixed identically. The `spawn_blocking` fix itself was fire-and-forget with
+  nothing to catch up a file changed during the (possibly slow) registration window — fixed with
+  one `execute_reload_sync` right after a successful `spawn()`, at both call sites. Plus: the
+  polling fallback aborted watching for *every* root over one root failing (fixed to match the
+  native path's per-root resilience), a stale doc comment, and a missing warning on a silently
+  dropped capped subtree. See `docs/quality.md`'s step 3.3 section for the full list, including
+  one accepted-not-fixed limitation (unbounded in-flight registration threads under rapid bursts)
+  and a live verification against this repo's own 40-directory workspace.
+- Verified again after all seven of these fixes: `cargo test --workspace` (369 passed, 1 ignored,
+  stable across three consecutive runs), clippy/fmt clean, `scripts/determinism.sh` unaffected.
 
 ### Added (P2 step 3.2 — persistent SQLite/WAL content-hash cache for cold-start indexing)
 - **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): a SQLite-in-WAL-mode cache

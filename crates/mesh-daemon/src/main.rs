@@ -172,8 +172,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let watcher_state = state.clone();
     let watcher_cancel = cancel_token.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = FileWatcherService::spawn(watcher_state, watcher_cancel) {
-            tracing::warn!(target: "meshd", "Failed to start FileWatcherService: {e}");
+        match FileWatcherService::spawn(watcher_state.clone(), watcher_cancel) {
+            Ok(_handle) => {
+                // Watches are confirmed live from this point on — but `spawn`'s own
+                // (synchronous, possibly slow on macOS — see `MAX_WATCHED_DIRS`'s doc)
+                // registration window means a file could have changed on disk before that
+                // finished, with no watcher yet in place to observe it, and no other
+                // mechanism to ever notice afterward (`reload`/`reload_paths` are purely
+                // event-driven). One differential reload right here closes that gap: it
+                // acquires `reload_lock` the same as the ingestion task above, so it safely
+                // waits its turn if ingestion is still running, then does a cheap VFS diff
+                // against whatever changed on disk since — including during setup above —
+                // rather than leaving a possible silent divergence until the next restart.
+                FileWatcherService::execute_reload_sync(&watcher_state);
+            }
+            Err(e) => {
+                tracing::warn!(target: "meshd", "Failed to start FileWatcherService: {e}");
+            }
         }
     });
 

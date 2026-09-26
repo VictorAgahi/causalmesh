@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use clap::{Parser, Subcommand};
-use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine, PersistentIndexCache};
+use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
 use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand, StatsCommand};
 use mesh_server::{run_server, WorkspaceIndexer};
 use std::path::{Path, PathBuf};
@@ -508,21 +508,10 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
     let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
 
-    // Persistent, content-hash-keyed cache of tree-sitter `FileIndex` fragments (P2 step 3.2):
-    // an unchanged file under an unchanged config is a SQLite lookup instead of a re-parse on
-    // this cold start. A cache the process can't open (permissions, disk full) degrades to
-    // "parse everything" rather than failing the boot — it's a performance optimization, never
-    // a correctness dependency.
-    let index_cache = match PersistentIndexCache::open(None) {
-        Ok(cache) => Some(cache),
-        Err(e) => {
-            tracing::warn!(
-                target: "mesh::indexer",
-                "Failed to open persistent index cache, continuing without it: {e}"
-            );
-            None
-        }
-    };
+    // Persistent, content-hash-keyed cache of tree-sitter `FileIndex` fragments (P2 step 3.2),
+    // one database per workspace under its quota (plan 4 step 4.4); see
+    // `AppState::open_index_cache` for why a failure to open it does not fail the boot.
+    let index_cache = state.open_index_cache(&base_dir);
 
     // Single parallel scan over all roots, one reconcile, one atomic install.
     let snapshot = {
@@ -532,7 +521,7 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
             &state.allowed_roots,
             None,
             Some(&mut vfs),
-            index_cache.as_ref(),
+            index_cache,
         )
     };
     state.install_snapshot(snapshot);

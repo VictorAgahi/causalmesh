@@ -139,3 +139,11 @@ cryptographic_audit_trail = true
 # [engines.policy.skills]
 # "proto-registry" = ".agents/skills/proto-contract-evolution.md"
 # "k8s-infrastructure" = ".agents/skills/k8s-manifest-review.md"
+
+# ==============================================================================
+# Parse cache (per workspace)
+# ==============================================================================
+# Quota of ~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db (database + WAL), in MiB.
+# Over quota, the least recently used entries are evicted down to 80 % of it.
+[cache]
+max_size_mb = 2048

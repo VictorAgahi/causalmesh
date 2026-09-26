@@ -15,7 +15,7 @@ mod server;
 mod socket;
 
 use clap::Parser;
-use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine, PersistentIndexCache};
+use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
 use mesh_server::{FileWatcherService, WorkspaceIndexer};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,24 +114,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot computed from a stale base out from under it (idempotence
     // invariant I2 — see `AppState::reload_lock`'s own doc).
     let ingest_state = state.clone();
+    let ingest_base_dir = base_dir.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = ingest_state
             .reload_lock
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
-        // See `mesh-server`'s `run_standalone` for why a cache-open failure degrades to
-        // "parse everything" instead of failing the boot (P2 step 3.2).
-        let index_cache = match PersistentIndexCache::open(None) {
-            Ok(cache) => Some(cache),
-            Err(e) => {
-                tracing::warn!(
-                    target: "meshd",
-                    "Failed to open persistent index cache, continuing without it: {e}"
-                );
-                None
-            }
-        };
+        // Per-workspace cache under its quota (plan 4 step 4.4); a failure to open it degrades
+        // to "parse everything" (see `AppState::open_index_cache`).
+        let index_cache = ingest_state.open_index_cache(&ingest_base_dir);
         let snapshot = {
             let mut vfs = ingest_state.vfs.lock().unwrap_or_else(|e| e.into_inner());
             WorkspaceIndexer::build_snapshot(
@@ -139,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &ingest_state.allowed_roots,
                 None,
                 Some(&mut vfs),
-                index_cache.as_ref(),
+                index_cache,
             )
         };
         ingest_state.install_snapshot(snapshot);

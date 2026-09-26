@@ -766,6 +766,58 @@ hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are 
 cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
 were not loosened to make larger corpora pass.
 
+## Update (2026-09-26, plan 4 step 4.4 — one parse cache per workspace, quota, LRU eviction)
+
+**Before.** `~/.cache/mesh-mcp/index-cache.db` was one file for every workspace on the machine,
+with no eviction. Measured with `scripts/bench/cache_growth.py` (new): a copy of
+`~/bench-repos/mesh-synth-5k` (5,000 code files) put under git, isolated `HOME`, then one
+simulated work week — 30 branch switches between 6 feature branches (50 edited files each) and
+`main`, and 10 rebases (upstream commit of 100 files, then `git rebase main`) — with a cold boot
+(`mesh-mcp run --standalone`, stdin closed) after each of the 40 events. A cold boot per event is
+the worst case: every content version the tree ever shows is parsed and written once. Size is
+database + `-wal` bytes, without forcing a checkpoint.
+
+| measurement (5k corpus) | 6.0.1 (`02695de`) | this step, no quota hit | this step, `max_size_mb = 6` |
+|---|---|---|---|
+| entries after the first boot | 5,000 | 5,000 | 5,000 |
+| size after the first boot | 5,349,376 B | 5,853,184 B | 5,857,280 B |
+| bytes per entry (payload alone: 802 B) | 1,070 | 1,171 | 1,171 |
+| entries after the week | 6,300 | 6,300 | 2,230 |
+| size after the week (db + WAL) | 6,664,192 B (×1.25) | 7,479,296 + 799,312 B WAL (×1.41) | 3,792,896 B |
+| largest size seen during the week | 6,664,192 B | 8,477,088 B | 6,193,152 B (quota 6,291,456) |
+| warm boot, median of 40 | 113–131 ms | 127–136 ms | 260 ms |
+
+Growth is 1,300 entries per week on this corpus (+1.31 MB before, +1.63 MB of database after),
+i.e. one entry per content version seen: before this step nothing is ever evicted, so a cache
+only grows, and every workspace adds to the same file. At the 2048 MB default the per-workspace
+quota holds ~1.8 million entries, over a thousand such weeks of this 5k corpus: it is a safety
+bound for large or long-lived workspaces, not a working-set limit.
+
+**What changed per entry.** +~100 B per entry: the `file_index_access(cache_key,
+last_accessed_at)` side table and its LRU index. Keeping the timestamp out of the payload row is
+deliberate — bumping it on every warm boot would otherwise rewrite every ~1 KB payload page into
+the WAL. The flush still leaves ~0.8–1.1 MB of WAL after a warm boot on this corpus (5,000
+access rows rewritten), counted in the quota, and costs ~10 ms of warm boot (113–115 vs
+127–136 ms over 3 runs each; cold first boots varied 314–1,417 ms across runs for both binaries,
+too noisy to compare).
+
+**Quota behaviour.** With `max_size_mb = 6`, just above the 5.9 MB working set, the size never
+exceeded the quota over the week (max 6,193,152 B), but the cache thrashes: each over-quota
+check evicts down to 80 % in 1,000-entry batches, the next boot re-parses the evicted files
+(warm boot 260 ms instead of ~130 ms). A quota below the working set trades boot time for disk,
+as expected from LRU.
+
+**Tests** (exit criteria): `index_cache::tests::inserts_past_a_10mb_quota_shrink_back_under_80_percent`
+(writes > 2× a 10 MB quota, file + WAL ≤ 8 MB after the check, hot entries kept);
+`index_cache_quota::four_processes_indexing_four_workspaces_hit_zero_sqlite_errors` (4 child
+processes, shared `HOME`, 3 scans each, 0 swallowed SQLite errors, one db per `workspace_id`,
+no legacy global file); `index_cache_quota::daemon_reloading_30_times_stays_under_quota`
+(an `AppState` with the cache attached, 30 `WorkspaceIndexer::reload` calls rewriting 150 files
+each, 1 MB quota, size ≤ quota after every reload, eviction observed).
+
+**Not measured**: a real long-lived `meshd` over a real week, and the cache on a real 200k-file
+repository (entry size depends on the language mix; the 5k corpus is synthetic).
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

@@ -222,15 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 const DAEMON_LOG_MAX_ROTATIONS: usize = 5;
 
 fn open_daemon_log(workspace_id: &str) -> std::io::Result<std::fs::File> {
-    let log_dir =
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("mesh-mcp")
-                .join("logs")
-        } else {
-            std::env::temp_dir().join("mesh-mcp").join("logs")
-        };
+    let log_dir = mesh_core::mesh_cache_dir().join("logs");
     rotate_and_open_log(&log_dir, workspace_id, DAEMON_LOG_MAX_ROTATIONS)
 }
 
@@ -245,26 +237,47 @@ fn rotate_and_open_log(
     max_rotations: usize,
 ) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(log_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o700));
+    }
 
     let current = log_dir.join(format!("meshd-{workspace_id}.log"));
-    let _ = std::fs::remove_file(log_dir.join(format!("meshd-{workspace_id}.log.{max_rotations}")));
+    let oldest = log_dir.join(format!("meshd-{workspace_id}.log.{max_rotations}"));
+    if oldest.exists() {
+        if let Err(e) = std::fs::remove_file(&oldest) {
+            tracing::warn!(target: "mesh::proxy", "Failed to remove oldest rotated daemon log {}: {e}", oldest.display());
+        }
+    }
     for i in (1..max_rotations).rev() {
         let from = log_dir.join(format!("meshd-{workspace_id}.log.{i}"));
+        if !from.exists() {
+            continue;
+        }
         let to = log_dir.join(format!("meshd-{workspace_id}.log.{}", i + 1));
-        let _ = std::fs::rename(&from, &to);
+        if let Err(e) = std::fs::rename(&from, &to) {
+            tracing::warn!(target: "mesh::proxy", "Failed to rotate daemon log {} -> {}: {e}", from.display(), to.display());
+        }
     }
     if current.exists() {
-        let _ = std::fs::rename(
-            &current,
-            log_dir.join(format!("meshd-{workspace_id}.log.1")),
-        );
+        let rotated = log_dir.join(format!("meshd-{workspace_id}.log.1"));
+        if let Err(e) = std::fs::rename(&current, &rotated) {
+            tracing::warn!(target: "mesh::proxy", "Failed to rotate current daemon log to {}: {e}", rotated.display());
+        }
     }
 
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&current)
+        .open(&current)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
 }
 
 /// `stdout`/`stderr` `Stdio` for a freshly `open_daemon_log`-ed file, sharing one file

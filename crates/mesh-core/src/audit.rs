@@ -62,14 +62,7 @@ impl AuditLogger {
     pub const CHAIN_VERSION: i64 = 2;
 
     pub fn default_db_path() -> PathBuf {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("mesh-mcp")
-                .join("audit.db")
-        } else {
-            std::env::temp_dir().join("mesh-mcp").join("audit.db")
-        }
+        crate::paths::mesh_cache_dir().join("audit.db")
     }
 
     pub fn default_log_path() -> PathBuf {

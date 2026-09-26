@@ -67,14 +67,7 @@ pub struct PersistentIndexCache {
 
 impl PersistentIndexCache {
     pub fn default_db_path() -> PathBuf {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("mesh-mcp")
-                .join("index-cache.db")
-        } else {
-            std::env::temp_dir().join("mesh-mcp").join("index-cache.db")
-        }
+        crate::paths::mesh_cache_dir().join("index-cache.db")
     }
 
     /// Opens (creating if absent) the cache database at `path`, or `default_db_path()` when

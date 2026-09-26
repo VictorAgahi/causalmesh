@@ -60,19 +60,82 @@ impl FileWatcherService {
     /// reach this fallback) every 150ms would itself be real, avoidable CPU/IO cost.
     pub const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 
-    /// Walks `root` for directories to individually watch (gitignore/`exclude_patterns`-aware,
-    /// `FilesystemCrawler::plan_watch_dirs`), consuming from `budget` (shared across every
-    /// root in one `spawn` call, so the *combined* directory count across all roots is what's
-    /// capped against `MAX_WATCHED_DIRS`, not each root independently).
+    /// Walks `walk_root` for directories to individually watch, with every `exclude_patterns`
+    /// check anchored to `matcher_root` rather than `walk_root` itself (see
+    /// `FilesystemCrawler::plan_watch_dirs_from`'s doc for why the two must be kept separate for
+    /// dynamic re-registration). Consumes from `budget` (shared across every root in one `spawn`
+    /// call, so the *combined* directory count across all roots is what's capped against
+    /// `MAX_WATCHED_DIRS`, not each root independently).
     fn plan_root(
-        root: &Path,
+        walk_root: &Path,
+        matcher_root: &Path,
         matcher: &ExcludeMatcher,
         budget: usize,
     ) -> crate::crawler::WatchPlan {
-        FilesystemCrawler::plan_watch_dirs(root, matcher, Some(10), budget)
+        FilesystemCrawler::plan_watch_dirs_from(walk_root, matcher_root, matcher, Some(10), budget)
     }
 
-    /// Spawns the debounced file watcher actor in a background thread
+    /// `.git/HEAD` (a file — checkout/rebase rewrite it) plus every directory under `.git/refs`
+    /// (branches, remotes, tags — `fetch`/`push`/`commit` update a file nested inside one of
+    /// these, not `.git/refs` itself), found by a plain recursive directory walk that
+    /// deliberately does not go through `ExcludeMatcher` at all: `.git` is unconditionally
+    /// excluded there (Commandment 4), which is exactly why these targets need to be found this
+    /// way instead of appearing in `plan_root`'s own output. Depth-capped at 5 (branches/remotes
+    /// nest at most 2–3 levels deep in practice — `refs/remotes/origin/`, `refs/heads/`); a
+    /// symlink under `.git` is skipped, matching every other watch target in this file.
+    ///
+    /// Honest limitation: this only runs at `spawn` time (startup) and on each root's initial
+    /// registration, not through the dynamic new-directory path — a brand new remote added after
+    /// startup (`git remote add`, creating `.git/refs/remotes/<new>/`) will not get a watch until
+    /// the next restart. Narrower than the base regression this fixes (an *existing* remote's ref
+    /// being updated, the common `fetch`/`push`/`commit` case, is covered from startup).
+    fn git_watch_targets(root: &Path) -> Vec<PathBuf> {
+        let mut targets = Vec::new();
+        let git_dir = root.join(".git");
+        let head = git_dir.join("HEAD");
+        if head.exists() {
+            targets.push(head);
+        }
+        let refs = git_dir.join("refs");
+        if refs.is_dir() {
+            targets.push(refs.clone());
+            Self::collect_subdirs(&refs, &mut targets, 5);
+        }
+        targets
+    }
+
+    fn collect_subdirs(dir: &Path, out: &mut Vec<PathBuf>, depth_left: usize) {
+        if depth_left == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                out.push(path.clone());
+                Self::collect_subdirs(&path, out, depth_left - 1);
+            }
+        }
+    }
+
+    /// Spawns the debounced file watcher actor in a background thread.
+    ///
+    /// Setup (the per-root `plan_root` walk, initial `.watch()` registration) runs synchronously
+    /// on the calling thread, *before* returning — deliberately, even though a large workspace
+    /// can make it take real time: callers (this crate's own tests, `mesh-server`'s
+    /// `run_standalone`) rely on watches being live the instant this function returns, and an
+    /// earlier version of this step made setup asynchronous (inside the spawned thread) to avoid
+    /// blocking `meshd`'s socket bind, which broke exactly that guarantee — a file changed in the
+    /// gap between `spawn()` returning and the background thread finishing registration was
+    /// silently missed (caught by `test_file_watcher_live_reload` failing intermittently).
+    /// `meshd`'s `main()` fixes the real blocking concern the other way instead: it wraps this
+    /// call in `tokio::task::spawn_blocking`, moving the synchronous work off the async runtime's
+    /// worker threads without changing this function's own synchronous contract.
     pub fn spawn(
         state: Arc<AppState>,
         cancel_token: CancellationToken,
@@ -89,7 +152,7 @@ impl FileWatcherService {
                 continue;
             }
             let budget = Self::MAX_WATCHED_DIRS.saturating_sub(watched_dirs.len());
-            let plan = Self::plan_root(root, &matcher, budget);
+            let plan = Self::plan_root(root, root, &matcher, budget);
             if plan.capped {
                 capped = true;
                 break;
@@ -144,12 +207,20 @@ impl FileWatcherService {
                     root.display()
                 );
 
-                // Watch .git/HEAD for branch checkouts / rebases
-                let git_head = root.join(".git").join("HEAD");
-                if git_head.exists() {
-                    let _ = debouncer
+                // `.git` is unconditionally excluded by `ExcludeMatcher::is_excluded_with_root`
+                // (Commandment 4's `default_exclude_patterns` intent, hardcoded there rather
+                // than configurable), so `plan_root`'s walk above never returns anything under
+                // it — `is_relevant_path` still treats `.git/HEAD` and `.git/refs/*` as relevant
+                // (checkout/rebase/fetch/push), so both need an explicit watch outside the
+                // exclude-matcher-driven plan, bypassing it entirely rather than trying to carve
+                // a matcher exception into a rule that's deliberately unconditional.
+                for target in Self::git_watch_targets(root) {
+                    if let Err(e) = debouncer
                         .watcher()
-                        .watch(&git_head, RecursiveMode::NonRecursive);
+                        .watch(&target, RecursiveMode::NonRecursive)
+                    {
+                        tracing::warn!(target: "mesh::watcher", "Failed to watch {}: {e}", target.display());
+                    }
                 }
             }
         }
@@ -161,15 +232,14 @@ impl FileWatcherService {
         // runloop to become idle. Measured on this machine: a single dynamic registration took
         // over 11 seconds under load. Doing that inline on the thread that also has to keep
         // draining `rx` would stall every *other* pending reload for however long that takes.
-        // The `Mutex` lets `Self::register_new_directories` dispatch the actual `.watch()` calls
-        // onto `state.rescan`'s background pool instead, so the event-receive loop below is
-        // never blocked by them (see there for the synchronous/deferred split).
-        let debouncer = Arc::new(std::sync::Mutex::new(debouncer));
+        // The `Mutex` lets the event loop below dispatch the actual `.watch()` calls onto a
+        // separate, detached thread per registration burst (never `state.rescan`'s own pool —
+        // see the dispatch site for why), so the event-receive loop is never blocked by them.
+        let debouncer_keepalive = Arc::new(std::sync::Mutex::new(debouncer));
 
         let handle = std::thread::Builder::new()
             .name("mesh-file-watcher".to_string())
             .spawn(move || {
-                let debouncer_keepalive = debouncer;
                 let mut watched_dirs = watched_dirs;
                 let roots = state.allowed_roots.clone();
 
@@ -208,6 +278,16 @@ impl FileWatcherService {
                                     if watched_dirs.contains(&ev.path) || !ev.path.is_dir() {
                                         continue;
                                     }
+                                    // Accepted inefficiency, not a correctness gap: if a parent
+                                    // and child directory both appear in the same debounced
+                                    // batch (e.g. a `git checkout`/archive extraction creating
+                                    // several nested directories at once) and the child is
+                                    // iterated first, its walk below re-enumerates a subtree the
+                                    // parent's later walk will enumerate again. `watched_dirs`'s
+                                    // `insert`-based dedup (below) still ensures each directory
+                                    // is registered exactly once either way — this is redundant
+                                    // work in a rare, bounded burst, not a double-watch or a
+                                    // missed one.
                                     let Some(root) =
                                         roots.iter().find(|r| ev.path.starts_with(r.as_path()))
                                     else {
@@ -219,7 +299,7 @@ impl FileWatcherService {
                                     // so `watched_dirs` bookkeeping (below) doesn't race a second
                                     // event for the same new directory arriving before the
                                     // deferred `.watch()` calls below have run.
-                                    let plan = Self::plan_root(&ev.path, &matcher, budget);
+                                    let plan = Self::plan_root(&ev.path, root, &matcher, budget);
                                     if plan.capped {
                                         continue;
                                     }
@@ -239,8 +319,20 @@ impl FileWatcherService {
                                         ev.path.display(),
                                         root.display()
                                     );
+                                    // A plain detached thread, deliberately *not*
+                                    // `state.rescan.spawn`: that pool is sized as small as 1
+                                    // thread (`num_cpus::get().min(4)`) and is also where the
+                                    // real reload work (`schedule_reload`, below) runs. A single
+                                    // `.watch()` call can itself take the ~11s this doc already
+                                    // measured on macOS — sharing that pool would let a burst of
+                                    // new-directory events starve reload jobs behind it, exactly
+                                    // the stall this deferral exists to avoid, just moved onto a
+                                    // different queue. New-directory bursts are rare and each
+                                    // spawned thread is short-lived (a handful of `.watch()`
+                                    // calls, then exit), so an unbounded thread per burst is an
+                                    // acceptable trade against reusing a pool sized for other work.
                                     let debouncer_for_task = debouncer_keepalive.clone();
-                                    state.rescan.spawn(move || {
+                                    std::thread::spawn(move || {
                                         let mut guard = debouncer_for_task
                                             .lock()
                                             .unwrap_or_else(|p| p.into_inner());
@@ -376,6 +468,44 @@ impl FileWatcherService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for a real bug caught by `/code-review`: `.git` is unconditionally excluded
+    /// by `ExcludeMatcher`, so `plan_root`'s walk never returns anything under it — the old
+    /// pre-3.3 single recursive watch covered `.git/refs/**` naturally (it watched everything),
+    /// but per-directory registration needs `git_watch_targets` to explicitly cover it, or a
+    /// `fetch`/`push`/branch update (which touches a file under `.git/refs/heads|remotes/...`,
+    /// not `.git/HEAD`) would silently never trigger a reload.
+    #[test]
+    fn git_watch_targets_covers_head_and_every_refs_subdirectory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("mkdir heads");
+        std::fs::create_dir_all(root.join(".git/refs/remotes/origin")).expect("mkdir remotes");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        std::fs::write(root.join(".git/refs/heads/main"), "deadbeef\n").expect("write ref");
+
+        let targets = FileWatcherService::git_watch_targets(&root);
+
+        assert!(targets.contains(&root.join(".git/HEAD")));
+        assert!(targets.contains(&root.join(".git/refs")));
+        assert!(
+            targets.contains(&root.join(".git/refs/heads")),
+            "a fetch/push/commit updates a file inside refs/heads, not refs/heads itself — that \
+             directory needs its own watch: {targets:?}"
+        );
+        assert!(targets.contains(&root.join(".git/refs/remotes")));
+        assert!(
+            targets.contains(&root.join(".git/refs/remotes/origin")),
+            "nested remote directories must be covered too: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn git_watch_targets_is_empty_for_a_non_git_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        assert!(FileWatcherService::git_watch_targets(&root).is_empty());
+    }
 
     #[test]
     fn test_relevant_paths_filter() {

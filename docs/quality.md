@@ -481,13 +481,61 @@ section left open, and eliminating an orphaned-daemon failure mode.
   different workspaces never interleave into the same file. Verified live: a real `meshd`
   auto-spawn's stdout was captured in the rotated log file exactly as the unit tests predict
   (see below), including the new "startup grace: 60s" log line confirming the watchdog wiring.
-- Verified: `cargo test --workspace` (363 passed, 1 ignored; +10 new since step 3.2's 353: 3
-  `plan_watch_dirs_*` gitignore/cap cases, 1 registration-time-exclusion end-to-end test
-  (`excluded_directory_never_triggers_a_reload`), 1 `#[ignore]`d dynamic-registration end-to-end
-  test, 2 idle-watchdog startup-grace cases, 4 `rotate_and_open_log` rotation cases),
-  `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all -- --check`
-  (clean), `scripts/determinism.sh` on both fixtures ("1 fingerprint over 13 runs" each,
-  unaffected — this step never touches `build_snapshot`/`crawl_scope_with`'s own indexing path).
+- **Hardened via `/code-review high` — ten real findings, all fixed**:
+  1. **Exclusion-anchor bug**: dynamic re-registration called `plan_watch_dirs(ev.path, ...)`
+     directly, using the newly-created directory itself as the exclusion matcher's anchor. Two
+     concrete breaks: `ev.path`'s own name could never be excluded (a walk's own root is never
+     passed to `filter_entry`), and a root-anchored pattern (`/vendor`) evaluated relative to the
+     wrong root would match different paths than at startup. Fixed: `plan_watch_dirs_from` takes
+     `walk_root` and `matcher_root` as separate parameters, with an explicit check for whether
+     `walk_root` itself is excluded (since `filter_entry` never runs on a walk's own root).
+  2. **`.git/refs` never watched**: `.git` is unconditionally excluded, so `plan_root`'s walk
+     never returns anything under it; only `.git/HEAD` had an explicit carve-out, but `fetch`/
+     `push`/`commit` update a file under `.git/refs/heads|remotes/...`, not `.git/HEAD` — a real
+     regression versus the pre-3.3 single recursive watch, which covered `.git/refs/**` simply by
+     covering everything. Fixed: `git_watch_targets` walks `.git/refs` directly (bypassing the
+     exclude matcher entirely, depth-capped at 5) and watches every subdirectory found.
+  3. **Blocking regression, then a second regression fixing it**: moving `plan_root`'s walk and
+     initial `.watch()` registration into the spawned OS thread (to stop blocking `meshd`'s
+     socket bind) made `spawn()` return before watches were live — a file changed in that window
+     was silently missed, caught by `test_file_watcher_live_reload` failing. Reverted: setup
+     stays synchronous inside `spawn()` (its real contract — every caller relies on watches being
+     live the instant it returns). The actual blocking concern is fixed at `meshd`'s call site
+     instead, with `tokio::task::spawn_blocking` — moving the work off the async runtime's worker
+     thread without changing `spawn()`'s synchronous guarantee.
+  4. **Shared-pool starvation**: deferred dynamic-registration tasks were dispatched onto
+     `state.rescan`, the same (as small as 1-thread) pool the real reload work runs on — a burst
+     of new-directory events could starve reload jobs behind an 11-second `.watch()` call, the
+     exact stall the deferral was meant to prevent, just moved onto a different queue. Fixed:
+     dispatched on a plain detached `std::thread::spawn` instead.
+  5. **No way to disable the startup-grace guard**: hardcoded 60s with no override broke a
+     developer's manual `meshd` debugging workflow (attach a client more than 60s after starting
+     it by hand). Fixed: new `--startup-grace-secs` CLI flag (default 60, `0` disables).
+  6. **Daemon log file default permissions**: `rotate_and_open_log` didn't harden the log
+     directory/file the way `AuditLogger`/`PersistentIndexCache` do for the same `~/.cache/
+     mesh-mcp/` tree, despite explicitly capturing a Rust panic's raw output. Fixed: `0700`/`0600`
+     on Unix, matching convention.
+  7. **Triplicated `$HOME`/`$USERPROFILE` resolution**: `AuditLogger`, `PersistentIndexCache` and
+     the new `open_daemon_log` each independently re-derived it. Factored into
+     `mesh_core::paths::mesh_cache_dir()`, used by all three.
+  8. **Duplicated `WalkBuilder` setup**: `crawl_scope_with` and `plan_watch_dirs_from` each
+     independently set the same five builder options — a fix to one (like finding #1 above)
+     could silently not apply to the other. Factored into `FilesystemCrawler::base_walk_builder`.
+  9. **Redundant walks on same-batch nested directory creation**: accepted and documented rather
+     than fixed — `watched_dirs`'s dedup still prevents a double-watch, this is bounded, rare-case
+     wasted work, not a correctness gap.
+  10. **Silent rotation failures**: `rotate_and_open_log`'s `rename`/`remove_file` calls discarded
+      every error, unlike its own `open` failure path. Fixed: each now logs a warning on failure.
+  New regression tests for findings #1 and #2: `plan_watch_dirs_from_excludes_the_walk_root_
+  itself_when_it_matches_a_pattern`, `plan_watch_dirs_from_anchors_patterns_to_matcher_root_not_
+  walk_root`, `plan_watch_dirs_and_plan_watch_dirs_from_agree_when_roots_match`,
+  `git_watch_targets_covers_head_and_every_refs_subdirectory`,
+  `git_watch_targets_is_empty_for_a_non_git_directory`.
+- Verified after all ten fixes: `cargo test --workspace` (369 passed, 1 ignored — stable across
+  repeated runs, confirming finding #3's fix didn't reintroduce the race), `cargo clippy
+  --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all -- --check` (clean),
+  `scripts/determinism.sh` on both fixtures re-run after the fixes (unaffected, same fingerprints
+  as before this step).
 
 ## What's NOT measured yet
 

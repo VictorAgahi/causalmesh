@@ -48,14 +48,25 @@ reload, driven by the watcher's own paths.
   making a crash before `meshd`'s own `tracing` subscriber initializes unobservable. Now redirected
   to a rotating, per-workspace log (`~/.cache/mesh-mcp/logs/meshd-<workspace_id>.log`, up to 5
   previous runs kept as `.1`–`.5`).
-- Verified: `cargo test --workspace` (363 passed, 1 ignored — a real end-to-end dynamic-watch test
-  whose ~11s-per-call macOS registration cost made it reliable in isolation but flaky under the
-  full suite's parallel CPU contention; the same decision logic is covered synchronously and
-  deterministically by `plan_watch_dirs_*`), `cargo clippy --workspace --all-targets -- -D
-  warnings` (clean), `cargo fmt --all -- --check` (clean), `scripts/determinism.sh` on both
-  fixtures (unaffected — this step never touches the indexing path itself). See `docs/quality.md`
-  for the full reasoning, the honest limitations (no measurement yet at real 200k+-file scale or
-  on Linux/Windows watch backends), and the live-smoke-test confirmation.
+- **Hardened via `/code-review high` — ten real findings, all fixed**, most notably: (1) dynamic
+  re-registration was anchoring exclude-pattern checks to the newly-created directory instead of
+  the real workspace root, which could both silently keep an excluded new directory and mismatch
+  root-anchored patterns — fixed with an explicit `walk_root`/`matcher_root` split
+  (`FilesystemCrawler::plan_watch_dirs_from`); (2) `.git/refs` was never watched at all under
+  per-directory registration (a real regression versus the old single recursive watch), fixed by
+  walking `.git/refs` directly outside the exclude matcher; (3) an attempt to fix `meshd`'s
+  socket-bind blocking by moving watch setup into the spawned thread instead introduced a race
+  where events before setup finished were silently missed — reverted, with the actual blocking
+  fixed at the `meshd` call site via `tokio::task::spawn_blocking` instead; (4) deferred
+  dynamic-registration work was sharing `state.rescan`'s small pool with real reload jobs,
+  reintroducing the exact starvation the deferral was meant to prevent — moved to a plain
+  detached thread. See `docs/quality.md`'s step 3.3 section for the full list and the two new
+  regression-test groups (`plan_watch_dirs_from_*`, `git_watch_targets_*`).
+- Verified after all ten fixes: `cargo test --workspace` (369 passed, 1 ignored, stable across
+  repeated runs), `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt
+  --all -- --check` (clean), `scripts/determinism.sh` on both fixtures re-confirmed (unaffected).
+  See `docs/quality.md` for the full reasoning, the honest limitations (no measurement yet at real
+  200k+-file scale or on Linux/Windows watch backends), and the live-smoke-test confirmation.
 
 ### Added (P2 step 3.2 — persistent SQLite/WAL content-hash cache for cold-start indexing)
 - **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): a SQLite-in-WAL-mode cache

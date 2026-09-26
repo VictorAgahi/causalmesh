@@ -721,14 +721,16 @@ impl WorkspaceIndexer {
             .map(|f| f.path.as_path())
             .chain(deleted.iter().map(PathBuf::as_path));
         snapshot.contract_graph.patch_files(stale);
-        for f in &changed {
-            snapshot.doc_index.remove_file(&f.path);
-            snapshot.property_registry.remove_file(&f.path);
-        }
-        for p in &deleted {
-            snapshot.doc_index.remove_file(p);
-            snapshot.property_registry.remove_file(p);
-        }
+        // One pass per index for the whole batch, not one per file: a branch
+        // switch reloading k of N files was O(k·N) here.
+        let stale_files: HashSet<&Path> = changed
+            .iter()
+            .map(|f| f.path.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+            .collect();
+        snapshot.doc_index.remove_files(&stale_files);
+        snapshot.property_registry.remove_files(&stale_files);
+        drop(stale_files);
         let changed_count = changed.len();
         for frag in changed {
             Self::fold(frag, &mut snapshot);

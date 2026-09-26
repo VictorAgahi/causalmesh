@@ -12,8 +12,9 @@ Usage:
 
 --contracts adds a contract mix that exercises `ContractGraph::reconcile_edges`
 (derive) and the YAML/Markdown ingestion paths, which plain code files never
-touch: every Java file imports a hot shared name (`com.acme.common.Shared`,
-declared in many packages), every TypeScript file gains a `@GrpcMethod`
+touch: every Java file imports a hot shared name (`com.acme.commonK.Shared`,
+`Shared` declared in many packages; K varies, so many *distinct* import targets
+land in the one `Shared` bucket), every TypeScript file gains a `@GrpcMethod`
 handler with a matching `.proto` service, and every 100th file index adds a
 Spring-style `application.yml` and a Markdown doc. Extra files are *in
 addition to* `file_count` and are reported separately.
@@ -110,7 +111,7 @@ export class Component{idx} {{
 """
 
 JAVA_IMPORT_TEMPLATE = JAVA_TEMPLATE.replace(
-    "package pkg{idx};\n", "package pkg{idx};\n\nimport com.acme.common.Shared;\n"
+    "package pkg{idx};\n", "package pkg{idx};\n\nimport com.acme.common{shared}.Shared;\n"
 )
 
 PROTO_TEMPLATE = """syntax = "proto3";
@@ -213,7 +214,9 @@ def main():
                 extras += write(os.path.join(svc_dir, f"application-{idx}.yml"), YAML_TEMPLATE.format(idx=idx, port=8000 + idx % 1000))
                 extras += write(os.path.join(svc_dir, f"README_{idx}.md"), MD_TEMPLATE.format(idx=idx))
             with open(fname, "w") as f:
-                f.write(template.format(idx=idx))
+                # The `Shared` declared nearest below this file (see the java branch).
+                shared_idx = idx // 50 * 50 + 4
+                f.write(template.format(idx=idx, shared="" if shared_idx == 4 else shared_idx))
             idx += 1
 
     print(f"generated {idx} files (+{extras} contract-mix extras) across {args.services} services under {args.out_dir}/services/")

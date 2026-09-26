@@ -138,6 +138,16 @@ impl DocIndex {
         self.sections.retain(|s| s.file_path != path);
     }
 
+    /// [`Self::remove_file`] for a whole batch in one pass over the sections.
+    /// Called once per file, a reload of k changed files cost k full passes —
+    /// O(k·N) on a mass change (branch switch) over a large doc index.
+    pub fn remove_files(&mut self, paths: &std::collections::HashSet<&Path>) {
+        if !paths.is_empty() {
+            self.sections
+                .retain(|s| !paths.contains(s.file_path.as_path()));
+        }
+    }
+
     /// Appends pre-parsed sections (from `parse_sections` on another thread).
     pub fn extend_sections(&mut self, sections: Vec<DocSection>) {
         self.sections.extend(sections);
@@ -441,6 +451,17 @@ impl DocIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_files_drops_a_whole_batch() {
+        let mut index = DocIndex::default();
+        for f in ["a.md", "b.md", "c.md"] {
+            index.extend_sections(index.parse_sections(Path::new(f), "# T\nbody"));
+        }
+        index.remove_files(&[Path::new("a.md"), Path::new("c.md")].into_iter().collect());
+        let left: Vec<_> = index.sections.iter().map(|s| s.file_path.clone()).collect();
+        assert_eq!(left, [Path::new("b.md").to_path_buf()]);
+    }
 
     /// ASCII sections keep no lowercase copy yet match exactly as
     /// `to_lowercase().contains(..)` did; non-ASCII sections keep the copy.

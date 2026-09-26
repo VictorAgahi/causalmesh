@@ -719,13 +719,17 @@ impl PolyglotIndexer {
                 for (i, (p_str, methods)) in spec.paths.0.iter().enumerate() {
                     let path_line = path_lines[i];
                     let next_path = path_lines[i + 1..].iter().flatten().next().copied();
-                    let mut method_seek = match path_line {
-                        Some(l) => lines.seeker_until(Some(l), next_path.unwrap_or(usize::MAX)),
-                        None => lines.seeker(None),
-                    };
+                    // An unlocated path's methods are not searched (they would
+                    // match some other path's `get:`); they take line 1, as before.
+                    let mut method_seek = path_line
+                        .map(|l| lines.seeker_until(Some(l), next_path.unwrap_or(usize::MAX)));
                     for m_str in methods {
                         let ep_name = format!("{} {}", m_str.to_uppercase(), p_str);
-                        let line = method_seek.key(m_str).or(path_line).unwrap_or(1);
+                        let line = method_seek
+                            .as_mut()
+                            .and_then(|s| s.key(m_str))
+                            .or(path_line)
+                            .unwrap_or(1);
                         let node = ContractNode {
                             id: 0,
                             name: CompactStr::new(&ep_name),
@@ -817,7 +821,8 @@ impl<'a> YamlLines<'a> {
             .map(|i| start + i + 1)
     }
 
-    /// A forward-only cursor over entries after `section` (the section key's line).
+    /// A forward-only cursor over entries after `section` (the section key's
+    /// line), or from line 1 when the section key itself was not located.
     fn seeker(&self, section: Option<usize>) -> Seeker<'_, 'a> {
         self.seeker_until(section, usize::MAX)
     }
@@ -827,25 +832,29 @@ impl<'a> YamlLines<'a> {
             lines: self,
             cursor: section.map_or(1, |l| l + 1),
             until,
-            exhausted: section.is_none(),
+            misses_left: Seeker::MAX_MISSES,
         }
     }
 }
 
 /// Locates a section's entries in document order. Each lookup resumes after the
-/// previous hit, and the first miss gives up on the rest of the section (every
-/// later entry falls back to line 1): together that bounds a whole section to
-/// one pass over its lines. Re-searching from the top on every entry was
-/// O(entries × lines) — quadratic on a large spec, worse for flow-style YAML
-/// where every lookup misses and scanned to EOF.
+/// previous hit; a miss leaves the cursor where it was, so one unlocatable entry
+/// (an escaped or multi-line key) does not cost the entries after it their lines.
+/// A miss scans to the end of the range, so after [`Seeker::MAX_MISSES`] of them
+/// the seeker gives up and every later entry falls back to line 1: that bounds a
+/// section to `MAX_MISSES + 1` passes over its lines. Re-searching from the top
+/// on every entry was O(entries × lines) — quadratic on a large spec, worse for
+/// flow-style YAML where every lookup misses and scanned to EOF.
 struct Seeker<'l, 'a> {
     lines: &'l YamlLines<'a>,
     cursor: usize,
     until: usize,
-    exhausted: bool,
+    misses_left: u8,
 }
 
 impl Seeker<'_, '_> {
+    const MAX_MISSES: u8 = 8;
+
     fn key(&mut self, key: &str) -> Option<usize> {
         self.advance(|lines, from, until| lines.key_line(key, from, until))
     }
@@ -858,13 +867,13 @@ impl Seeker<'_, '_> {
         &mut self,
         find: impl FnOnce(&YamlLines<'_>, usize, usize) -> Option<usize>,
     ) -> Option<usize> {
-        if self.exhausted {
+        if self.misses_left == 0 {
             return None;
         }
         let found = find(self.lines, self.cursor, self.until);
         match found {
             Some(line) => self.cursor = line + 1,
-            None => self.exhausted = true,
+            None => self.misses_left -= 1,
         }
         found
     }
@@ -1017,6 +1026,66 @@ channels:
         assert_eq!(graph.node_count(), 1);
         let impact = graph.analyze_impact("billing.events");
         assert!(!impact.topics.is_empty());
+    }
+
+    /// Line recovery for spec entries: one unlocatable key (an escaped quote
+    /// the text search cannot match) must not cost the keys after it their
+    /// lines, and an OpenAPI method is only searched inside its own path.
+    #[test]
+    fn spec_line_recovery_survives_a_miss_and_is_path_bounded() {
+        let asyncapi = "asyncapi: 2.6.0\nchannels:\n  'it''s.escaped':\n    description: x\n  orders.created:\n    description: y\n";
+        let idx = PolyglotIndexer::extract_with_config(
+            Path::new("asyncapi.yaml"),
+            asyncapi,
+            0,
+            &ExtractConfig::default(),
+        );
+        let line_of = |name: &str| {
+            idx.nodes
+                .iter()
+                .find(|n| n.name.as_str() == name)
+                .map(|n| n.line_start)
+        };
+        assert_eq!(line_of("it's.escaped"), Some(1), "unlocatable key");
+        assert_eq!(line_of("orders.created"), Some(5), "key after a miss");
+
+        let openapi = "openapi: 3.0.0\npaths:\n  /a: {get: {}}\n  /b:\n    post: {}\n    get: {}\n";
+        let idx = PolyglotIndexer::extract_with_config(
+            Path::new("openapi.yaml"),
+            openapi,
+            0,
+            &ExtractConfig::default(),
+        );
+        let line_of = |name: &str| {
+            idx.nodes
+                .iter()
+                .find(|n| n.name.as_str() == name)
+                .map(|n| n.line_start)
+        };
+        assert_eq!(
+            line_of("GET /a"),
+            Some(3),
+            "flow-style method: its path's line, not /b's get"
+        );
+        assert_eq!(line_of("POST /b"), Some(5));
+        assert_eq!(line_of("GET /b"), Some(6));
+    }
+
+    /// Flow-style YAML misses every key; the seeker stops searching after
+    /// `MAX_MISSES` instead of rescanning the file once per entry.
+    #[test]
+    fn seeker_gives_up_after_its_miss_budget() {
+        let content = (0..50).map(|i| format!("k{i}: v\n")).collect::<String>();
+        let lines = YamlLines::new(&content);
+        let mut seek = lines.seeker(None);
+        for _ in 0..Seeker::MAX_MISSES {
+            assert_eq!(seek.key("absent"), None);
+        }
+        assert_eq!(seek.key("k3"), None, "budget spent: no more searching");
+        let mut fresh = lines.seeker(None);
+        assert_eq!(fresh.key("absent"), None);
+        assert_eq!(fresh.key("k3"), Some(4), "a miss keeps the cursor");
+        assert_eq!(fresh.key("k1"), None, "forward-only");
     }
 
     #[test]

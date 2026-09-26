@@ -30,7 +30,7 @@
 //! [`put_batch`]: PersistentIndexCache::put_batch
 
 use ring::digest::{Context, SHA256};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -224,7 +224,7 @@ impl PersistentIndexCache {
     }
 
     fn from_connection(
-        conn: Connection,
+        mut conn: Connection,
         db_path: Option<PathBuf>,
         max_size_bytes: u64,
     ) -> Result<Self, IndexCacheError> {
@@ -245,33 +245,7 @@ impl PersistentIndexCache {
             "PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES};"
         ))?;
 
-        let user_version: i64 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        if user_version != i64::from(SCHEMA_VERSION) {
-            // A database from another layout (or a brand-new file): the cache is disposable,
-            // so start over rather than migrate.
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS file_index_access;
-                 DROP TABLE IF EXISTS file_index_cache;",
-            )?;
-            let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))?;
-            if auto_vacuum != 2 {
-                conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
-            }
-            conn.execute_batch(&format!(
-                "CREATE TABLE file_index_cache (
-                     cache_key BLOB PRIMARY KEY,
-                     payload BLOB NOT NULL,
-                     updated_at INTEGER NOT NULL
-                 );
-                 CREATE TABLE file_index_access (
-                     cache_key BLOB PRIMARY KEY,
-                     last_accessed_at INTEGER NOT NULL
-                 ) WITHOUT ROWID;
-                 CREATE INDEX file_index_access_lru
-                     ON file_index_access (last_accessed_at, cache_key);
-                 PRAGMA user_version = {SCHEMA_VERSION};"
-            ))?;
-        }
+        Self::ensure_schema(&mut conn)?;
 
         let cache = Self {
             inner: Mutex::new(Inner {
@@ -287,6 +261,62 @@ impl PersistentIndexCache {
         };
         cache.enforce_quota()?;
         Ok(cache)
+    }
+
+    /// Creates the current layout unless the database already has it. Every process of one
+    /// workspace (a CLI `run --standalone` next to a `meshd`, several editors) opens the same
+    /// file, so the check-and-create runs in one `BEGIN IMMEDIATE` transaction that re-reads
+    /// `user_version` under the write lock: a plain read-then-create let two processes opening
+    /// a new database both see version 0, and the second then failed its open on "table
+    /// already exists" (or dropped the tables the first had just started filling).
+    fn ensure_schema(conn: &mut Connection) -> Result<(), IndexCacheError> {
+        // Pass 1 recreates the layout in place when the database already uses incremental
+        // auto-vacuum (always, for a new file: the pragma above precedes its first table).
+        // Otherwise it only drops the old tables; the `VACUUM` switching the mode cannot run
+        // inside a transaction, and pass 2 then creates the tables.
+        for pass in 0..2 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let user_version: i64 = tx.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+            if user_version == i64::from(SCHEMA_VERSION) {
+                tx.commit()?;
+                return Ok(());
+            }
+            // A database from another layout (or a brand-new file): the cache is disposable,
+            // so start over rather than migrate.
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS file_index_access;
+                 DROP TABLE IF EXISTS file_index_cache;",
+            )?;
+            let auto_vacuum: i64 = tx.query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))?;
+            if auto_vacuum == 2 || pass == 1 {
+                tx.execute_batch(&format!(
+                    "CREATE TABLE file_index_cache (
+                         cache_key BLOB PRIMARY KEY,
+                         payload BLOB NOT NULL,
+                         updated_at INTEGER NOT NULL
+                     );
+                     CREATE TABLE file_index_access (
+                         cache_key BLOB PRIMARY KEY,
+                         last_accessed_at INTEGER NOT NULL
+                     ) WITHOUT ROWID;
+                     CREATE INDEX file_index_access_lru
+                         ON file_index_access (last_accessed_at, cache_key);
+                     PRAGMA user_version = {SCHEMA_VERSION};"
+                ))?;
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.commit()?;
+            // Best effort: another process reading the file can make `VACUUM` fail; the
+            // cache then works without returning freed pages to the filesystem.
+            if let Err(e) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
+                tracing::warn!(
+                    target: "mesh::index_cache",
+                    "Could not switch the index cache to incremental auto-vacuum: {e}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Cache key for one file's extraction: every input the caller's extraction depends on

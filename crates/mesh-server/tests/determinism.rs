@@ -13,8 +13,8 @@
 //! `cargo test -p mesh-server --test determinism -- --include-ignored`
 
 use mesh_core::{
-    expand_roots, AppState, AuditLogger, BackgroundRescanEngine, Config, MeshSnapshot, RepoId,
-    SnapshotFingerprint,
+    expand_roots, AppState, AuditLogger, BackgroundRescanEngine, Config, MeshSnapshot,
+    PersistentIndexCache, RepoId, SnapshotFingerprint,
 };
 use mesh_server::WorkspaceIndexer;
 use std::collections::HashMap;
@@ -395,4 +395,109 @@ fn concurrent_reloads_converge_to_full_build() {
         full_fingerprint(&check_config, &check_roots),
         "concurrent reloads lost or duplicated an update"
     );
+}
+
+// ── Persistent index cache (plan 4 step 4.4) ───────────────────────────────
+
+/// `AppState` with a file-backed persistent cache of `quota` bytes attached, then fully
+/// built through it, the way `run --standalone` and `meshd` boot.
+fn cached_state(
+    config: Config,
+    roots: Vec<PathBuf>,
+    db: &Path,
+    quota: u64,
+) -> Arc<AppState> {
+    let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+    let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+    let state = Arc::new(AppState::new(config, roots, audit, rescan));
+    assert!(state
+        .index_cache
+        .set(PersistentIndexCache::open(db.to_path_buf(), quota).expect("open cache"))
+        .is_ok());
+    let snapshot = {
+        let mut vfs = state.vfs.lock().expect("vfs lock");
+        WorkspaceIndexer::build_snapshot(
+            &state.config,
+            &state.allowed_roots,
+            None,
+            Some(&mut vfs),
+            state.index_cache.get(),
+        )
+    };
+    state.install_snapshot(snapshot);
+    state
+}
+
+/// A cache hit must never change what gets indexed: cold, warm and partially or fully
+/// evicted caches all produce the uncached fingerprint, on full builds and on reloads that
+/// switch files back to already-cached content.
+#[test]
+fn cached_builds_and_reloads_match_uncached() {
+    for fixture in fixtures() {
+        let (tmp, base) = workspace_copy(&fixture);
+        let cfg = config(&["."]);
+        let roots = resolved_roots(&cfg, &base);
+        let reference = full_fingerprint(&cfg, &roots);
+
+        // Unbounded, then half the working set, then a quota below an empty database
+        // (evicts everything each time). These fixtures are too small for a partial
+        // eviction; `index_cache_quota.rs` covers that on a larger workspace.
+        let unbounded_db = tmp.path().join("unbounded").join("index-cache.db");
+        let cache = PersistentIndexCache::open(unbounded_db, u64::MAX).expect("open");
+        for pass in ["cold", "warm"] {
+            let got = WorkspaceIndexer::build_snapshot(&cfg, &roots, None, None, Some(&cache))
+                .fingerprint();
+            assert_eq!(got, reference, "{}: {pass} cache", fixture.display());
+        }
+        let working_set = cache.size_bytes();
+        for (label, quota) in [("half", working_set / 2), ("tiny", 1)] {
+            let db = tmp.path().join(label).join("index-cache.db");
+            let cache = PersistentIndexCache::open(db, quota).expect("open");
+            for pass in 0..3 {
+                let got = WorkspaceIndexer::build_snapshot(&cfg, &roots, None, None, Some(&cache))
+                    .fingerprint();
+                assert_eq!(
+                    got,
+                    reference,
+                    "{}: {label} quota, pass {pass}",
+                    fixture.display()
+                );
+            }
+            let stats = cache.stats();
+            assert_eq!(stats.errors, 0, "{label}: {stats:?}");
+            if label == "tiny" {
+                assert!(stats.evicted > 0, "{label}: {stats:?}");
+            }
+        }
+    }
+
+    // Reloads through the cache: every other step restores the original tree, so the
+    // reload re-reads content the cache has already seen (a branch switch back).
+    let (tmp, base) = workspace_copy(&determinism_fixture());
+    let cfg = config(&["."]);
+    let roots = resolved_roots(&cfg, &base);
+    for (label, quota) in [("unbounded", u64::MAX), ("tiny", 1)] {
+        let db = tmp.path().join(format!("reload-{label}")).join("index-cache.db");
+        let state = cached_state(config(&["."]), roots.clone(), &db, quota);
+        let mut rng = Lcg(0x5eed_0044);
+        for step in 0..20 {
+            let op = rng.below(6);
+            if step % 2 == 0 {
+                apply_edit(&base, op, step);
+            } else {
+                copy_dir(&determinism_fixture(), &base);
+            }
+            WorkspaceIndexer::reload(&state);
+            assert_eq!(
+                state.snapshot().fingerprint(),
+                full_fingerprint(&cfg, &roots),
+                "{label} cache, step {step} (edit #{op}): cached reload diverged from an uncached full build"
+            );
+        }
+        let stats = state.index_cache.get().expect("cache").stats();
+        assert_eq!(stats.errors, 0, "{label}: {stats:?}");
+        if quota == u64::MAX {
+            assert!(stats.hits > 0, "reloads must hit the cache: {stats:?}");
+        }
+    }
 }

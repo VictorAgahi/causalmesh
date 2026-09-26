@@ -209,3 +209,109 @@ fn daemon_reloading_30_times_stays_under_quota() {
         "30 reloads must have pushed the cache past its quota at least once: {stats:?}"
     );
 }
+
+const SHARED_QUOTA_MB_ENV: &str = "MESH_TEST_CACHE_SHARED_QUOTA_MB";
+
+/// Child half of `processes_sharing_one_workspace_cache_hit_zero_sqlite_errors`: every child
+/// indexes the *same* workspace, so they all open, write and evict the same database file.
+#[test]
+#[ignore = "spawned as a child process by processes_sharing_one_workspace_cache_hit_zero_sqlite_errors"]
+fn child_index_shared_workspace() {
+    let Some(ws) = std::env::var_os(CHILD_ENV) else {
+        return;
+    };
+    let ws = PathBuf::from(ws);
+    let go = PathBuf::from(std::env::var_os(GO_ENV).expect("go file"));
+    let quota_mb: u64 = std::env::var(SHARED_QUOTA_MB_ENV)
+        .expect("quota")
+        .parse()
+        .expect("quota mb");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !go.exists() {
+        assert!(Instant::now() < deadline, "parent never signalled go");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let config = config_for(&ws);
+    let roots = WorkspaceIndexer::resolve_roots(&config, &ws);
+    // Opened concurrently by every child on a database that does not exist yet: the schema
+    // creation itself races.
+    let cache = PersistentIndexCache::open_for_workspace(&ws, quota_mb).expect("open cache");
+    let reference = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
+    for _ in 0..4 {
+        let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(
+            snap.fingerprint(),
+            reference.fingerprint(),
+            "a cached scan must index exactly what an uncached one does"
+        );
+    }
+    let stats = cache.stats();
+    assert_eq!(
+        stats.errors, 0,
+        "SQLite errors (SQLITE_BUSY included): {stats:?}"
+    );
+}
+
+#[test]
+fn processes_sharing_one_workspace_cache_hit_zero_sqlite_errors() {
+    // A CLI `run --standalone` and a `meshd` (or several editors) on the same workspace
+    // share one database. 1 MB is below this workspace's working set, so the processes
+    // evict while the others read and write.
+    for quota_mb in [2048u64, 1] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let go = base.join("go");
+        let exe = std::env::current_exe().expect("test exe");
+        let ws = base.join("ws");
+        write_workspace(&ws, 1500, 0);
+        let children: Vec<_> = (0..4)
+            .map(|_| {
+                Command::new(&exe)
+                    .args([
+                        "child_index_shared_workspace",
+                        "--exact",
+                        "--ignored",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD_ENV, &ws)
+                    .env(GO_ENV, &go)
+                    .env(SHARED_QUOTA_MB_ENV, quota_mb.to_string())
+                    .env("HOME", &home)
+                    .env("USERPROFILE", &home)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn child")
+            })
+            .collect();
+        std::fs::write(&go, b"go").expect("go");
+        for child in children {
+            let out = child.wait_with_output().expect("wait child");
+            assert!(
+                out.status.success(),
+                "quota {quota_mb} MB: child failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // While the processes run, one's WAL can sit past the quota until the next
+        // checkpoint no other reader blocks; once they are all gone it must fit.
+        let db = home
+            .join(".cache")
+            .join("mesh-mcp")
+            .join("workspaces")
+            .join(mesh_core::workspace_id(&ws))
+            .join("index-cache.db");
+        let wal = db.with_file_name("index-cache.db-wal");
+        let on_disk = std::fs::metadata(&db).expect("shared db").len()
+            + std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            on_disk <= PersistentIndexCache::quota_bytes_from_mb(quota_mb),
+            "quota {quota_mb} MB: shared cache left at {on_disk} bytes"
+        );
+    }
+}
+

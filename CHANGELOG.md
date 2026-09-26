@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [6.0.1] — 2026-09-26
+
+### Fixed
+- **`mesh-mcp init --write-ide-config` no longer deletes the user's other MCP servers.** It used to
+  rewrite `.cursor/mcp.json` and `.vscode/mcp.json` with a fresh object containing only
+  `mesh-mcp`. It now merges: only the `mesh-mcp` entry is added or replaced, every other server and
+  top-level key is kept, a second run changes nothing, and a file that is not valid JSON is left
+  untouched with a warning instead of being overwritten.
+- **VS Code config uses VS Code's schema**: the entry goes under `servers` with `"type": "stdio"`
+  (VS Code does not read Cursor's `mcpServers` key); the stale `mcpServers.mesh-mcp` entry earlier
+  versions wrote into `.vscode/mcp.json` is removed.
+
 ## [6.0.0] — 2026-09-26
 
 **Plan 3 (P2) complete: scale, and MCP protocol compliance.** Major version because of the step

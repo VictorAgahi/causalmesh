@@ -636,6 +636,136 @@ section left open, and eliminating an orphaned-daemon failure mode.
   p95 112 ms (step 3.4: 67–88 / 96–109 ms). Boot 3.7 s, cold because the index-cache schema
   bump orphans previous rows.
 
+## Update (2026-09-26, step 3.5 — streaming YAML, doc memory, `derive()` without quadratic passes, 200k validation)
+
+- **`derive()` / `reconcile_edges` quadratic passes removed**:
+  - `Implements` compared every proto method with every gRPC handler (O(P·H)). Handlers are now
+    indexed by every key the match predicate can succeed on (exact name, ASCII-lowercased and
+    `_`-normalized last segment, PascalCase, signature identifiers — the latter a sorted list
+    searched by prefix range); candidates are re-checked with the unchanged predicate, so the
+    edge set is identical (`handler_index_never_drops_a_predicate_match`).
+  - Import resolution scanned a whole `name_to_nodes` bucket per importer; it is now memoized per
+    (target, importer repo), the only inputs it depends on.
+  - `patch_files` did one `retain` over a key's bucket per stale node (O(k·N) for a hot name like
+    `handle`); removals are grouped per key.
+  - The step-3.4 AsyncAPI/OpenAPI line lookup re-scanned the file from the top for every key
+    (`lines().skip(from)`), and to EOF on every miss: now one pre-split line index with a
+    forward-only cursor that gives up on a section at its first miss, and OpenAPI methods are
+    searched only within their path's line range — O(lines + keys) per file.
+- **Streaming YAML**: Spring property files flatten through a serde visitor straight into
+  `(dotted.key, value)` pairs — no `serde_yaml::Value` tree. Output is byte-identical to the old
+  tree flattening (`streaming_yaml_matches_dom_flattening`), ingestion stays atomic on malformed
+  input, and a multi-document file now contributes its first (default-profile) document instead of
+  being rejected wholesale. AsyncAPI/OpenAPI specs deserialize into key-only shapes
+  (`languages/spec_shape.rs`) that skip every schema/example subtree as `IgnoredAny`.
+- **Docs memory**: `DocSection` no longer keeps a lowercased copy of ASCII content (matching is
+  byte-wise equivalent to `to_lowercase().contains`); only non-ASCII sections keep one.
+- **`gen_synthetic.py --contracts`**: the plain generator never produced imports, protos, gRPC
+  handlers, YAML or Markdown, so it could not exercise any of the above. The flag adds that mix
+  (default off; nightly numbers unchanged).
+- **Measured at 200,000 files** (release, single root, cold persistent cache via a fresh `HOME`,
+  `/usr/bin/time -l` peak memory footprint — `ps` RSS is unusable on macOS here: memory
+  compression dropped an idle server from 900 MB to 12 MB within 2 minutes; baseline = step 3.4
+  head `835361f`):
+
+  | build | corpus | boot | peak footprint |
+  |---|---|---|---|
+  | 3.4 | 200k plain | 13.9 s | 630 MB |
+  | 3.5 | 200k plain | 15.3 s | 637 MB |
+  | 3.4 | 200k + 48k contract mix | **307.8 s** | 809 MB |
+  | 3.5 | 200k + 48k contract mix | **17.0 s** | 829 MB |
+
+  The contract-mix boot drops ~18x and now scales like the plain corpus; memory is flat. **Honest
+  gap**: at 200k files both builds are far over the 5k-derived CI budgets (boot 3 s, RSS 300 MB,
+  search p50/p95 400-480 / 920-1,040 ms). The peak is dominated by the parallel parse phase and the
+  resident graph, not by anything this step touched; it is not hidden by loosening the budgets.
+
+### Step 3.5 review corrections (PR #30)
+
+- **More quadratic passes the step missed** (measured with synthetic graphs, release, N = 4k → 16k):
+  - Import strategy 1 (`pkg.Name`) scanned the whole `Name` bucket once per *distinct* target, so
+    N packages each importing their own `pN.Constants` was O(N²) even with the (target, repo) memo:
+    0.53 s → 9.1 s. Now a per-bucket "first node of each package" map: 2 ms → 10 ms. Relative
+    imports (`./a/index`, `../b/index`, …) get the same per-(stem, repo) memo.
+  - `CallsRpc` disambiguated each call by scanning every same-named proto method for the caller's
+    package: N services each calling their own `Get` was 1.2 s → 11.3 s. Candidates are now grouped
+    by package once: 4 ms → 18 ms.
+  - Stale topic hubs were removed one at a time, each `retain`ing the `event-bus` file entry all
+    hubs share (O(k·H)); removal is now batched with `patch_files`' grouped-key logic.
+  - Reload (`WorkspaceIndexer::reload`) called `DocIndex::remove_file` and
+    `PropertyRegistry::remove_file` once per changed file, each a full pass (O(k·N) on a branch
+    switch); both are now one batched pass.
+  - `gen_synthetic.py --contracts` imported one single `com.acme.common.Shared` target, which the
+    memo reduced to one lookup and so could not show the first bug; imports now vary across the
+    `Shared` declarations.
+  - Opt-in guard: `reconcile_scales_linearly_on_hot_buckets` (`--ignored`).
+  - 200k contract-mix boot re-run (same corpus as above, generated before the generator change, so
+    it has one import target and does not hit these paths), interleaved A/B on a loaded machine
+    (load average 13–18): `05443a4` 16.8 / 27.4 / 20.1 s, with these fixes 16.7 / 20.8 / 16.1 s;
+    peak footprint 809–825 vs 807–827 MB. No regression; the spread is machine noise.
+- **"Byte-identical" YAML was not**: a tagged key (`!Tag key:`) aborted the whole file (the tree
+  read it through the tag), and a repeated key ingested both values (the tree rejected the file,
+  as Spring does). Both fixed and checked against the `Value` tree itself. The AsyncAPI/OpenAPI
+  views likewise dropped tagged nodes and read a root *list* positionally as `channels`/`topics`;
+  fixed. The views still accept a duplicate key deep in a schema, which the tree rejected — kept on
+  purpose.
+- **Spec line recovery** gave up on a whole section at its first unlocatable key (every later
+  entry anchored at line 1). A miss now keeps the cursor; the seeker gives up only after 8 misses,
+  which still bounds a section to 9 passes.
+- **What "streaming under a memory budget" does and does not mean here**: no `serde_yaml::Value`
+  tree, but `serde_yaml` 0.9 still buffers one document's event list before the visitor runs; the
+  only memory bound on a YAML or Markdown file is the indexer's per-file size cap (384 KB, checked
+  before the read). **Markdown is not streamed at all**: files are read whole and every section's
+  content stays resident in `DocIndex`; the step only dropped the second, lowercased copy for ASCII
+  sections. There is no global memory budget for docs or properties. Spec item 1 is therefore
+  delivered for YAML's tree, not for Markdown, and not as a budget.
+
+## Plan 3 closeout (2026-09-26, 6.0.0 — final verification after steps 3.0–3.6)
+
+All numbers below come from the release build of `6.0.0` (branch `p2/3.6-visualize-and-mcp-compliance`),
+on this machine, with a fresh `HOME` per run so the persistent index cache (step 3.2) is cold, and
+compared against step 3.4's head (`835361f`) as the reference where a before/after exists.
+
+**Regression suites**
+
+| suite | result |
+|---|---|
+| `scripts/determinism.sh` (Plan 1) | ✔ `polyglot-shop` 1 fingerprint / 13 runs; ✔ `volontariapp-fixture` 1 fingerprint / 13 runs (5 sequential + 8 concurrent each) |
+| `scripts/golden/score.py online-boutique` (Plan 2) | 14/14 — **100% precision / 100% recall** (unchanged) |
+| `scripts/golden/score.py otel-demo` | 7/13 — **87.5% / 53.8%**, identical to the reference binary and to the last recorded value: the known TypeScript `@grpc/grpc-js` client gap + the `checkout -> health` extra edge, not a regression |
+| `scripts/golden/score.py bank-of-anthos` | 0/0 — vacuous 100% / 100% (gRPC-free, nothing fabricated) |
+| nightly `scale_bench.py` (5k files, 8 roots, `budgets.json`) | ✔ no violation, 3 runs + 1 run outside the repo: boot 0.5–1.1 s (budget 3 s), RSS peak 48–49 MB (300), search p50 4.4–9.7 ms (300), p95 7.6–24.2 ms (800), reload **207 ms** (3 s; reference 210 ms) |
+
+**Re-verified on the final tree** (after merging the step 3.5 and 3.6 review fixes, `047d6b3`):
+`determinism.sh` gives the same two fingerprints (`27c5fb5d…`, `a40bf20f…`); golden unchanged
+(100/100, 87.5/53.8, 100/100); nightly 5k outside the repo, 2 runs: boot 0.30–0.31 s, RSS peak
+49 MB, search p50 2.2–2.4 ms / p95 3.7–7.8 ms, reload 205–209 ms, no violation.
+
+**`reload_ms: None` explained, not a regression.** Every corpus generated under `target/`
+(git-ignored by this repo's `/target` rule) reported `reload_ms: None` — for the reference binary
+too. Step 3.3's watcher honours `.gitignore` files *above* the watched root, so edits inside a
+git-ignored directory are, correctly, never watched and the harness's reload probe times out. The
+same 5k corpus generated outside the repository (`~/bench-repos/mesh-synth-5k`) reloads in 207 ms.
+Scale corpora must therefore not live under an ignored path; the step 3.4/3.5 notes that called
+this "a harness issue to investigate" are resolved by this.
+
+**Scale, end to end (cold)**
+
+| measurement | before (first number in Plan 3) | 6.0.0 |
+|---|---|---|
+| `smart_search` 30k files, single root, p50 / p95 | 905 / 3,342 ms (`04f213c`) | 57 / 112 ms |
+| boot, 200k files + 48k contract mix | 307.8 s (step 3.4 head) | 17.0 s |
+| peak footprint, same corpus | 809 MB | 829 MB |
+| boot / peak footprint, 200k plain files | 13.9 s / 630 MB | 15.3 s / 637 MB |
+| `visualize_mesh`, 248k nodes | raw graph over 48 KB, cut mid-document (invalid HTML/JSON) | 4.3 KB mermaid / 16.9 KB json / 40.4 KB html, all valid |
+| `visualize_mesh` latency, 248k nodes (mermaid / json / html / zoom) | 516 / 522 / 1,034 / 1,603 ms (`000fa3f`) | 124 / 111 / 101 / 222 ms (step 3.6 review: the fold runs once, the shrink loop only re-selects) |
+| `tools/list` schemas | 7,696 bytes | 5,524 bytes (~540 tokens/session less) |
+
+**Still over budget, recorded not hidden**: the nightly budgets are derived from the 5k corpus and
+hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are far above them; that
+cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
+were not loosened to make larger corpora pass.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

@@ -9,6 +9,7 @@ pub mod python;
 pub mod ruby;
 pub mod rust_lang;
 pub mod scala;
+mod spec_shape;
 pub mod swift;
 pub mod ts_config;
 pub mod typescript;
@@ -647,64 +648,49 @@ impl PolyglotIndexer {
                 .any(|f| spec_file_matches(&path_str, f))
         };
         if is_asyncapi {
-            if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
-                if let Some(channels) = yaml_val.get("channels").and_then(|c| c.as_mapping()) {
-                    // `serde_yaml::Mapping` keeps document order, so each key is
-                    // searched from the previous one's line: linear, not quadratic.
-                    let mut cursor = yaml_key_line(content, "channels", 1).unwrap_or(1);
-                    for (ch_name, _) in channels {
-                        if let Some(name_str) = ch_name.as_str() {
-                            let found = yaml_key_line(content, name_str, cursor);
-                            cursor = found.unwrap_or(cursor);
-                            let line = found.unwrap_or(1);
-                            let node = ContractNode {
-                                id: 0,
-                                name: CompactStr::new(name_str),
-                                kind: NodeKind::EventStream,
-                                file_path: interned.clone(),
-                                line_start: line,
-                                line_end: line,
-                                package: CompactStr::new("asyncapi"),
-                                repo_id,
-                                signature: Some(CompactStr::new(format!("channel {name_str}"))),
-                                docstring: None,
-                            };
-                            out.producers
-                                .push((out.nodes.len(), CompactStr::new(name_str)));
-                            out.nodes.push(node);
-                        }
-                    }
+            if let Ok(spec) = serde_yaml::from_str::<spec_shape::AsyncApiShape>(content) {
+                let lines = YamlLines::new(content);
+                let mut seek = lines.seeker(lines.key_line("channels", 1, usize::MAX));
+                for name_str in spec.channels.0.iter().map(String::as_str) {
+                    let line = seek.key(name_str).unwrap_or(1);
+                    let node = ContractNode {
+                        id: 0,
+                        name: CompactStr::new(name_str),
+                        kind: NodeKind::EventStream,
+                        file_path: interned.clone(),
+                        line_start: line,
+                        line_end: line,
+                        package: CompactStr::new("asyncapi"),
+                        repo_id,
+                        signature: Some(CompactStr::new(format!("channel {name_str}"))),
+                        docstring: None,
+                    };
+                    out.producers
+                        .push((out.nodes.len(), CompactStr::new(name_str)));
+                    out.nodes.push(node);
                 }
 
                 // `infer_string_topics`: beyond the structured `channels` mapping,
                 // also pick up a non-standard top-level `topics: [..]` string list.
                 if cfg.infer_string_topics {
-                    if let Some(topics) = yaml_val.get("topics").and_then(|t| t.as_sequence()) {
-                        let mut cursor = yaml_key_line(content, "topics", 1).unwrap_or(1);
-                        for entry in topics {
-                            if let Some(name_str) = entry.as_str() {
-                                let found = yaml_item_line(content, name_str, cursor);
-                                cursor = found.unwrap_or(cursor);
-                                let line = found.unwrap_or(1);
-                                let node = ContractNode {
-                                    id: 0,
-                                    name: CompactStr::new(name_str),
-                                    kind: NodeKind::EventStream,
-                                    file_path: interned.clone(),
-                                    line_start: line,
-                                    line_end: line,
-                                    package: CompactStr::new("asyncapi"),
-                                    repo_id,
-                                    signature: Some(CompactStr::new(format!(
-                                        "inferred topic {name_str}"
-                                    ))),
-                                    docstring: None,
-                                };
-                                out.producers
-                                    .push((out.nodes.len(), CompactStr::new(name_str)));
-                                out.nodes.push(node);
-                            }
-                        }
+                    let mut seek = lines.seeker(lines.key_line("topics", 1, usize::MAX));
+                    for name_str in spec.topics.0.iter().map(String::as_str) {
+                        let line = seek.item(name_str).unwrap_or(1);
+                        let node = ContractNode {
+                            id: 0,
+                            name: CompactStr::new(name_str),
+                            kind: NodeKind::EventStream,
+                            file_path: interned.clone(),
+                            line_start: line,
+                            line_end: line,
+                            package: CompactStr::new("asyncapi"),
+                            repo_id,
+                            signature: Some(CompactStr::new(format!("inferred topic {name_str}"))),
+                            docstring: None,
+                        };
+                        out.producers
+                            .push((out.nodes.len(), CompactStr::new(name_str)));
+                        out.nodes.push(node);
                     }
                 }
             }
@@ -722,38 +708,41 @@ impl PolyglotIndexer {
                 .any(|f| spec_file_matches(&path_str, f))
         };
         if is_openapi {
-            if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
-                if let Some(paths) = yaml_val.get("paths").and_then(|p| p.as_mapping()) {
-                    let mut cursor = yaml_key_line(content, "paths", 1).unwrap_or(1);
-                    for (path_name, methods) in paths {
-                        if let Some(p_str) = path_name.as_str() {
-                            let path_line = yaml_key_line(content, p_str, cursor);
-                            cursor = path_line.unwrap_or(cursor);
-                            if let Some(m_map) = methods.as_mapping() {
-                                for (method_name, _) in m_map {
-                                    if let Some(m_str) = method_name.as_str() {
-                                        let ep_name = format!("{} {}", m_str.to_uppercase(), p_str);
-                                        let line = path_line
-                                            .and_then(|l| yaml_key_line(content, m_str, l + 1))
-                                            .or(path_line)
-                                            .unwrap_or(1);
-                                        let node = ContractNode {
-                                            id: 0,
-                                            name: CompactStr::new(&ep_name),
-                                            kind: NodeKind::HttpEndpoint,
-                                            file_path: interned.clone(),
-                                            line_start: line,
-                                            line_end: line,
-                                            package: CompactStr::new("openapi"),
-                                            repo_id,
-                                            signature: Some(CompactStr::new(&ep_name)),
-                                            docstring: None,
-                                        };
-                                        out.nodes.push(node);
-                                    }
-                                }
-                            }
-                        }
+            if let Ok(spec) = serde_yaml::from_str::<spec_shape::OpenApiShape>(content) {
+                let lines = YamlLines::new(content);
+                // Pass 1: each path's line, in document order (one forward scan).
+                let mut seek = lines.seeker(lines.key_line("paths", 1, usize::MAX));
+                let path_lines: Vec<Option<usize>> =
+                    spec.paths.0.iter().map(|(p, _)| seek.key(p)).collect();
+                // Pass 2: a method is searched only between its path's line and the
+                // next located path's line, so every line is scanned O(1) times.
+                for (i, (p_str, methods)) in spec.paths.0.iter().enumerate() {
+                    let path_line = path_lines[i];
+                    let next_path = path_lines[i + 1..].iter().flatten().next().copied();
+                    // An unlocated path's methods are not searched (they would
+                    // match some other path's `get:`); they take line 1, as before.
+                    let mut method_seek = path_line
+                        .map(|l| lines.seeker_until(Some(l), next_path.unwrap_or(usize::MAX)));
+                    for m_str in methods {
+                        let ep_name = format!("{} {}", m_str.to_uppercase(), p_str);
+                        let line = method_seek
+                            .as_mut()
+                            .and_then(|s| s.key(m_str))
+                            .or(path_line)
+                            .unwrap_or(1);
+                        let node = ContractNode {
+                            id: 0,
+                            name: CompactStr::new(&ep_name),
+                            kind: NodeKind::HttpEndpoint,
+                            file_path: interned.clone(),
+                            line_start: line,
+                            line_end: line,
+                            package: CompactStr::new("openapi"),
+                            repo_id,
+                            signature: Some(CompactStr::new(&ep_name)),
+                            docstring: None,
+                        };
+                        out.nodes.push(node);
                     }
                 }
             }
@@ -784,17 +773,26 @@ impl LineCursor {
     }
 }
 
-/// 1-based line of the first `key:` mapping entry (bare, `"key"` or `'key'`) at or
-/// after line `from`. `serde_yaml` keeps no source positions, so contract nodes read
-/// from a parsed spec recover their declaration line textually; `None` when the key
-/// cannot be found (flow style, anchors), in which case callers fall back to line 1
-/// and `smart_search` treats the anchor as unverified.
-fn yaml_key_line(content: &str, key: &str, from: usize) -> Option<usize> {
-    content
-        .lines()
-        .enumerate()
-        .skip(from.saturating_sub(1))
-        .find(|(_, l)| {
+/// A spec's lines, split once. `serde_yaml` keeps no source positions, so
+/// contract nodes read from a parsed spec recover their declaration line
+/// textually; a key that cannot be found (flow style, anchors) yields `None`, in
+/// which case callers fall back to line 1 and `smart_search` treats the anchor
+/// as unverified.
+struct YamlLines<'a> {
+    lines: Vec<&'a str>,
+}
+
+impl<'a> YamlLines<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            lines: content.lines().collect(),
+        }
+    }
+
+    /// 1-based line of the first `key:` mapping entry (bare, `"key"` or `'key'`)
+    /// in lines `[from, until)`.
+    fn key_line(&self, key: &str, from: usize, until: usize) -> Option<usize> {
+        self.find(from, until, |l| {
             let t = l.trim_start().trim_start_matches("- ");
             let rest = t
                 .strip_prefix(key)
@@ -802,22 +800,83 @@ fn yaml_key_line(content: &str, key: &str, from: usize) -> Option<usize> {
                 .or_else(|| t.strip_prefix('\'')?.strip_prefix(key)?.strip_prefix('\''));
             rest.is_some_and(|r| r.starts_with(':'))
         })
-        .map(|(i, _)| i + 1)
-}
+    }
 
-/// 1-based line of the first `- item` sequence entry equal to `item` at or after `from`.
-fn yaml_item_line(content: &str, item: &str, from: usize) -> Option<usize> {
-    content
-        .lines()
-        .enumerate()
-        .skip(from.saturating_sub(1))
-        .find(|(_, l)| {
+    /// 1-based line of the first `- item` sequence entry in lines `[from, until)`.
+    fn item_line(&self, item: &str, from: usize, until: usize) -> Option<usize> {
+        self.find(from, until, |l| {
             l.trim_start()
                 .strip_prefix('-')
                 .map(|r| r.trim().trim_matches(|c| c == '"' || c == '\''))
                 == Some(item)
         })
-        .map(|(i, _)| i + 1)
+    }
+
+    fn find(&self, from: usize, until: usize, pred: impl Fn(&str) -> bool) -> Option<usize> {
+        let start = from.saturating_sub(1).min(self.lines.len());
+        let end = until.saturating_sub(1).clamp(start, self.lines.len());
+        self.lines[start..end]
+            .iter()
+            .position(|l| pred(l))
+            .map(|i| start + i + 1)
+    }
+
+    /// A forward-only cursor over entries after `section` (the section key's
+    /// line), or from line 1 when the section key itself was not located.
+    fn seeker(&self, section: Option<usize>) -> Seeker<'_, 'a> {
+        self.seeker_until(section, usize::MAX)
+    }
+
+    fn seeker_until(&self, section: Option<usize>, until: usize) -> Seeker<'_, 'a> {
+        Seeker {
+            lines: self,
+            cursor: section.map_or(1, |l| l + 1),
+            until,
+            misses_left: Seeker::MAX_MISSES,
+        }
+    }
+}
+
+/// Locates a section's entries in document order. Each lookup resumes after the
+/// previous hit; a miss leaves the cursor where it was, so one unlocatable entry
+/// (an escaped or multi-line key) does not cost the entries after it their lines.
+/// A miss scans to the end of the range, so after [`Seeker::MAX_MISSES`] of them
+/// the seeker gives up and every later entry falls back to line 1: that bounds a
+/// section to `MAX_MISSES + 1` passes over its lines. Re-searching from the top
+/// on every entry was O(entries × lines) — quadratic on a large spec, worse for
+/// flow-style YAML where every lookup misses and scanned to EOF.
+struct Seeker<'l, 'a> {
+    lines: &'l YamlLines<'a>,
+    cursor: usize,
+    until: usize,
+    misses_left: u8,
+}
+
+impl Seeker<'_, '_> {
+    const MAX_MISSES: u8 = 8;
+
+    fn key(&mut self, key: &str) -> Option<usize> {
+        self.advance(|lines, from, until| lines.key_line(key, from, until))
+    }
+
+    fn item(&mut self, item: &str) -> Option<usize> {
+        self.advance(|lines, from, until| lines.item_line(item, from, until))
+    }
+
+    fn advance(
+        &mut self,
+        find: impl FnOnce(&YamlLines<'_>, usize, usize) -> Option<usize>,
+    ) -> Option<usize> {
+        if self.misses_left == 0 {
+            return None;
+        }
+        let found = find(self.lines, self.cursor, self.until);
+        match found {
+            Some(line) => self.cursor = line + 1,
+            None => self.misses_left -= 1,
+        }
+        found
+    }
 }
 
 #[cfg(test)]
@@ -967,6 +1026,66 @@ channels:
         assert_eq!(graph.node_count(), 1);
         let impact = graph.analyze_impact("billing.events");
         assert!(!impact.topics.is_empty());
+    }
+
+    /// Line recovery for spec entries: one unlocatable key (an escaped quote
+    /// the text search cannot match) must not cost the keys after it their
+    /// lines, and an OpenAPI method is only searched inside its own path.
+    #[test]
+    fn spec_line_recovery_survives_a_miss_and_is_path_bounded() {
+        let asyncapi = "asyncapi: 2.6.0\nchannels:\n  'it''s.escaped':\n    description: x\n  orders.created:\n    description: y\n";
+        let idx = PolyglotIndexer::extract_with_config(
+            Path::new("asyncapi.yaml"),
+            asyncapi,
+            0,
+            &ExtractConfig::default(),
+        );
+        let line_of = |name: &str| {
+            idx.nodes
+                .iter()
+                .find(|n| n.name.as_str() == name)
+                .map(|n| n.line_start)
+        };
+        assert_eq!(line_of("it's.escaped"), Some(1), "unlocatable key");
+        assert_eq!(line_of("orders.created"), Some(5), "key after a miss");
+
+        let openapi = "openapi: 3.0.0\npaths:\n  /a: {get: {}}\n  /b:\n    post: {}\n    get: {}\n";
+        let idx = PolyglotIndexer::extract_with_config(
+            Path::new("openapi.yaml"),
+            openapi,
+            0,
+            &ExtractConfig::default(),
+        );
+        let line_of = |name: &str| {
+            idx.nodes
+                .iter()
+                .find(|n| n.name.as_str() == name)
+                .map(|n| n.line_start)
+        };
+        assert_eq!(
+            line_of("GET /a"),
+            Some(3),
+            "flow-style method: its path's line, not /b's get"
+        );
+        assert_eq!(line_of("POST /b"), Some(5));
+        assert_eq!(line_of("GET /b"), Some(6));
+    }
+
+    /// Flow-style YAML misses every key; the seeker stops searching after
+    /// `MAX_MISSES` instead of rescanning the file once per entry.
+    #[test]
+    fn seeker_gives_up_after_its_miss_budget() {
+        let content = (0..50).map(|i| format!("k{i}: v\n")).collect::<String>();
+        let lines = YamlLines::new(&content);
+        let mut seek = lines.seeker(None);
+        for _ in 0..Seeker::MAX_MISSES {
+            assert_eq!(seek.key("absent"), None);
+        }
+        assert_eq!(seek.key("k3"), None, "budget spent: no more searching");
+        let mut fresh = lines.seeker(None);
+        assert_eq!(fresh.key("absent"), None);
+        assert_eq!(fresh.key("k3"), Some(4), "a miss keeps the cursor");
+        assert_eq!(fresh.key("k1"), None, "forward-only");
     }
 
     #[test]

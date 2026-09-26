@@ -128,10 +128,12 @@ async fn test_smart_search_sandbox_escape_rejected() {
         "scope": "/etc"
     });
 
-    let res = ToolRegistry::call_tool("smart_search", args, state).await;
-    assert!(res.is_err());
-    let (code, msg) = res.unwrap_err();
-    assert_eq!(code, -32602); // RFC Commandment 4
+    // A sandbox escape is a tool-level failure: an MCP `CallToolResult` with
+    // `isError: true` the agent can read and correct, not a JSON-RPC error.
+    let val = ToolRegistry::call_tool("smart_search", args, state)
+        .await
+        .expect("tool failures are not protocol errors");
+    let msg = tool_error_text(&val);
     assert!(msg.contains("Sandbox escape") || msg.contains("Path not found"));
 }
 
@@ -152,7 +154,7 @@ async fn test_find_dependents_success() {
 }
 
 /// An unrecognized `granularity` (typo, wrong case, invented value) must be a
-/// JSON-RPC -32602 error, not a silent fallback to symbol-level output — a
+/// tool error (`isError: true`), not a silent fallback to symbol-level output — a
 /// silent fallback would look like a successful narrower query while quietly
 /// returning the full, undeduplicated result set.
 #[tokio::test]
@@ -164,11 +166,10 @@ async fn test_find_dependents_rejects_unknown_granularity() {
         "granularity": "Package"
     });
 
-    let res = ToolRegistry::call_tool("find_dependents", args, state).await;
-    assert!(res.is_err());
-    let (code, msg) = res.unwrap_err();
-    assert_eq!(code, -32602);
-    assert!(msg.contains("Package"));
+    let val = ToolRegistry::call_tool("find_dependents", args, state)
+        .await
+        .expect("tool failures are not protocol errors");
+    assert!(tool_error_text(&val).contains("Package"));
 }
 
 #[tokio::test]
@@ -903,4 +904,43 @@ fn test_setup_md_config_reference_status_sync() {
             "SETUP.md section {section} must NOT be documented as Accepted-only (got line: {line})"
         );
     }
+}
+
+/// The text of an MCP `CallToolResult` that must be a tool error.
+fn tool_error_text(val: &serde_json::Value) -> &str {
+    assert_eq!(val["isError"], true, "expected isError: true in {val}");
+    val["content"][0]["text"].as_str().expect("error text")
+}
+
+/// Invalid arguments are the model's mistake to fix, so they come back as a
+/// tool error with the deserializer's message, not a JSON-RPC -32602.
+#[tokio::test]
+async fn test_invalid_arguments_are_a_tool_error() {
+    let (state, _temp) = setup_test_environment();
+    let val = ToolRegistry::call_tool("smart_search", json!({ "query": "x", "bogus": 1 }), state)
+        .await
+        .expect("tool failures are not protocol errors");
+    assert!(tool_error_text(&val).contains("Invalid arguments for smart_search"));
+}
+
+/// An unknown tool name stays a protocol error: the MCP spec reserves
+/// `isError` for failures *inside* a tool that exists.
+#[tokio::test]
+async fn test_unknown_tool_is_a_protocol_error() {
+    let (state, _temp) = setup_test_environment();
+    let (code, msg) = ToolRegistry::call_tool("no_such_tool", json!({}), state)
+        .await
+        .expect_err("unknown tool is a protocol error");
+    assert_eq!(code, -32602);
+    assert!(msg.contains("no_such_tool"));
+}
+
+/// A successful call says so explicitly.
+#[tokio::test]
+async fn test_successful_call_has_is_error_false() {
+    let (state, _temp) = setup_test_environment();
+    let val = ToolRegistry::call_tool("search_docs", json!({ "query": "auth" }), state)
+        .await
+        .expect("ok");
+    assert_eq!(val["isError"], false);
 }

@@ -28,7 +28,9 @@ pub type ToolError = (i32, String);
 
 /// Implementation-defined JSON-RPC server error (per spec, the -32000..-32099
 /// range) for a call refused by active governance (RSAH). Distinct from
-/// -32602 (invalid params) and -32601 (unknown tool).
+/// -32602 (invalid params). Tool-level codes like this one classify a failure
+/// internally; `call_tool` surfaces every one of them to the client as a
+/// `CallToolResult` with `isError: true`, never as a JSON-RPC error.
 pub const GOVERNANCE_BLOCKED_CODE: i32 = -32001;
 
 /// Result of one tool invocation, before audit and MCP framing.
@@ -80,6 +82,13 @@ pub trait McpTool {
     fn mutates(_args: &Self::Args) -> bool {
         false
     }
+
+    /// Whether this call returns a machine-readable document (JSON, HTML) rather
+    /// than Markdown prose. Nothing is appended to such a document — no skill
+    /// footer — since any trailing text would make it unparseable.
+    fn returns_document(_args: &Self::Args) -> bool {
+        false
+    }
 }
 
 pub struct ToolRegistry;
@@ -110,13 +119,24 @@ impl ToolRegistry {
         })
     }
 
-    /// Dispatches an incoming MCP tools/call request
+    /// Dispatches an incoming MCP `tools/call` request.
+    ///
+    /// Per the MCP specification (2024-11-05), a failure *inside* a tool —
+    /// invalid arguments, a scope outside the sandbox jail, a missing target, an
+    /// RSAH governance refusal — is not a protocol error: it is returned as a
+    /// successful JSON-RPC response carrying a `CallToolResult` with
+    /// `isError: true` and the message as text content, so the client hands it
+    /// to the model as the tool's answer and the agent can self-correct. Only
+    /// protocol-level faults come back as `Err` for the caller to send as a
+    /// JSON-RPC error: an unknown tool name (`-32602`, as the MCP spec
+    /// prescribes) and an internal failure such as a panicked tool task
+    /// (`-32603`).
     pub async fn call_tool(
         name: &str,
         arguments: Value,
         state: Arc<AppState>,
     ) -> Result<Value, ToolError> {
-        let text_output = match name {
+        let outcome = match name {
             SmartSearchTool::NAME => Self::invoke::<SmartSearchTool>(arguments, state).await?,
             FindDependentsTool::NAME => {
                 Self::invoke::<FindDependentsTool>(arguments, state).await?
@@ -127,17 +147,26 @@ impl ToolRegistry {
             VisualizeMeshTool::NAME => Self::invoke::<VisualizeMeshTool>(arguments, state).await?,
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => Self::invoke::<TestSlowOpTool>(arguments, state).await?,
-            unknown => return Err((-32601, format!("Unknown tool: {unknown}"))),
+            unknown => return Err((-32602, format!("Unknown tool: {unknown}"))),
         };
 
-        Ok(json!({
+        Ok(match outcome {
+            Ok(text) => Self::tool_result(text, false),
+            Err((_, message)) => Self::tool_result(message, true),
+        })
+    }
+
+    /// An MCP `CallToolResult` with one text content block.
+    pub fn tool_result(text: String, is_error: bool) -> Value {
+        json!({
             "content": [
                 {
                     "type": "text",
-                    "text": text_output
+                    "text": text
                 }
-            ]
-        }))
+            ],
+            "isError": is_error
+        })
     }
 
     /// Footer pointing the agent at a configured skill file. The path is what the
@@ -172,12 +201,22 @@ impl ToolRegistry {
 
     /// Parses arguments, runs the tool body and the audit write on the blocking
     /// pool, and returns the rendered text.
+    /// Runs one tool. The outer `Result` is a protocol-level fault (the tool task
+    /// itself failed); the inner one is the tool's own outcome, which
+    /// `call_tool` turns into a `CallToolResult` (`isError` on `Err`).
     async fn invoke<T: McpTool>(
         arguments: Value,
         state: Arc<AppState>,
-    ) -> Result<String, ToolError> {
-        let args: T::Args = serde_json::from_value(arguments)
-            .map_err(|e| (-32602, format!("Invalid arguments for {}: {e}", T::NAME)))?;
+    ) -> Result<Result<String, ToolError>, ToolError> {
+        let args: T::Args = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return Ok(Err((
+                    -32602,
+                    format!("Invalid arguments for {}: {e}", T::NAME),
+                )))
+            }
+        };
 
         // Active governance (RSAH): mutating calls are subject to a stop rule.
         // For read-only tools, behavior depends on `read_governance_mode`:
@@ -195,7 +234,7 @@ impl ToolRegistry {
                         let payload = serde_json::to_string(&rsah).unwrap_or_else(|_| {
                             "RSAH governance refusal (payload serialization failed)".to_string()
                         });
-                        return Err((GOVERNANCE_BLOCKED_CODE, payload));
+                        return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
                     } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
                         tracing::warn!(
                             target: "mesh::security",
@@ -215,24 +254,25 @@ impl ToolRegistry {
             // Surface the team's own playbook for this area, so the agent reads the
             // house rules before acting instead of inferring them from the code.
             if let Ok(out) = &mut result {
-                if let Some(skill) = state.governance.recommend_skill(T::NAME, T::subject(&args)) {
-                    out.text.push_str(&Self::render_skill_hint(skill));
+                if !T::returns_document(&args) {
+                    if let Some(skill) =
+                        state.governance.recommend_skill(T::NAME, T::subject(&args))
+                    {
+                        out.text.push_str(&Self::render_skill_hint(skill));
+                    }
                 }
 
                 // Centralized 48 KB Payload Budget Capping
                 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
                 if out.text.len() > MAX_TOOL_OUTPUT_BYTES {
-                    let mut cut_off = MAX_TOOL_OUTPUT_BYTES - 384;
-                    while !out.text.is_char_boundary(cut_off) {
-                        cut_off -= 1;
-                    }
-                    out.text.truncate(cut_off);
                     let hint = T::truncation_hint(&args, &state).unwrap_or_else(|| {
                         "Refine scope or pass specific search targets to narrow output.".to_string()
                     });
-                    out.text.push_str(&format!(
-                        "\n\n> [!NOTE]\n> Output payload truncated to fit within maximum MCP output payload cap (48 KB). {hint}\n",
-                    ));
+                    // Budget the note first: the cut text, its closing fence and
+                    // the note together stay within the cap.
+                    let note = truncation_note(&hint);
+                    truncate_markdown(&mut out.text, MAX_TOOL_OUTPUT_BYTES - note.len());
+                    out.text.push_str(&note);
                 }
             }
 
@@ -269,13 +309,165 @@ impl ToolRegistry {
             result.map(|out| out.text)
         })
         .await
-        .map_err(|e| (-32603, format!("Tool task failed: {e}")))?
+        .map_err(|e| (-32603, format!("Tool task failed: {e}")))
+    }
+}
+
+/// Longest truncation hint kept in the truncation note. Hints echo caller
+/// arguments (`smart_search`'s query and scope), which are unbounded: without a
+/// cap, the note alone could push the payload past the 48 KB it enforces.
+const MAX_TRUNCATION_HINT_BYTES: usize = 512;
+
+/// The note appended to a truncated payload. One line of prose: newlines in the
+/// hint are flattened so an echoed argument cannot open a code fence or a new
+/// Markdown block after the cut.
+fn truncation_note(hint: &str) -> String {
+    let mut hint = hint.replace(['\n', '\r'], " ");
+    if hint.len() > MAX_TRUNCATION_HINT_BYTES {
+        let mut cut = MAX_TRUNCATION_HINT_BYTES;
+        while !hint.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        hint.truncate(cut);
+        hint.push('…');
+    }
+    format!(
+        "\n\n> [!NOTE]\n> Output payload truncated to fit within maximum MCP output payload cap (48 KB). {hint}\n"
+    )
+}
+
+/// The fence that is still open at the end of `text`, if any (e.g. ```` ``` ````
+/// or `~~~~`), following CommonMark: an opening fence is 3+ backticks or tildes
+/// indented by at most 3 spaces (a backtick fence's info string cannot contain a
+/// backtick); inside it, only a line of at least as many of the *same* character
+/// and nothing else closes it — a ```` ```rust ```` line inside a block is content.
+fn open_fence(text: &str) -> Option<String> {
+    let mut open: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let rest = line.trim_start_matches(' ');
+        if line.len() - rest.len() > 3 {
+            continue;
+        }
+        let Some(c) = rest.chars().next().filter(|c| *c == '`' || *c == '~') else {
+            continue;
+        };
+        let run = rest.len() - rest.trim_start_matches(c).len();
+        if run < 3 {
+            continue;
+        }
+        let after = &rest[run..];
+        match open {
+            None if !(c == '`' && after.contains('`')) => open = Some((c, run)),
+            Some((oc, on)) if c == oc && run >= on && after.trim().is_empty() => open = None,
+            _ => {}
+        }
+    }
+    open.map(|(c, n)| std::iter::repeat_n(c, n).collect())
+}
+
+/// Byte offset `text` is cut at for a `budget`: a char boundary, backed off to
+/// the last complete line when there is one in the kept half (a single huge
+/// line is cut mid-line rather than dropped).
+fn line_cut(text: &str, budget: usize) -> usize {
+    let mut cut = budget.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    match text[..cut].rfind('\n') {
+        Some(nl) if nl >= cut / 2 => nl,
+        _ => cut,
+    }
+}
+
+/// Cuts `text` to at most `budget` bytes — the closing fence included — on a
+/// line boundary, and closes any Markdown code fence left open, so a truncated
+/// payload never ends mid-token or inside an unterminated block (which makes
+/// everything after it, including the truncation note, parse as code downstream).
+fn truncate_markdown(text: &mut String, budget: usize) {
+    if text.len() <= budget {
+        return;
+    }
+    // Room kept for the closing fence. It only grows (a larger reserve is only
+    // taken when the fence found needs more than the current one), so this ends.
+    let mut reserve = 0usize;
+    loop {
+        let cut = line_cut(text, budget.saturating_sub(reserve));
+        let fence = open_fence(&text[..cut]);
+        let need = fence.as_ref().map_or(0, |f| f.len() + 1);
+        if cut + need <= budget || need <= reserve || reserve >= budget {
+            text.truncate(cut);
+            if let Some(f) = fence {
+                text.push('\n');
+                text.push_str(&f);
+            }
+            return;
+        }
+        reserve = need;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_markdown_closes_open_fence_on_a_line_boundary() {
+        let mut text = String::from("## Title\n```rust\nfn a() {}\nfn b() {}\nfn c() {}\n```\n");
+        truncate_markdown(&mut text, 30);
+        assert!(text.ends_with("\n```"), "{text:?}");
+        assert_eq!(text.matches("```").count(), 2, "{text:?}");
+        assert!(
+            !text.contains("fn b() {"),
+            "cut on a line boundary: {text:?}"
+        );
+
+        // Already-balanced output is only cut, never given a stray fence.
+        let mut balanced = String::from("```\na\n```\nplain text that is long enough\n");
+        truncate_markdown(&mut balanced, 20);
+        assert_eq!(balanced.matches("```").count() % 2, 0, "{balanced:?}");
+
+        // Multi-byte text never splits a char.
+        let mut utf8 = "é".repeat(100);
+        truncate_markdown(&mut utf8, 51);
+        assert!(utf8.len() <= 51);
+    }
+
+    #[test]
+    fn open_fence_follows_commonmark() {
+        // A ```rust line inside an open block is content, not a close.
+        assert_eq!(
+            open_fence("```\ncode\n```rust\nmore").as_deref(),
+            Some("```")
+        );
+        // Tilde fences, closed only by tildes.
+        assert_eq!(open_fence("~~~\n```\n```\n").as_deref(), Some("~~~"));
+        assert_eq!(open_fence("~~~\nx\n~~~\n"), None);
+        // A 4-backtick fence is closed by 4+, not by an inner ```.
+        assert_eq!(
+            open_fence("````md\n```rust\nfn a() {}\n```\n").as_deref(),
+            Some("````")
+        );
+        // Indented by 4 spaces: an indented code line, not a fence.
+        assert_eq!(open_fence("    ```\ntext\n"), None);
+        // Backticks in a backtick fence's info string: inline code, not a fence.
+        assert_eq!(open_fence("```a``` inline\ntext\n"), None);
+        assert_eq!(open_fence("use `x` and ``` y\n"), None);
+    }
+
+    #[test]
+    fn truncation_stays_within_budget_with_fence_and_note() {
+        // A long fence opener must still fit: cut + "\n" + fence <= budget.
+        let fence = "`".repeat(40);
+        let mut text = format!("{fence}\n{}", "line of code\n".repeat(50));
+        truncate_markdown(&mut text, 100);
+        assert!(text.len() <= 100, "{} > 100", text.len());
+        assert!(text.ends_with(&fence));
+
+        // An unbounded hint (echoed query) is capped and flattened.
+        let note = truncation_note(&format!("```\n{}", "q".repeat(100_000)));
+        assert!(note.len() < 1024, "{}", note.len());
+        assert_eq!(note.matches('\n').count(), 4, "{note:?}");
+    }
     use mesh_core::{AuditLogger, BackgroundRescanEngine, Config};
     use serde::Deserialize;
 
@@ -371,7 +563,9 @@ roots = ["."]
         let state = governed_state();
         let args = json!({ "target": "services/proto-registry/auth.proto" });
 
-        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state).await;
+        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state)
+            .await
+            .expect("a governance refusal is a tool outcome, not a protocol fault");
         let (code, message) = result.expect_err("guarded mutation must be refused");
         assert_eq!(code, GOVERNANCE_BLOCKED_CODE);
 
@@ -411,9 +605,85 @@ roots = ["."]
             }
         }
 
-        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state).await;
+        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state)
+            .await
+            .expect("no protocol fault");
         let text = result.expect("read-only call on a guarded subject stays allowed");
         assert!(text.contains("read services/proto-registry/auth.proto"));
+    }
+
+    /// The 48 KB cap holds for the whole payload — cut text, closing fence and
+    /// note — even when the tool's hint echoes a huge argument.
+    #[tokio::test]
+    async fn test_invoke_caps_output_including_note_and_fence() {
+        struct HugeTool;
+        impl McpTool for HugeTool {
+            const NAME: &'static str = "test_huge_tool";
+            const DESCRIPTION: &'static str = "Test-only tool with an oversized answer.";
+            type Args = MutatingToolArgs;
+            fn meta(_args: &Self::Args) -> Option<&RequestMeta> {
+                None
+            }
+            fn run(_args: &Self::Args, _state: &AppState) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text(format!(
+                    "```rust\n{}",
+                    "fn f() {}\n".repeat(20_000)
+                )))
+            }
+            fn truncation_hint(args: &Self::Args, _state: &AppState) -> Option<String> {
+                Some(format!("Query '{}' is too broad.", args.target))
+            }
+        }
+        let args = json!({ "target": "x".repeat(200_000) });
+        let text = ToolRegistry::invoke::<HugeTool>(args, governed_state())
+            .await
+            .expect("no protocol fault")
+            .expect("tool ok");
+        assert!(text.len() <= 48 * 1024, "{} bytes", text.len());
+        assert_eq!(open_fence(&text), None, "fence closed before the note");
+        assert!(text.contains("> [!NOTE]"));
+    }
+
+    /// Internal W3C trace context is accepted on input but never advertised to
+    /// the model in `tools/list`.
+    #[test]
+    fn test_list_tools_hides_request_meta() {
+        let listed = ToolRegistry::list_tools().to_string();
+        assert!(!listed.contains("_meta"), "{listed}");
+        assert!(!listed.contains("traceparent"), "{listed}");
+        assert!(!listed.contains("RequestMeta"), "{listed}");
+    }
+
+    /// Hiding `_meta` from the schema must not make `deny_unknown_fields`
+    /// reject it: every tool still accepts a W3C trace context, and every
+    /// advertised schema still forbids unknown fields.
+    #[tokio::test]
+    async fn test_every_tool_accepts_hidden_meta() {
+        let tools = ToolRegistry::list_tools();
+        for tool in tools.as_array().expect("tools array") {
+            let name = tool["name"].as_str().expect("name");
+            assert_eq!(
+                tool["inputSchema"]["additionalProperties"], false,
+                "{name} must still deny unknown fields"
+            );
+            let mut args = match name {
+                "smart_search" | "search_docs" => json!({ "query": "x" }),
+                "visualize_mesh" => json!({}),
+                _ => json!({ "target": "x" }),
+            };
+            args["_meta"] = json!({
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            });
+            let val = ToolRegistry::call_tool(name, args, governed_state())
+                .await
+                .expect("no protocol fault");
+            let text = val["content"][0]["text"].as_str().unwrap_or_default();
+            // Other arguments may be invalid for a given tool; `_meta` must not be.
+            assert!(
+                !text.contains("unknown field"),
+                "{name} rejected _meta: {text}"
+            );
+        }
     }
 
     #[test]
@@ -487,10 +757,13 @@ roots = ["."]
 
     #[test]
     fn test_mcp_tools_md_schema_drift_check() {
-        let path = std::path::Path::new("docs/mcp-tools.md");
-        if !path.exists() {
-            return;
-        }
+        // Resolved from the crate, not the cwd: `cargo test` runs in the crate
+        // directory, where a bare "docs/mcp-tools.md" never exists and this
+        // check used to pass vacuously.
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/mcp-tools.md"
+        ));
         let doc_text = std::fs::read_to_string(path).expect("read mcp-tools.md");
 
         // Parse tool sections starting with `### Tool `
@@ -524,45 +797,30 @@ roots = ["."]
                 .and_then(|p| p.as_object())
                 .expect("JSON schema in docs/mcp-tools.md must have properties object");
 
-            let prop_keys: Vec<&String> = props.keys().collect();
-
-            // Verify that no obsolete field names exist in any tool schema block
+            // The documented properties are exactly the advertised ones.
+            let name = section
+                .lines()
+                .next()
+                .and_then(|l| l.split('`').nth(1))
+                .expect("section header names the tool");
+            let tools = ToolRegistry::list_tools();
+            let real = tools
+                .as_array()
+                .and_then(|t| t.iter().find(|t| t["name"] == name))
+                .and_then(|t| t["inputSchema"]["properties"].as_object());
             assert!(
-                !prop_keys.contains(&&"service_name".to_string()),
-                "Schema block must not contain obsolete field 'service_name'"
+                real.is_some(),
+                "docs/mcp-tools.md documents unknown tool {name}"
             );
-            assert!(
-                !prop_keys.contains(&&"method_name".to_string()),
-                "Schema block must not contain obsolete field 'method_name'"
+            let real = real.expect("checked above");
+            let mut documented: Vec<&String> = props.keys().collect();
+            let mut advertised: Vec<&String> = real.keys().collect();
+            documented.sort();
+            advertised.sort();
+            assert_eq!(
+                documented, advertised,
+                "docs/mcp-tools.md drifted for {name}"
             );
-            assert!(
-                !prop_keys.contains(&&"changed_file".to_string()),
-                "Schema block must not contain obsolete field 'changed_file'"
-            );
-
-            // Verify that required fields match real tool structs
-            if section.contains("`find_dependents`")
-                || section.contains("`analyze_grpc`")
-                || section.contains("`analyze_impact`")
-            {
-                assert!(
-                    prop_keys.contains(&&"target".to_string()),
-                    "Schema block for target tools must contain 'target'"
-                );
-            }
-            if section.contains("`smart_search`") {
-                assert!(
-                    prop_keys.contains(&&"query".to_string())
-                        && prop_keys.contains(&&"scope".to_string()),
-                    "Schema block for smart_search must contain 'query' and 'scope'"
-                );
-            }
-            if section.contains("`search_docs`") {
-                assert!(
-                    prop_keys.contains(&&"query".to_string()),
-                    "Schema block for search_docs must contain 'query'"
-                );
-            }
         }
     }
 

@@ -26,7 +26,9 @@ def call_tool(proc, tool, args, req_id):
     if result is None:
         return {"tool": tool, "args": args, "ms": round(elapsed_ms, 1), "error": resp.get("error"), "text": ""}
     text = result.get("content", [{}])[0].get("text", "")
-    return {"tool": tool, "args": args, "ms": round(elapsed_ms, 1), "error": None, "text": text}
+    # MCP tool errors (isError: true) are results, not JSON-RPC errors.
+    error = text if result.get("isError") else None
+    return {"tool": tool, "args": args, "ms": round(elapsed_ms, 1), "error": error, "text": text}
 
 
 def main():

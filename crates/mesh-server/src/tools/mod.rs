@@ -262,6 +262,13 @@ impl ToolRegistry {
                     }
                 }
 
+                // Plan 4 step 4.2: while a Git operation holds reloads back, say which
+                // (complete) index generation answered. Prepended, so the 48 KB cap below
+                // can never cut it off.
+                if let Some(note) = mesh_core::FileWatcherService::git_operation_note(&state) {
+                    out.text.insert_str(0, &note);
+                }
+
                 // Centralized 48 KB Payload Budget Capping
                 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
                 if out.text.len() > MAX_TOOL_OUTPUT_BYTES {

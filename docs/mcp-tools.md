@@ -58,6 +58,22 @@ Resolution order:
    deliberate: it means "no symbol by that name is declared here", not "the file doesn't
    mention it".
 
+Results are **ranked and paginated**: exact-name matches first, then prefix, then substring
+(ties: protocol declarations before plain classes, then path). A page holds at most `limit`
+files (default 20, max 100) starting at `offset`, and only that page's files are read and
+decapitated — a broad query over 30,000 files no longer parses every hit. A page also stops
+early before the 48 KB payload cap; when more results exist, the footer gives the exact
+`offset` to request next. Index-backed pages are cached per `(query, scope, include_body,
+fuzzy, limit, offset)` and dropped on every index reload (snapshot generation bump).
+
+Line numbers (`L<start>-L<end>`) are exact original-file coordinates: an indexed hit is
+anchored on the symbol's tree-sitter line, and every decapitated line maps back to the
+original lines it came from (a stripped body spans its full extent). A relative `scope` is
+resolved against the configured `workspace_root`, not the server process's working directory.
+
+Python functions keep their docstring when decapitated; only the statements after it are
+replaced by `...`.
+
 **Negative Constraints**: Do NOT use for full-file inspection, documentation (`search_docs`), or
 mapping import hierarchies (`find_dependents`). Use `include_body: true` only to expand one
 specific implementation.
@@ -83,6 +99,14 @@ specific implementation.
     "fuzzy": {
       "type": "boolean",
       "description": "If true and the symbol index has no match, falls back to a full-text scan of the scope (slower). Defaults to false."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Maximum number of files returned in this page (1-100, default 20). DO NOT raise it to see everything; page with `offset` or narrow `scope` instead."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "Number of ranked files to skip (default 0), as given by a previous page's 'More results' footer."
     }
   },
   "additionalProperties": false

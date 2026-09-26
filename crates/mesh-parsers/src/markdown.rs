@@ -13,15 +13,63 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+/// Position of one page of `smart_search` results within the full ranked set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchPage {
+    /// Ranked matches across all pages (a lower bound when the scan stopped early).
+    pub total: usize,
+    /// Index of this page's first result in the ranked set.
+    pub offset: usize,
+    /// `offset` to request for the next page; `None` on the last page.
+    pub next_offset: Option<usize>,
+}
+
+impl SearchPage {
+    /// The whole result set on one page.
+    pub fn single(total: usize) -> Self {
+        Self {
+            total,
+            offset: 0,
+            next_offset: None,
+        }
+    }
+}
+
 pub struct MarkdownFormatter;
 
 impl MarkdownFormatter {
     /// Formats smart search results with AST decapitated snippets and affordance truncation
     pub fn format_search_results(query: &str, scope: &str, results: &[SearchResult]) -> String {
-        let mut header = format!(
-            "## Search Results for `{query}` (Scope: `{scope}`)\n*Matches: {} definitions found (AST-Decapitated)*\n\n",
-            results.len()
-        );
+        Self::format_search_page(query, scope, results, &SearchPage::single(results.len()))
+    }
+
+    /// [`Self::format_search_results`] for one page of a larger ranked result set:
+    /// the header reports the full `total` and the range shown, and a footer tells
+    /// the caller the exact `offset` to request next instead of re-running a
+    /// broader query.
+    pub fn format_search_page(
+        query: &str,
+        scope: &str,
+        results: &[SearchResult],
+        page: &SearchPage,
+    ) -> String {
+        let mut header = if results.len() == page.total && page.offset == 0 {
+            format!(
+                "## Search Results for `{query}` (Scope: `{scope}`)\n*Matches: {} definitions found (AST-Decapitated)*\n\n",
+                page.total
+            )
+        } else {
+            let first = if results.is_empty() {
+                page.offset
+            } else {
+                page.offset + 1
+            };
+            format!(
+                "## Search Results for `{query}` (Scope: `{scope}`)\n*Matches: {} definitions found (AST-Decapitated) — showing {first}-{}*\n\n",
+                page.total,
+                page.offset + results.len()
+            )
+        };
 
         let mut body = String::new();
         let mut scope_counts: HashMap<String, usize> = HashMap::new();
@@ -56,6 +104,11 @@ impl MarkdownFormatter {
             body.push_str(&entry_str);
         }
 
+        if let Some(next) = page.next_offset {
+            body.push_str(&format!(
+                "*More results: repeat the same call with `offset: {next}` for the next page (or narrow `scope`).*\n",
+            ));
+        }
         body.push_str(
             "*Tip: Use `smart_search(query: \"...\", scope: \"...\", include_body: true)` to expand an implementation.*\n",
         );

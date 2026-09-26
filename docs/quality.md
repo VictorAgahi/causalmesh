@@ -589,6 +589,39 @@ section left open, and eliminating an orphaned-daemon failure mode.
   stable across three consecutive runs), clippy/fmt clean, `scripts/determinism.sh` unaffected
   (same fingerprints).
 
+## Update (2026-09-26, step 3.4 — `smart_search` at scale, exact line anchoring, Python docstrings, anchored scopes)
+
+- **Pagination + early stop**: `smart_search` gains `limit` (default 20, max 100) and `offset`.
+  Files are ranked in memory from the symbol index; only the requested page's files are read and
+  decapitated (the old path read + tree-sitter-parsed *every* matching file — thousands for
+  `Service` at 30k files — before the 48 KB cap threw most of it away). A page also stops before
+  the payload budget and prints the exact next `offset`.
+- **Result cache** (`mesh_core::SearchCache`, on `AppState`): keyed by (query, canonical scope,
+  include_body, fuzzy, limit, offset), valid only at the snapshot generation it was computed
+  from; any reload bump drops it, and a page computed from an older generation is discarded on
+  insert. Fuzzy pages (disk state the index doesn't track) are not cached.
+- **Exact line anchoring**: removed the `orig_lines.iter().position(...)` re-matching.
+  `AstDecapitator::decapitate_auto_mapped` returns a per-output-line map to original lines,
+  built from the replaced tree-sitter nodes' byte ranges; indexed hits anchor on the symbol's
+  `start_position().row + 1`.
+- **Python docstrings** survive decapitation; only the statements after them become `...`.
+- **`ValidatedScope`** anchors relative scopes on the resolved `workspace_root`
+  (`Config::resolve_workspace_root`) instead of the process CWD.
+- **Measured** (`scale_bench.py`, 30,000-file single-root synthetic workspace, release build,
+  same machine, baseline = `04f213c`):
+
+  | build | queries | search_p50_ms | search_p95_ms | boot_ms | rss_peak_mb |
+  |---|---|---|---|---|---|
+  | baseline | 60 (6 distinct) | 905 | 3,342 | 2,978 | 169 |
+  | step 3.4 | 60 (6 distinct, 54 cache hits) | 0.2 | 64 | 1,954 | 128 |
+  | baseline | 6 cold, 3 runs | 840–885 | 1,849–2,613 | | |
+  | step 3.4 | 6 cold (all cache misses), 3 runs | 67–88 | 96–109 | | |
+
+  The cold rows are the honest number: with the cache out of the picture, p50/p95 are ~10x/20x
+  under baseline and well inside the 300/800 ms budget. `reload_ms` came back `None` for *both*
+  binaries on this corpus (the harness's reload probe did not see its marker within 20 s) — a
+  harness issue to investigate separately, not a 3.4 regression.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

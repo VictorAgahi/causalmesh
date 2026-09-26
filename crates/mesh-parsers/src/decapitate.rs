@@ -132,6 +132,50 @@ impl LanguageKind {
     }
 }
 
+/// Decapitated text plus its mapping back onto the original source.
+#[derive(Debug, Clone)]
+pub struct DecapitatedSource {
+    pub text: String,
+    /// One entry per `text.lines()` line: the `(first, last)` 1-based original
+    /// lines it was produced from. `first == last` for an untouched line; a line
+    /// holding a stripped body spans the body's whole original extent.
+    pub line_map: Vec<(u32, u32)>,
+}
+
+fn identity_line_map(content: &str) -> Vec<(u32, u32)> {
+    (1..=content.lines().count() as u32)
+        .map(|l| (l, l))
+        .collect()
+}
+
+fn count_newlines(s: &str) -> u32 {
+    s.bytes().filter(|b| *b == b'\n').count() as u32
+}
+
+/// Accumulates the original-line span of the output line being built.
+#[derive(Default)]
+struct LineTracker {
+    current: Option<(u32, u32)>,
+}
+
+impl LineTracker {
+    fn push(&mut self, byte: u8, orig_line: u32, map: &mut Vec<(u32, u32)>) {
+        let span = self.current.get_or_insert((orig_line, orig_line));
+        span.1 = orig_line;
+        if byte == b'\n' {
+            map.push(*span);
+            self.current = None;
+        }
+    }
+
+    /// Flushes a final line with no trailing newline (`str::lines` yields it too).
+    fn finish(self, map: &mut Vec<(u32, u32)>) {
+        if let Some(span) = self.current {
+            map.push(span);
+        }
+    }
+}
+
 /// Polyglot AST Decapitation Engine per RFC-001 Section 4.4
 pub struct AstDecapitator;
 
@@ -190,28 +234,135 @@ impl AstDecapitator {
 
         let mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)> = Vec::new();
         Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements, 0);
+        Self::apply_replacements(content, replacements, None)
+    }
 
+    /// [`Self::decapitate_auto`] plus, for every output line, the span of
+    /// original 1-based lines it came from — see [`DecapitatedSource::line_map`].
+    /// The map is derived from the replaced tree-sitter nodes' byte ranges, so a
+    /// caller can anchor a snippet on an exact original line instead of guessing
+    /// by re-matching decapitated text against the source.
+    pub fn decapitate_auto_mapped(
+        content: &str,
+        lang_kind: LanguageKind,
+        include_body: bool,
+    ) -> DecapitatedSource {
+        let identity = || DecapitatedSource {
+            text: content.to_string(),
+            line_map: identity_line_map(content),
+        };
+        let stub = || DecapitatedSource {
+            text: Self::BOUNDED_ERROR_STUB.to_string(),
+            line_map: vec![(1, content.lines().count().max(1) as u32)],
+        };
+        if include_body {
+            return identity();
+        }
+        match lang_kind {
+            LanguageKind::Protobuf | LanguageKind::Yaml => return identity(),
+            LanguageKind::Unknown => {
+                return if content.len() > 1024 {
+                    stub()
+                } else {
+                    identity()
+                };
+            }
+            _ => {}
+        }
+
+        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
+            let Some(tree) = parser.parse(content, None) else {
+                tracing::warn!(
+                    target: "mesh::parser",
+                    "Parser timeout or C-FFI failure; returning bounded stub (<= 256 bytes)"
+                );
+                return None;
+            };
+            let mut replacements = Vec::new();
+            Self::collect_body_replacements(
+                content,
+                tree.root_node(),
+                lang_kind,
+                &mut replacements,
+                0,
+            );
+            let mut line_map = Vec::new();
+            let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
+            Some(DecapitatedSource { text, line_map })
+        })
+        .flatten()
+        .unwrap_or_else(stub)
+    }
+
+    /// Applies non-overlapping `(start, end, text)` byte-range replacements in one
+    /// forward pass. A replacement overlapping an already-applied one (or not on a
+    /// char boundary) is skipped rather than producing a corrupt splice. When
+    /// `line_map` is given it receives one `(first, last)` original-line span per
+    /// output line: copied bytes keep their own line; a replacement's first byte
+    /// maps to the line its node starts on and the rest to the line it ends on,
+    /// so `fn f() { /* stripped */ }` spans the function's full original extent.
+    fn apply_replacements(
+        content: &str,
+        mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)>,
+        mut line_map: Option<&mut Vec<(u32, u32)>>,
+    ) -> String {
         if replacements.is_empty() {
+            if let Some(map) = line_map {
+                *map = identity_line_map(content);
+            }
             return content.to_string();
         }
+        // Ascending start; at an identical start an insertion (`start == end`, e.g. a
+        // synthetic TS return type) precedes the range replaced after it.
+        replacements.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-        // Sort replacements in reverse order of start byte to apply bottom-up.
-        // For identical start bytes (e.g. insertion at start of body), sort by end byte descending.
-        replacements.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-
-        let mut result = content.to_string();
-        for (start_byte, end_byte, replacement) in replacements {
-            if start_byte < result.len()
-                && end_byte <= result.len()
-                && start_byte <= end_byte
-                && result.is_char_boundary(start_byte)
-                && result.is_char_boundary(end_byte)
+        let mut out = String::with_capacity(content.len());
+        let mut tracker = LineTracker::default();
+        let mut cursor = 0usize;
+        let mut orig_line: u32 = 1;
+        for (start, end, replacement) in replacements {
+            if start < cursor
+                || end > content.len()
+                || start > end
+                || !content.is_char_boundary(start)
+                || !content.is_char_boundary(end)
             {
-                result.replace_range(start_byte..end_byte, &replacement);
+                continue;
             }
+            let kept = &content[cursor..start];
+            out.push_str(kept);
+            if let Some(map) = line_map.as_deref_mut() {
+                for b in kept.bytes() {
+                    tracker.push(b, orig_line, map);
+                    if b == b'\n' {
+                        orig_line += 1;
+                    }
+                }
+            } else {
+                orig_line += count_newlines(kept);
+            }
+            let start_line = orig_line;
+            orig_line += count_newlines(&content[start..end]);
+            out.push_str(&replacement);
+            if let Some(map) = line_map.as_deref_mut() {
+                for (i, b) in replacement.bytes().enumerate() {
+                    tracker.push(b, if i == 0 { start_line } else { orig_line }, map);
+                }
+            }
+            cursor = end;
         }
-
-        result
+        let rest = &content[cursor..];
+        out.push_str(rest);
+        if let Some(map) = line_map {
+            for b in rest.bytes() {
+                tracker.push(b, orig_line, map);
+                if b == b'\n' {
+                    orig_line += 1;
+                }
+            }
+            tracker.finish(map);
+        }
+        out
     }
 
     fn collect_body_replacements(
@@ -328,11 +479,27 @@ impl AstDecapitator {
             }
             LanguageKind::Python if kind == "function_definition" => {
                 if let Some(body) = node.child_by_field_name("body") {
-                    replacements.push((
-                        body.start_byte(),
-                        body.end_byte(),
-                        std::borrow::Cow::Borrowed(" ..."),
-                    ));
+                    // The docstring is the only contract a partially-typed Python
+                    // function has, so it survives; only the statements after it go.
+                    match Self::python_docstring(body) {
+                        Some(doc) if doc.end_byte() < body.end_byte() => {
+                            let tail = if doc.start_position().row == node.start_position().row {
+                                // `def f(): """doc"""; return 1` — stay on one line.
+                                std::borrow::Cow::Borrowed("; ...")
+                            } else {
+                                let indent = " ".repeat(doc.start_position().column);
+                                std::borrow::Cow::Owned(format!("\n{indent}..."))
+                            };
+                            replacements.push((doc.end_byte(), body.end_byte(), tail));
+                        }
+                        // Docstring-only body: nothing to strip.
+                        Some(_) => {}
+                        None => replacements.push((
+                            body.start_byte(),
+                            body.end_byte(),
+                            std::borrow::Cow::Borrowed(" ..."),
+                        )),
+                    }
                     return;
                 }
             }
@@ -427,6 +594,21 @@ impl AstDecapitator {
     }
 
     /// Recursively collects key names from returned object literals to synthesize inferred return types
+    /// The docstring of a Python `body: block`: its first statement (comments are
+    /// skipped — tree-sitter keeps them as named children) when that statement is
+    /// a bare string literal expression.
+    fn python_docstring(body: Node) -> Option<Node> {
+        let mut cursor = body.walk();
+        let first = body
+            .named_children(&mut cursor)
+            .find(|c| c.kind() != "comment")?;
+        if first.kind() != "expression_statement" {
+            return None;
+        }
+        let expr = first.named_child(0)?;
+        matches!(expr.kind(), "string" | "concatenated_string").then_some(first)
+    }
+
     fn extract_returned_object_keys(source: &str, node: Node) -> Vec<String> {
         let mut keys = Vec::new();
         Self::collect_keys_recursive(source, node, &mut keys, 0);
@@ -632,6 +814,50 @@ class AuthService:
         assert!(decapitated.contains("def login(self, username: str, secret: str) -> dict:"));
         assert!(decapitated.contains("..."));
         assert!(!decapitated.contains("generate_jwt"));
+    }
+
+    /// A Python docstring is parsed as the first `expression_statement` of the
+    /// body; replacing the whole body with `...` used to destroy it, and with it
+    /// the only contract a partially-typed function carries.
+    #[test]
+    fn test_python_docstring_preserved() {
+        let code = r#"
+class AuthService:
+    def login(self, username, secret):
+        # leading comment
+        """Authenticate a user.
+
+        Returns a dict with a signed `token`.
+        """
+        token = generate_jwt(username)
+        return {"token": token}
+
+    def ping(self):
+        """Only a docstring."""
+
+    def short(self): """One-liner."""; return compute()
+
+    def plain(self):
+        return helper()
+"#;
+        let mut parser = Parser::new();
+        let lang = tree_sitter_python::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+
+        let out = AstDecapitator::decapitate(code, LanguageKind::Python, &mut parser, false);
+        assert!(out.contains("\"\"\"Authenticate a user.\n\n        Returns a dict with a signed `token`.\n        \"\"\"\n        ..."), "{out}");
+        assert!(!out.contains("generate_jwt"), "{out}");
+        assert!(
+            out.contains("def ping(self):\n        \"\"\"Only a docstring.\"\"\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("def short(self): \"\"\"One-liner.\"\"\"; ..."),
+            "{out}"
+        );
+        assert!(!out.contains("compute()"), "{out}");
+        assert!(out.contains("def plain(self):\n         ..."), "{out}");
+        assert!(!out.contains("helper()"), "{out}");
     }
 
     #[test]

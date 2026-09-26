@@ -122,6 +122,7 @@ impl DoctorCommand {
                                     &root.to_string_lossy(),
                                     &roots,
                                     &cfg.workspace.mount_aliases,
+                                    None,
                                 ) {
                                     let files = mesh_core::FilesystemCrawler::crawl_scope(
                                         &scope,
@@ -169,6 +170,7 @@ impl DoctorCommand {
                                             &root.to_string_lossy(),
                                             &roots,
                                             &cfg.workspace.mount_aliases,
+                                            None,
                                         )
                                     {
                                         let files = mesh_core::FilesystemCrawler::crawl_scope(
@@ -213,6 +215,7 @@ impl DoctorCommand {
                                                 &root.to_string_lossy(),
                                                 &roots,
                                                 &cfg.workspace.mount_aliases,
+                                                None,
                                             )
                                         {
                                             let files = mesh_core::FilesystemCrawler::crawl_scope(

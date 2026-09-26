@@ -6,6 +6,7 @@ use crate::governance::GovernanceEngine;
 use crate::health::IndexHealth;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
+use crate::search_cache::SearchCache;
 use crate::vfs::DifferentialVfs;
 use arc_swap::{ArcSwap, Guard};
 use std::path::PathBuf;
@@ -126,6 +127,8 @@ pub struct AppState {
     /// snapshot at a time, so a slower first pass can never install a snapshot that
     /// clobbers a second, newer one that finished first (idempotence invariant I2).
     pub reload_lock: Mutex<()>,
+    /// `smart_search` result pages, invalidated on every snapshot generation bump.
+    pub search_cache: SearchCache,
 }
 
 impl AppState {
@@ -166,6 +169,7 @@ impl AppState {
             reload_pending: AtomicBool::new(false),
             pending_reload_paths: Mutex::new(Vec::new()),
             reload_lock: Mutex::new(()),
+            search_cache: SearchCache::default(),
         }
     }
 

@@ -155,6 +155,9 @@ impl WorkspaceIndexer {
                 // Skill paths are written relative to the config file; the server is
                 // spawned by an IDE with an arbitrary cwd.
                 cfg.resolve_skill_paths(&base);
+                // Same reason: relative tool scopes anchor on the workspace root,
+                // not on whatever CWD the IDE launched us from.
+                cfg.resolve_workspace_root(&base);
                 Ok((cfg, base))
             }
             None => {
@@ -163,7 +166,9 @@ impl WorkspaceIndexer {
                     env!("CARGO_PKG_VERSION"),
                     "\"\nroots = [\".\"]\n"
                 );
-                Ok((Config::load_from_str(default)?, PathBuf::from(".")))
+                let mut cfg = Config::load_from_str(default)?;
+                cfg.resolve_workspace_root(Path::new("."));
+                Ok((cfg, PathBuf::from(".")))
             }
         }
     }
@@ -833,6 +838,7 @@ impl WorkspaceIndexer {
                 &root.to_string_lossy(),
                 roots,
                 &config.workspace.mount_aliases,
+                None,
             ) {
                 Ok(scope) => {
                     let exclusions = Self::exclude_patterns_for_root(

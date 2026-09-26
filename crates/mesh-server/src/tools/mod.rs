@@ -593,6 +593,8 @@ roots = ["."]
             scope: mesh_core::CompactStr::new("ms-user"),
             include_body: false,
             fuzzy: None,
+            limit: None,
+            offset: None,
             _meta: None,
         };
         let hint_search = SmartSearchTool::truncation_hint(&search_args, &state).unwrap();

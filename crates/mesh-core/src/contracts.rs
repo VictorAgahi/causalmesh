@@ -1282,9 +1282,18 @@ impl ContractGraph {
             return true;
         }
 
-        let a_norm: String = a_bare.chars().filter(|c| *c != '_').collect();
-        let b_norm: String = b_bare.chars().filter(|c| *c != '_').collect();
-        !a_norm.is_empty() && a_norm.eq_ignore_ascii_case(&b_norm)
+        // Allocation-free: `search_symbols` runs this for every in-scope node on
+        // every query. `_` is ASCII, so skipping it byte-wise never splits a char.
+        let mut a_norm = a_bare.bytes().filter(|b| *b != b'_');
+        let mut b_norm = b_bare.bytes().filter(|b| *b != b'_');
+        let mut non_empty = false;
+        loop {
+            match (a_norm.next(), b_norm.next()) {
+                (None, None) => return non_empty,
+                (Some(x), Some(y)) if x.eq_ignore_ascii_case(&y) => non_empty = true,
+                _ => return false,
+            }
+        }
     }
 
     /// Allocation-free check whether `sig` contains `bare` prefixed by `@`, `'`, `"`, `fn `, `func `, or `def `.

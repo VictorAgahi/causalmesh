@@ -66,6 +66,13 @@ pub struct WorkspaceConfig {
     pub exclude_patterns: Vec<String>,
     #[serde(default)]
     pub mount_aliases: HashMap<String, String>,
+    /// `workspace_root` expanded and canonicalized against the config file's
+    /// directory by [`Config::resolve_workspace_root`]. Relative tool scopes are
+    /// anchored here instead of on the process CWD, which an IDE-spawned server
+    /// does not control (often `~`). `None` until resolved (e.g. configs built
+    /// from a string in tests), in which case scopes keep CWD semantics.
+    #[serde(skip)]
+    pub resolved_workspace_root: Option<PathBuf>,
 }
 
 fn default_version() -> String {
@@ -409,6 +416,37 @@ impl Config {
             }
         }
     }
+    /// Expands `[workspace] workspace_root` (env vars, `${WORKSPACE_ROOT:-..}`)
+    /// and resolves it against `base_dir` — the config file's directory, the same
+    /// base `expand_roots` uses — storing the canonical result in
+    /// `resolved_workspace_root`. Must run while the process CWD is still the one
+    /// `base_dir` was discovered from when `base_dir` is itself relative.
+    pub fn resolve_workspace_root(&mut self, base_dir: &Path) {
+        let raw = &self.workspace.workspace_root;
+        let expanded = match shellexpand::env_with_context(raw, |var| {
+            Ok::<_, std::convert::Infallible>(std::env::var(var).ok().map(Cow::Owned))
+        }) {
+            Ok(e) => e.into_owned(),
+            Err(e) => {
+                tracing::warn!(target: "mesh::config", "workspace_root expansion failed: {e}");
+                return;
+            }
+        };
+        let joined = if Path::new(&expanded).is_absolute() {
+            PathBuf::from(expanded)
+        } else {
+            base_dir.join(expanded)
+        };
+        match dunce::canonicalize(&joined) {
+            Ok(root) => self.workspace.resolved_workspace_root = Some(root),
+            Err(e) => tracing::warn!(
+                target: "mesh::config",
+                "workspace_root {} does not resolve ({e}); relative scopes fall back to the process CWD",
+                joined.display()
+            ),
+        }
+    }
+
     pub fn load_from_str(content: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(content)?;
         Ok(cfg)

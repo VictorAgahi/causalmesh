@@ -44,14 +44,22 @@ pub struct ValidatedScope(PathBuf);
 impl ValidatedScope {
     /// Resolves and canonicalizes a raw scope path, asserting it is jailed within one of `allowed_roots`.
     pub fn resolve(raw_scope: &str, allowed_roots: &[PathBuf]) -> Result<Self, SecurityError> {
-        Self::resolve_with_aliases(raw_scope, allowed_roots, &HashMap::new())
+        Self::resolve_with_aliases(raw_scope, allowed_roots, &HashMap::new(), None)
     }
 
     /// Resolves and canonicalizes a raw scope path with Docker bind-mount alias translation and Unicode NFC normalization.
+    ///
+    /// A relative scope (after alias translation) is joined onto `anchor` — the
+    /// resolved workspace root — *before* canonicalization. Without it,
+    /// `dunce::canonicalize` would evaluate the scope against the process CWD,
+    /// which for an IDE-spawned server is arbitrary (often `~`), so
+    /// `scope: "crates/mesh-core"` failed with `PathNotFound`. Anchoring does not
+    /// widen the jail: the canonical result must still sit under an allowed root.
     pub fn resolve_with_aliases(
         raw_scope: &str,
         allowed_roots: &[PathBuf],
         mount_aliases: &HashMap<String, String>,
+        anchor: Option<&Path>,
     ) -> Result<Self, SecurityError> {
         // Step 1: Normalize input string to Unicode NFC form
         let nfc_input: String = raw_scope.nfc().collect();
@@ -70,7 +78,12 @@ impl ValidatedScope {
             }
         }
 
-        let clean = path_clean::clean(&translated_scope);
+        let clean = match anchor {
+            Some(root) if Path::new(&translated_scope).is_relative() => {
+                path_clean::clean(root.join(&translated_scope))
+            }
+            _ => path_clean::clean(&translated_scope),
+        };
         let canonical =
             dunce::canonicalize(&clean).map_err(|_| SecurityError::PathNotFound(clean.clone()))?;
 
@@ -154,6 +167,46 @@ impl std::fmt::Display for ValidatedScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IDE-spawned servers run with an arbitrary CWD; a relative scope must
+    /// resolve against the workspace root anchor, and anchoring must not let a
+    /// `..` walk out of the jail.
+    #[test]
+    fn relative_scope_anchors_on_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("crates/core")).expect("mkdir");
+        let roots = [root.clone()];
+        let aliases = HashMap::new();
+
+        let scope =
+            ValidatedScope::resolve_with_aliases("crates/core", &roots, &aliases, Some(&root))
+                .expect("anchored relative scope resolves");
+        assert_eq!(scope.as_path(), root.join("crates/core"));
+
+        // Without an anchor the same string is evaluated against the CWD (the
+        // crate dir under `cargo test`), where it does not exist.
+        assert!(matches!(
+            ValidatedScope::resolve_with_aliases("crates/core", &roots, &aliases, None),
+            Err(SecurityError::PathNotFound(_))
+        ));
+
+        // `.` is the workspace root itself.
+        assert!(ValidatedScope::resolve_with_aliases(".", &roots, &aliases, Some(&root)).is_ok());
+
+        // Anchoring never widens the jail: `..` from an anchor that is itself the
+        // only allowed root lands outside it.
+        let jailed = [root.join("crates")];
+        assert!(matches!(
+            ValidatedScope::resolve_with_aliases(
+                "..",
+                &jailed,
+                &aliases,
+                Some(&root.join("crates"))
+            ),
+            Err(SecurityError::SandboxEscapeAttempt(_))
+        ));
+    }
 
     #[test]
     fn test_scope_jail_success() {
@@ -265,6 +318,7 @@ mod tests {
             "/workspace/services/billing",
             &[canonical_root],
             &aliases,
+            None,
         );
 
         assert!(

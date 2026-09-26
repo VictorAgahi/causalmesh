@@ -5,8 +5,274 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [Unreleased]
+## [6.0.0] — 2026-09-26
 
+**Plan 3 (P2) complete: scale, and MCP protocol compliance.** Major version because of the step
+3.6 breaking changes below (tool errors are `isError` results; `visualize_mesh` returns an
+aggregated view). Verified on the final build: `scripts/determinism.sh` green, golden corpus
+unchanged (online-boutique 100%/100%, otel-demo 87.5%/53.8%, bank-of-anthos 100%/100%), nightly
+5k budgets hold with reload 207 ms — details in `docs/quality.md` ("Plan 3 closeout").
+
+Plan 3 (P2): scale. Step 3.6 — MCP protocol compliance (tool errors as `isError`, notifications,
+fence-safe truncation, lean schemas) and a per-service `visualize_mesh`. Step 3.5 — `derive()`
+without quadratic passes, streaming YAML. Step 3.4 — `smart_search` pagination/early-stop/cache and
+exact line anchoring. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
+Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 — real incremental
+reload, driven by the watcher's own paths.
+
+### Breaking Changes (P2 step 3.6 — MCP protocol compliance)
+- **Tool failures are MCP tool results, not JSON-RPC errors.** A failure *inside* a tool — invalid
+  or unknown arguments, a scope outside the sandbox jail, a missing target, an RSAH governance
+  refusal, `meshd` still indexing — now returns a successful JSON-RPC response whose
+  `CallToolResult` has `isError: true` and the message as text content, as the MCP specification
+  (2024-11-05) requires. Previously these were JSON-RPC errors `-32602` / `-32001` / `-32000`,
+  which clients (Claude Code, Cursor, Windsurf) treat as a protocol failure that aborts the agent's
+  turn instead of letting the model read the message and correct its call. **Clients must read
+  `result.isError`**; `error` is now reserved for protocol faults: `-32700` parse error, `-32600`
+  invalid request (not a request object / `jsonrpc` not `"2.0"`, newly enforced), `-32601` unknown
+  method, `-32602` unknown tool or missing `tools/call` params, `-32603` internal error. There is no
+  compatibility flag.
+- **`visualize_mesh` returns a per-service aggregated view** in every format (Mermaid, JSON, HTML)
+  instead of the raw contract graph, which at a few thousand nodes exceeded the 48 KB cap and came
+  back cut mid-document. New arguments `service` (zoom into one service) and `max_services`. The
+  complete graph remains available from the CLI (`mesh-mcp graph`).
+
+### Fixed (P2 step 3.6)
+- JSON-RPC notifications (no `id`) never receive a reply — not even an error with `"id": null` —
+  in both the stdio server and `meshd` (JSON-RPC 2.0 §4.1). Both now share one request classifier
+  and one responder.
+- The 48 KB output cap cuts on a line boundary and closes any open Markdown code fence.
+- `_meta` (W3C trace context) is accepted but no longer advertised in `tools/list`
+  (7,696 → 5,524 bytes of tool schemas, ~540 tokens per session).
+
+### Fixed (P2 step 3.6 review)
+- **Stored XSS in the `visualize_mesh` / `mesh-mcp graph` HTML page**: a scanned name containing
+  `</script>` closed the inline JSON element; the JSON is now `\u003c`-escaped, the workspace name
+  HTML-escaped, and the side panel's `innerHTML` escapes node names.
+- **Mermaid label injection**: names are escaped with Mermaid entity codes (`#quot;`, `#lt;`,
+  `#gt;`, `#35;`, `#96;`) and newlines flattened, instead of a partial character strip that let a
+  newline or `"]` start a new statement.
+- **48 KB cap now holds for the whole payload**: the truncation note is budgeted before the cut,
+  the closing fence is counted, and a hint echoing an unbounded argument is capped (512 bytes) and
+  flattened to one line. Fence detection follows CommonMark (`~~~`, 4+-backtick fences, a
+  ```` ```rust ```` line inside a block is content, 4-space indent is not a fence).
+- **`visualize_mesh`**: the zoom ranked neighbour services by their global degree instead of their
+  links to the zoomed service (a hub linked once crowded out a service linked fifty times); a zoom prefers an exact-case match over a case-insensitive one;
+  the footer never suggests zooming into a topic; names are shortened to 120 bytes when drawn, so
+  one huge topic literal cannot push even the smallest view past the cap; JSON/HTML never get a
+  skill footer appended; the O(contracts + edges) fold runs once per call instead of once per
+  shrink iteration.
+- The `docs/mcp-tools.md` schema drift test resolved its path from the crate directory, where the
+  file never exists, and passed vacuously; it now compares every documented property set with the
+  advertised schema. A test covers `_meta` acceptance on every tool.
+
+
+### Changed (P2 step 3.5 — `derive()` without quadratic passes, streaming YAML)
+- **`ContractGraph::reconcile_edges` has no quadratic pass left**: the `Implements` pass indexes
+  gRPC handlers by every key its unchanged match predicate can succeed on instead of comparing every
+  proto method with every handler; import resolution is memoized per (target, importer repo);
+  `patch_files` groups index removals per key. AsyncAPI/OpenAPI line recovery is one pass per file.
+  200k files + 48k contract mix, cold: boot **307.8 s → 17.0 s**; peak footprint 809 → 829 MB;
+  plain 200k unchanged.
+- **Streaming YAML**: Spring property files flatten through a serde visitor (no `serde_yaml::Value`
+  tree), byte-identical to before; a multi-document file now contributes its first (default-profile)
+  document instead of being rejected outright. AsyncAPI/OpenAPI specs are read as key-only shapes.
+- Doc sections keep a lowercase copy only for non-ASCII content.
+- `scripts/bench/gen_synthetic.py --contracts` adds an imports/protos/gRPC/YAML/Markdown mix.
+
+### Added (P2 step 3.4 — `smart_search` at scale, exact line anchoring)
+- **`smart_search` pagination**: `limit` (default 20, max 100) / `offset`; only the requested
+  page's files are read and decapitated, each result's rendered size is measured before it is
+  accepted (no silent drop past the 48 KB cap), and the footer names the exact next `offset`.
+  Pages are cached per snapshot generation (and re-validated against file mtime/size).
+  30k files, cold: p50/p95 **~860/~2,600 ms → 57/112 ms** (budget 300/800).
+- **Exact line numbers**: snippets are anchored on the symbol's tree-sitter line through a
+  decapitated→original line map; the old text re-matching (which could attribute a symbol at line
+  800 to an identical line 15) is gone. Pattern/AsyncAPI/OpenAPI nodes record real lines.
+- **Python docstrings survive decapitation**; only the statements after them become `...`.
+- **Relative scopes resolve from `workspace_root`** (then the process CWD), not only the CWD an
+  IDE happened to launch the server in.
+
+### Added (P2 step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
+- **Watchers now respect `.gitignore`/`exclude_patterns` at registration, not just after an event
+  arrives**: `FilesystemCrawler::plan_watch_dirs` (`crates/mesh-core/src/crawler.rs`) walks each
+  root once (the same nested-gitignore-aware `ignore::WalkBuilder` construction a full crawl
+  already uses) to decide which directories to individually watch; `FileWatcherService::spawn`
+  registers one `RecursiveMode::NonRecursive` watch per surviving directory instead of one
+  `RecursiveMode::Recursive` watch per root. A genuinely excluded subtree (`node_modules`,
+  gitignored build output, ...) never gets a watch at all — closing the nested-`.gitignore` gap
+  step 3.1 documented in `docs/quality.md` for the common case, rather than reactively filtering
+  events downstream.
+- **Watch-count cap with a transparent polling fallback**: above `MAX_WATCHED_DIRS` (2048 on
+  Linux/Windows, 200 on macOS, combined across all roots), `spawn` falls back to a
+  `notify::PollWatcher` backend (2s interval, one plain recursive watch per root) instead of
+  per-directory native registration — protects Linux's `fs.inotify.max_user_watches` ceiling on
+  very large workspaces without needing gitignore-aware enumeration at all, since `PollWatcher`
+  re-scans the tree itself.
+- **New directories created after startup are still watched**: per-directory registration doesn't
+  automatically track new subdirectories the way the old single-recursive-watch design did. The
+  event loop detects a newly-created, non-excluded directory and registers it (plus any of its own
+  qualifying subdirectories) dynamically.
+- **Real finding**: a dynamic `.watch()` call on macOS (`notify`'s FSEvents backend stops and
+  restarts its whole event stream per call) measured over 11 seconds under this machine's own
+  test-suite load. Fixed by deferring those calls to `state.rescan`'s background pool
+  (`Arc<Mutex<AnyDebouncer>>`) instead of running them inline on the thread that also drains the
+  debouncer's channel — the fast, filesystem-walk-only *planning* step stays synchronous, only the
+  slow OS registration itself is deferred, so other pending reloads are never stalled behind it.
+- **Idle watchdog gains an unconditional startup-grace deadline** (`crates/mesh-daemon/src/
+  idle.rs`, `spawn_idle_watchdog`'s new `startup_grace` parameter, 60s in `meshd`'s `main.rs`): a
+  daemon that never gets a single client at all (an `ensure_daemon_running` auto-spawn racing or
+  failing after the process started, a wrong workspace path) now shuts itself down the same
+  graceful way idle-after-use does, instead of living forever as an unreachable zombie. Spawned
+  unconditionally now (previously gated behind `idle_timeout_minutes > 0`), so disabling the
+  idle-*after-use* policy no longer also disables this orphan guard.
+- **`meshd` auto-spawn output is no longer discarded**: `ensure_daemon_running`/
+  `ensure_daemon_running_windows` (`crates/mesh-server/src/main.rs`) redirected `Stdio::null()`,
+  making a crash before `meshd`'s own `tracing` subscriber initializes unobservable. Now redirected
+  to a rotating, per-workspace log (`~/.cache/mesh-mcp/logs/meshd-<workspace_id>.log`, up to 5
+  previous runs kept as `.1`–`.5`).
+- **Hardened via `/code-review high` — ten real findings, all fixed**, most notably: (1) dynamic
+  re-registration was anchoring exclude-pattern checks to the newly-created directory instead of
+  the real workspace root, which could both silently keep an excluded new directory and mismatch
+  root-anchored patterns — fixed with an explicit `walk_root`/`matcher_root` split
+  (`FilesystemCrawler::plan_watch_dirs_from`); (2) `.git/refs` was never watched at all under
+  per-directory registration (a real regression versus the old single recursive watch), fixed by
+  walking `.git/refs` directly outside the exclude matcher; (3) an attempt to fix `meshd`'s
+  socket-bind blocking by moving watch setup into the spawned thread instead introduced a race
+  where events before setup finished were silently missed — reverted, with the actual blocking
+  fixed at the `meshd` call site via `tokio::task::spawn_blocking` instead; (4) deferred
+  dynamic-registration work was sharing `state.rescan`'s small pool with real reload jobs,
+  reintroducing the exact starvation the deferral was meant to prevent — moved to a plain
+  detached thread. See `docs/quality.md`'s step 3.3 section for the full list and the two new
+  regression-test groups (`plan_watch_dirs_from_*`, `git_watch_targets_*`).
+- Verified after all ten fixes: `cargo test --workspace` (369 passed, 1 ignored, stable across
+  repeated runs), `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt
+  --all -- --check` (clean), `scripts/determinism.sh` on both fixtures re-confirmed (unaffected).
+  See `docs/quality.md` for the full reasoning, the honest limitations (no measurement yet at real
+  200k+-file scale or on Linux/Windows watch backends), and the live-smoke-test confirmation.
+- **A second `/code-review high` round found the fixes above needed fixes of their own**: the
+  severity-1 finding was that initial (startup) per-directory registration pays macOS's
+  per-`.watch()`-call FSEvents restart cost sequentially for every planned directory, not just the
+  dynamic re-registration path originally measured — fixed with a platform-specific
+  `MAX_WATCHED_DIRS` (200 on macOS, 2048 elsewhere, since inotify/ReadDirectoryChangesW
+  have no equivalent per-call cost). `run_standalone` wasn't wrapped in `spawn_blocking` the way
+  `meshd`'s call was, fixed identically. The `spawn_blocking` fix itself was fire-and-forget with
+  nothing to catch up a file changed during the (possibly slow) registration window — fixed with
+  one `execute_reload_sync` right after a successful `spawn()`, at both call sites. Plus: the
+  polling fallback aborted watching for *every* root over one root failing (fixed to match the
+  native path's per-root resilience), a stale doc comment, and a missing warning on a silently
+  dropped capped subtree. See `docs/quality.md`'s step 3.3 section for the full list, including
+  one accepted-not-fixed limitation (unbounded in-flight registration threads under rapid bursts)
+  and a live verification against this repo's own 40-directory workspace.
+- Verified again after all seven of these fixes: `cargo test --workspace` (369 passed, 1 ignored,
+  stable across three consecutive runs), clippy/fmt clean, `scripts/determinism.sh` unaffected.
+
+### Added (P2 step 3.2 — persistent SQLite/WAL content-hash cache for cold-start indexing)
+- **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): a SQLite-in-WAL-mode cache
+  (`~/.cache/mesh-mcp/index-cache.db`, mode `0600`, same convention as the Commandment 7 audit db)
+  of `mesh_parsers::FileIndex` — the per-file, pre-`NodeId`-numbering tree-sitter extraction
+  fragment — keyed by `SHA256(schema_version, path, content_hash, repo_id, config_fingerprint)`.
+  An unchanged file rescanned under an unchanged `[engines.contracts.*]` config on a later cold
+  start is now a single indexed lookup instead of a full tree-sitter re-parse. Wired into the two
+  real server boot paths (`mesh-server run_standalone`, `meshd`'s initial ingestion) via a new
+  `Option<&PersistentIndexCache>` parameter on `WorkspaceIndexer::build_snapshot` (and
+  `build_snapshot_from_files`/`build_graph`); a cache the process can't open degrades to "parse
+  everything" rather than failing the boot. Incremental `reload()` (step 3.1) is untouched — it
+  already only re-parses differential-VFS-flagged changed files.
+- **Not Plan 1's `NodeId`s, deliberately**: `NodeId`s are a deterministic-but-not-stable sequential
+  counter assigned while folding files into the graph (idempotence invariant I1), never
+  content-addressed, so they shift on any workspace add/remove and would have been the wrong cache
+  key. The cache stores the pre-numbering `FileIndex` fragment instead; global `NodeId`s are still
+  freshly (re-)assigned on every build regardless of cache hits. See `docs/quality.md`'s step 3.2
+  section for the full reasoning.
+- Real measured baseline (`scale_bench.py`, cold vs. warm cache, same workspace/config unchanged
+  between runs): boot time down ~65% at 5,000 files (283.5ms → ~90–105ms) and ~50% at 30,000 files
+  (1,344.9ms → 668.0ms). `smart_search`/`reload_ms` are unaffected, as expected — this cache only
+  short-circuits tree-sitter parsing.
+- Honest limitation: no eviction or size cap yet — `index-cache.db` grows unboundedly across
+  distinct workspaces/configs on a shared machine over time; only the "same workspace, second
+  boot" scenario is measured so far, not a mixed cache-hit-rate cold start.
+- Verified: `cargo test --workspace` (352 passed, +5 new: `PersistentIndexCache` key/get/put-batch
+  cases), `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all --
+  --check` (clean).
+
+### Added (P2 step 3.1 — real incremental reload from watcher paths)
+- **The file watcher no longer re-crawls the whole tree to find out what changed.**
+  `WorkspaceIndexer::reload` (used for the initial load and any caller without specific paths)
+  is unchanged, but the live file watcher now calls new `WorkspaceIndexer::reload_paths`, which
+  works directly from the watcher's own reported paths: each is resolved to its most specific
+  containing root (the same attribution `crawl_all`'s nested-root exclusion gives an overlapping
+  file) and checked against that root's `exclude_patterns`/`.gitignore` via new
+  `FilesystemCrawler::is_path_excluded` — one path in O(path depth) stat calls, not an O(repo
+  size) walk. `reload` and `reload_paths` now share one `apply_incremental` tail (VFS diff, scan,
+  graph patch, snapshot install) so the two paths can't silently drift apart.
+- **Two deliberate, documented fallbacks to the old full-crawl `reload`, not silent gaps**: (1) a
+  path under a nested `.gitignore` (any `.gitignore` strictly between the root and the file, not
+  the root's own top-level one) — `is_path_excluded` can't cheaply and correctly reproduce
+  `ignore::WalkBuilder`'s per-directory gitignore stacking for one path without walking, so rather
+  than risk a false "not excluded" it returns `None` and the caller falls back; (2) a
+  `.git/HEAD`/`.git/refs/*` change (checkout, rebase, branch switch), which can alter an arbitrary
+  number of tracked files without each one necessarily producing its own watcher event.
+- **`AppState` gains `pending_reload_paths`** so a burst of watcher events arriving while a reload
+  job is already queued or running still has its paths picked up by whichever job drains the
+  accumulator next, instead of being silently dropped by `reload_pending`'s existing
+  best-effort coalescing check (that check only ever decided whether to spawn a *second* Rayon
+  job, never whether the first job would see the second burst's paths — this closes that gap).
+- Verified: `cargo test --workspace` (341 passed, +10 new: `is_path_excluded`'s exclude/gitignore/
+  nested-gitignore-fallback cases, `reload_paths`'s edit+delete/create/exclude-pattern/git-ref-
+  fallback cases, and the watcher's path-delivery/accumulator cases), `cargo clippy --workspace
+  --all-targets -- -D warnings` (clean), `cargo fmt --all -- --check` (clean),
+  `scripts/golden/score.py online-boutique` (100%/100%, unaffected), `scripts/determinism.sh` on
+  all three fixtures ("1 fingerprint over 13 runs" each, unaffected — those exercise a fresh
+  `mesh-mcp graph` process per run, i.e. `build_snapshot`, not the live watcher's `reload_paths`
+  path; that path's correctness is what the new unit/integration tests above cover, plus the
+  pre-existing `test_file_watcher_live_reload` end-to-end test, unchanged and still green, which
+  now exercises `reload_paths` instead of `reload` under the hood).
+- Honest limitation: the nested-`.gitignore` fallback (above) means a targeted reload is not
+  strictly zero-crawl for every workspace shape — only for the common case of a single
+  root-level `.gitignore` (or none). A repo with per-service nested `.gitignore` files still gets
+  a full crawl on every reload of a file under one, same as before this change; closing that gap
+  would mean reproducing `ignore::WalkBuilder`'s directory-by-directory gitignore stack for a
+  single path, which this step deliberately did not attempt rather than risk a subtly wrong
+  exclusion decision.
+- Hardened via ruthless review — seven real findings, all fixed:
+  - **Sandbox escape via symlink** (Commandment 4): `reload_paths` used to check
+    `std::fs::metadata(raw).is_ok()` on the *raw* watched path, which follows symlinks — a symlink
+    created inside a watched root pointing outside every allowed root would have its *target's*
+    content read and indexed. Fixed: every path is `dunce::canonicalize`d before root-resolution
+    and indexing now use the *canonical* path; one that resolves outside every allowed root is
+    dropped (logged), never indexed.
+  - **Silent, unlogged path drop on a root-match miss**: an uncanonicalized watched path (e.g.
+    macOS FSEvents reporting `/tmp/...` against a `/private/tmp/...`-canonicalized allowed root)
+    could fail `most_specific_root` and be dropped with zero log output and no fallback — silently
+    defeating the whole reload for that path. The same canonicalize-before-matching fix above
+    closes this (canonical paths compare equal to the canonicalized `allowed_roots`), plus a debug
+    log line on every drop.
+  - **`is_path_excluded` only checked root-level `.gitignore`**, missing `.ignore` files and
+    `.git/info/exclude` that `ignore::WalkBuilder` also honors by default. Fixed: both are now
+    folded into the same `GitignoreBuilder`, and a nested `.ignore` (not just `.gitignore`) also
+    forces the documented fallback. A user's *global* `core.excludesFile` remains an explicit,
+    documented gap (detecting it would mean reading git config).
+  - **TOCTOU on a "deleted" path**: `reload_paths` stats a path before `reload_lock` is acquired
+    (it must return, not block, before its fallback-to-`reload()` branches); a file briefly absent
+    in that window (an editor's atomic save, a fast delete-then-recreate) would be purged from the
+    graph and never re-added. Fixed: `apply_incremental` re-verifies every `deleted` path
+    immediately before acting on it, re-indexing one that resurrected instead of dropping it.
+  - **Coalesced directory-level delete**: `rm -rf a_service/` can produce fewer watcher events
+    than one per contained file; `reload_paths` only ever removed the specific paths reported,
+    leaving siblings' graph nodes stale. Fixed: a deleted path whose parent directory is *also*
+    gone now falls back to a full `reload()`'s crawl-vs-VFS sweep instead of guessing.
+  - **Matcher/gitignore recompiled per path**: `schedule_reload` deliberately coalesces a whole
+    debounce burst into one `reload_paths` call, but the exclude matcher (and, inside
+    `is_path_excluded`, the parsed ignore files) were rebuilt from scratch for every path in that
+    batch. Fixed: cached per root for the duration of one call.
+  - **`is_path_excluded`'s nested-ignore-file walk could stat directories above `root`** for an
+    unnormalized or non-descendant path (or `path == root` itself), reading outside the intended
+    scope. Fixed: an explicit `path == root` short-circuit, plus a `starts_with(root)` guard on
+    every step of the ancestor walk.
+  - Verified again after all seven fixes: `cargo test --workspace` (347 passed, +6 more:
+    symlink-escape, parent-directory-gone fallback, TOCTOU resurrection, root-level `.ignore`,
+    `.git/info/exclude`, and `path == root` cases), clippy/fmt clean, golden/determinism unaffected.
 ### Added (P2 step 3.0 — scale bench: synthetic generator, boot/reload/RSS/p50/p95, nightly budgets)
 - **`scripts/bench/gen_synthetic.py`**: deterministic (fixed-seed) multi-root synthetic workspace
   generator, so scale numbers are reproducible across machines and runs instead of depending on a

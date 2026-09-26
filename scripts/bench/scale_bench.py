@@ -229,8 +229,8 @@ def main():
                 {"name": "smart_search", "arguments": {"query": q, "scope": scope, "fuzzy": False}},
                 100 + i,
             )
-            if resp.get("error"):
-                raise RuntimeError(f"smart_search({q!r}) failed: {resp['error']}")
+            if resp.get("error") or resp.get("result", {}).get("isError"):
+                raise RuntimeError(f"smart_search({q!r}) failed: {resp.get('error') or resp['result']}")
             latencies.append(ms)
             rss_samples_total += 1
             sample = rss_mb(proc.pid)

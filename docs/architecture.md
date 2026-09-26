@@ -131,7 +131,7 @@ AI coding agents are vulnerable to path traversal attacks, malicious symlinks in
 2. **Canonicalization**: The path is resolved via `dunce::canonicalize()` (which resolves Windows UNC paths safely and eliminates virtual directory segments).
 3. **Case Folding Normalization**: On macOS (APFS) and Windows (NTFS), case insensitivity can bypass string prefix checks (e.g., `/Users/REPO` vs `/users/repo`). MeshMCP canonicalizes paths to lowercase before boundary validation.
 4. **Boundary Prefix Check**: The resolved path must start with at least one configured root in `mesh-mcp.toml`.
-5. **Symlink Prohibition**: `follow_links(false)` is enforced across all filesystem crawlers (`ignore::WalkBuilder`). Any traversal targeting symlinks pointing outside the workspace jail immediately errors with JSON-RPC `-32602`.
+5. **Symlink Prohibition**: `follow_links(false)` is enforced across all filesystem crawlers (`ignore::WalkBuilder`). Any traversal targeting symlinks pointing outside the workspace jail immediately fails the tool call with an MCP tool error (`isError: true`), which the agent can read and correct.
 
 ```mermaid
 graph TD
@@ -139,7 +139,7 @@ graph TD
     Clean --> Dunce["dunce::canonicalize"]
     Dunce --> Fold["Case-Fold APFS/NTFS to lowercase"]
     Fold --> Check{"Prefix within allowed_roots?"}
-    Check -->|No| Err["Reject: JSON-RPC Error -32602"]
+    Check -->|No| Err["Reject: tool error, isError: true"]
     Check -->|Yes| Valid["ValidatedScope Instance Created"]
 ```
 

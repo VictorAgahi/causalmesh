@@ -177,10 +177,10 @@ mod tests {
         assert_eq!(code(r#"{"jsonrpc":"2.0","id":3}"#), Some(-32600));
         assert_eq!(code("[1,2]"), Some(-32600));
         // The id is echoed on Invalid Request when it could be read.
-        match classify(r#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#) {
-            Incoming::Reject(r) => assert_eq!(r.id, Some(serde_json::json!(7))),
-            other => panic!("expected reject, got {other:?}"),
-        }
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#),
+            Incoming::Reject(r) if r.id == Some(serde_json::json!(7))
+        ));
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub struct FindDependentsArgs {
     #[serde(default)]
     #[schemars(
         with = "String",
-        description = "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a JSON-RPC -32602 error, not a silent fallback to 'symbol'."
+        description = "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a tool error, not a silent fallback to 'symbol'."
     )]
     pub granularity: Option<CompactStr>,
 

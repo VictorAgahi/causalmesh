@@ -247,8 +247,14 @@ impl GraphRenderer {
 
     /// Exports the graph to an autonomous, standalone interactive Dark Mode HTML5 application.
     pub fn to_html(graph: &ContractGraph, workspace_name: &str, repo_names: &[String]) -> String {
-        let payload = Self::to_payload(graph, workspace_name, repo_names);
-        let json_data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+        Self::payload_to_html(&Self::to_payload(graph, workspace_name, repo_names))
+    }
+
+    /// The standalone HTML application around any payload (full graph, or the
+    /// aggregated `Topology` view `visualize_mesh` returns).
+    pub fn payload_to_html(payload: &WebGraphPayload) -> String {
+        let workspace_name = payload.workspace_name.as_str();
+        let json_data = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
 
         format!(
             r#"<!DOCTYPE html>

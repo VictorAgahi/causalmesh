@@ -7,9 +7,38 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 3 (P2): scale. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
+Plan 3 (P2): scale. Step 3.6 — MCP protocol compliance (tool errors as `isError`, notifications,
+fence-safe truncation, lean schemas) and a per-service `visualize_mesh`. Step 3.5 — `derive()`
+without quadratic passes, streaming YAML. Step 3.4 — `smart_search` pagination/early-stop/cache and
+exact line anchoring. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
 Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 — real incremental
 reload, driven by the watcher's own paths.
+
+### Breaking Changes (P2 step 3.6 — MCP protocol compliance)
+- **Tool failures are MCP tool results, not JSON-RPC errors.** A failure *inside* a tool — invalid
+  or unknown arguments, a scope outside the sandbox jail, a missing target, an RSAH governance
+  refusal, `meshd` still indexing — now returns a successful JSON-RPC response whose
+  `CallToolResult` has `isError: true` and the message as text content, as the MCP specification
+  (2024-11-05) requires. Previously these were JSON-RPC errors `-32602` / `-32001` / `-32000`,
+  which clients (Claude Code, Cursor, Windsurf) treat as a protocol failure that aborts the agent's
+  turn instead of letting the model read the message and correct its call. **Clients must read
+  `result.isError`**; `error` is now reserved for protocol faults: `-32700` parse error, `-32600`
+  invalid request (not a request object / `jsonrpc` not `"2.0"`, newly enforced), `-32601` unknown
+  method, `-32602` unknown tool or missing `tools/call` params, `-32603` internal error. There is no
+  compatibility flag.
+- **`visualize_mesh` returns a per-service aggregated view** in every format (Mermaid, JSON, HTML)
+  instead of the raw contract graph, which at a few thousand nodes exceeded the 48 KB cap and came
+  back cut mid-document. New arguments `service` (zoom into one service) and `max_services`. The
+  complete graph remains available from the CLI (`mesh-mcp graph`).
+
+### Fixed (P2 step 3.6)
+- JSON-RPC notifications (no `id`) never receive a reply — not even an error with `"id": null` —
+  in both the stdio server and `meshd` (JSON-RPC 2.0 §4.1). Both now share one request classifier
+  and one responder.
+- The 48 KB output cap cuts on a line boundary and closes any open Markdown code fence.
+- `_meta` (W3C trace context) is accepted but no longer advertised in `tools/list`
+  (7,696 → 5,524 bytes of tool schemas, ~540 tokens per session).
+
 
 ### Added (P2 step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
 - **Watchers now respect `.gitignore`/`exclude_patterns` at registration, not just after an event

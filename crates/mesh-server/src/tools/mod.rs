@@ -28,7 +28,9 @@ pub type ToolError = (i32, String);
 
 /// Implementation-defined JSON-RPC server error (per spec, the -32000..-32099
 /// range) for a call refused by active governance (RSAH). Distinct from
-/// -32602 (invalid params) and -32601 (unknown tool).
+/// -32602 (invalid params). Tool-level codes like this one classify a failure
+/// internally; `call_tool` surfaces every one of them to the client as a
+/// `CallToolResult` with `isError: true`, never as a JSON-RPC error.
 pub const GOVERNANCE_BLOCKED_CODE: i32 = -32001;
 
 /// Result of one tool invocation, before audit and MCP framing.
@@ -110,13 +112,24 @@ impl ToolRegistry {
         })
     }
 
-    /// Dispatches an incoming MCP tools/call request
+    /// Dispatches an incoming MCP `tools/call` request.
+    ///
+    /// Per the MCP specification (2024-11-05), a failure *inside* a tool —
+    /// invalid arguments, a scope outside the sandbox jail, a missing target, an
+    /// RSAH governance refusal — is not a protocol error: it is returned as a
+    /// successful JSON-RPC response carrying a `CallToolResult` with
+    /// `isError: true` and the message as text content, so the client hands it
+    /// to the model as the tool's answer and the agent can self-correct. Only
+    /// protocol-level faults come back as `Err` for the caller to send as a
+    /// JSON-RPC error: an unknown tool name (`-32602`, as the MCP spec
+    /// prescribes) and an internal failure such as a panicked tool task
+    /// (`-32603`).
     pub async fn call_tool(
         name: &str,
         arguments: Value,
         state: Arc<AppState>,
     ) -> Result<Value, ToolError> {
-        let text_output = match name {
+        let outcome = match name {
             SmartSearchTool::NAME => Self::invoke::<SmartSearchTool>(arguments, state).await?,
             FindDependentsTool::NAME => {
                 Self::invoke::<FindDependentsTool>(arguments, state).await?
@@ -127,17 +140,26 @@ impl ToolRegistry {
             VisualizeMeshTool::NAME => Self::invoke::<VisualizeMeshTool>(arguments, state).await?,
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => Self::invoke::<TestSlowOpTool>(arguments, state).await?,
-            unknown => return Err((-32601, format!("Unknown tool: {unknown}"))),
+            unknown => return Err((-32602, format!("Unknown tool: {unknown}"))),
         };
 
-        Ok(json!({
+        Ok(match outcome {
+            Ok(text) => Self::tool_result(text, false),
+            Err((_, message)) => Self::tool_result(message, true),
+        })
+    }
+
+    /// An MCP `CallToolResult` with one text content block.
+    pub fn tool_result(text: String, is_error: bool) -> Value {
+        json!({
             "content": [
                 {
                     "type": "text",
-                    "text": text_output
+                    "text": text
                 }
-            ]
-        }))
+            ],
+            "isError": is_error
+        })
     }
 
     /// Footer pointing the agent at a configured skill file. The path is what the
@@ -172,12 +194,22 @@ impl ToolRegistry {
 
     /// Parses arguments, runs the tool body and the audit write on the blocking
     /// pool, and returns the rendered text.
+    /// Runs one tool. The outer `Result` is a protocol-level fault (the tool task
+    /// itself failed); the inner one is the tool's own outcome, which
+    /// `call_tool` turns into a `CallToolResult` (`isError` on `Err`).
     async fn invoke<T: McpTool>(
         arguments: Value,
         state: Arc<AppState>,
-    ) -> Result<String, ToolError> {
-        let args: T::Args = serde_json::from_value(arguments)
-            .map_err(|e| (-32602, format!("Invalid arguments for {}: {e}", T::NAME)))?;
+    ) -> Result<Result<String, ToolError>, ToolError> {
+        let args: T::Args = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(e) => {
+                return Ok(Err((
+                    -32602,
+                    format!("Invalid arguments for {}: {e}", T::NAME),
+                )))
+            }
+        };
 
         // Active governance (RSAH): mutating calls are subject to a stop rule.
         // For read-only tools, behavior depends on `read_governance_mode`:
@@ -195,7 +227,7 @@ impl ToolRegistry {
                         let payload = serde_json::to_string(&rsah).unwrap_or_else(|_| {
                             "RSAH governance refusal (payload serialization failed)".to_string()
                         });
-                        return Err((GOVERNANCE_BLOCKED_CODE, payload));
+                        return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
                     } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
                         tracing::warn!(
                             target: "mesh::security",
@@ -222,14 +254,10 @@ impl ToolRegistry {
                 // Centralized 48 KB Payload Budget Capping
                 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
                 if out.text.len() > MAX_TOOL_OUTPUT_BYTES {
-                    let mut cut_off = MAX_TOOL_OUTPUT_BYTES - 384;
-                    while !out.text.is_char_boundary(cut_off) {
-                        cut_off -= 1;
-                    }
-                    out.text.truncate(cut_off);
                     let hint = T::truncation_hint(&args, &state).unwrap_or_else(|| {
                         "Refine scope or pass specific search targets to narrow output.".to_string()
                     });
+                    truncate_markdown(&mut out.text, MAX_TOOL_OUTPUT_BYTES - 384);
                     out.text.push_str(&format!(
                         "\n\n> [!NOTE]\n> Output payload truncated to fit within maximum MCP output payload cap (48 KB). {hint}\n",
                     ));
@@ -269,13 +297,65 @@ impl ToolRegistry {
             result.map(|out| out.text)
         })
         .await
-        .map_err(|e| (-32603, format!("Tool task failed: {e}")))?
+        .map_err(|e| (-32603, format!("Tool task failed: {e}")))
+    }
+}
+
+/// Cuts `text` to at most `budget` bytes on a line boundary and closes any
+/// Markdown code fence left open, so a truncated payload never ends mid-token
+/// or inside an unterminated ```` ``` ```` block (which makes everything after it —
+/// including the truncation note — parse as code downstream).
+fn truncate_markdown(text: &mut String, budget: usize) {
+    if text.len() <= budget {
+        return;
+    }
+    let mut cut = budget;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Back off to the last complete line when there is one in the kept half.
+    if let Some(nl) = text[..cut].rfind('\n') {
+        if nl >= cut / 2 {
+            cut = nl;
+        }
+    }
+    text.truncate(cut);
+    let open_fence = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count()
+        % 2
+        == 1;
+    if open_fence {
+        text.push_str("\n```");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_markdown_closes_open_fence_on_a_line_boundary() {
+        let mut text = String::from("## Title\n```rust\nfn a() {}\nfn b() {}\nfn c() {}\n```\n");
+        truncate_markdown(&mut text, 30);
+        assert!(text.ends_with("\n```"), "{text:?}");
+        assert_eq!(text.matches("```").count(), 2, "{text:?}");
+        assert!(
+            !text.contains("fn b() {"),
+            "cut on a line boundary: {text:?}"
+        );
+
+        // Already-balanced output is only cut, never given a stray fence.
+        let mut balanced = String::from("```\na\n```\nplain text that is long enough\n");
+        truncate_markdown(&mut balanced, 20);
+        assert_eq!(balanced.matches("```").count() % 2, 0, "{balanced:?}");
+
+        // Multi-byte text never splits a char.
+        let mut utf8 = "é".repeat(100);
+        truncate_markdown(&mut utf8, 51);
+        assert!(utf8.len() <= 51);
+    }
     use mesh_core::{AuditLogger, BackgroundRescanEngine, Config};
     use serde::Deserialize;
 
@@ -371,7 +451,9 @@ roots = ["."]
         let state = governed_state();
         let args = json!({ "target": "services/proto-registry/auth.proto" });
 
-        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state).await;
+        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state)
+            .await
+            .expect("a governance refusal is a tool outcome, not a protocol fault");
         let (code, message) = result.expect_err("guarded mutation must be refused");
         assert_eq!(code, GOVERNANCE_BLOCKED_CODE);
 
@@ -411,9 +493,21 @@ roots = ["."]
             }
         }
 
-        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state).await;
+        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state)
+            .await
+            .expect("no protocol fault");
         let text = result.expect("read-only call on a guarded subject stays allowed");
         assert!(text.contains("read services/proto-registry/auth.proto"));
+    }
+
+    /// Internal W3C trace context is accepted on input but never advertised to
+    /// the model in `tools/list`.
+    #[test]
+    fn test_list_tools_hides_request_meta() {
+        let listed = ToolRegistry::list_tools().to_string();
+        assert!(!listed.contains("_meta"), "{listed}");
+        assert!(!listed.contains("traceparent"), "{listed}");
+        assert!(!listed.contains("RequestMeta"), "{listed}");
     }
 
     #[test]

@@ -39,7 +39,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// different serialization). Folded into every cache key, so a version bump silently orphans
 /// every old row (they simply never match again) instead of requiring an explicit migration
 /// or a stored-and-checked version column.
-const SCHEMA_VERSION: u8 = 1;
+/// v2: pattern / AsyncAPI / OpenAPI nodes carry their real declaration line instead
+/// of a placeholder `1` (P2 step 3.4 review).
+const SCHEMA_VERSION: u8 = 2;
 
 /// SHA-256 of `data`. Exposed so callers computing a `PersistentIndexCache::key_for` input
 /// fingerprint (e.g. `mesh-server`'s per-scan extraction-config fingerprint) don't need `ring`

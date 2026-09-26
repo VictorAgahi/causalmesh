@@ -545,7 +545,13 @@ impl PolyglotIndexer {
                 continue;
             }
 
+            // `captures_iter` yields ascending offsets, so the 1-based line of each
+            // match is tracked incrementally instead of re-counting from byte 0.
+            let mut line_cursor = LineCursor::default();
             for caps in pat.regex.captures_iter(content) {
+                let line = caps
+                    .get(0)
+                    .map_or(1, |m| line_cursor.line_at(content, m.start()));
                 let target = caps
                     .get(pat.target_group)
                     .map(|m| m.as_str().trim())
@@ -597,8 +603,8 @@ impl PolyglotIndexer {
                     name: CompactStr::new(node_name),
                     kind,
                     file_path: interned.clone(),
-                    line_start: 1,
-                    line_end: 1,
+                    line_start: line,
+                    line_end: line,
                     package,
                     repo_id,
                     signature: Some(CompactStr::new(signature)),
@@ -643,15 +649,21 @@ impl PolyglotIndexer {
         if is_asyncapi {
             if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
                 if let Some(channels) = yaml_val.get("channels").and_then(|c| c.as_mapping()) {
+                    // `serde_yaml::Mapping` keeps document order, so each key is
+                    // searched from the previous one's line: linear, not quadratic.
+                    let mut cursor = yaml_key_line(content, "channels", 1).unwrap_or(1);
                     for (ch_name, _) in channels {
                         if let Some(name_str) = ch_name.as_str() {
+                            let found = yaml_key_line(content, name_str, cursor);
+                            cursor = found.unwrap_or(cursor);
+                            let line = found.unwrap_or(1);
                             let node = ContractNode {
                                 id: 0,
                                 name: CompactStr::new(name_str),
                                 kind: NodeKind::EventStream,
                                 file_path: interned.clone(),
-                                line_start: 1,
-                                line_end: 1,
+                                line_start: line,
+                                line_end: line,
                                 package: CompactStr::new("asyncapi"),
                                 repo_id,
                                 signature: Some(CompactStr::new(format!("channel {name_str}"))),
@@ -668,15 +680,19 @@ impl PolyglotIndexer {
                 // also pick up a non-standard top-level `topics: [..]` string list.
                 if cfg.infer_string_topics {
                     if let Some(topics) = yaml_val.get("topics").and_then(|t| t.as_sequence()) {
+                        let mut cursor = yaml_key_line(content, "topics", 1).unwrap_or(1);
                         for entry in topics {
                             if let Some(name_str) = entry.as_str() {
+                                let found = yaml_item_line(content, name_str, cursor);
+                                cursor = found.unwrap_or(cursor);
+                                let line = found.unwrap_or(1);
                                 let node = ContractNode {
                                     id: 0,
                                     name: CompactStr::new(name_str),
                                     kind: NodeKind::EventStream,
                                     file_path: interned.clone(),
-                                    line_start: 1,
-                                    line_end: 1,
+                                    line_start: line,
+                                    line_end: line,
                                     package: CompactStr::new("asyncapi"),
                                     repo_id,
                                     signature: Some(CompactStr::new(format!(
@@ -708,19 +724,26 @@ impl PolyglotIndexer {
         if is_openapi {
             if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(content) {
                 if let Some(paths) = yaml_val.get("paths").and_then(|p| p.as_mapping()) {
+                    let mut cursor = yaml_key_line(content, "paths", 1).unwrap_or(1);
                     for (path_name, methods) in paths {
                         if let Some(p_str) = path_name.as_str() {
+                            let path_line = yaml_key_line(content, p_str, cursor);
+                            cursor = path_line.unwrap_or(cursor);
                             if let Some(m_map) = methods.as_mapping() {
                                 for (method_name, _) in m_map {
                                     if let Some(m_str) = method_name.as_str() {
                                         let ep_name = format!("{} {}", m_str.to_uppercase(), p_str);
+                                        let line = path_line
+                                            .and_then(|l| yaml_key_line(content, m_str, l + 1))
+                                            .or(path_line)
+                                            .unwrap_or(1);
                                         let node = ContractNode {
                                             id: 0,
                                             name: CompactStr::new(&ep_name),
                                             kind: NodeKind::HttpEndpoint,
                                             file_path: interned.clone(),
-                                            line_start: 1,
-                                            line_end: 1,
+                                            line_start: line,
+                                            line_end: line,
                                             package: CompactStr::new("openapi"),
                                             repo_id,
                                             signature: Some(CompactStr::new(&ep_name)),
@@ -736,6 +759,65 @@ impl PolyglotIndexer {
             }
         }
     }
+}
+
+/// Incremental byte-offset -> 1-based line lookup for ascending offsets.
+#[derive(Default)]
+struct LineCursor {
+    offset: usize,
+    line: usize,
+}
+
+impl LineCursor {
+    fn line_at(&mut self, content: &str, offset: usize) -> usize {
+        if offset < self.offset {
+            *self = Self::default();
+        }
+        let end = offset.min(content.len());
+        let start = self.offset.min(end);
+        self.line += content.as_bytes()[start..end]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count();
+        self.offset = end;
+        self.line + 1
+    }
+}
+
+/// 1-based line of the first `key:` mapping entry (bare, `"key"` or `'key'`) at or
+/// after line `from`. `serde_yaml` keeps no source positions, so contract nodes read
+/// from a parsed spec recover their declaration line textually; `None` when the key
+/// cannot be found (flow style, anchors), in which case callers fall back to line 1
+/// and `smart_search` treats the anchor as unverified.
+fn yaml_key_line(content: &str, key: &str, from: usize) -> Option<usize> {
+    content
+        .lines()
+        .enumerate()
+        .skip(from.saturating_sub(1))
+        .find(|(_, l)| {
+            let t = l.trim_start().trim_start_matches("- ");
+            let rest = t
+                .strip_prefix(key)
+                .or_else(|| t.strip_prefix('"')?.strip_prefix(key)?.strip_prefix('"'))
+                .or_else(|| t.strip_prefix('\'')?.strip_prefix(key)?.strip_prefix('\''));
+            rest.is_some_and(|r| r.starts_with(':'))
+        })
+        .map(|(i, _)| i + 1)
+}
+
+/// 1-based line of the first `- item` sequence entry equal to `item` at or after `from`.
+fn yaml_item_line(content: &str, item: &str, from: usize) -> Option<usize> {
+    content
+        .lines()
+        .enumerate()
+        .skip(from.saturating_sub(1))
+        .find(|(_, l)| {
+            l.trim_start()
+                .strip_prefix('-')
+                .map(|r| r.trim().trim_matches(|c| c == '"' || c == '\''))
+                == Some(item)
+        })
+        .map(|(i, _)| i + 1)
 }
 
 #[cfg(test)]
@@ -1079,5 +1161,65 @@ topics:
         assert_eq!(cfg.openapi_spec_files, vec!["openapi.yaml".to_string()]);
         assert_eq!(cfg.asyncapi_spec_files, vec!["asyncapi.yaml".to_string()]);
         assert!(!cfg.infer_string_topics);
+    }
+
+    /// Pattern / AsyncAPI / OpenAPI nodes carry their real declaration line, not
+    /// a placeholder `1` (smart_search anchors snippets on it).
+    #[test]
+    fn declarative_nodes_record_real_lines() {
+        let patterns = CompiledPattern::compile_all(&[CustomPatternConfig {
+            name: "producer".to_string(),
+            kind: PatternKind::TopicProducer,
+            file_pattern: None,
+            regex: r#"send\("([^"]+)"\)"#.to_string(),
+            target_group: 1,
+            consumer_group: None,
+        }]);
+        let src = "a\nb\nsend(\"t.one\")\nc\n\nsend(\"t.two\")\n";
+        let out = PolyglotIndexer::extract_custom_patterns(Path::new("x.java"), src, 0, &patterns);
+        let lines: Vec<(String, usize)> = out
+            .nodes
+            .iter()
+            .map(|n| (n.name.to_string(), n.line_start))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("produce:t.one".to_string(), 3),
+                ("produce:t.two".to_string(), 6)
+            ]
+        );
+
+        let asyncapi = "asyncapi: 2.6.0\ninfo:\n  title: x\nchannels:\n  billing.events:\n    description: d\n  'orders.created':\n    description: e\n";
+        let out = PolyglotIndexer::extract(Path::new("asyncapi.yaml"), asyncapi, 0);
+        let lines: Vec<(String, usize)> = out
+            .nodes
+            .iter()
+            .map(|n| (n.name.to_string(), n.line_start))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("billing.events".to_string(), 5),
+                ("orders.created".to_string(), 7)
+            ]
+        );
+
+        let openapi = "openapi: 3.0.0\npaths:\n  /orders:\n    get:\n      summary: list\n    post:\n      summary: create\n  /users:\n    get:\n      summary: u\n";
+        let out = PolyglotIndexer::extract(Path::new("openapi.yaml"), openapi, 0);
+        let mut lines: Vec<(String, usize)> = out
+            .nodes
+            .iter()
+            .map(|n| (n.name.to_string(), n.line_start))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                ("GET /orders".to_string(), 4),
+                ("GET /users".to_string(), 9),
+                ("POST /orders".to_string(), 6)
+            ]
+        );
     }
 }

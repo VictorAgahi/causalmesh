@@ -1233,17 +1233,16 @@ impl ContractGraph {
         }
 
         // Substring path: walk only the files inside the scope instead of every node.
-        // `file_to_nodes` is a `HashMap`: sorted by path first, so this walk's
-        // order depends only on content, not the per-process hash seed (I5).
-        let mut in_scope_paths: Vec<&FilePath> = self
+        // `file_to_nodes` is a `HashMap`, so the walk itself is in hash-seed order;
+        // only the (usually few) *matches* are sorted afterwards, by content, so the
+        // result order is still independent of the per-process seed (I5) without
+        // sorting every in-scope path on every query.
+        let exact = matches.len();
+        let in_scope = self
             .file_to_nodes
-            .keys()
-            .filter(|path| scope_filter.is_none_or(|s| path.starts_with(s)))
-            .collect();
-        in_scope_paths.sort();
-        let in_scope = in_scope_paths
-            .into_iter()
-            .flat_map(|path| self.file_to_nodes[path].iter());
+            .iter()
+            .filter(|(path, _)| scope_filter.is_none_or(|s| path.starts_with(s)))
+            .flat_map(|(_, ids)| ids.iter());
         for id in in_scope {
             if seen.contains(id) {
                 continue;
@@ -1257,6 +1256,13 @@ impl ContractGraph {
                 }
             }
         }
+        matches[exact..].sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         matches
     }

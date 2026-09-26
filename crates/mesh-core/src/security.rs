@@ -78,14 +78,24 @@ impl ValidatedScope {
             }
         }
 
-        let clean = match anchor {
+        // A relative scope is tried against the workspace-root anchor first, then —
+        // only when that path does not exist — against the process CWD (the
+        // pre-anchoring behaviour, which a config whose `workspace_root` defaults to
+        // its own `.agents/` directory still relies on). Either candidate must then
+        // pass the same jail check below.
+        let plain = path_clean::clean(&translated_scope);
+        let canonical = match anchor {
             Some(root) if Path::new(&translated_scope).is_relative() => {
-                path_clean::clean(root.join(&translated_scope))
+                let anchored = path_clean::clean(root.join(&translated_scope));
+                match dunce::canonicalize(&anchored) {
+                    Ok(c) => c,
+                    Err(_) => dunce::canonicalize(&plain)
+                        .map_err(|_| SecurityError::PathNotFound(anchored.clone()))?,
+                }
             }
-            _ => path_clean::clean(&translated_scope),
+            _ => dunce::canonicalize(&plain)
+                .map_err(|_| SecurityError::PathNotFound(plain.clone()))?,
         };
-        let canonical =
-            dunce::canonicalize(&clean).map_err(|_| SecurityError::PathNotFound(clean.clone()))?;
 
         let canonical_nfc = to_nfc_path(&canonical);
 
@@ -206,6 +216,46 @@ mod tests {
             ),
             Err(SecurityError::SandboxEscapeAttempt(_))
         ));
+    }
+
+    /// The anchor is tried first; a relative scope that does not exist under it
+    /// still resolves against the CWD (pre-anchoring behaviour), and the jail
+    /// applies to that fallback exactly as to the anchored path.
+    #[test]
+    fn relative_scope_falls_back_to_cwd_when_absent_under_anchor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let anchor = dunce::canonicalize(tmp.path()).expect("canon");
+        let cwd = dunce::canonicalize(std::env::current_dir().expect("cwd")).expect("canon cwd");
+        // `cargo test` runs with the crate directory as CWD, which has `src/`.
+        assert!(cwd.join("src").is_dir());
+        let aliases = HashMap::new();
+
+        let scope = ValidatedScope::resolve_with_aliases(
+            "src",
+            std::slice::from_ref(&cwd),
+            &aliases,
+            Some(&anchor),
+        )
+        .expect("CWD fallback resolves");
+        assert_eq!(scope.as_path(), cwd.join("src"));
+
+        // Same fallback, but the CWD is outside the only allowed root: rejected.
+        assert!(matches!(
+            ValidatedScope::resolve_with_aliases(
+                "src",
+                std::slice::from_ref(&anchor),
+                &aliases,
+                Some(&anchor)
+            ),
+            Err(SecurityError::SandboxEscapeAttempt(_))
+        ));
+
+        // Present under the anchor: the anchor wins over the CWD.
+        std::fs::create_dir_all(anchor.join("src")).expect("mkdir");
+        let roots = [anchor.clone(), cwd.clone()];
+        let scope = ValidatedScope::resolve_with_aliases("src", &roots, &aliases, Some(&anchor))
+            .expect("anchored");
+        assert_eq!(scope.as_path(), anchor.join("src"));
     }
 
     #[test]

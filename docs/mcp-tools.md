@@ -61,15 +61,27 @@ Resolution order:
 Results are **ranked and paginated**: exact-name matches first, then prefix, then substring
 (ties: protocol declarations before plain classes, then path). A page holds at most `limit`
 files (default 20, max 100) starting at `offset`, and only that page's files are read and
-decapitated — a broad query over 30,000 files no longer parses every hit. A page also stops
-early before the 48 KB payload cap; when more results exist, the footer gives the exact
-`offset` to request next. Index-backed pages are cached per `(query, scope, include_body,
-fuzzy, limit, offset)` and dropped on every index reload (snapshot generation bump).
+decapitated — a broad query over 30,000 files no longer parses every hit. Each result's rendered
+size is measured before it is accepted, so a page stops early rather than ever hitting the 48 KB
+truncation; when more results exist, the footer gives the exact `offset` to request next. The
+header's `showing a-b` range always ends where that `offset` resumes (files in the range that
+could not be read are reported as skipped), and an `offset` past the end says so explicitly.
+A `fuzzy` page reports its total as a lower bound (`≥N`) when the scan stopped early, and only
+announces "More results" after it has actually seen a further match. Index-backed pages are
+cached per `(query, scope as resolved, scope as spelled, include_body, fuzzy, limit, offset)`,
+dropped on every index reload (snapshot generation bump), and re-validated against the size and
+mtime of every file they read, so an on-disk edit the index has not yet picked up is never
+served from the cache.
 
-Line numbers (`L<start>-L<end>`) are exact original-file coordinates: an indexed hit is
-anchored on the symbol's tree-sitter line, and every decapitated line maps back to the
-original lines it came from (a stripped body spans its full extent). A relative `scope` is
-resolved against the configured `workspace_root`, not the server process's working directory.
+Line numbers (`L<start>-L<end>`) are original-file coordinates: an indexed hit is anchored on
+the symbol's recorded declaration line, and every decapitated line maps back to the original
+lines it came from (a stripped body spans its full extent). The anchor is only trusted when the
+original lines around it mention the query (or its `_`-insensitive form); otherwise — a stale
+index, an anchor past the end of the file — the snippet comes from a text search of the file as
+it is now, and a file that no longer mentions the query is dropped. A relative `scope` is
+resolved against the configured `workspace_root` first, then against the server process's
+working directory if it does not exist there; the sandbox jail applies to both. Case-insensitive
+matching uses Unicode case folding for non-ASCII queries.
 
 Python functions keep their docstring when decapitated; only the statements after it are
 replaced by `...`.

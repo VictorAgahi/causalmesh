@@ -35,7 +35,7 @@ pub use index_cache::{sha256, CacheEntry, IndexCacheError, PersistentIndexCache}
 pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
-pub use search_cache::{CachedSearch, SearchCache, SearchCacheKey};
+pub use search_cache::{file_stamp, CachedSearch, FileStamp, SearchCache, SearchCacheKey};
 pub use security::{SecurityError, ValidatedScope};
 pub use socket::{cleanup_stale_socket, socket_path, socket_path_for, workspace_id};
 #[cfg(windows)]

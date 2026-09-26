@@ -16,8 +16,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SearchCacheKey {
     pub query: CompactStr,
-    /// Canonical `ValidatedScope` path, so `./a` and `a` share one entry.
+    /// Canonical `ValidatedScope` path.
     pub scope: PathBuf,
+    /// The caller's own spelling of the scope: it is echoed in the rendered page's
+    /// header, so `./a` and `a` (or an alias and its target) must not share text.
+    pub raw_scope: CompactStr,
     pub include_body: bool,
     pub fuzzy: bool,
     pub limit: u32,
@@ -29,6 +32,31 @@ pub struct SearchCacheKey {
 pub struct CachedSearch {
     pub text: String,
     pub files_accessed: Vec<String>,
+    /// `(path, modified, len)` of every file the page read. A generation bump does
+    /// not cover every on-disk change (watcher debounce window, a re-parse that
+    /// failed and kept last-known-good facts without installing a snapshot), so the
+    /// caller re-stats these on a hit and recomputes when any differs.
+    pub file_stamps: Vec<FileStamp>,
+}
+
+/// Cheap identity of a file's on-disk content: `(path, mtime, len)`.
+pub type FileStamp = (PathBuf, Option<std::time::SystemTime>, u64);
+
+/// Current [`FileStamp`] of `path` (`None` mtime/zero len when it cannot be read).
+pub fn file_stamp(path: &std::path::Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(m) => (path.to_path_buf(), m.modified().ok(), m.len()),
+        Err(_) => (path.to_path_buf(), None, 0),
+    }
+}
+
+impl CachedSearch {
+    /// `true` when every file the page read is unchanged on disk.
+    pub fn is_fresh(&self) -> bool {
+        self.file_stamps
+            .iter()
+            .all(|stamp| file_stamp(&stamp.0) == *stamp)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +126,7 @@ mod tests {
         SearchCacheKey {
             query: q.into(),
             scope: PathBuf::from("/ws"),
+            raw_scope: "/ws".into(),
             include_body: false,
             fuzzy: false,
             limit: 20,
@@ -109,6 +138,7 @@ mod tests {
         CachedSearch {
             text: t.to_string(),
             files_accessed: vec![],
+            file_stamps: vec![],
         }
     }
 
@@ -134,6 +164,21 @@ mod tests {
         cache.insert(4, key("A"), page("stale"));
         assert!(cache.get(5, &key("A")).is_none());
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stamps_detect_on_disk_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one").expect("write");
+        let page = CachedSearch {
+            text: String::new(),
+            files_accessed: vec![],
+            file_stamps: vec![file_stamp(&f)],
+        };
+        assert!(page.is_fresh());
+        std::fs::write(&f, "three").expect("rewrite");
+        assert!(!page.is_fresh(), "a length change must invalidate the page");
     }
 
     #[test]

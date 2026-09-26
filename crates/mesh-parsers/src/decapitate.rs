@@ -140,6 +140,11 @@ pub struct DecapitatedSource {
     /// lines it was produced from. `first == last` for an untouched line; a line
     /// holding a stripped body spans the body's whole original extent.
     pub line_map: Vec<(u32, u32)>,
+    /// `true` when `text` is [`AstDecapitator::BOUNDED_ERROR_STUB`] (parse
+    /// failure/timeout, or an oversized file with no grammar), not decapitated
+    /// source: the map then carries no per-line information and a caller that
+    /// knows the line it wants should show the original lines instead.
+    pub bounded: bool,
 }
 
 fn identity_line_map(content: &str) -> Vec<(u32, u32)> {
@@ -160,8 +165,14 @@ struct LineTracker {
 
 impl LineTracker {
     fn push(&mut self, byte: u8, orig_line: u32, map: &mut Vec<(u32, u32)>) {
-        let span = self.current.get_or_insert((orig_line, orig_line));
-        span.1 = orig_line;
+        self.push_span(byte, orig_line, orig_line, map);
+    }
+
+    /// Like [`Self::push`], but an output line *opened* by this byte starts its
+    /// span at `first` (≤ `last`) rather than at `last`.
+    fn push_span(&mut self, byte: u8, first: u32, last: u32, map: &mut Vec<(u32, u32)>) {
+        let span = self.current.get_or_insert((first.min(last), last));
+        span.1 = last;
         if byte == b'\n' {
             map.push(*span);
             self.current = None;
@@ -250,10 +261,12 @@ impl AstDecapitator {
         let identity = || DecapitatedSource {
             text: content.to_string(),
             line_map: identity_line_map(content),
+            bounded: false,
         };
         let stub = || DecapitatedSource {
             text: Self::BOUNDED_ERROR_STUB.to_string(),
             line_map: vec![(1, content.lines().count().max(1) as u32)],
+            bounded: true,
         };
         if include_body {
             return identity();
@@ -288,7 +301,11 @@ impl AstDecapitator {
             );
             let mut line_map = Vec::new();
             let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
-            Some(DecapitatedSource { text, line_map })
+            Some(DecapitatedSource {
+                text,
+                line_map,
+                bounded: false,
+            })
         })
         .flatten()
         .unwrap_or_else(stub)
@@ -301,6 +318,10 @@ impl AstDecapitator {
     /// output line: copied bytes keep their own line; a replacement's first byte
     /// maps to the line its node starts on and the rest to the line it ends on,
     /// so `fn f() { /* stripped */ }` spans the function's full original extent.
+    /// A line the replacement itself opens after an embedded `\n` (Ruby's
+    /// `\n # stripped\n`, a Python docstring's `\n    ...` tail) starts at the
+    /// first non-blank line of the replaced range, so it too covers the whole
+    /// stripped extent rather than only its last line.
     fn apply_replacements(
         content: &str,
         mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)>,
@@ -342,11 +363,18 @@ impl AstDecapitator {
                 orig_line += count_newlines(kept);
             }
             let start_line = orig_line;
-            orig_line += count_newlines(&content[start..end]);
+            let region = &content[start..end];
+            orig_line += count_newlines(region);
             out.push_str(&replacement);
             if let Some(map) = line_map.as_deref_mut() {
+                let lead = region.len() - region.trim_start().len();
+                let body_line = start_line + count_newlines(&region[..lead]);
                 for (i, b) in replacement.bytes().enumerate() {
-                    tracker.push(b, if i == 0 { start_line } else { orig_line }, map);
+                    if i == 0 {
+                        tracker.push(b, start_line, map);
+                    } else {
+                        tracker.push_span(b, body_line, orig_line, map);
+                    }
                 }
             }
             cursor = end;
@@ -483,7 +511,7 @@ impl AstDecapitator {
                     // function has, so it survives; only the statements after it go.
                     match Self::python_docstring(body) {
                         Some(doc) if doc.end_byte() < body.end_byte() => {
-                            let tail = if doc.start_position().row == node.start_position().row {
+                            let tail = if Self::python_body_is_inline(node, body) {
                                 // `def f(): """doc"""; return 1` — stay on one line.
                                 std::borrow::Cow::Borrowed("; ...")
                             } else {
@@ -593,22 +621,49 @@ impl AstDecapitator {
         }
     }
 
-    /// Recursively collects key names from returned object literals to synthesize inferred return types
     /// The docstring of a Python `body: block`: its first statement (comments are
     /// skipped — tree-sitter keeps them as named children) when that statement is
-    /// a bare string literal expression.
+    /// a bare string literal expression. An f-string is not a docstring in Python
+    /// (and would carry code), so one with an `interpolation` is rejected.
     fn python_docstring(body: Node) -> Option<Node> {
         let mut cursor = body.walk();
         let first = body
             .named_children(&mut cursor)
             .find(|c| c.kind() != "comment")?;
-        if first.kind() != "expression_statement" {
+        if first.kind() != "expression_statement" || first.named_child_count() != 1 {
             return None;
         }
         let expr = first.named_child(0)?;
-        matches!(expr.kind(), "string" | "concatenated_string").then_some(first)
+        let is_string = matches!(expr.kind(), "string" | "concatenated_string");
+        (is_string && !Self::has_interpolation(expr, 0)).then_some(first)
     }
 
+    fn has_interpolation(node: Node, depth: usize) -> bool {
+        if node.kind() == "interpolation" {
+            return true;
+        }
+        if depth >= 2 {
+            return false;
+        }
+        node.named_children(&mut node.walk())
+            .any(|c| Self::has_interpolation(c, depth + 1))
+    }
+
+    /// `true` when the Python `body` begins on the same line as its function's
+    /// header colon (`def f(a,\n      b): """doc"""; return 1`), i.e. it is a
+    /// simple-statement suite that must stay on one line.
+    fn python_body_is_inline(node: Node, body: Node) -> bool {
+        let mut cursor = node.walk();
+        let mut colon_row = None;
+        for c in node.children(&mut cursor) {
+            if c.kind() == ":" && c.end_byte() <= body.start_byte() {
+                colon_row = Some(c.end_position().row);
+            }
+        }
+        colon_row == Some(body.start_position().row)
+    }
+
+    /// Recursively collects key names from returned object literals to synthesize inferred return types
     fn extract_returned_object_keys(source: &str, node: Node) -> Vec<String> {
         let mut keys = Vec::new();
         Self::collect_keys_recursive(source, node, &mut keys, 0);
@@ -1157,5 +1212,94 @@ export const getUserAccount = (id: string) => ({
         // Imperative literal values must not leak
         assert!(!decapitated.contains("rec_123"));
         assert!(!decapitated.contains("user@corp.com"));
+    }
+
+    fn mapped(code: &str, kind: LanguageKind) -> DecapitatedSource {
+        let d = AstDecapitator::decapitate_auto_mapped(code, kind, false);
+        assert!(!d.bounded, "{}", d.text);
+        assert_eq!(d.text.lines().count(), d.line_map.len(), "{}", d.text);
+        d
+    }
+
+    fn span_of(d: &DecapitatedSource, needle: &str) -> (u32, u32) {
+        let i = d
+            .text
+            .lines()
+            .position(|l| l.contains(needle))
+            .expect("needle present in decapitated text");
+        d.line_map[i]
+    }
+
+    #[test]
+    fn line_map_crlf_python() {
+        let code = "def a():\r\n    x = 1\r\n    return x\r\n\r\nclass B:\r\n    pass\r\n";
+        let d = mapped(code, LanguageKind::Python);
+        assert_eq!(
+            d.line_map,
+            vec![(1, 1), (2, 3), (4, 4), (5, 5), (6, 6)],
+            "{:?}",
+            d.text
+        );
+        assert_eq!(span_of(&d, "class B"), (5, 5));
+    }
+
+    /// A synthetic TS return type inserted at the very byte the stripped body
+    /// starts on keeps both edits and a single mapped line.
+    #[test]
+    fn line_map_typescript_insertion_at_body_start() {
+        let code = "function f(){\n  return { a: 1 };\n}\nconst z = 1;\n";
+        let d = mapped(code, LanguageKind::TypeScript);
+        assert!(
+            d.text
+                .contains("function f(): { a: any }{ /* stripped */ }"),
+            "{}",
+            d.text
+        );
+        assert_eq!(d.line_map, vec![(1, 3), (4, 4)], "{}", d.text);
+        // The non-mapped path produces the identical text.
+        assert_eq!(
+            AstDecapitator::decapitate_auto(code, LanguageKind::TypeScript, false),
+            d.text
+        );
+    }
+
+    #[test]
+    fn line_map_kotlin_and_ruby() {
+        let kt = "class A {\n    fun f(): Int {\n        val x = 1\n        return x\n    }\n}\n";
+        let d = mapped(kt, LanguageKind::Kotlin);
+        assert_eq!(span_of(&d, "fun f()"), (2, 5), "{}", d.text);
+        assert_eq!(*d.line_map.last().expect("line"), (6, 6));
+
+        let rb = "class A\n  def foo\n    a\n    b\n  end\nend\n";
+        let d = mapped(rb, LanguageKind::Ruby);
+        // A replacement opening its own line (`\n # stripped\n`) spans the whole
+        // stripped range, not only its last line.
+        assert_eq!(span_of(&d, "# stripped"), (3, 4), "{}", d.text);
+        assert_eq!(span_of(&d, "  end"), (5, 5), "{}", d.text);
+    }
+
+    #[test]
+    fn line_map_python_docstring_tail_spans_stripped_statements() {
+        let code = "def f():\n    \"\"\"doc\"\"\"\n    a = 1\n    b = 2\n\nz = 3\n";
+        let d = mapped(code, LanguageKind::Python);
+        assert_eq!(
+            d.line_map,
+            vec![(1, 1), (2, 2), (3, 4), (5, 5), (6, 6)],
+            "{}",
+            d.text
+        );
+    }
+
+    #[test]
+    fn python_multiline_signature_one_liner_and_fstring() {
+        let code = "def f(a,\n      b): \"\"\"d\"\"\"; return 1\n\ndef g(x):\n    f\"{secret()}\"\n    return x\n";
+        let mut parser = Parser::new();
+        let lang = tree_sitter_python::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let out = AstDecapitator::decapitate(code, LanguageKind::Python, &mut parser, false);
+        assert!(out.contains("b): \"\"\"d\"\"\"; ..."), "{out}");
+        assert!(!out.contains("return 1"), "{out}");
+        // An f-string is not a docstring: the whole body goes.
+        assert!(!out.contains("secret()"), "{out}");
     }
 }

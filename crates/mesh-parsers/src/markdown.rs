@@ -16,10 +16,16 @@ pub struct SearchResult {
 /// Position of one page of `smart_search` results within the full ranked set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchPage {
-    /// Ranked matches across all pages (a lower bound when the scan stopped early).
+    /// Ranked matches across all pages.
     pub total: usize,
-    /// Index of this page's first result in the ranked set.
+    /// `total` is only a lower bound (a fuzzy scan stopped once the page was full).
+    pub total_is_lower_bound: bool,
+    /// The requested offset: rank index of this page's first candidate.
     pub offset: usize,
+    /// Rank index just past the last candidate this page considered. Candidates in
+    /// `offset..end` that yielded no result (unreadable, oversized) are reported as
+    /// skipped, so the shown range always meets `next_offset` exactly.
+    pub end: usize,
     /// `offset` to request for the next page; `None` on the last page.
     pub next_offset: Option<usize>,
 }
@@ -29,7 +35,9 @@ impl SearchPage {
     pub fn single(total: usize) -> Self {
         Self {
             total,
+            total_is_lower_bound: false,
             offset: 0,
+            end: total,
             next_offset: None,
         }
     }
@@ -43,6 +51,30 @@ impl MarkdownFormatter {
         Self::format_search_page(query, scope, results, &SearchPage::single(results.len()))
     }
 
+    /// One rendered result entry, exactly as [`Self::format_search_page`] emits it
+    /// (`idx` is 0-based within the page).
+    pub fn format_search_entry(idx: usize, r: &SearchResult) -> String {
+        format!(
+            "### [{}] `{}` (L{}-L{})\n```{}\n{}\n```\n\n",
+            idx + 1,
+            r.file_path,
+            r.line_start,
+            r.line_end,
+            r.language,
+            r.snippet.trim()
+        )
+    }
+
+    /// Bytes of rendered entries ([`Self::format_search_entry`]) a paged caller may
+    /// emit for `query`/`scope` while guaranteeing [`Self::format_search_page`] never
+    /// falls back to its truncated output — which hides results without telling the
+    /// caller where to resume. Reserves an upper bound of the header.
+    pub fn search_page_entry_budget(query: &str, scope: &str) -> usize {
+        const HEADER_FIXED_UPPER_BOUND: usize = 384;
+        (MAX_OUTPUT_BYTES - 1024)
+            .saturating_sub(HEADER_FIXED_UPPER_BOUND + query.len() + scope.len())
+    }
+
     /// [`Self::format_search_results`] for one page of a larger ranked result set:
     /// the header reports the full `total` and the range shown, and a footer tells
     /// the caller the exact `offset` to request next instead of re-running a
@@ -53,23 +85,44 @@ impl MarkdownFormatter {
         results: &[SearchResult],
         page: &SearchPage,
     ) -> String {
-        let mut header = if results.len() == page.total && page.offset == 0 {
-            format!(
-                "## Search Results for `{query}` (Scope: `{scope}`)\n*Matches: {} definitions found (AST-Decapitated)*\n\n",
-                page.total
-            )
+        let total = if page.total_is_lower_bound {
+            format!("≥{}", page.total)
         } else {
-            let first = if results.is_empty() {
-                page.offset
+            page.total.to_string()
+        };
+        let summary = if results.is_empty()
+            && page.next_offset.is_none()
+            && page.offset > 0
+            && page.offset >= page.total
+        {
+            format!(
+                "*No results at `offset: {}`: the result set has {total} match(es); request an offset below {}.*",
+                page.offset, page.total
+            )
+        } else if page.offset == 0
+            && page.next_offset.is_none()
+            && !page.total_is_lower_bound
+            && results.len() == page.total
+        {
+            format!("*Matches: {total} definitions found (AST-Decapitated)*")
+        } else {
+            let skipped = page
+                .end
+                .saturating_sub(page.offset)
+                .saturating_sub(results.len());
+            let skipped = if skipped > 0 {
+                format!(", {skipped} unreadable/oversized skipped")
             } else {
-                page.offset + 1
+                String::new()
             };
             format!(
-                "## Search Results for `{query}` (Scope: `{scope}`)\n*Matches: {} definitions found (AST-Decapitated) — showing {first}-{}*\n\n",
-                page.total,
-                page.offset + results.len()
+                "*Matches: {total} definitions found (AST-Decapitated) — showing {}-{}{skipped}*",
+                page.offset + 1,
+                page.end
             )
         };
+        let mut header =
+            format!("## Search Results for `{query}` (Scope: `{scope}`)\n{summary}\n\n");
 
         let mut body = String::new();
         let mut scope_counts: HashMap<String, usize> = HashMap::new();
@@ -79,15 +132,7 @@ impl MarkdownFormatter {
             let sub_scope = Self::extract_sub_scope(&r.file_path);
             *scope_counts.entry(sub_scope).or_default() += 1;
 
-            let entry_str = format!(
-                "### [{}] `{}` (L{}-L{})\n```{}\n{}\n```\n\n",
-                idx + 1,
-                r.file_path,
-                r.line_start,
-                r.line_end,
-                r.language,
-                r.snippet.trim()
-            );
+            let entry_str = Self::format_search_entry(idx, r);
 
             if header.len() + body.len() + entry_str.len() > MAX_OUTPUT_BYTES - 1024 {
                 // Truncate with affordance guidance

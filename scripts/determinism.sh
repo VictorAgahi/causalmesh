@@ -20,13 +20,13 @@
 # Portability: must run under bash 3.2 (macOS /bin/bash) and bash 5 (ubuntu),
 # so no `wait -n`, `mapfile`, associative arrays or empty-array expansions.
 #
-# Why the binary's stdout is captured to a file instead of piped: 4.12a. The
-# fingerprint is 4 lines, and Rust's line-buffered stdout emits them in more than one
-# write(2) calls. The previous `mesh-mcp … | head -n 1` let `head` exit after
-# the first line; when the scheduler ran it between the two writes (a loaded
-# macOS runner), the second write hit a closed pipe, mesh-mcp exited 1 on
-# EPIPE with its stderr discarded, and `pipefail` + `set -e` ended the script
-# with exit 1 and no output at all.
+# Why the binary's stdout is captured to a file instead of piped (4.12a): the
+# fingerprint is 4 lines, written by Rust's line-buffered stdout in more than
+# one write(2). The previous `mesh-mcp … | head -n 1` let `head` exit after the
+# first line; when the scheduler ran it between two writes (a loaded macOS
+# runner), the next write hit a closed pipe, mesh-mcp exited 1 on EPIPE with
+# its stderr discarded, and `pipefail` + `set -e` ended the script with exit 1
+# and no output at all.
 set -Eeuo pipefail
 
 on_err() {

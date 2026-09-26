@@ -45,6 +45,27 @@ reload, driven by the watcher's own paths.
 - `_meta` (W3C trace context) is accepted but no longer advertised in `tools/list`
   (7,696 → 5,524 bytes of tool schemas, ~540 tokens per session).
 
+### Fixed (P2 step 3.6 review)
+- **Stored XSS in the `visualize_mesh` / `mesh-mcp graph` HTML page**: a scanned name containing
+  `</script>` closed the inline JSON element; the JSON is now `\u003c`-escaped, the workspace name
+  HTML-escaped, and the side panel's `innerHTML` escapes node names.
+- **Mermaid label injection**: names are escaped with Mermaid entity codes (`#quot;`, `#lt;`,
+  `#gt;`, `#35;`, `#96;`) and newlines flattened, instead of a partial character strip that let a
+  newline or `"]` start a new statement.
+- **48 KB cap now holds for the whole payload**: the truncation note is budgeted before the cut,
+  the closing fence is counted, and a hint echoing an unbounded argument is capped (512 bytes) and
+  flattened to one line. Fence detection follows CommonMark (`~~~`, 4+-backtick fences, a
+  ```` ```rust ```` line inside a block is content, 4-space indent is not a fence).
+- **`visualize_mesh`**: the zoom ranked neighbour services by their global degree instead of their
+  links to the zoomed service (a hub linked once crowded out a service linked fifty times); a zoom prefers an exact-case match over a case-insensitive one;
+  the footer never suggests zooming into a topic; names are shortened to 120 bytes when drawn, so
+  one huge topic literal cannot push even the smallest view past the cap; JSON/HTML never get a
+  skill footer appended; the O(contracts + edges) fold runs once per call instead of once per
+  shrink iteration.
+- The `docs/mcp-tools.md` schema drift test resolved its path from the crate directory, where the
+  file never exists, and passed vacuously; it now compares every documented property set with the
+  advertised schema. A test covers `_meta` acceptance on every tool.
+
 
 ### Changed (P2 step 3.5 — `derive()` without quadratic passes, streaming YAML)
 - **`ContractGraph::reconcile_edges` has no quadratic pass left**: the `Implements` pass indexes

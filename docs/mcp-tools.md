@@ -330,7 +330,8 @@ drawn (default 40), the rest fold into one "other services" / "other topics" nod
 shrinks further on its own until it fits, and the footer lists the largest hidden groups plus the
 exact `visualize_mesh(service: "...")` call to zoom. A zoom draws that service's own contracts
 (best-connected first, capped) and the services they talk to. Mermaid, JSON and HTML all render
-this same view; JSON/HTML stay parseable documents (no prose appended). For the complete graph,
+this same view; JSON/HTML stay parseable documents (no prose appended). Names longer than 120
+bytes are shortened when drawn (never offered as zoom targets). For the complete graph,
 use the CLI: `mesh-mcp graph --format html -o graph.html`.
 
 **Negative Constraints**: Do NOT use for a targeted question about one symbol or dependency (use

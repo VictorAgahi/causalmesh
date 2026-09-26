@@ -61,8 +61,8 @@ pub struct Topology {
     pub total_groups: usize,
     pub total_contracts: usize,
     pub total_edges: usize,
-    /// Largest hidden groups, `(name, contracts)`, biggest first.
-    pub hidden: Vec<(String, usize)>,
+    /// Every hidden group, `(name, contracts, kind)`, biggest first.
+    pub hidden: Vec<(String, usize, GroupKind)>,
     /// What a "service" is here: `"root"` (one per workspace root) or `"package"`.
     pub grouping: &'static str,
     /// The zoomed-in service, when one was requested and found.
@@ -130,175 +130,270 @@ fn is_topic_hub(node: &ContractNode) -> bool {
         )
 }
 
-/// Group key of one contract: `(name, kind)`.
-fn group_of(node: &ContractNode, repo_names: &[String], by_root: bool) -> (String, GroupKind) {
+/// Group of one contract: `(name, kind)`, borrowed from the node or the root
+/// names — building the view never allocates per contract.
+fn group_of<'a>(
+    node: &'a ContractNode,
+    repo_names: &'a [String],
+    by_root: bool,
+) -> (&'a str, GroupKind) {
     if is_topic_hub(node) {
-        return (node.name.to_string(), GroupKind::Topic);
+        return (node.name.as_str(), GroupKind::Topic);
     }
     if by_root {
         if let Some(repo) = repo_names.get(node.repo_id as usize) {
-            return (repo.clone(), GroupKind::Service);
+            return (repo.as_str(), GroupKind::Service);
         }
     }
-    let pkg = if node.package.is_empty() {
-        "shared".to_string()
+    if node.package.is_empty() {
+        ("shared", GroupKind::Service)
     } else {
-        node.package.to_string()
-    };
-    (pkg, GroupKind::Service)
+        (node.package.as_str(), GroupKind::Service)
+    }
 }
 
-impl Topology {
-    pub fn build(graph: &ContractGraph, repo_names: &[String], opts: &TopologyOptions) -> Self {
-        // One root → grouping by root would draw a single box; use packages.
-        let mut roots_seen: Vec<RepoId> = graph
-            .all_nodes()
-            .filter(|n| !is_topic_hub(n) && (n.repo_id as usize) < repo_names.len())
-            .map(|n| n.repo_id)
-            .collect();
-        roots_seen.sort_unstable();
-        roots_seen.dedup();
-        let by_root = roots_seen.len() > 1;
+/// One cross-group edge bundle before folding: `(from, to, kind)` → count and
+/// weakest confidence rank.
+#[derive(Debug, Clone)]
+struct AggLink {
+    from: u32,
+    to: u32,
+    kind: EdgeKind,
+    count: usize,
+    weakest: u8,
+}
 
-        // The zoomed service, matched case-insensitively against service names.
-        let focus: Option<String> = opts.focus.as_deref().and_then(|f| {
-            let mut names: Vec<String> = graph
+/// The unfolded per-service view: everything `visualize_mesh` needs that does
+/// not depend on how many groups are drawn. It is the O(contracts + edges)
+/// part, so it is built once per call; [`Aggregate::select`] is then cheap
+/// (O(groups + links)) and is what the renderer's shrink-to-fit loop repeats.
+#[derive(Debug, Clone)]
+pub struct Aggregate {
+    groups: Vec<Group>,
+    /// Node id of a zoom `Contract` group (its name is not unique), 0 otherwise.
+    /// With `(kind, name)` it makes the ranking a total, deterministic order.
+    node_ids: Vec<NodeId>,
+    links: Vec<AggLink>,
+    /// Cross-group edges touching each group.
+    degree: Vec<usize>,
+    /// Zoom only: edges between each group and the focused service's contracts.
+    focus_weight: Vec<usize>,
+    /// Group indices, best-connected first.
+    ranked: Vec<u32>,
+    total_contracts: usize,
+    total_edges: usize,
+    by_root: bool,
+    focus: Option<String>,
+}
+
+impl Aggregate {
+    /// Folds the graph into services and topics. `focus` names a service to
+    /// explode into its own contracts: an exact match wins, otherwise the
+    /// case-insensitive one (the first in byte order if several differ only by
+    /// case). An unknown `focus` leaves `focus()` at `None`.
+    pub fn build(graph: &ContractGraph, repo_names: &[String], focus: Option<&str>) -> Self {
+        // One root → grouping by root would draw a single box; use packages.
+        // Stops at the second distinct root instead of collecting every id.
+        let by_root = {
+            let mut first: Option<RepoId> = None;
+            graph
                 .all_nodes()
-                .map(|n| group_of(n, repo_names, by_root))
-                .filter(|(name, kind)| *kind == GroupKind::Service && name.eq_ignore_ascii_case(f))
-                .map(|(name, _)| name)
-                .collect();
-            names.sort();
-            names.into_iter().next()
+                .filter(|n| !is_topic_hub(n) && (n.repo_id as usize) < repo_names.len())
+                .any(|n| *first.get_or_insert(n.repo_id) != n.repo_id)
+        };
+
+        let focus: Option<String> = focus.and_then(|f| {
+            let mut best: Option<&str> = None;
+            for node in graph.all_nodes() {
+                let (name, kind) = group_of(node, repo_names, by_root);
+                if kind != GroupKind::Service {
+                    continue;
+                }
+                if name == f {
+                    return Some(name.to_string());
+                }
+                if name.eq_ignore_ascii_case(f) && best.is_none_or(|b| name < b) {
+                    best = Some(name);
+                }
+            }
+            best.map(str::to_string)
         });
 
-        // Unfolded groups keyed by (kind, key) for a deterministic order. In a
-        // zoom, each contract of the focused service is its own group (key
-        // made unique by node id, displayed by name).
-        type Key = (GroupKind, String);
-        let mut groups: BTreeMap<Key, Group> = BTreeMap::new();
-        let mut node_group: HashMap<NodeId, Key> = HashMap::new();
-        let mut total_contracts = 0usize;
+        // Group indices are assigned in node-id order (the graph's BTreeMap),
+        // so every index below is deterministic.
+        let mut groups: Vec<Group> = Vec::new();
+        let mut node_ids: Vec<NodeId> = Vec::new();
+        let mut interned: HashMap<(GroupKind, &str), u32> = HashMap::new();
+        let mut node_group: HashMap<NodeId, u32> = HashMap::with_capacity(graph.node_count());
         for node in graph.all_nodes() {
             let (name, kind) = group_of(node, repo_names, by_root);
-            let (key, display, kind) =
-                if kind == GroupKind::Service && focus.as_deref() == Some(name.as_str()) {
-                    (
-                        format!("{}\u{0}{}", node.name, node.id),
-                        format!("{} [{}]", node.name, kind_label(node.kind)),
-                        GroupKind::Contract,
-                    )
-                } else {
-                    (name.clone(), name, kind)
-                };
-            let key = (kind, key);
-            let g = groups.entry(key.clone()).or_insert_with(|| Group {
-                name: display,
-                kind,
-                contracts: 0,
-                by_kind: BTreeMap::new(),
-                internal_edges: 0,
-                folded: 0,
-            });
-            g.contracts += 1;
-            if kind != GroupKind::Contract {
+            let gi = if kind == GroupKind::Service && focus.as_deref() == Some(name) {
+                groups.push(Group {
+                    name: format!("{} [{}]", node.name, kind_label(node.kind)),
+                    kind: GroupKind::Contract,
+                    contracts: 1,
+                    by_kind: BTreeMap::new(),
+                    internal_edges: 0,
+                    folded: 0,
+                });
+                node_ids.push(node.id);
+                (groups.len() - 1) as u32
+            } else {
+                let gi = *interned.entry((kind, name)).or_insert_with(|| {
+                    groups.push(Group {
+                        name: name.to_string(),
+                        kind,
+                        contracts: 0,
+                        by_kind: BTreeMap::new(),
+                        internal_edges: 0,
+                        folded: 0,
+                    });
+                    node_ids.push(0);
+                    (groups.len() - 1) as u32
+                });
+                let g = &mut groups[gi as usize];
+                g.contracts += 1;
                 *g.by_kind.entry(kind_label(node.kind)).or_default() += 1;
-            }
-            node_group.insert(node.id, key);
-            total_contracts += 1;
+                gi
+            };
+            node_group.insert(node.id, gi);
         }
 
-        // Cross-group edge weights: (from, to, kind) -> (count, weakest, kind).
-        let mut weights: BTreeMap<(&Key, &Key, u8), (usize, u8, EdgeKind)> = BTreeMap::new();
-        let mut degree: HashMap<&Key, usize> = HashMap::new();
+        // Cross-group edge weights per (from, to, kind).
+        let mut weights: HashMap<(u32, u32, u8), AggLink> = HashMap::new();
+        let mut degree = vec![0usize; groups.len()];
         let edges = graph.all_edges();
         for e in edges {
-            let (Some(from), Some(to)) = (node_group.get(&e.from), node_group.get(&e.to)) else {
+            let (Some(&from), Some(&to)) = (node_group.get(&e.from), node_group.get(&e.to)) else {
                 continue;
             };
             if from == to {
-                if let Some(g) = groups.get_mut(from) {
-                    g.internal_edges += 1;
-                }
+                groups[from as usize].internal_edges += 1;
                 continue;
             }
             let w = weights
                 .entry((from, to, e.kind as u8))
-                .or_insert((0, 0, e.kind));
-            w.0 += 1;
-            w.1 = w.1.max(confidence_rank(e.confidence));
-            *degree.entry(from).or_default() += 1;
-            *degree.entry(to).or_default() += 1;
+                .or_insert_with(|| AggLink {
+                    from,
+                    to,
+                    kind: e.kind,
+                    count: 0,
+                    weakest: 0,
+                });
+            w.count += 1;
+            w.weakest = w.weakest.max(confidence_rank(e.confidence));
+            degree[from as usize] += 1;
+            degree[to as usize] += 1;
+        }
+        let mut links: Vec<AggLink> = weights.into_values().collect();
+        links.sort_unstable_by_key(|l| (l.from, l.to, l.kind as u8));
+
+        let mut focus_weight = vec![0usize; groups.len()];
+        if focus.is_some() {
+            for l in &links {
+                let (a, b) = (l.from as usize, l.to as usize);
+                match (groups[a].kind, groups[b].kind) {
+                    (GroupKind::Contract, GroupKind::Contract) => {}
+                    (GroupKind::Contract, _) => focus_weight[b] += l.count,
+                    (_, GroupKind::Contract) => focus_weight[a] += l.count,
+                    _ => {}
+                }
+            }
         }
 
-        // Ranking: best-connected, then largest, then by key.
-        let mut ranked: Vec<&Key> = groups.keys().collect();
-        ranked.sort_by(|a, b| {
-            let da = degree.get(a).copied().unwrap_or(0);
-            let db = degree.get(b).copied().unwrap_or(0);
-            db.cmp(&da)
-                .then_with(|| groups[*b].contracts.cmp(&groups[*a].contracts))
-                .then_with(|| a.cmp(b))
-        });
+        let mut agg = Self {
+            groups,
+            node_ids,
+            links,
+            degree,
+            focus_weight,
+            ranked: Vec::new(),
+            total_contracts: graph.node_count(),
+            total_edges: edges.len(),
+            by_root,
+            focus,
+        };
+        let mut ranked: Vec<u32> = (0..agg.groups.len() as u32).collect();
+        ranked.sort_unstable_by(|&a, &b| agg.rank_cmp(a, b));
+        agg.ranked = ranked;
+        agg
+    }
 
-        // Drawn groups. Zoom: the focused service's best-connected contracts,
-        // then the groups they link to. Otherwise: the top groups overall.
+    /// The service `build` zoomed into, if it was found.
+    pub fn focus(&self) -> Option<&str> {
+        self.focus.as_deref()
+    }
+
+    /// Best-connected, then largest, then by `(kind, name, node id)` — a total
+    /// order, so ties never depend on insertion or hashing.
+    fn rank_cmp(&self, a: u32, b: u32) -> std::cmp::Ordering {
+        let (ga, gb) = (&self.groups[a as usize], &self.groups[b as usize]);
+        self.degree[b as usize]
+            .cmp(&self.degree[a as usize])
+            .then_with(|| gb.contracts.cmp(&ga.contracts))
+            .then_with(|| ga.kind.cmp(&gb.kind))
+            .then_with(|| ga.name.cmp(&gb.name))
+            .then_with(|| self.node_ids[a as usize].cmp(&self.node_ids[b as usize]))
+    }
+
+    /// Draws at most `max_groups` groups (in a zoom: `max_focus_contracts` of
+    /// the service's contracts plus `max_groups` of the groups they link to)
+    /// and folds the rest into one "other ..." node per kind.
+    pub fn select(&self, opts: &TopologyOptions) -> Topology {
+        const UNSEEN: u32 = u32::MAX;
         let max_groups = opts.max_groups.max(1);
-        let shown: Vec<&Key> = if focus.is_some() {
-            let contracts: Vec<&Key> = ranked
+        let shown: Vec<u32> = if self.focus.is_some() {
+            let contracts = self
+                .ranked
                 .iter()
                 .copied()
-                .filter(|k| k.0 == GroupKind::Contract)
-                .take(opts.max_focus_contracts.max(1))
+                .filter(|&g| self.groups[g as usize].kind == GroupKind::Contract)
+                .take(opts.max_focus_contracts.max(1));
+            // Neighbours ranked by how much they talk to *this* service, not by
+            // their global degree (a hub linked once must not crowd out a
+            // service linked fifty times).
+            let mut neighbours: Vec<u32> = (0..self.groups.len() as u32)
+                .filter(|&g| self.focus_weight[g as usize] > 0)
                 .collect();
-            let mut neighbours: Vec<&Key> = weights
-                .keys()
-                .filter_map(|(a, b, _)| match (a.0, b.0) {
-                    (GroupKind::Contract, GroupKind::Contract) => None,
-                    (GroupKind::Contract, _) => Some(*b),
-                    (_, GroupKind::Contract) => Some(*a),
-                    _ => None,
-                })
-                .collect();
-            neighbours.sort_by(|a, b| {
-                let da = degree.get(a).copied().unwrap_or(0);
-                let db = degree.get(b).copied().unwrap_or(0);
-                db.cmp(&da).then_with(|| a.cmp(b))
+            neighbours.sort_unstable_by(|&a, &b| {
+                self.focus_weight[b as usize]
+                    .cmp(&self.focus_weight[a as usize])
+                    .then_with(|| self.rank_cmp(a, b))
             });
-            neighbours.dedup();
             neighbours.truncate(max_groups);
-            contracts.into_iter().chain(neighbours).collect()
+            contracts.chain(neighbours).collect()
         } else {
-            ranked.iter().copied().take(max_groups).collect()
+            self.ranked.iter().copied().take(max_groups).collect()
         };
 
-        let total_groups = groups.len();
+        let mut index = vec![UNSEEN; self.groups.len()];
         let mut out_groups: Vec<Group> = Vec::new();
-        let mut index: HashMap<&Key, usize> = HashMap::new();
-        for key in &shown {
-            if index.contains_key(*key) {
-                continue;
+        for g in shown {
+            if index[g as usize] == UNSEEN {
+                index[g as usize] = out_groups.len() as u32;
+                out_groups.push(self.groups[g as usize].clone());
             }
-            index.insert(*key, out_groups.len());
-            out_groups.push(groups[*key].clone());
         }
 
         // Fold everything else into one "other ..." node per kind.
-        let mut hidden: Vec<(String, usize)> = Vec::new();
-        let mut other_idx: HashMap<GroupKind, usize> = HashMap::new();
-        for key in &ranked {
-            if index.contains_key(*key) {
+        let mut hidden: Vec<(String, usize, GroupKind)> = Vec::new();
+        let mut other_idx: BTreeMap<GroupKind, u32> = BTreeMap::new();
+        for &g in &self.ranked {
+            if index[g as usize] != UNSEEN {
                 continue;
             }
-            let g = &groups[*key];
-            hidden.push((g.name.clone(), g.contracts));
-            let bucket = g.kind;
+            let group = &self.groups[g as usize];
+            hidden.push((group.name.clone(), group.contracts, group.kind));
+            let bucket = group.kind;
             let idx = *other_idx.entry(bucket).or_insert_with(|| {
                 out_groups.push(Group {
                     name: match bucket {
                         GroupKind::Topic => "other topics".to_string(),
                         GroupKind::Contract => {
-                            format!("other {} contracts", focus.as_deref().unwrap_or_default())
+                            format!(
+                                "other {} contracts",
+                                self.focus.as_deref().unwrap_or_default()
+                            )
                         }
                         _ => "other services".to_string(),
                     },
@@ -308,33 +403,31 @@ impl Topology {
                     internal_edges: 0,
                     folded: 0,
                 });
-                out_groups.len() - 1
+                (out_groups.len() - 1) as u32
             });
-            let other = &mut out_groups[idx];
-            other.contracts += g.contracts;
+            let other = &mut out_groups[idx as usize];
+            other.contracts += group.contracts;
             other.folded += 1;
-            index.insert(*key, idx);
+            index[g as usize] = idx;
         }
         hidden.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Re-fold links onto drawn nodes; a link folded onto itself disappears.
-        let mut folded: BTreeMap<(usize, usize, u8), (usize, u8, EdgeKind)> = BTreeMap::new();
-        for ((from, to, kind_idx), (count, conf, kind)) in &weights {
-            let (Some(&f), Some(&t)) = (index.get(*from), index.get(*to)) else {
-                continue;
-            };
+        let mut folded: BTreeMap<(u32, u32, u8), (usize, u8, EdgeKind)> = BTreeMap::new();
+        for l in &self.links {
+            let (f, t) = (index[l.from as usize], index[l.to as usize]);
             if f == t {
                 continue;
             }
-            let entry = folded.entry((f, t, *kind_idx)).or_insert((0, 0, *kind));
-            entry.0 += count;
-            entry.1 = entry.1.max(*conf);
+            let entry = folded.entry((f, t, l.kind as u8)).or_insert((0, 0, l.kind));
+            entry.0 += l.count;
+            entry.1 = entry.1.max(l.weakest);
         }
         let links = folded
             .into_iter()
             .map(|((from, to, _), (count, conf, kind))| Link {
-                from,
-                to,
+                from: from as usize,
+                to: to as usize,
                 kind,
                 count,
                 weakest: match conf {
@@ -345,19 +438,82 @@ impl Topology {
             })
             .collect();
 
-        Self {
+        Topology {
             groups: out_groups,
             links,
-            total_groups,
-            total_contracts,
-            total_edges: edges.len(),
+            total_groups: self.groups.len(),
+            total_contracts: self.total_contracts,
+            total_edges: self.total_edges,
             hidden,
-            grouping: if by_root { "root" } else { "package" },
-            focus,
+            grouping: if self.by_root { "root" } else { "package" },
+            focus: self.focus.clone(),
         }
     }
+}
 
-    fn caption(g: &Group) -> String {
+/// Escapes text for a double-quoted Mermaid label with Mermaid entity codes:
+/// a name from scanned source (topic literal, package, root) can neither end
+/// the label (`"`), inject markup (`<`, `>`), forge an entity (`#`) nor break
+/// the line-based syntax (newlines).
+fn mermaid_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("#quot;"),
+            '<' => out.push_str("#lt;"),
+            '>' => out.push_str("#gt;"),
+            '#' => out.push_str("#35;"),
+            // A label opening with a backtick is a Mermaid markdown string.
+            '`' => out.push_str("#96;"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Longest name drawn, in bytes. Topic names are string literals from scanned
+/// source and package/root names are unbounded too: without a cap, one huge
+/// name makes even the smallest view (`max_groups = 1`) exceed the 48 KB cap,
+/// and the central truncation would then cut the JSON/HTML document in half.
+pub const MAX_NAME_BYTES: usize = 120;
+
+/// `s` shortened to [`MAX_NAME_BYTES`] (on a char boundary, marked with `…`).
+pub fn display_name(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_NAME_BYTES {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut cut = MAX_NAME_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}…", &s[..cut]))
+}
+
+/// A name inside Markdown inline code: no backtick can close it early and no
+/// newline can start a new block.
+pub fn inline_code_text(s: &str) -> String {
+    display_name(s).replace('`', "'").replace(['\n', '\r'], " ")
+}
+
+impl Topology {
+    pub fn build(graph: &ContractGraph, repo_names: &[String], opts: &TopologyOptions) -> Self {
+        Aggregate::build(graph, repo_names, opts.focus.as_deref()).select(opts)
+    }
+
+    /// Node caption: `(title, detail)`, e.g. `("checkout", "30 interface · 503 class")`.
+    fn caption(g: &Group) -> (String, Option<String>) {
+        if g.kind == GroupKind::Other {
+            return (
+                format!(
+                    "{} ({} groups, {} contracts)",
+                    display_name(&g.name),
+                    g.folded,
+                    g.contracts
+                ),
+                None,
+            );
+        }
         let mut parts: Vec<String> = g
             .by_kind
             .iter()
@@ -365,19 +521,8 @@ impl Topology {
             .map(|(k, n)| format!("{n} {k}"))
             .collect();
         parts.truncate(3);
-        match g.kind {
-            GroupKind::Other => format!(
-                "{} ({} groups, {} contracts)",
-                g.name, g.folded, g.contracts
-            ),
-            _ if parts.is_empty() => g.name.clone(),
-            _ => format!("{}<br/>{}", g.name, parts.join(" · ")),
-        }
-    }
-
-    fn sanitize(s: &str) -> String {
-        s.replace('"', "'")
-            .replace(['[', ']', '{', '}', '(', ')', '<', '>'], " ")
+        let detail = (!parts.is_empty()).then(|| parts.join(" · "));
+        (display_name(&g.name).into_owned(), detail)
     }
 
     /// Mermaid flowchart of the aggregated topology.
@@ -385,11 +530,16 @@ impl Topology {
         let mut out = String::with_capacity(4096);
         out.push_str(&format!(
             "%% CausalMesh service topology: {}\n",
-            Self::sanitize(workspace_name)
+            workspace_name.replace(['\n', '\r'], " ")
         ));
         out.push_str("graph LR\n");
         for (i, g) in self.groups.iter().enumerate() {
-            let label = Self::caption(g).replace('"', "'");
+            let (title, detail) = Self::caption(g);
+            let mut label = mermaid_text(&title);
+            if let Some(d) = detail {
+                label.push_str("<br/>");
+                label.push_str(&mermaid_text(&d));
+            }
             let (open, close) = match g.kind {
                 GroupKind::Topic => ("([", "])"),
                 GroupKind::Other => ("[/", "/]"),
@@ -408,15 +558,10 @@ impl Topology {
                 EdgeConfidence::Ambiguous => label.push_str(" (ambiguous)"),
                 EdgeConfidence::Exact => {}
             }
-            let arrow = match l.kind {
-                EdgeKind::Produces | EdgeKind::DispatchesTo => "==",
-                EdgeKind::Consumes => "-.",
-                _ => "--",
-            };
-            let tail = match l.kind {
-                EdgeKind::Produces | EdgeKind::DispatchesTo => "==>",
-                EdgeKind::Consumes => ".->",
-                _ => "-->",
+            let (arrow, tail) = match l.kind {
+                EdgeKind::Produces | EdgeKind::DispatchesTo => ("==", "==>"),
+                EdgeKind::Consumes => ("-.", ".->"),
+                _ => ("--", "-->"),
             };
             out.push_str(&format!(
                 "  g{} {arrow} \"{label}\" {tail} g{}\n",
@@ -432,16 +577,23 @@ impl Topology {
             .groups
             .iter()
             .enumerate()
-            .map(|(i, g)| WebNode {
-                id: i as u32,
-                name: g.name.clone(),
-                kind: format!("{:?}", g.kind),
-                file_path: String::new(),
-                line_start: 0,
-                line_end: 0,
-                package: g.name.clone(),
-                repo: g.name.clone(),
-                signature: Some(Self::caption(g).replace("<br/>", " — ")),
+            .map(|(i, g)| {
+                let (title, detail) = Self::caption(g);
+                let name = display_name(&g.name).into_owned();
+                WebNode {
+                    id: i as u32,
+                    name: name.clone(),
+                    kind: format!("{:?}", g.kind),
+                    file_path: String::new(),
+                    line_start: 0,
+                    line_end: 0,
+                    package: name.clone(),
+                    repo: name,
+                    signature: Some(match detail {
+                        Some(d) => format!("{title} — {d}"),
+                        None => title,
+                    }),
+                }
             })
             .collect::<Vec<_>>();
         let edges = self
@@ -480,20 +632,36 @@ impl Topology {
                 "\n{} groups are folded into \"other\". Largest hidden:\n",
                 self.hidden.len()
             ));
-            for (name, contracts) in self.hidden.iter().take(5) {
-                out.push_str(&format!("  - `{name}` ({contracts} contracts)\n"));
+            for (name, contracts, kind) in self.hidden.iter().take(5) {
+                let what = match kind {
+                    GroupKind::Topic => " — topic",
+                    GroupKind::Contract => " — contract",
+                    _ => "",
+                };
+                out.push_str(&format!(
+                    "  - `{}` ({contracts} contracts{what})\n",
+                    inline_code_text(name)
+                ));
             }
         }
-        let example = self.hidden.first().map(|(n, _)| n.clone()).or_else(|| {
-            self.groups
-                .iter()
-                .find(|g| g.kind == GroupKind::Service)
-                .map(|g| g.name.clone())
-        });
         if self.focus.is_none() {
+            // Only a *service* can be zoomed into: never suggest a topic.
+            let example = self
+                .hidden
+                .iter()
+                .find(|(name, _, kind)| *kind == GroupKind::Service && name.len() <= MAX_NAME_BYTES)
+                .map(|(name, _, _)| name.as_str())
+                .or_else(|| {
+                    self.groups
+                        .iter()
+                        .find(|g| g.kind == GroupKind::Service && g.name.len() <= MAX_NAME_BYTES)
+                        .map(|g| g.name.as_str())
+                });
             if let Some(name) = example {
+                let quoted = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
                 out.push_str(&format!(
-                    "\n👉 Zoom into one service: `visualize_mesh(service: \"{name}\")`.\n"
+                    "\n👉 Zoom into one service: `visualize_mesh(service: {})`.\n",
+                    quoted.replace('`', "'")
                 ));
             }
         }
@@ -613,6 +781,149 @@ mod tests {
         assert!(!names.contains(&"misc-svc"), "{names:?}");
         let m = t.to_mermaid("ws");
         assert!(m.contains("CallsRpc"), "{m}");
+    }
+
+    #[test]
+    fn names_from_source_cannot_break_the_mermaid_label() {
+        let mut g = ContractGraph::new();
+        let a = g.add_node(node("A", "evil\"]\ng9[x", 0, NodeKind::ServiceClass));
+        let b = g.add_node(node(
+            "B",
+            "<img src=x onerror=alert(1)>#quot;",
+            0,
+            NodeKind::ServiceClass,
+        ));
+        g.add_edge(edge(a, b, EdgeKind::CallsRpc));
+        let t = Topology::build(&g, &["root".into()], &TopologyOptions::default());
+        let m = t.to_mermaid("ws\ninjected");
+        assert!(!m.contains("<img"), "{m}");
+        assert!(m.contains("evil#quot;] g9[x"), "{m}");
+        assert!(m.contains("#35;quot;"), "entity forged: {m}");
+        // One comment line, one header, two nodes, one link — no injected line.
+        assert_eq!(m.lines().count(), 5, "{m}");
+    }
+
+    #[test]
+    fn focus_prefers_the_exact_case_match() {
+        let mut g = ContractGraph::new();
+        g.add_node(node("X", "Api", 0, NodeKind::ServiceClass));
+        g.add_node(node("Y", "api", 0, NodeKind::ServiceClass));
+        let zoom = |f: &str| {
+            Topology::build(
+                &g,
+                &["root".into()],
+                &TopologyOptions {
+                    focus: Some(f.into()),
+                    ..Default::default()
+                },
+            )
+            .focus
+        };
+        assert_eq!(zoom("api").as_deref(), Some("api"));
+        assert_eq!(zoom("Api").as_deref(), Some("Api"));
+        assert_eq!(zoom("API").as_deref(), Some("Api"), "first in byte order");
+    }
+
+    #[test]
+    fn footer_never_suggests_zooming_into_a_topic() {
+        let mut g = ContractGraph::new();
+        let s = g.add_node(node("Svc", "svc", 0, NodeKind::ServiceClass));
+        for i in 0..5 {
+            let mut t = node(&format!("topic.{i}"), "", RepoId::MAX, NodeKind::KafkaTopic);
+            t.repo_id = RepoId::MAX;
+            let t = g.add_node(t);
+            g.add_edge(edge(s, t, EdgeKind::Produces));
+        }
+        let t = Topology::build(
+            &g,
+            &["root".into()],
+            &TopologyOptions {
+                max_groups: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            t.hidden.iter().all(|h| h.2 == GroupKind::Topic),
+            "{:?}",
+            t.hidden
+        );
+        let footer = t.footer();
+        assert!(
+            footer.contains("visualize_mesh(service: \"svc\")"),
+            "{footer}"
+        );
+        assert!(footer.contains("— topic"), "{footer}");
+    }
+
+    #[test]
+    fn zoom_ranks_neighbours_by_links_to_the_focused_service() {
+        let mut g = ContractGraph::new();
+        let f = g.add_node(node("F", "focus", 0, NodeKind::ServiceClass));
+        // `hub` is linked once to the focus but to many others.
+        let hub = g.add_node(node("H", "hub", 0, NodeKind::ServiceClass));
+        g.add_edge(edge(f, hub, EdgeKind::CallsRpc));
+        for i in 0..20 {
+            let o = g.add_node(node(
+                &format!("O{i}"),
+                &format!("o{i:02}"),
+                0,
+                NodeKind::ServiceClass,
+            ));
+            g.add_edge(edge(o, hub, EdgeKind::CallsRpc));
+        }
+        // `peer` is linked to the focus three times.
+        let peer = g.add_node(node("P", "peer", 0, NodeKind::ServiceClass));
+        for _ in 0..3 {
+            g.add_edge(edge(f, peer, EdgeKind::CallsRpc));
+        }
+        let t = Topology::build(
+            &g,
+            &["root".into()],
+            &TopologyOptions {
+                focus: Some("focus".into()),
+                max_groups: 1,
+                ..Default::default()
+            },
+        );
+        let names: Vec<_> = t.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"peer"), "{names:?}");
+        assert!(!names.contains(&"hub"), "{names:?}");
+    }
+
+    /// The shrink loop builds the aggregate once and re-selects: that must be
+    /// exactly what a from-scratch build gives.
+    #[test]
+    fn select_on_one_aggregate_matches_a_fresh_build() {
+        let (g, repos) = two_root_graph();
+        let agg = Aggregate::build(&g, &repos, None);
+        for max_groups in [1, 2, 40] {
+            let opts = TopologyOptions {
+                max_groups,
+                ..Default::default()
+            };
+            assert_eq!(
+                agg.select(&opts).to_mermaid("ws"),
+                Topology::build(&g, &repos, &opts).to_mermaid("ws")
+            );
+        }
+    }
+
+    /// A huge name (a topic literal, a package) is shortened everywhere it is
+    /// drawn, so no single name can blow the 48 KB cap of the smallest view.
+    #[test]
+    fn huge_names_are_capped_in_every_rendering() {
+        let huge = "x".repeat(100_000);
+        let mut g = ContractGraph::new();
+        let a = g.add_node(node("A", &huge, 0, NodeKind::ServiceClass));
+        let b = g.add_node(node("B", "small", 0, NodeKind::ServiceClass));
+        g.add_edge(edge(a, b, EdgeKind::CallsRpc));
+        let t = Topology::build(&g, &["root".into()], &TopologyOptions::default());
+        assert!(t.to_mermaid("ws").len() < 2048);
+        assert!(t.footer().len() < 2048, "{}", t.footer());
+        let json = serde_json::to_string(&t.to_payload("ws")).expect("json");
+        assert!(json.len() < 4096, "{}", json.len());
+        // A shortened name is never offered as a zoom target (it would not match).
+        assert!(!t.footer().contains("xxx…\""), "{}", t.footer());
     }
 
     #[test]

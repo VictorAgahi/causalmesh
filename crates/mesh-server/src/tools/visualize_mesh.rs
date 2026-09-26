@@ -2,7 +2,8 @@ use crate::indexer::WorkspaceIndexer;
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr};
-use mesh_parsers::{GraphRenderer, Topology, TopologyOptions};
+use mesh_parsers::topology::{display_name, inline_code_text};
+use mesh_parsers::{Aggregate, GraphRenderer, TopologyOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,12 @@ impl McpTool for VisualizeMeshTool {
         args._meta.as_ref()
     }
 
+    fn returns_document(args: &Self::Args) -> bool {
+        args.format
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("json") || f.eq_ignore_ascii_case("html"))
+    }
+
     fn truncation_hint(_args: &Self::Args, state: &AppState) -> Option<String> {
         let snapshot = state.snapshot();
         let graph = &snapshot.contract_graph;
@@ -93,19 +100,24 @@ impl McpTool for VisualizeMeshTool {
             ..TopologyOptions::default()
         };
 
+        // The O(contracts + edges) fold runs once; the shrink loop below only
+        // re-selects over the (small) aggregated groups and links.
+        let aggregate = Aggregate::build(graph, &repo_names, opts.focus.as_deref());
+        if let (Some(asked), None) = (&opts.focus, aggregate.focus()) {
+            return Err((
+                -32602,
+                format!(
+                    "No service named '{}'. Call visualize_mesh without `service` to list them.",
+                    display_name(asked)
+                ),
+            ));
+        }
+
         // Shrink until the rendering fits the budget: the same "show the top
         // groups, fold the rest, say how to zoom" contract `smart_search`'s
         // truncation follows, instead of cutting a document in half.
         loop {
-            let topology = Topology::build(graph, &repo_names, &opts);
-            if let (Some(asked), None) = (&opts.focus, &topology.focus) {
-                return Err((
-                    -32602,
-                    format!(
-                        "No service named '{asked}'. Call visualize_mesh without `service` to list them."
-                    ),
-                ));
-            }
+            let topology = aggregate.select(&opts);
             let body = match format_choice.as_str() {
                 "html" => GraphRenderer::payload_to_html(&topology.to_payload(workspace_name)),
                 "json" => serde_json::to_string_pretty(&topology.to_payload(workspace_name))
@@ -115,19 +127,30 @@ impl McpTool for VisualizeMeshTool {
                     topology
                         .focus
                         .as_deref()
-                        .map(|f| format!(" — service `{f}`"))
+                        .map(|f| format!(" — service `{}`", inline_code_text(f)))
                         .unwrap_or_default(),
                     topology.to_mermaid(workspace_name)
                 ),
             };
-            let shrinkable = opts.max_groups > 1 || opts.max_focus_contracts > 1;
-            if body.len() <= RENDER_BUDGET || !shrinkable {
+            if body.len() <= RENDER_BUDGET {
                 let text = match format_choice.as_str() {
                     // The page / document must stay parseable: no appended prose.
                     "html" | "json" => body,
                     _ => format!("{body}\n{}", topology.footer()),
                 };
                 return Ok(ToolOutput::text(text));
+            }
+            if opts.max_groups <= 1 && opts.max_focus_contracts <= 1 {
+                // Names are capped, so this is not expected; but a document cut
+                // by the central 48 KB truncation would be unparseable, so say
+                // so instead of returning half of one.
+                return Err((
+                    -32602,
+                    format!(
+                        "The smallest {format_choice} view is still {} KB, over the 48 KB cap. Use format 'mermaid' or zoom with `service`.",
+                        body.len() / 1024
+                    ),
+                ));
             }
             opts.max_groups = (opts.max_groups / 2).max(1);
             opts.max_focus_contracts = (opts.max_focus_contracts / 2).max(1);

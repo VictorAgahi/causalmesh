@@ -253,8 +253,9 @@ impl GraphRenderer {
     /// The standalone HTML application around any payload (full graph, or the
     /// aggregated `Topology` view `visualize_mesh` returns).
     pub fn payload_to_html(payload: &WebGraphPayload) -> String {
-        let workspace_name = payload.workspace_name.as_str();
-        let json_data = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+        let workspace_name = html_escape(&payload.workspace_name);
+        let json_data =
+            script_safe_json(serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()));
 
         format!(
             r#"<!DOCTYPE html>
@@ -624,6 +625,9 @@ impl GraphRenderer {
 
   <script>
     const rawData = JSON.parse(document.getElementById('graph-data').textContent);
+    // Names come from scanned source (topic literals, packages, roots): never
+    // let one reach innerHTML unescaped.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
 
     const canvas = document.getElementById('viewport');
     const ctx = canvas.getContext('2d');
@@ -1004,7 +1008,7 @@ impl GraphRenderer {
             else if (e.kind === 'DispatchesTo') color = '#ec4899';
             else color = '#64748b';
 
-            badge.innerHTML = `<span style="color: ${{color}}; font-weight: 600; font-size: 10px;">${{isOutgoing ? '' : arrowIcon + ' '}}${{actionLabel}}${{isOutgoing ? ' ' + arrowIcon : ''}}</span> <span style="color: #fff; font-family: var(--font-mono); font-size: 11px;">${{other ? other.name : 'unknown'}}</span>`;
+            badge.innerHTML = `<span style="color: ${{color}}; font-weight: 600; font-size: 10px;">${{isOutgoing ? '' : arrowIcon + ' '}}${{esc(actionLabel)}}${{isOutgoing ? ' ' + arrowIcon : ''}}</span> <span style="color: #fff; font-family: var(--font-mono); font-size: 11px;">${{esc(other ? other.name : 'unknown')}}</span>`;
             connDiv.appendChild(badge);
           }});
         }}
@@ -1256,6 +1260,44 @@ impl GraphRenderer {
     }
 }
 
+/// Escapes text for an HTML text/attribute context.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Makes serialized JSON safe to inline in a `<script>` element: a name
+/// containing `</script>` (or `<!--`) must not end the element early. `<`, `>`
+/// and `&` only ever occur inside JSON strings, where `\u003c`-style escapes
+/// are equivalent, so the payload still parses to the same value.
+fn script_safe_json(json: String) -> String {
+    if !json.contains(['<', '>', '&', '\u{2028}', '\u{2029}']) {
+        return json;
+    }
+    let mut out = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,5 +1354,39 @@ mod tests {
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("CausalMesh Interactive Topology"));
         assert!(html.contains("OrderCreatedEvent"));
+    }
+
+    /// A name from scanned source must not close the inline JSON `<script>`
+    /// element (stored XSS in the standalone page), and must round-trip.
+    #[test]
+    fn html_payload_cannot_break_out_of_its_script_element() {
+        let evil = "</script><script>alert(1)</script><!--";
+        let payload = WebGraphPayload {
+            workspace_name: "<b>ws</b>".to_string(),
+            total_nodes: 1,
+            total_edges: 0,
+            nodes: vec![WebNode {
+                id: 0,
+                name: evil.to_string(),
+                kind: "Service".to_string(),
+                file_path: String::new(),
+                line_start: 0,
+                line_end: 0,
+                package: evil.to_string(),
+                repo: evil.to_string(),
+                signature: None,
+            }],
+            edges: vec![],
+        };
+        let html = GraphRenderer::payload_to_html(&payload);
+        assert!(!html.contains(evil), "raw name reached the page");
+        assert!(!html.contains("<b>ws</b>"), "workspace name not escaped");
+        let start = html
+            .find("id=\"graph-data\" type=\"application/json\">")
+            .expect("data");
+        let rest = &html[start..];
+        let body = &rest[rest.find('>').expect(">") + 1..rest.find("</script>").expect("end")];
+        let parsed: serde_json::Value = serde_json::from_str(body.trim()).expect("still JSON");
+        assert_eq!(parsed["nodes"][0]["name"], evil);
     }
 }

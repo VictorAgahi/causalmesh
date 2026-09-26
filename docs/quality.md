@@ -712,7 +712,8 @@ this "a harness issue to investigate" are resolved by this.
 | boot, 200k files + 48k contract mix | 307.8 s (step 3.4 head) | 17.0 s |
 | peak footprint, same corpus | 809 MB | 829 MB |
 | boot / peak footprint, 200k plain files | 13.9 s / 630 MB | 15.3 s / 637 MB |
-| `visualize_mesh`, 248k nodes | raw graph over 48 KB, cut mid-document (invalid HTML/JSON) | 4.3 KB mermaid / 16.9 KB json / 40.1 KB html, all valid |
+| `visualize_mesh`, 248k nodes | raw graph over 48 KB, cut mid-document (invalid HTML/JSON) | 4.3 KB mermaid / 16.9 KB json / 40.4 KB html, all valid |
+| `visualize_mesh` latency, 248k nodes (mermaid / json / html / zoom) | 516 / 522 / 1,034 / 1,603 ms (`000fa3f`) | 124 / 111 / 101 / 222 ms (step 3.6 review: the fold runs once, the shrink loop only re-selects) |
 | `tools/list` schemas | 7,696 bytes | 5,524 bytes (~540 tokens/session less) |
 
 **Still over budget, recorded not hidden**: the nightly budgets are derived from the 5k corpus and

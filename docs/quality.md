@@ -622,6 +622,20 @@ section left open, and eliminating an orphaned-daemon failure mode.
   binaries on this corpus (the harness's reload probe did not see its marker within 20 s) — a
   harness issue to investigate separately, not a 3.4 regression.
 
+### Step 3.4 review fixes (PR #29)
+
+- Indexed anchors are verified against the file on disk (in range, surrounding lines mention the
+  query or its `_`-insensitive form) before use; pattern / AsyncAPI / OpenAPI nodes now record
+  their real line (index-cache `SCHEMA_VERSION` 2). The bounded stub falls back to original lines.
+- Pages measure each rendered entry before accepting it, so the formatter's 48 KB truncation can
+  no longer silently drop a result that `next_offset` then skips. Fuzzy pages stop announcing
+  "More results" without a real further match and show lower-bound totals as `≥N`.
+- The cache key includes the raw scope spelling; cached pages re-stat the files they read.
+- `ValidatedScope` falls back to the CWD when a relative scope is absent under `workspace_root`.
+- Re-measured once (30k synthetic workspace, release, 6 cold queries): search p50 57 ms /
+  p95 112 ms (step 3.4: 67–88 / 96–109 ms). Boot 3.7 s, cold because the index-cache schema
+  bump orphans previous rows.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

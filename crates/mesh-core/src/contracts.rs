@@ -219,28 +219,48 @@ impl ContractGraph {
             return;
         }
 
-        // Targeted removal from the indices keyed by a node attribute we know.
+        // Targeted removal from the indices keyed by a node attribute we know,
+        // grouped by key: one `retain` per touched key rather than one per stale
+        // node. Per-node removal was O(k·N) when k stale nodes share a hot key —
+        // every file declaring `new`/`handle` lands in the same `name_to_nodes`
+        // bucket, so reloading 50k of 200k such files rescanned a 200k-long list
+        // 50k times.
+        let mut by_name: HashSet<CompactStr> = HashSet::new();
+        let mut by_package: HashSet<CompactStr> = HashSet::new();
+        let mut by_fqcn: HashSet<CompactStr> = HashSet::new();
         for id in &stale_set {
             let Some(node) = self.nodes.remove(id) else {
                 continue;
             };
-            Self::remove_from_index(&mut self.name_to_nodes, &node.name, *id);
             if node.kind == NodeKind::KafkaTopic
                 || node.kind == NodeKind::EventStream
                 || node.kind == NodeKind::Queue
             {
-                let key = CompactStr::new(node.name.to_lowercase());
-                Self::remove_from_index(&mut self.name_to_nodes, &key, *id);
+                by_name.insert(CompactStr::new(node.name.to_lowercase()));
             }
             if !node.package.is_empty() {
-                Self::remove_from_index(&mut self.package_to_nodes, &node.package, *id);
+                by_package.insert(node.package.clone());
             }
             if node.kind == NodeKind::GrpcMethod
                 || node.kind == NodeKind::GrpcService
                 || !node.package.is_empty()
             {
-                let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
-                Self::remove_from_index(&mut self.fqcn_to_node, &fqcn, *id);
+                by_fqcn.insert(CompactStr::new(format!("{}/{}", node.package, node.name)));
+            }
+            by_name.insert(node.name);
+        }
+        for (index, keys) in [
+            (&mut self.name_to_nodes, by_name),
+            (&mut self.package_to_nodes, by_package),
+            (&mut self.fqcn_to_node, by_fqcn),
+        ] {
+            for key in keys {
+                if let Some(ids) = index.get_mut(&key) {
+                    ids.retain(|x| !stale_set.contains(x));
+                    if ids.is_empty() {
+                        index.remove(&key);
+                    }
+                }
             }
         }
 
@@ -525,11 +545,20 @@ impl ContractGraph {
             .collect();
         import_facts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         let mut import_edges = Vec::new();
+        // `resolve_import_targets` depends on the importer only through its repo,
+        // and each call can scan a whole `name_to_nodes` bucket — which for a hot
+        // name is O(N). Memoized per (target, importer repo), N importers of one
+        // hot name cost one scan instead of N (was O(importers × bucket)).
+        let mut resolved: HashMap<(&CompactStr, RepoId), Vec<(NodeId, EdgeConfidence)>> =
+            HashMap::new();
         for (importer_id, target) in import_facts {
-            if !self.nodes.contains_key(&importer_id) {
+            let Some(importer_repo) = self.nodes.get(&importer_id).map(|n| n.repo_id) else {
                 continue;
-            }
-            for (to_id, confidence) in self.resolve_import_targets(importer_id, target.as_str()) {
+            };
+            let targets = resolved
+                .entry((target, importer_repo))
+                .or_insert_with(|| self.resolve_import_targets(importer_id, target.as_str()));
+            for &(to_id, confidence) in targets.iter() {
                 if edge_set.insert((importer_id, to_id, EdgeKind::Imports)) {
                     import_edges.push(ContractEdge {
                         from: importer_id,
@@ -696,14 +725,29 @@ impl ContractGraph {
             })
             .collect();
 
+        // Handlers indexed by every key the match predicate below can succeed on,
+        // so each proto method looks up its few candidates instead of testing
+        // every handler (was O(proto methods × handlers)). Candidates are then
+        // re-checked with the exact original predicate, so the edge set is
+        // unchanged — the index only prunes pairs that could never match.
+        let handler_index = HandlerIndex::build(
+            handlers
+                .iter()
+                .map(|h| (h.name, h.pascal_name.as_str(), h.signature)),
+        );
+
         let mut new_edges = Vec::new();
+        let mut candidates: Vec<usize> = Vec::new();
         for (proto_id, method_fqcn) in &proto_methods {
             let bare = method_fqcn
                 .split('.')
                 .next_back()
                 .unwrap_or(method_fqcn.as_str());
 
-            for h in &handlers {
+            candidates.clear();
+            handler_index.candidates(method_fqcn.as_str(), bare, &mut candidates);
+            for &i in &candidates {
+                let h = &handlers[i];
                 // Only an exact match against the full FQCN is trustworthy;
                 // case-folding, PascalCase normalization, and substring
                 // signature scraping are all bare-name heuristics that can
@@ -1268,6 +1312,128 @@ impl ContractGraph {
     }
 }
 
+/// Lookup index over gRPC handler candidates for `reconcile_edges`' `Implements`
+/// pass. Every way the pass's match predicate can succeed maps to a hash key:
+///
+/// - exact full name (`h.name == fqcn`);
+/// - ASCII-lowercased last `.` segment (`eq_ignore_ascii_case`, `bare_names_match`);
+/// - that segment with `_` removed (`bare_names_match`'s normalized form);
+/// - `pascal_name` verbatim;
+/// - for each identifier following a signature prefix (`@`, quotes, `fn `,
+///   `func `, `def `): its lowercased and normalized forms; the identifier
+///   itself goes into a sorted list, so `signature_contains_bare`'s
+///   `rest.starts_with(bare)` test is a binary-searched prefix range (one entry
+///   per identifier — indexing every prefix as its own key cost hundreds of MB
+///   of short-lived strings on a 40k-handler workspace).
+///
+/// A `bare` containing a non-identifier character can match a signature in ways
+/// no identifier key captures, so it falls back to every handler that has a
+/// signature — rare, and still exact.
+struct HandlerIndex {
+    keys: HashMap<String, Vec<usize>>,
+    /// `(signature identifier, handler)`, sorted: identifiers sharing a prefix
+    /// are contiguous.
+    sig_idents: Vec<(String, usize)>,
+    with_signature: Vec<usize>,
+}
+
+impl HandlerIndex {
+    const SIG_PREFIXES: [&'static str; 6] = ["@", "'", "\"", "fn ", "func ", "def "];
+
+    fn is_ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    fn last_segment(s: &str) -> &str {
+        s.split('.').next_back().unwrap_or(s)
+    }
+
+    fn normalized(s: &str) -> String {
+        s.bytes()
+            .filter(|b| *b != b'_')
+            .map(|b| b.to_ascii_lowercase() as char)
+            .collect()
+    }
+
+    fn build<'a>(handlers: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>) -> Self {
+        let mut keys: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut sig_idents: Vec<(String, usize)> = Vec::new();
+        let mut with_signature = Vec::new();
+        for (i, (name, pascal, signature)) in handlers.enumerate() {
+            let mut own: HashSet<String> = HashSet::new();
+            own.insert(format!("f:{name}"));
+            let last = Self::last_segment(name);
+            own.insert(format!("l:{}", last.to_ascii_lowercase()));
+            own.insert(format!("n:{}", Self::normalized(last)));
+            own.insert(format!("p:{pascal}"));
+            if let Some(sig) = signature {
+                with_signature.push(i);
+                for prefix in Self::SIG_PREFIXES {
+                    let mut offset = 0;
+                    while let Some(pos) = sig[offset..].find(prefix) {
+                        let start = offset + pos + prefix.len();
+                        let ident_len: usize = sig[start..]
+                            .chars()
+                            .take_while(|c| Self::is_ident_char(*c))
+                            .map(char::len_utf8)
+                            .sum();
+                        let ident = &sig[start..start + ident_len];
+                        if !ident.is_empty() {
+                            own.insert(format!("l:{}", ident.to_ascii_lowercase()));
+                            own.insert(format!("n:{}", Self::normalized(ident)));
+                            sig_idents.push((ident.to_string(), i));
+                        }
+                        offset += pos + prefix.len();
+                    }
+                }
+            }
+            for key in own {
+                keys.entry(key).or_default().push(i);
+            }
+        }
+        sig_idents.sort_unstable();
+        sig_idents.dedup();
+        Self {
+            keys,
+            sig_idents,
+            with_signature,
+        }
+    }
+
+    /// Every handler index that *may* match `(fqcn, bare)`, sorted and deduplicated.
+    fn candidates(&self, fqcn: &str, bare: &str, out: &mut Vec<usize>) {
+        let mut push = |key: String| {
+            if let Some(ids) = self.keys.get(&key) {
+                out.extend_from_slice(ids);
+            }
+        };
+        push(format!("f:{fqcn}"));
+        push(format!("l:{}", bare.to_ascii_lowercase()));
+        let norm = Self::normalized(bare);
+        if !norm.is_empty() {
+            push(format!("n:{norm}"));
+        }
+        push(format!("p:{bare}"));
+        if !bare.is_empty() {
+            // Identifiers starting with `bare` form one contiguous sorted run.
+            let start = self
+                .sig_idents
+                .partition_point(|(ident, _)| ident.as_str() < bare);
+            out.extend(
+                self.sig_idents[start..]
+                    .iter()
+                    .take_while(|(ident, _)| ident.starts_with(bare))
+                    .map(|&(_, i)| i),
+            );
+            if !bare.chars().all(Self::is_ident_char) {
+                out.extend_from_slice(&self.with_signature);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
 /// Allocation-free `haystack.to_lowercase().contains(&needle.to_lowercase())` for ASCII needles.
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
@@ -1412,6 +1578,75 @@ impl ContractGraph {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// `HandlerIndex` only prunes: every (handler, proto method) pair the
+    /// original all-pairs predicate accepts must be among its candidates.
+    #[test]
+    fn handler_index_never_drops_a_predicate_match() {
+        let names = [
+            "GetUser",
+            "getUser",
+            "get_user",
+            "GET_USER",
+            "svc.GetUser",
+            "a.b.get_user",
+            "GetUserById",
+            "ListUsers",
+            "",
+            "x.",
+            "Ünïcode",
+            "_",
+        ];
+        let sigs = [
+            None,
+            Some("fn get_user(&self)"),
+            Some("@GrpcMethod('UserService', 'GetUser')"),
+            Some("def getUserById(self): pass"),
+            Some("func (s *S) GetUser(ctx) error"),
+            Some("\"Get-User\" handler"),
+            Some("@Ünïcode"),
+        ];
+        let bares = [
+            ("pkg.UserService.GetUser", "GetUser"),
+            ("GetUser", "GetUser"),
+            ("x.getuser", "getuser"),
+            ("x.GetUserBy", "GetUserBy"),
+            ("x.Get-User", "Get-User"),
+            ("x.", ""),
+            ("x.Ünïcode", "Ünïcode"),
+            ("x.ListUsers", "ListUsers"),
+        ];
+        let handlers: Vec<(String, String, Option<&str>)> = names
+            .iter()
+            .flat_map(|n| {
+                sigs.iter()
+                    .map(move |s| (n.to_string(), crate::types::to_pascal_case(n), *s))
+            })
+            .collect();
+        let index = HandlerIndex::build(
+            handlers
+                .iter()
+                .map(|(n, p, s)| (n.as_str(), p.as_str(), *s)),
+        );
+        let mut cands = Vec::new();
+        for (fqcn, bare) in bares {
+            cands.clear();
+            index.candidates(fqcn, bare, &mut cands);
+            for (i, (name, pascal, sig)) in handlers.iter().enumerate() {
+                let matches = name == fqcn
+                    || name.eq_ignore_ascii_case(bare)
+                    || pascal == bare
+                    || ContractGraph::bare_names_match(name, bare)
+                    || sig.is_some_and(|s| ContractGraph::signature_contains_bare(s, bare));
+                if matches {
+                    assert!(
+                        cands.contains(&i),
+                        "index dropped handler {name:?}/{sig:?} for {fqcn:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_reverse_dependency_graph() {

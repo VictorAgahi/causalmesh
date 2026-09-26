@@ -363,14 +363,203 @@ impl PropertyRegistry {
         }
     }
 
-    /// Ingests YAML configuration and flattens nested keys with dot notation
+    /// Ingests YAML configuration and flattens nested keys with dot notation.
+    ///
+    /// Streams the first YAML document's events straight into flat
+    /// `(dotted.key, value)` pairs through a serde visitor — no
+    /// `serde_yaml::Value` tree is ever built, so peak memory is the flat pairs,
+    /// not a DOM several times the file size. Only the first document is read:
+    /// in a multi-document Spring file (`---` profile sections) it is the default
+    /// profile, and merging later profile documents over it would report
+    /// profile-specific overrides as the base value. (`serde_yaml::from_str`,
+    /// used before, rejected multi-document files outright, ingesting nothing.)
+    /// The pairs are only inserted once the document parsed cleanly, so a
+    /// malformed file still contributes nothing rather than a partial prefix.
     pub fn ingest_yaml_str(&mut self, content: &str) -> Result<(), serde_yaml::Error> {
-        let value: serde_yaml::Value = serde_yaml::from_str(content)?;
-        self.flatten_yaml_value("", &value);
+        let Some(document) = serde_yaml::Deserializer::from_str(content).next() else {
+            return Ok(());
+        };
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        serde::de::DeserializeSeed::deserialize(
+            yaml_flatten::FlattenSeed {
+                prefix: String::new(),
+                out: &mut pairs,
+            },
+            document,
+        )?;
+        for (key, value) in pairs {
+            self.insert_sanitized(&key, &value);
+        }
         Ok(())
     }
+}
 
-    fn flatten_yaml_value(&mut self, prefix: &str, value: &serde_yaml::Value) {
+/// Streaming YAML → flat dotted-key pairs. Mirrors the old `Value`-tree
+/// flattening exactly: string keys only (a non-string key skips its subtree),
+/// strings/numbers/bools become values (numbers formatted through
+/// `serde_yaml::Number`, as `Value`'s `Display` did), and sequences, nulls and
+/// tagged values are skipped.
+mod yaml_flatten {
+    use serde::de::{
+        self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
+    };
+    use std::fmt;
+
+    pub(super) struct FlattenSeed<'a> {
+        pub(super) prefix: String,
+        pub(super) out: &'a mut Vec<(String, String)>,
+    }
+
+    impl<'de> DeserializeSeed<'de> for FlattenSeed<'_> {
+        type Value = ();
+
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl FlattenSeed<'_> {
+        fn scalar(self, value: String) {
+            self.out.push((self.prefix, value));
+        }
+    }
+
+    impl<'de> Visitor<'de> for FlattenSeed<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a YAML value")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+            self.scalar(v.to_string());
+            Ok(())
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<(), E> {
+            self.scalar(v);
+            Ok(())
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
+            self.scalar(v.to_string());
+            Ok(())
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
+            self.scalar(serde_yaml::Number::from(v).to_string());
+            Ok(())
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
+            self.scalar(serde_yaml::Number::from(v).to_string());
+            Ok(())
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
+            self.scalar(serde_yaml::Number::from(v).to_string());
+            Ok(())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(())
+        }
+
+        fn visit_enum<A: de::EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+            // A tagged value (`!Tag value`); the tree flattening skipped these.
+            let (IgnoredAny, variant) = data.variant::<IgnoredAny>()?;
+            de::VariantAccess::newtype_variant::<IgnoredAny>(variant)?;
+            Ok(())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<StrKey>()? {
+                match key.0 {
+                    Some(k) => {
+                        let prefix = if self.prefix.is_empty() {
+                            k
+                        } else {
+                            format!("{}.{k}", self.prefix)
+                        };
+                        map.next_value_seed(FlattenSeed {
+                            prefix,
+                            out: &mut *self.out,
+                        })?;
+                    }
+                    None => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A mapping key: `Some` for a string key, `None` for any other shape.
+    struct StrKey(Option<String>);
+
+    impl<'de> de::Deserialize<'de> for StrKey {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl<'de> Visitor<'de> for KeyVisitor {
+                type Value = StrKey;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a mapping key")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<StrKey, E> {
+                    Ok(StrKey(Some(v.to_string())))
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<StrKey, E> {
+                    Ok(StrKey(Some(v)))
+                }
+                fn visit_bool<E: de::Error>(self, _: bool) -> Result<StrKey, E> {
+                    Ok(StrKey(None))
+                }
+                fn visit_i64<E: de::Error>(self, _: i64) -> Result<StrKey, E> {
+                    Ok(StrKey(None))
+                }
+                fn visit_u64<E: de::Error>(self, _: u64) -> Result<StrKey, E> {
+                    Ok(StrKey(None))
+                }
+                fn visit_f64<E: de::Error>(self, _: f64) -> Result<StrKey, E> {
+                    Ok(StrKey(None))
+                }
+                fn visit_unit<E: de::Error>(self) -> Result<StrKey, E> {
+                    Ok(StrKey(None))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StrKey, A::Error> {
+                    while seq.next_element::<IgnoredAny>()?.is_some() {}
+                    Ok(StrKey(None))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StrKey, A::Error> {
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(StrKey(None))
+                }
+            }
+            d.deserialize_any(KeyVisitor)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-streaming implementation, kept verbatim as the oracle.
+    fn dom_flatten(prefix: &str, value: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
         match value {
             serde_yaml::Value::Mapping(map) => {
                 for (k, v) in map {
@@ -380,27 +569,82 @@ impl PropertyRegistry {
                         } else {
                             format!("{prefix}.{k_str}")
                         };
-                        self.flatten_yaml_value(&new_prefix, v);
+                        dom_flatten(&new_prefix, v, out);
                     }
                 }
             }
-            serde_yaml::Value::String(s) => {
-                self.insert_sanitized(prefix, s);
-            }
-            serde_yaml::Value::Number(n) => {
-                self.insert_sanitized(prefix, &n.to_string());
-            }
-            serde_yaml::Value::Bool(b) => {
-                self.insert_sanitized(prefix, &b.to_string());
-            }
+            serde_yaml::Value::String(s) => out.push((prefix.to_string(), s.clone())),
+            serde_yaml::Value::Number(n) => out.push((prefix.to_string(), n.to_string())),
+            serde_yaml::Value::Bool(b) => out.push((prefix.to_string(), b.to_string())),
             _ => {}
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Streaming flattening yields exactly the pairs the `Value`-tree
+    /// flattening did, across every scalar/collection shape.
+    #[test]
+    fn streaming_yaml_matches_dom_flattening() {
+        let yaml = r#"
+server:
+  port: 8080
+  ratio: 1.0
+  big: 18446744073709551615
+  neg: -3
+  inf: .inf
+  enabled: true
+  name: "billing"
+  empty: ~
+  list: [a, b, {nested: x}]
+  1: numeric-key-skipped
+  ? [complex, key]
+  : skipped
+  tagged: !Custom value
+anchors:
+  base: &b
+    url: http://x
+  copy: *b
+"#;
+        let mut streamed = Vec::new();
+        let doc = serde_yaml::Deserializer::from_str(yaml)
+            .next()
+            .expect("doc");
+        serde::de::DeserializeSeed::deserialize(
+            yaml_flatten::FlattenSeed {
+                prefix: String::new(),
+                out: &mut streamed,
+            },
+            doc,
+        )
+        .expect("stream");
+        let dom: serde_yaml::Value = serde_yaml::from_str(yaml).expect("dom");
+        let mut expected = Vec::new();
+        dom_flatten("", &dom, &mut expected);
+        assert_eq!(streamed, expected);
+        assert!(streamed
+            .iter()
+            .any(|(k, v)| k == "server.ratio" && v == "1.0"));
+        assert!(streamed
+            .iter()
+            .any(|(k, v)| k == "anchors.copy.url" && v == "http://x"));
+    }
+
+    /// A multi-document Spring file used to be rejected wholesale; now its first
+    /// (default-profile) document is ingested and later profiles don't override it.
+    #[test]
+    fn multi_document_yaml_ingests_first_document_only() {
+        let mut reg = PropertyRegistry::new();
+        reg.ingest_yaml_str("app:\n  mode: default\n---\napp:\n  mode: prod\n")
+            .expect("multi-doc");
+        assert_eq!(reg.get("app.mode"), Some("default"));
+    }
+
+    /// Malformed YAML contributes nothing, not a partial prefix.
+    #[test]
+    fn malformed_yaml_is_atomic() {
+        let mut reg = PropertyRegistry::new();
+        assert!(reg.ingest_yaml_str("a: 1\nb: [unclosed\n").is_err());
+        assert_eq!(reg.get("a"), None);
+    }
 
     #[test]
     fn test_secret_redaction_properties() {

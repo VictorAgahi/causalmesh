@@ -636,6 +636,50 @@ section left open, and eliminating an orphaned-daemon failure mode.
   p95 112 ms (step 3.4: 67–88 / 96–109 ms). Boot 3.7 s, cold because the index-cache schema
   bump orphans previous rows.
 
+## Update (2026-09-26, step 3.5 — streaming YAML, doc memory, `derive()` without quadratic passes, 200k validation)
+
+- **`derive()` / `reconcile_edges` quadratic passes removed**:
+  - `Implements` compared every proto method with every gRPC handler (O(P·H)). Handlers are now
+    indexed by every key the match predicate can succeed on (exact name, ASCII-lowercased and
+    `_`-normalized last segment, PascalCase, signature identifiers — the latter a sorted list
+    searched by prefix range); candidates are re-checked with the unchanged predicate, so the
+    edge set is identical (`handler_index_never_drops_a_predicate_match`).
+  - Import resolution scanned a whole `name_to_nodes` bucket per importer; it is now memoized per
+    (target, importer repo), the only inputs it depends on.
+  - `patch_files` did one `retain` over a key's bucket per stale node (O(k·N) for a hot name like
+    `handle`); removals are grouped per key.
+  - The step-3.4 AsyncAPI/OpenAPI line lookup re-scanned the file from the top for every key
+    (`lines().skip(from)`), and to EOF on every miss: now one pre-split line index with a
+    forward-only cursor that gives up on a section at its first miss, and OpenAPI methods are
+    searched only within their path's line range — O(lines + keys) per file.
+- **Streaming YAML**: Spring property files flatten through a serde visitor straight into
+  `(dotted.key, value)` pairs — no `serde_yaml::Value` tree. Output is byte-identical to the old
+  tree flattening (`streaming_yaml_matches_dom_flattening`), ingestion stays atomic on malformed
+  input, and a multi-document file now contributes its first (default-profile) document instead of
+  being rejected wholesale. AsyncAPI/OpenAPI specs deserialize into key-only shapes
+  (`languages/spec_shape.rs`) that skip every schema/example subtree as `IgnoredAny`.
+- **Docs memory**: `DocSection` no longer keeps a lowercased copy of ASCII content (matching is
+  byte-wise equivalent to `to_lowercase().contains`); only non-ASCII sections keep one.
+- **`gen_synthetic.py --contracts`**: the plain generator never produced imports, protos, gRPC
+  handlers, YAML or Markdown, so it could not exercise any of the above. The flag adds that mix
+  (default off; nightly numbers unchanged).
+- **Measured at 200,000 files** (release, single root, cold persistent cache via a fresh `HOME`,
+  `/usr/bin/time -l` peak memory footprint — `ps` RSS is unusable on macOS here: memory
+  compression dropped an idle server from 900 MB to 12 MB within 2 minutes; baseline = step 3.4
+  head `835361f`):
+
+  | build | corpus | boot | peak footprint |
+  |---|---|---|---|
+  | 3.4 | 200k plain | 13.9 s | 630 MB |
+  | 3.5 | 200k plain | 15.3 s | 637 MB |
+  | 3.4 | 200k + 48k contract mix | **307.8 s** | 809 MB |
+  | 3.5 | 200k + 48k contract mix | **17.0 s** | 829 MB |
+
+  The contract-mix boot drops ~18x and now scales like the plain corpus; memory is flat. **Honest
+  gap**: at 200k files both builds are far over the 5k-derived CI budgets (boot 3 s, RSS 300 MB,
+  search p50/p95 400-480 / 920-1,040 ms). The peak is dominated by the parallel parse phase and the
+  resident graph, not by anything this step touched; it is not hidden by loosening the budgets.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

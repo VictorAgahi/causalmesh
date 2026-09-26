@@ -4,7 +4,8 @@ on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    # Stacked PRs target a previous milestone branch (p3/…), not main.
+    branches: [ "main", "p*/**" ]
 
 env:
   CARGO_TERM_COLOR: always

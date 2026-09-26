@@ -23,8 +23,9 @@ l'utilisateur.
 
 **Fichiers partagés, propriété exclusive de l'orchestrateur** (sinon conflits garantis) :
 - `CHANGELOG.md` : chaque PR ajoute à la place un fragment `changelog.d/4.x-<slug>.md` (sections
-  Keep a Changelog : `### Added` / `### Changed` / `### Fixed`). L'orchestrateur consolide à la
-  clôture.
+  Keep a Changelog : `### Added` / `### Changed` / `### Fixed`). Le dossier `changelog.d/`
+  n'existe pas encore : le premier jalon qui écrit un fragment le crée (`mkdir -p changelog.d`) et
+  le committe avec son fragment. L'orchestrateur consolide à la clôture.
 - Version (`Cargo.toml` `[workspace.package] version`, `.agents/mesh-mcp.toml`) : aucune PR de jalon
   n'y touche. Clôture du Plan 4 : **6.1.0**.
 - `docs/quality.md` : une PR n'y **ajoute** qu'une section datée à la fin (avant « What's NOT
@@ -171,8 +172,13 @@ bug.
   `rebase-merge/`, `rebase-apply/` dans ce répertoire. Tant qu'une opération est en cours, accumuler
   les chemins sans recharger. À la fin (verrou disparu et `HEAD` stable pendant la fenêtre de
   debounce), faire **un seul** rechargement groupé.
+- **Ordre du filtrage** : les événements qui visent le répertoire Git résolu sont interceptés
+  **avant** le filtre `.gitignore`/`exclude_patterns`. Ce filtre ignore `.git/` par défaut : appliqué
+  en premier, il avalerait les événements de verrou et de `HEAD`.
 - **Verrou orphelin** : `index.lock` plus vieux que 30 s **et** aucun processus `git` de
-  l'utilisateur (table des processus, sans `lsof`) → log `warn` et reprise normale.
+  l'utilisateur → log `warn` et reprise normale. La vérification des processus n'ajoute aucune crate
+  lourde : `pgrep -u <uid> -x git` (code de sortie 1 = aucun processus), avec repli sur
+  `ps -u <uid> -o comm=`. Pas de `lsof`.
 - **Pendant l'attente**, les outils répondent avec le dernier snapshot complet et ajoutent une note
   dans le **texte** du résultat (« opération Git en cours ; index de la génération N »). Pas de champ
   JSON-RPC ajouté, pas d'attente imposée aux appels d'outils.
@@ -287,9 +293,11 @@ la fixture.
 ### 4.6b — Ruptures wire-format
 
 **Travail.** `analyze_grpc` reçoit un argument `base: Option<String>`.
-- **Défaut** : merge-base de `HEAD` et de la branche par défaut distante (`origin/HEAD`). À défaut,
-  `HEAD` (comparaison du working tree au dernier commit). **Jamais `HEAD~1`**, qui comparerait au
-  commit précédent et non à la branche de base.
+- **Défaut** : `git merge-base HEAD <ref>`, où `<ref>` est la première référence existante de la
+  chaîne `origin/HEAD` → `origin/main` → `main` (existence testée avec
+  `git rev-parse --verify --quiet <ref>`). Si aucune n'existe, ou si le merge-base échoue : `HEAD`
+  (comparaison du working tree au dernier commit). **Jamais `HEAD~1`**, qui comparerait au commit
+  précédent et non à la branche de base. La référence retenue est citée dans le résultat.
 - Version « avant » lue par `git show <base>:<chemin relatif>`, en mémoire : aucune écriture disque,
   aucune persistance SQLite.
 - Trois règles, chacune signalée `WIRE_FORMAT_BREAKING_CHANGE` : numéro de champ réutilisé pour un

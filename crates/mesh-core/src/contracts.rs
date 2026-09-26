@@ -219,16 +219,36 @@ impl ContractGraph {
             return;
         }
 
-        // Targeted removal from the indices keyed by a node attribute we know,
-        // grouped by key: one `retain` per touched key rather than one per stale
-        // node. Per-node removal was O(k·N) when k stale nodes share a hot key —
-        // every file declaring `new`/`handle` lands in the same `name_to_nodes`
-        // bucket, so reloading 50k of 200k such files rescanned a 200k-long list
-        // 50k times.
+        self.remove_nodes(&stale_set);
+
+        // Indices keyed by *target* (not node) need one sweep — done once for the whole batch.
+        for map in [
+            &mut self.reverse_deps,
+            &mut self.topic_producers,
+            &mut self.topic_consumers,
+        ] {
+            map.retain(|_, ids| {
+                ids.retain(|id| !stale_set.contains(id));
+                !ids.is_empty()
+            });
+        }
+        self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
+        self.edges
+            .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
+    }
+
+    /// Removes every node in `stale` from `self.nodes` and from each index keyed
+    /// by a node attribute (name, lowercase stream name, package, FQCN, file),
+    /// grouped by key: one `retain` per touched key rather than one per removed
+    /// node. Per-node removal was O(k·N) when k removed nodes share a hot key —
+    /// every file declaring `new`/`handle` lands in the same `name_to_nodes`
+    /// bucket, and every synthetic topic hub shares the `event-bus` file entry.
+    fn remove_nodes(&mut self, stale: &HashSet<NodeId>) {
         let mut by_name: HashSet<CompactStr> = HashSet::new();
         let mut by_package: HashSet<CompactStr> = HashSet::new();
         let mut by_fqcn: HashSet<CompactStr> = HashSet::new();
-        for id in &stale_set {
+        let mut by_file: HashSet<FilePath> = HashSet::new();
+        for id in stale {
             let Some(node) = self.nodes.remove(id) else {
                 continue;
             };
@@ -248,6 +268,7 @@ impl ContractGraph {
                 by_fqcn.insert(CompactStr::new(format!("{}/{}", node.package, node.name)));
             }
             by_name.insert(node.name);
+            by_file.insert(node.file_path);
         }
         for (index, keys) in [
             (&mut self.name_to_nodes, by_name),
@@ -255,75 +276,23 @@ impl ContractGraph {
             (&mut self.fqcn_to_node, by_fqcn),
         ] {
             for key in keys {
-                if let Some(ids) = index.get_mut(&key) {
-                    ids.retain(|x| !stale_set.contains(x));
-                    if ids.is_empty() {
-                        index.remove(&key);
-                    }
-                }
+                Self::retain_bucket(index, &key, stale);
             }
         }
-
-        // Indices keyed by *target* (not node) need one sweep — done once for the whole batch.
-        for map in [
-            &mut self.reverse_deps,
-            &mut self.topic_producers,
-            &mut self.topic_consumers,
-        ] {
-            map.retain(|_, ids| {
-                ids.retain(|id| !stale_set.contains(id));
-                !ids.is_empty()
-            });
+        for file in by_file {
+            Self::retain_bucket(&mut self.file_to_nodes, &file, stale);
         }
-        self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
-        self.edges
-            .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
     }
 
-    fn remove_from_index(
-        index: &mut HashMap<CompactStr, Vec<NodeId>>,
-        key: &CompactStr,
-        id: NodeId,
+    fn retain_bucket<K: std::hash::Hash + Eq>(
+        index: &mut HashMap<K, Vec<NodeId>>,
+        key: &K,
+        stale: &HashSet<NodeId>,
     ) {
         if let Some(ids) = index.get_mut(key) {
-            ids.retain(|x| *x != id);
+            ids.retain(|x| !stale.contains(x));
             if ids.is_empty() {
                 index.remove(key);
-            }
-        }
-    }
-
-    /// Fully removes one node (by id) from `self.nodes` and every secondary index
-    /// that references it — the same per-node cleanup `patch_files` does for a
-    /// whole file's worth of stale nodes, available standalone for garbage
-    /// collecting a single synthetic node (a `reconcile_edges`-created topic hub
-    /// that no longer has any producer or consumer backing it; see the note there).
-    fn remove_node(&mut self, id: NodeId) {
-        let Some(node) = self.nodes.remove(&id) else {
-            return;
-        };
-        Self::remove_from_index(&mut self.name_to_nodes, &node.name, id);
-        if node.kind == NodeKind::KafkaTopic
-            || node.kind == NodeKind::EventStream
-            || node.kind == NodeKind::Queue
-        {
-            let key = CompactStr::new(node.name.to_lowercase());
-            Self::remove_from_index(&mut self.name_to_nodes, &key, id);
-        }
-        if !node.package.is_empty() {
-            Self::remove_from_index(&mut self.package_to_nodes, &node.package, id);
-        }
-        if node.kind == NodeKind::GrpcMethod
-            || node.kind == NodeKind::GrpcService
-            || !node.package.is_empty()
-        {
-            let fqcn = CompactStr::new(format!("{}/{}", node.package, node.name));
-            Self::remove_from_index(&mut self.fqcn_to_node, &fqcn, id);
-        }
-        if let Some(ids) = self.file_to_nodes.get_mut(&node.file_path) {
-            ids.retain(|x| *x != id);
-            if ids.is_empty() {
-                self.file_to_nodes.remove(&node.file_path);
             }
         }
     }
@@ -394,38 +363,26 @@ impl ContractGraph {
         }
     }
 
-    /// Same shape as [`Self::pick_or_ambiguous`], grouping by declared `package`
-    /// instead of `repo_id` — used to disambiguate an RPC call's bare-method-name
-    /// candidates by the caller's own package.
-    fn pick_or_ambiguous_by_package(
+    /// Wraps each candidate list with its ids grouped by declared `package`, for
+    /// [`PackageBucket::pick_or_ambiguous`].
+    fn group_by_package(
         &self,
-        ids: &[NodeId],
-        caller_package: &CompactStr,
-        confidence_if_unique: EdgeConfidence,
-    ) -> Vec<(NodeId, EdgeConfidence)> {
-        if let [only] = ids {
-            return vec![(*only, confidence_if_unique)];
-        }
-        let same_package: Vec<NodeId> = ids
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.nodes
-                    .get(id)
-                    .is_some_and(|n| n.package == *caller_package)
+        buckets: HashMap<String, Vec<NodeId>>,
+    ) -> HashMap<String, PackageBucket<'_>> {
+        buckets
+            .into_iter()
+            .map(|(key, ids)| {
+                let mut by_package: HashMap<&str, Vec<NodeId>> = HashMap::new();
+                if ids.len() > 1 {
+                    for &id in &ids {
+                        if let Some(n) = self.nodes.get(&id) {
+                            by_package.entry(n.package.as_str()).or_default().push(id);
+                        }
+                    }
+                }
+                (key, PackageBucket { ids, by_package })
             })
-            .collect();
-        match same_package.as_slice() {
-            [only] => vec![(*only, confidence_if_unique)],
-            [] => ids
-                .iter()
-                .map(|&id| (id, EdgeConfidence::Ambiguous))
-                .collect(),
-            _ => same_package
-                .into_iter()
-                .map(|id| (id, EdgeConfidence::Ambiguous))
-                .collect(),
-        }
+            .collect()
     }
 
     /// Resolves an `Imports` fact (`importer` imports `target_str`) using the O(1)
@@ -433,26 +390,37 @@ impl ContractGraph {
     /// produces any candidate(s) — one unambiguous winner, or every tied candidate
     /// tagged `Ambiguous` (see [`Self::pick_or_ambiguous`]). An empty result means
     /// no strategy matched at all (e.g. an external package like `@nestjs/common`).
-    fn resolve_import_targets(
-        &self,
-        importer: NodeId,
+    ///
+    /// `memo` carries the per-bucket work shared by distinct targets (see
+    /// [`ImportMemo`]), so no bucket is scanned more than once per repo.
+    fn resolve_import_targets<'g>(
+        &'g self,
+        importer_repo: Option<RepoId>,
         target_str: &str,
+        memo: &mut ImportMemo<'g>,
     ) -> Vec<(NodeId, EdgeConfidence)> {
         let is_relative_or_absolute_path =
             target_str.starts_with('.') || target_str.starts_with('/');
-        let importer_repo = self.nodes.get(&importer).map(|n| n.repo_id);
 
         // 1. Fully-qualified name (Java `a.b.C`, Rust `a::b::C`, gRPC
         // `package/Name`): an exact package+name pair is unambiguous, so
         // this is tried first and is the only strategy tagged `Exact`.
         if !is_relative_or_absolute_path {
             if let Some((pkg, name)) = Self::split_fully_qualified(target_str) {
-                if let Some(ids) = self.name_to_nodes.get(name) {
-                    if let Some(&id) = ids.iter().find(|id| {
-                        self.nodes
-                            .get(id)
-                            .is_some_and(|n| n.package.as_str() == pkg.as_ref())
-                    }) {
+                if let Some((bucket_key, ids)) = self.name_to_nodes.get_key_value(name) {
+                    let by_package = memo
+                        .first_by_package
+                        .entry(bucket_key.as_str())
+                        .or_insert_with(|| {
+                            let mut first = HashMap::new();
+                            for id in ids {
+                                if let Some(n) = self.nodes.get(id) {
+                                    first.entry(n.package.as_str()).or_insert(*id);
+                                }
+                            }
+                            first
+                        });
+                    if let Some(&id) = by_package.get(pkg.as_ref()) {
                         return vec![(id, EdgeConfidence::Exact)];
                     }
                 }
@@ -480,15 +448,21 @@ impl ContractGraph {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(target_str);
-            if let Some(ids) = self.name_to_nodes.get(target_stem) {
-                let same_repo: Vec<NodeId> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
-                    .collect();
+            if let Some((bucket_key, ids)) = self.name_to_nodes.get_key_value(target_stem) {
+                // Memoized per (stem, repo): `./a/index`, `../b/index`, ... are
+                // distinct targets that all rescan the one `index` bucket.
+                let same_repo = memo
+                    .same_repo_by_stem
+                    .entry((bucket_key.as_str(), importer_repo))
+                    .or_insert_with(|| {
+                        ids.iter()
+                            .copied()
+                            .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                            .collect()
+                    });
                 if !same_repo.is_empty() {
                     return self.pick_or_ambiguous(
-                        &same_repo,
+                        same_repo,
                         importer_repo,
                         EdgeConfidence::Heuristic,
                     );
@@ -545,19 +519,21 @@ impl ContractGraph {
             .collect();
         import_facts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         let mut import_edges = Vec::new();
-        // `resolve_import_targets` depends on the importer only through its repo,
-        // and each call can scan a whole `name_to_nodes` bucket — which for a hot
-        // name is O(N). Memoized per (target, importer repo), N importers of one
-        // hot name cost one scan instead of N (was O(importers × bucket)).
+        // `resolve_import_targets` depends on the importer only through its repo
+        // (its signature takes nothing else), and each call can scan a whole
+        // `name_to_nodes` bucket — which for a hot name is O(N). Memoized per
+        // (target, importer repo), N importers of one hot name cost one scan
+        // instead of N (was O(importers × bucket)).
         let mut resolved: HashMap<(&CompactStr, RepoId), Vec<(NodeId, EdgeConfidence)>> =
             HashMap::new();
+        let mut memo = ImportMemo::default();
         for (importer_id, target) in import_facts {
             let Some(importer_repo) = self.nodes.get(&importer_id).map(|n| n.repo_id) else {
                 continue;
             };
-            let targets = resolved
-                .entry((target, importer_repo))
-                .or_insert_with(|| self.resolve_import_targets(importer_id, target.as_str()));
+            let targets = resolved.entry((target, importer_repo)).or_insert_with(|| {
+                self.resolve_import_targets(Some(importer_repo), target.as_str(), &mut memo)
+            });
             for &(to_id, confidence) in targets.iter() {
                 if edge_set.insert((importer_id, to_id, EdgeKind::Imports)) {
                     import_edges.push(ContractEdge {
@@ -589,7 +565,7 @@ impl ContractGraph {
         // it, so leaving it in place would make an incremental reload permanently
         // diverge from a full rebuild (idempotence invariant I2).
         let live_topics: HashSet<&CompactStr> = all_topics.iter().collect();
-        let stale_hubs: Vec<NodeId> = self
+        let stale_hubs: HashSet<NodeId> = self
             .nodes
             .values()
             .filter(|n| {
@@ -602,9 +578,7 @@ impl ContractGraph {
             })
             .map(|n| n.id)
             .collect();
-        for id in stale_hubs {
-            self.remove_node(id);
-        }
+        self.remove_nodes(&stale_hubs);
 
         for topic_key in all_topics {
             // `add_node` indexes stream-like nodes under their lowercase name, and
@@ -827,6 +801,13 @@ impl ContractGraph {
             }
         }
 
+        // Each candidate list grouped by declared package, once: the per-call
+        // package filter `pick_or_ambiguous_by_package` did was O(candidates) per
+        // call — O(calls × homonyms) when N services each declare their own
+        // `Get` and each one's client calls it.
+        let proto_by_fqcn = self.group_by_package(proto_by_fqcn);
+        let proto_by_bare = self.group_by_package(proto_by_bare);
+
         let mut rpc_edges = Vec::new();
         for (caller_id, target_rpc) in &self.rpc_calls {
             let target_str = target_rpc.as_str();
@@ -841,33 +822,28 @@ impl ContractGraph {
             // one does) fans out to every tied candidate as `Ambiguous` rather than
             // picking whichever one the index happened to list first.
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
-            let matches: Vec<(NodeId, EdgeConfidence)> = if let Some(candidates) =
-                proto_by_fqcn.get(&target_lower)
-            {
-                match &caller_package {
-                    Some(pkg) => {
-                        self.pick_or_ambiguous_by_package(candidates, pkg, EdgeConfidence::Exact)
+            let matches: Vec<(NodeId, EdgeConfidence)> =
+                if let Some(candidates) = proto_by_fqcn.get(&target_lower) {
+                    match &caller_package {
+                        Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Exact),
+                        None => candidates
+                            .ids
+                            .iter()
+                            .map(|&id| (id, EdgeConfidence::Exact))
+                            .collect(),
                     }
-                    None => candidates
-                        .iter()
-                        .map(|&id| (id, EdgeConfidence::Exact))
-                        .collect(),
-                }
-            } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
-                match &caller_package {
-                    Some(pkg) => self.pick_or_ambiguous_by_package(
-                        candidates,
-                        pkg,
-                        EdgeConfidence::Heuristic,
-                    ),
-                    None => candidates
-                        .iter()
-                        .map(|&id| (id, EdgeConfidence::Ambiguous))
-                        .collect(),
-                }
-            } else {
-                Vec::new()
-            };
+                } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
+                    match &caller_package {
+                        Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Heuristic),
+                        None => candidates
+                            .ids
+                            .iter()
+                            .map(|&id| (id, EdgeConfidence::Ambiguous))
+                            .collect(),
+                    }
+                } else {
+                    Vec::new()
+                };
 
             for (target_id, confidence) in matches {
                 if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
@@ -1312,6 +1288,63 @@ impl ContractGraph {
     }
 }
 
+/// A candidate list plus its ids grouped by declared package (in list order),
+/// so disambiguating by the caller's package is a lookup, not a scan.
+struct PackageBucket<'g> {
+    ids: Vec<NodeId>,
+    /// Empty when `ids` has a single entry (never consulted then).
+    by_package: HashMap<&'g str, Vec<NodeId>>,
+}
+
+impl PackageBucket<'_> {
+    /// Same shape as [`ContractGraph::pick_or_ambiguous`], grouping by declared
+    /// `package` instead of `repo_id`: one candidate, or exactly one sharing the
+    /// caller's package, wins at `confidence_if_unique`; otherwise every tied
+    /// candidate (the same-package ones if several, else all) is `Ambiguous`.
+    fn pick_or_ambiguous(
+        &self,
+        caller_package: &CompactStr,
+        confidence_if_unique: EdgeConfidence,
+    ) -> Vec<(NodeId, EdgeConfidence)> {
+        if let [only] = self.ids.as_slice() {
+            return vec![(*only, confidence_if_unique)];
+        }
+        let same_package = self
+            .by_package
+            .get(caller_package.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        match same_package {
+            [only] => vec![(*only, confidence_if_unique)],
+            [] => self
+                .ids
+                .iter()
+                .map(|&id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+            _ => same_package
+                .iter()
+                .map(|&id| (id, EdgeConfidence::Ambiguous))
+                .collect(),
+        }
+    }
+}
+
+/// Per-`reconcile_edges` memo for [`ContractGraph::resolve_import_targets`],
+/// keyed by `name_to_nodes` bucket so that *distinct* targets landing in the same
+/// bucket share one scan of it:
+///
+/// - `first_by_package`: for strategy 1 (`pkg.Name`), the first node of each
+///   package in the `Name` bucket, in bucket order — exactly the node the old
+///   per-call `find` returned. Scanning per call was O(distinct targets ×
+///   bucket): N packages each declaring their own `Constants` and importing
+///   `pN.Constants` rescanned an N-long bucket N times.
+/// - `same_repo_by_stem`: for strategy 3 (relative imports), the bucket of a
+///   file stem filtered to one repo, in bucket order.
+#[derive(Default)]
+struct ImportMemo<'g> {
+    first_by_package: HashMap<&'g str, HashMap<&'g str, NodeId>>,
+    same_repo_by_stem: HashMap<(&'g str, Option<RepoId>), Vec<NodeId>>,
+}
+
 /// Lookup index over gRPC handler candidates for `reconcile_edges`' `Implements`
 /// pass. Every way the pass's match predicate can succeed maps to a hash key:
 ///
@@ -1646,6 +1679,224 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Randomized companion to `handler_index_never_drops_a_predicate_match`:
+    /// names, signatures and proto FQCNs assembled from the fragments the
+    /// predicate is sensitive to (case, `_`, `.`, non-ASCII, signature
+    /// prefixes, non-identifier characters, empty pieces).
+    #[test]
+    fn handler_index_never_drops_a_predicate_match_fuzzed() {
+        const PIECES: [&str; 16] = [
+            "get", "Get", "GET", "_", ".", "user", "User", "é", "É", "-", "@", "'", "fn ", "def ",
+            "x1", "",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut word = |max: u64| -> String {
+            let len = next() % max;
+            (0..len)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect()
+        };
+        let handlers: Vec<(String, String, Option<String>)> = (0..600)
+            .map(|i| {
+                let name = word(5);
+                let pascal = crate::types::to_pascal_case(&name);
+                let sig = (i % 3 != 0).then(|| word(8));
+                (name, pascal, sig)
+            })
+            .collect();
+        let fqcns: Vec<String> = (0..400).map(|_| word(6)).collect();
+        let index = HandlerIndex::build(
+            handlers
+                .iter()
+                .map(|(n, p, s)| (n.as_str(), p.as_str(), s.as_deref())),
+        );
+        let mut cands = Vec::new();
+        for fqcn in &fqcns {
+            let bare = fqcn.split('.').next_back().unwrap_or(fqcn.as_str());
+            cands.clear();
+            index.candidates(fqcn, bare, &mut cands);
+            for (i, (name, pascal, sig)) in handlers.iter().enumerate() {
+                let matches = name == fqcn
+                    || name.eq_ignore_ascii_case(bare)
+                    || pascal == bare
+                    || ContractGraph::bare_names_match(name, bare)
+                    || sig
+                        .as_deref()
+                        .is_some_and(|s| ContractGraph::signature_contains_bare(s, bare));
+                if matches {
+                    assert!(
+                        cands.binary_search(&i).is_ok(),
+                        "index dropped handler {name:?}/{sig:?} for {fqcn:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn memo_node(name: &str, pkg: &str, file: &str, repo: RepoId, kind: NodeKind) -> ContractNode {
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: FilePath::from(Path::new(file)),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new(pkg),
+            repo_id: repo,
+            signature: None,
+            docstring: None,
+        }
+    }
+
+    fn edges_from(
+        g: &ContractGraph,
+        from: NodeId,
+        kind: EdgeKind,
+    ) -> Vec<(NodeId, EdgeConfidence)> {
+        let mut out: Vec<_> = g
+            .all_edges()
+            .iter()
+            .filter(|e| e.from == from && e.kind == kind)
+            .map(|e| (e.to, e.confidence))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// The per-bucket memos in `reconcile_edges` (import strategies 1 and 3,
+    /// RPC package grouping) answer exactly what the per-call scans did: first
+    /// node of the package in bucket order, same-repo stem matches, and the
+    /// unique / same-package-tie / no-match tiers of the package tiebreak.
+    #[test]
+    fn reconcile_memos_keep_per_call_semantics() {
+        use NodeKind::{GrpcMethod, ServiceClass};
+        let mut g = ContractGraph::new();
+        // Strategy 1: two `p.C` in bucket order, plus `q.C`.
+        let pc1 = g.add_node(memo_node("C", "p", "p/C1.java", 0, ServiceClass));
+        let pc2 = g.add_node(memo_node("C", "p", "p/C2.java", 0, ServiceClass));
+        let qc = g.add_node(memo_node("C", "q", "q/C.java", 1, ServiceClass));
+        let imp_p = g.add_node(memo_node("UseP", "x", "x/UseP.java", 0, ServiceClass));
+        let imp_q = g.add_node(memo_node("UseQ", "x", "x/UseQ.java", 1, ServiceClass));
+        g.add_dependency(imp_p, "p.C");
+        g.add_dependency(imp_q, "q.C");
+        // Strategy 3: an `index` in each repo, reached by distinct relative paths.
+        let idx0 = g.add_node(memo_node("index", "", "r0/index.ts", 0, ServiceClass));
+        let idx1 = g.add_node(memo_node("index", "", "r1/index.ts", 1, ServiceClass));
+        let rel0 = g.add_node(memo_node("a", "", "r0/a.ts", 0, ServiceClass));
+        let rel0b = g.add_node(memo_node("b", "", "r0/b.ts", 0, ServiceClass));
+        let rel1 = g.add_node(memo_node("c", "", "r1/c.ts", 1, ServiceClass));
+        g.add_dependency(rel0, "./index");
+        g.add_dependency(rel0b, "../r0/index");
+        g.add_dependency(rel1, "./index");
+        // RPC: bare `Get` declared twice in package a, once in b.
+        let a1 = g.add_node(memo_node("a.S1.Get", "a", "a1.proto", 0, GrpcMethod));
+        let a2 = g.add_node(memo_node("a.S2.Get", "a", "a2.proto", 0, GrpcMethod));
+        let b1 = g.add_node(memo_node("b.S.Get", "b", "b.proto", 0, GrpcMethod));
+        let call_a = g.add_node(memo_node("ca", "a", "ca.go", 0, ServiceClass));
+        let call_b = g.add_node(memo_node("cb", "b", "cb.go", 0, ServiceClass));
+        let call_c = g.add_node(memo_node("cc", "c", "cc.go", 0, ServiceClass));
+        let call_fq = g.add_node(memo_node("cf", "z", "cf.go", 0, ServiceClass));
+        for c in [call_a, call_b, call_c] {
+            g.add_rpc_call(c, "Get");
+        }
+        g.add_rpc_call(call_fq, "b.S.Get");
+        g.reconcile_edges();
+
+        use EdgeConfidence::{Ambiguous, Exact, Heuristic};
+        assert_eq!(edges_from(&g, imp_p, EdgeKind::Imports), [(pc1, Exact)]);
+        assert_eq!(edges_from(&g, imp_q, EdgeKind::Imports), [(qc, Exact)]);
+        assert_ne!(pc1, pc2);
+        assert_eq!(edges_from(&g, rel0, EdgeKind::Imports), [(idx0, Heuristic)]);
+        assert_eq!(
+            edges_from(&g, rel0b, EdgeKind::Imports),
+            [(idx0, Heuristic)]
+        );
+        assert_eq!(edges_from(&g, rel1, EdgeKind::Imports), [(idx1, Heuristic)]);
+        assert_eq!(
+            edges_from(&g, call_a, EdgeKind::CallsRpc),
+            [(a1, Ambiguous), (a2, Ambiguous)]
+        );
+        assert_eq!(
+            edges_from(&g, call_b, EdgeKind::CallsRpc),
+            [(b1, Heuristic)]
+        );
+        assert_eq!(
+            edges_from(&g, call_c, EdgeKind::CallsRpc),
+            [(a1, Ambiguous), (a2, Ambiguous), (b1, Ambiguous)]
+        );
+        assert_eq!(edges_from(&g, call_fq, EdgeKind::CallsRpc), [(b1, Exact)]);
+    }
+
+    /// Stale synthetic topic hubs are removed from every index in one batch,
+    /// including the `event-bus` file entry they all share.
+    #[test]
+    fn stale_topic_hubs_leave_no_index_entries() {
+        let mut g = ContractGraph::new();
+        let mut files = Vec::new();
+        for i in 0..50 {
+            let file = format!("t{i}.ts");
+            let id = g.add_node(memo_node("p", "", &file, 0, NodeKind::ServiceClass));
+            g.add_producer(id, &format!("topic{i}"));
+            files.push(PathBuf::from(file));
+        }
+        g.reconcile_edges();
+        assert_eq!(g.get_nodes_for_file(Path::new("event-bus")).len(), 50);
+        g.patch_files(files.iter().map(PathBuf::as_path));
+        g.reconcile_edges();
+        assert_eq!(g.node_count(), 0);
+        assert!(g.get_nodes_for_file(Path::new("event-bus")).is_empty());
+        assert!(g.search_symbols("topic7", None).is_empty());
+    }
+
+    /// Scaling guard for the paths above (hot-name imports, RPC homonyms, mass
+    /// hub removal): each was O(N²) — 9–11 s at N = 16k — and is now ~linear.
+    /// Timing-based, so opt-in: `cargo test --release -p mesh-core -- --ignored`.
+    #[test]
+    #[ignore]
+    fn reconcile_scales_linearly_on_hot_buckets() {
+        let n = 16_000usize;
+        let mut g = ContractGraph::new();
+        for i in 0..n {
+            let id = g.add_node(memo_node(
+                "Constants",
+                &format!("p{i}"),
+                &format!("p{i}/C.java"),
+                0,
+                NodeKind::ServiceClass,
+            ));
+            g.add_dependency(id, &format!("p{i}.Constants"));
+            g.add_node(memo_node(
+                &format!("s{i}.Svc.Get"),
+                &format!("s{i}"),
+                &format!("s{i}.proto"),
+                0,
+                NodeKind::GrpcMethod,
+            ));
+            let caller = g.add_node(memo_node(
+                "call",
+                &format!("s{i}"),
+                &format!("c{i}.go"),
+                0,
+                NodeKind::ServiceClass,
+            ));
+            g.add_rpc_call(caller, "Get");
+            g.add_producer(caller, &format!("topic{i}"));
+        }
+        g.reconcile_edges();
+        let files: Vec<PathBuf> = (0..n).map(|i| PathBuf::from(format!("c{i}.go"))).collect();
+        g.patch_files(files.iter().map(PathBuf::as_path));
+        let t = std::time::Instant::now();
+        g.reconcile_edges();
+        let elapsed = t.elapsed();
+        assert!(elapsed.as_secs_f64() < 2.0, "reconcile took {elapsed:?}");
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use clap::{Parser, Subcommand};
 use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine, PersistentIndexCache};
 use mesh_server::cli::{DoctorCommand, HooksCommand, InitCommand, StatsCommand};
@@ -206,6 +208,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
+/// Rotates and opens this workspace's `meshd` auto-spawn log (P2 step 3.3), replacing the old
+/// `Stdio::null()` — a daemon spawned ad-hoc by `ensure_daemon_running`/
+/// `ensure_daemon_running_windows` has no supervisor capturing its output, so a crash or panic
+/// *before* its own `tracing` subscriber initializes (or one bypassing it entirely, e.g. a
+/// Rust panic's default handler, which writes to stderr directly) was previously unobservable.
+/// One file per workspace (named by `workspace_id`, the same scoping `socket_path_for` already
+/// uses, so concurrent daemons for different workspaces never interleave into the same file);
+/// up to `MAX_ROTATIONS` previous runs are kept (`meshd-<id>.log.1` most recent,
+/// `.MAX_ROTATIONS` oldest) so a repeatedly-crashing daemon's history survives past the very
+/// next restart without growing the log directory unboundedly. Shared, platform-independent
+/// code — not `#[cfg(unix)]`-gated, since both the Unix and Windows auto-spawn paths use it.
+const DAEMON_LOG_MAX_ROTATIONS: usize = 5;
+
+fn open_daemon_log(workspace_id: &str) -> std::io::Result<std::fs::File> {
+    let log_dir = mesh_core::mesh_cache_dir().join("logs");
+    rotate_and_open_log(&log_dir, workspace_id, DAEMON_LOG_MAX_ROTATIONS)
+}
+
+/// The rotation algorithm itself, factored out of [`open_daemon_log`] so it can be unit-tested
+/// against a temp directory instead of the real `~/.cache/mesh-mcp/logs` (which every other
+/// `~/.cache/mesh-mcp/*` helper in this codebase — `AuditLogger`, `PersistentIndexCache` —
+/// likewise never unit-tests directly, for the same reason: it's process-wide, shared, real
+/// user state, not something a test should create, rotate or delete).
+fn rotate_and_open_log(
+    log_dir: &Path,
+    workspace_id: &str,
+    max_rotations: usize,
+) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(log_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let current = log_dir.join(format!("meshd-{workspace_id}.log"));
+    let oldest = log_dir.join(format!("meshd-{workspace_id}.log.{max_rotations}"));
+    if oldest.exists() {
+        if let Err(e) = std::fs::remove_file(&oldest) {
+            tracing::warn!(target: "mesh::proxy", "Failed to remove oldest rotated daemon log {}: {e}", oldest.display());
+        }
+    }
+    for i in (1..max_rotations).rev() {
+        let from = log_dir.join(format!("meshd-{workspace_id}.log.{i}"));
+        if !from.exists() {
+            continue;
+        }
+        let to = log_dir.join(format!("meshd-{workspace_id}.log.{}", i + 1));
+        if let Err(e) = std::fs::rename(&from, &to) {
+            tracing::warn!(target: "mesh::proxy", "Failed to rotate daemon log {} -> {}: {e}", from.display(), to.display());
+        }
+    }
+    if current.exists() {
+        let rotated = log_dir.join(format!("meshd-{workspace_id}.log.1"));
+        if let Err(e) = std::fs::rename(&current, &rotated) {
+            tracing::warn!(target: "mesh::proxy", "Failed to rotate current daemon log to {}: {e}", rotated.display());
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&current)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+/// `stdout`/`stderr` `Stdio` for a freshly `open_daemon_log`-ed file, sharing one file
+/// description (via `try_clone`) so writes from both streams land in one consistent, ordered
+/// file rather than two independently-buffered views of the same path. Falls back to
+/// `Stdio::null()` (the pre-3.3 behaviour) if the log can't be opened at all — a daemon that
+/// can't be auto-spawned with logging is still better than one that can't be spawned.
+fn daemon_output_stdio(workspace_id: &str) -> (std::process::Stdio, std::process::Stdio) {
+    match open_daemon_log(workspace_id) {
+        Ok(file) => match file.try_clone() {
+            Ok(file2) => (
+                std::process::Stdio::from(file),
+                std::process::Stdio::from(file2),
+            ),
+            Err(e) => {
+                tracing::warn!(target: "mesh::proxy", "Failed to duplicate meshd log handle: {e}");
+                (std::process::Stdio::from(file), std::process::Stdio::null())
+            }
+        },
+        Err(e) => {
+            tracing::warn!(target: "mesh::proxy", "Failed to open meshd log file, discarding daemon output: {e}");
+            (std::process::Stdio::null(), std::process::Stdio::null())
+        }
+    }
+}
+
 /// Checks if this workspace's meshd is alive at `sock_path`. If not, spawns
 /// it — with `--socket sock_path` and `.current_dir(base_dir)` (plus
 /// `--config` when the caller passed an explicit one) so the daemon binds
@@ -241,13 +339,14 @@ async fn ensure_daemon_running(
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
 
+    let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
     let mut cmd = std::process::Command::new(&meshd_path);
     cmd.current_dir(base_dir)
         .arg("--socket")
         .arg(sock_path)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(stdout_io)
+        .stderr(stderr_io);
     if let Some(config) = explicit_config {
         let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
         cmd.arg("--config").arg(canonical_config);
@@ -335,13 +434,14 @@ async fn ensure_daemon_running_windows(
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
 
+    let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
     let mut cmd = std::process::Command::new(&meshd_path);
     cmd.current_dir(base_dir)
         .arg("--socket")
         .arg(pipe_name)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(stdout_io)
+        .stderr(stderr_io);
     if let Some(config) = explicit_config {
         let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
         cmd.arg("--config").arg(canonical_config);
@@ -446,10 +546,111 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
         cancel_sig.cancel();
     });
 
-    if let Err(e) = mesh_server::FileWatcherService::spawn(state.clone(), cancel_token.clone()) {
-        tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
-    }
+    // `spawn_blocking`, not called inline: `FileWatcherService::spawn`'s setup (the per-root
+    // directory walk and initial OS watch registration) runs synchronously before returning —
+    // deliberately, so watches are guaranteed live the instant it returns (see its own doc). On
+    // macOS that setup can take real time (`MAX_WATCHED_DIRS`'s doc), so running it on this
+    // process's single async task would freeze the whole stdio/MCP proxy during startup instead
+    // of just delaying watcher readiness, exactly like `meshd`'s equivalent call.
+    let watcher_state = state.clone();
+    let watcher_cancel = cancel_token.clone();
+    tokio::task::spawn_blocking(move || {
+        match mesh_server::FileWatcherService::spawn(watcher_state.clone(), watcher_cancel) {
+            Ok(_handle) => {
+                // Closes the gap between "watches are live" and "the snapshot installed above
+                // was already stale by the time that happened" — see `meshd`'s identical fix for
+                // the full reasoning (a file changed during `spawn`'s registration window has no
+                // other mechanism to ever be noticed afterward).
+                mesh_server::FileWatcherService::execute_reload_sync(&watcher_state);
+            }
+            Err(e) => {
+                tracing::warn!(target: "mesh::watcher", "Failed to start FileWatcherService: {e}");
+            }
+        }
+    });
 
     run_server(state, cancel_token).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod daemon_log_tests {
+    use super::rotate_and_open_log;
+    use std::io::Write;
+
+    #[test]
+    fn first_open_creates_the_current_log_with_no_rotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f = rotate_and_open_log(dir.path(), "ws", 3).expect("open");
+        write!(f, "hello").expect("write");
+        assert!(dir.path().join("meshd-ws.log").exists());
+        assert!(!dir.path().join("meshd-ws.log.1").exists());
+    }
+
+    #[test]
+    fn reopening_rotates_the_previous_log_instead_of_overwriting_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f1 = rotate_and_open_log(dir.path(), "ws", 3).expect("open 1");
+        write!(f1, "run 1").expect("write 1");
+        drop(f1);
+
+        let mut f2 = rotate_and_open_log(dir.path(), "ws", 3).expect("open 2");
+        write!(f2, "run 2").expect("write 2");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-ws.log.1")).expect("read .1"),
+            "run 1",
+            "the previous run's log must survive as .1, not be silently overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-ws.log")).expect("read current"),
+            "run 2"
+        );
+    }
+
+    #[test]
+    fn old_rotations_shift_up_and_the_oldest_is_eventually_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // With max_rotations=2, the retained set is [current, .1, .2] — 3 generations. The 4th
+        // open is the first one where something (run 1, by then in the .2 slot) must be deleted
+        // rather than shifted further, since there is no .3 slot to shift it into.
+        for content in ["run 1", "run 2", "run 3", "run 4"] {
+            let mut f = rotate_and_open_log(dir.path(), "ws", 2).expect("open");
+            write!(f, "{content}").expect("write");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-ws.log")).expect("read current"),
+            "run 4"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-ws.log.1")).expect("read .1"),
+            "run 3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-ws.log.2")).expect("read .2"),
+            "run 2"
+        );
+        assert!(
+            !dir.path().join("meshd-ws.log.3").exists(),
+            "max_rotations=2 must never retain a .3 generation"
+        );
+    }
+
+    #[test]
+    fn different_workspace_ids_never_share_a_log_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut a = rotate_and_open_log(dir.path(), "workspace-a", 3).expect("open a");
+        write!(a, "from a").expect("write a");
+        let mut b = rotate_and_open_log(dir.path(), "workspace-b", 3).expect("open b");
+        write!(b, "from b").expect("write b");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-workspace-a.log")).expect("read a"),
+            "from a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("meshd-workspace-b.log")).expect("read b"),
+            "from b"
+        );
+    }
 }

@@ -15,11 +15,39 @@ pub struct DocSection {
     /// case-insensitive and used to re-lowercase every section on every query.
     #[serde(skip)]
     title_lower: String,
+    /// Lowercased content, kept only when `content` is non-ASCII. For ASCII
+    /// text (nearly all docs) lowercasing is byte-wise, so
+    /// [`DocSection::content_lower_contains`] tests the original bytes directly
+    /// instead of keeping a second full copy of every indexed doc resident.
     #[serde(skip)]
-    content_lower: String,
+    content_lower: Option<String>,
 }
 
 impl DocSection {
+    /// `content.to_lowercase().contains(needle)`, without the lowercase copy for
+    /// ASCII content. `needle` is compared as given (it is normally already
+    /// lowercase; an uppercase alias still never matches, exactly as before).
+    fn content_lower_contains(&self, needle: &str) -> bool {
+        match &self.content_lower {
+            Some(lower) => lower.contains(needle),
+            None => {
+                let (h, n) = (self.content.as_bytes(), needle.as_bytes());
+                n.is_empty()
+                    || (h.len() >= n.len()
+                        && h.windows(n.len())
+                            .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b)))
+            }
+        }
+    }
+
+    /// The lowercased content, materialized only for the rare fuzzy pass.
+    fn content_lower(&self) -> std::borrow::Cow<'_, str> {
+        match &self.content_lower {
+            Some(lower) => std::borrow::Cow::Borrowed(lower.as_str()),
+            None => std::borrow::Cow::Owned(self.content.to_ascii_lowercase()),
+        }
+    }
+
     fn new(
         file_path: &Path,
         title: CompactStr,
@@ -31,7 +59,7 @@ impl DocSection {
         Self {
             file_path: file_path.to_path_buf(),
             title_lower: title.as_str().to_lowercase(),
-            content_lower: content.to_lowercase(),
+            content_lower: (!content.is_ascii()).then(|| content.to_lowercase()),
             title,
             level,
             start_line,
@@ -108,6 +136,16 @@ impl DocIndex {
     /// Drops every section that came from `path` (used before re-indexing a changed file).
     pub fn remove_file(&mut self, path: &Path) {
         self.sections.retain(|s| s.file_path != path);
+    }
+
+    /// [`Self::remove_file`] for a whole batch in one pass over the sections.
+    /// Called once per file, a reload of k changed files cost k full passes —
+    /// O(k·N) on a mass change (branch switch) over a large doc index.
+    pub fn remove_files(&mut self, paths: &std::collections::HashSet<&Path>) {
+        if !paths.is_empty() {
+            self.sections
+                .retain(|s| !paths.contains(s.file_path.as_path()));
+        }
     }
 
     /// Appends pre-parsed sections (from `parse_sections` on another thread).
@@ -306,8 +344,8 @@ impl DocIndex {
             .split(is_word_char)
             .filter(|t| !t.is_empty())
             .collect();
-        let content_tokens: Vec<&str> = section
-            .content_lower
+        let content_lower = section.content_lower();
+        let content_tokens: Vec<&str> = content_lower
             .split(is_word_char)
             .filter(|t| !t.is_empty())
             .collect();
@@ -392,7 +430,7 @@ impl DocIndex {
         }
 
         // Exact content match
-        if section.content_lower.contains(norm_query) {
+        if section.content_lower_contains(norm_query) {
             score += 20;
         }
 
@@ -401,7 +439,7 @@ impl DocIndex {
             if section.title_lower.contains(word) {
                 score += 15;
             }
-            if section.content_lower.contains(word) {
+            if section.content_lower_contains(word) {
                 score += 5;
             }
         }
@@ -413,6 +451,49 @@ impl DocIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_files_drops_a_whole_batch() {
+        let mut index = DocIndex::default();
+        for f in ["a.md", "b.md", "c.md"] {
+            index.extend_sections(index.parse_sections(Path::new(f), "# T\nbody"));
+        }
+        index.remove_files(&[Path::new("a.md"), Path::new("c.md")].into_iter().collect());
+        let left: Vec<_> = index.sections.iter().map(|s| s.file_path.clone()).collect();
+        assert_eq!(left, [Path::new("b.md").to_path_buf()]);
+    }
+
+    /// ASCII sections keep no lowercase copy yet match exactly as
+    /// `to_lowercase().contains(..)` did; non-ASCII sections keep the copy.
+    #[test]
+    fn content_lower_contains_matches_to_lowercase_semantics() {
+        let ascii = DocSection::new(
+            Path::new("a.md"),
+            "T".into(),
+            1,
+            1,
+            2,
+            "Kafka TOPIC Orders".into(),
+        );
+        assert!(ascii.content_lower.is_none());
+        assert!(ascii.content_lower_contains("topic orders"));
+        assert!(
+            !ascii.content_lower_contains("TOPIC"),
+            "needle is compared as given"
+        );
+        assert!(ascii.content_lower_contains(""));
+
+        let utf8 = DocSection::new(
+            Path::new("b.md"),
+            "T".into(),
+            1,
+            1,
+            2,
+            "Événement Émis".into(),
+        );
+        assert!(utf8.content_lower.is_some());
+        assert!(utf8.content_lower_contains("événement émis"));
+    }
 
     #[test]
     fn test_doc_indexing_and_search() {

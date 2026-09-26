@@ -32,7 +32,7 @@ graph TD
         Server --> MutCheck{Tool declares mutates == true?}
         MutCheck -->|No -- every shipped tool| Allowed2[Call proceeds, read-only]
         MutCheck -->|Yes| GovCheck{Target in stop_rules?}
-        GovCheck -->|Yes| RSAH[Return RSAH Refusal Payload, code -32001]
+        GovCheck -->|Yes| RSAH[Return RSAH Refusal Payload, isError: true]
         RSAH --> ChannelCoT[Channel Agent Chain-of-Thought]
         ChannelCoT --> Human[Handoff to Human Engineer]
     end
@@ -63,23 +63,25 @@ RSAH eliminates this loop by providing:
 ### 3.2 Concrete RSAH Payload
 
 `ToolRegistry::invoke` checks `evaluate_guard` **before** running the tool, for any call where
-`McpTool::mutates(&args)` returns `true`. On a hit it short-circuits with a JSON-RPC error
-(code `-32001`, an implementation-defined server error) instead of a normal result envelope —
-the agent's tool call fails outright rather than succeeding with a refusal buried in the text:
+`McpTool::mutates(&args)` returns `true`. On a hit it short-circuits before the tool runs and
+returns an MCP tool error — a `CallToolResult` with `isError: true` whose text is the RSAH
+payload. Per the MCP specification a refusal is a tool outcome, not a protocol fault: the client
+hands it to the model (which can follow `agent_next_action`) instead of aborting the turn, as the
+JSON-RPC error `-32001` used before this did:
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 42,
-  "error": {
-    "code": -32001,
-    "message": "{\"status\":\"GOVERNANCE_BLOCKED\",\"policy\":\"CONTRACT_FIRST_CASCADE_CI\",\"required_workflow\":{\"step_1\":\"...\",\"step_2\":\"...\",\"step_3\":\"...\",\"step_4\":\"DO NOT modify 'api-gateway' or 'services/*' until the published packages are available.\"},\"agent_next_action\":\"STOP_AND_REPORT_TO_USER\",\"message_to_user\":\"I detected a mutation targeting the Protobuf contract in 'proto-registry'. Per active architecture governance, I'm stopping here: you must submit the contract PR and let CI generate the stubs before adapting the microservices.\"}"
+  "result": {
+    "isError": true,
+    "content": [{ "type": "text", "text": "{\"status\":\"GOVERNANCE_BLOCKED\",\"policy\":\"CONTRACT_FIRST_CASCADE_CI\",\"required_workflow\":{\"step_1\":\"...\",\"step_2\":\"...\",\"step_3\":\"...\",\"step_4\":\"DO NOT modify 'api-gateway' or 'services/*' until the published packages are available.\"},\"agent_next_action\":\"STOP_AND_REPORT_TO_USER\",\"message_to_user\":\"I detected a mutation targeting the Protobuf contract in 'proto-registry'. Per active architecture governance, I'm stopping here: you must submit the contract PR and let CI generate the stubs before adapting the microservices.\"}" }]
   }
 }
 ```
 
-`message` is the serialized `RsahResponse` (the same struct the `evaluate_guard` unit tests use)
-as a string, since a JSON-RPC error's `message` field is a string, not a nested object.
+The text is the serialized `RsahResponse` (the same struct the `evaluate_guard` unit tests use),
+so an agent can parse it back as JSON.
 
 > **Honest scope**: this check is gated on `McpTool::mutates()`, which every shipped tool
 > (`smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`,

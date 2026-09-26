@@ -699,6 +699,10 @@ section left open, and eliminating an orphaned-daemon failure mode.
     memo reduced to one lookup and so could not show the first bug; imports now vary across the
     `Shared` declarations.
   - Opt-in guard: `reconcile_scales_linearly_on_hot_buckets` (`--ignored`).
+  - 200k contract-mix boot re-run (same corpus as above, generated before the generator change, so
+    it has one import target and does not hit these paths), interleaved A/B on a loaded machine
+    (load average 13–18): `05443a4` 16.8 / 27.4 / 20.1 s, with these fixes 16.7 / 20.8 / 16.1 s;
+    peak footprint 809–825 vs 807–827 MB. No regression; the spread is machine noise.
 - **"Byte-identical" YAML was not**: a tagged key (`!Tag key:`) aborted the whole file (the tree
   read it through the tag), and a repeated key ingested both values (the tree rejected the file,
   as Spring does). Both fixed and checked against the `Value` tree itself. The AsyncAPI/OpenAPI

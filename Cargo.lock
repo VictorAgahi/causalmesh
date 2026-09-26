@@ -574,7 +574,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh-core"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "arc-swap",
  "compact_str",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-daemon"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "arc-swap",
  "clap",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-parsers"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "compact_str",
  "mesh-core",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-server"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "clap",
  "compact_str",

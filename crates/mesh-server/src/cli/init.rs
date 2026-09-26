@@ -287,41 +287,103 @@ cryptographic_audit_trail = true
     }
 
     fn configure_cursor(cur_dir: &Path) -> Result<(), std::io::Error> {
-        let cursor_dir = cur_dir.join(".cursor");
-        fs::create_dir_all(&cursor_dir)?;
-        let mcp_path = cursor_dir.join("mcp.json");
-
-        let content = serde_json::json!({
-            "mcpServers": {
-                "mesh-mcp": {
-                    "command": "mesh-mcp",
-                    "args": []
-                }
+        let entry = serde_json::json!({ "command": "mesh-mcp", "args": [] });
+        Self::upsert_mcp_server(
+            &cur_dir.join(".cursor").join("mcp.json"),
+            "mcpServers",
+            entry,
+            None,
+        )
+        .map(|written| {
+            if written {
+                eprintln!("  ✔ Detected Cursor: Added 'mesh-mcp' entry to .cursor/mcp.json");
             }
-        });
-
-        fs::write(mcp_path, serde_json::to_string_pretty(&content)?)?;
-        eprintln!("  ✔ Detected Cursor: Added 'mesh-mcp' entry to .cursor/mcp.json");
-        Ok(())
+        })
     }
 
     fn configure_vscode(cur_dir: &Path) -> Result<(), std::io::Error> {
-        let vscode_dir = cur_dir.join(".vscode");
-        fs::create_dir_all(&vscode_dir)?;
-        let mcp_path = vscode_dir.join("mcp.json");
-
-        let content = serde_json::json!({
-            "mcpServers": {
-                "mesh-mcp": {
-                    "command": "mesh-mcp",
-                    "args": []
-                }
+        // VS Code's workspace `mcp.json` keys servers under `servers` (not Cursor's
+        // `mcpServers`) and names the transport explicitly.
+        let entry = serde_json::json!({ "type": "stdio", "command": "mesh-mcp", "args": [] });
+        Self::upsert_mcp_server(
+            &cur_dir.join(".vscode").join("mcp.json"),
+            "servers",
+            entry,
+            Some("mcpServers"),
+        )
+        .map(|written| {
+            if written {
+                eprintln!("  ✔ Detected VS Code: Added 'mesh-mcp' entry to .vscode/mcp.json");
             }
-        });
+        })
+    }
 
-        fs::write(mcp_path, serde_json::to_string_pretty(&content)?)?;
-        eprintln!("  ✔ Detected VS Code: Added 'mesh-mcp' entry to .vscode/mcp.json");
-        Ok(())
+    /// Adds or replaces only the `mesh-mcp` entry under `root_key` in an IDE's
+    /// MCP config, keeping every other server and top-level key the user has.
+    /// Earlier versions rewrote the whole file with a fresh object, silently
+    /// deleting the user's other MCP servers.
+    ///
+    /// `legacy_key` names a root key older versions wrongly wrote `mesh-mcp`
+    /// under; that stale entry is removed (and the key too, once empty).
+    ///
+    /// A file that exists but is not a JSON object is left untouched with a
+    /// warning — never overwritten. Returns whether the file was written.
+    fn upsert_mcp_server(
+        path: &Path,
+        root_key: &str,
+        entry: serde_json::Value,
+        legacy_key: Option<&str>,
+    ) -> Result<bool, std::io::Error> {
+        let mut doc = match fs::read_to_string(path) {
+            Ok(text) if text.trim().is_empty() => serde_json::json!({}),
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) if v.is_object() => v,
+                _ => {
+                    eprintln!(
+                        "  ⚠ {} is not a valid JSON object; left unchanged. Add the 'mesh-mcp' server by hand.",
+                        path.display()
+                    );
+                    return Ok(false);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e),
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return Ok(false);
+        };
+
+        if let Some(legacy) = legacy_key {
+            let now_empty = obj
+                .get_mut(legacy)
+                .and_then(|v| v.as_object_mut())
+                .map(|servers| {
+                    servers.remove("mesh-mcp");
+                    servers.is_empty()
+                })
+                .unwrap_or(false);
+            if now_empty {
+                obj.remove(legacy);
+            }
+        }
+
+        let servers = obj.entry(root_key).or_insert_with(|| serde_json::json!({}));
+        if !servers.is_object() {
+            eprintln!(
+                "  ⚠ '{root_key}' in {} is not an object; left unchanged.",
+                path.display()
+            );
+            return Ok(false);
+        }
+        if let Some(servers) = servers.as_object_mut() {
+            servers.insert("mesh-mcp".to_string(), entry);
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")?;
+        Ok(true)
     }
 }
 
@@ -336,6 +398,77 @@ mod tests {
     // change cwd would race. Serialize just the cwd-touching tests on this lock;
     // every other test in the crate is unaffected.
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read")).expect("json")
+    }
+
+    /// `--write-ide-config` used to overwrite `.cursor/mcp.json` with a fresh
+    /// object, deleting every other MCP server the user had configured.
+    #[test]
+    fn cursor_config_keeps_other_servers_and_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".cursor").join("mcp.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"github":{"command":"gh-mcp"},"mesh-mcp":{"command":"old"}},"other":1}"#,
+        )
+        .expect("write");
+
+        InitCommand::configure_cursor(tmp.path()).expect("configure");
+        let doc = read_json(&path);
+        assert_eq!(doc["mcpServers"]["github"]["command"], "gh-mcp");
+        assert_eq!(doc["mcpServers"]["mesh-mcp"]["command"], "mesh-mcp");
+        assert_eq!(doc["other"], 1);
+
+        // Idempotent: a second run changes nothing.
+        let before = fs::read_to_string(&path).expect("read");
+        InitCommand::configure_cursor(tmp.path()).expect("configure again");
+        assert_eq!(fs::read_to_string(&path).expect("read"), before);
+    }
+
+    /// VS Code keys servers under `servers`; the stale `mcpServers.mesh-mcp`
+    /// older versions wrote there is removed, the user's own entries are kept.
+    #[test]
+    fn vscode_config_uses_servers_key_and_drops_legacy_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".vscode").join("mcp.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{"servers":{"db":{"type":"stdio","command":"db-mcp"}},"mcpServers":{"mesh-mcp":{"command":"mesh-mcp","args":[]}}}"#,
+        )
+        .expect("write");
+
+        InitCommand::configure_vscode(tmp.path()).expect("configure");
+        let doc = read_json(&path);
+        assert_eq!(doc["servers"]["db"]["command"], "db-mcp");
+        assert_eq!(doc["servers"]["mesh-mcp"]["type"], "stdio");
+        assert!(doc.get("mcpServers").is_none(), "{doc}");
+    }
+
+    /// A config that is not a JSON object is never overwritten.
+    #[test]
+    fn malformed_ide_config_is_left_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".cursor").join("mcp.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let broken = "{ \"mcpServers\": { oops";
+        fs::write(&path, broken).expect("write");
+
+        InitCommand::configure_cursor(tmp.path()).expect("no hard failure");
+        assert_eq!(fs::read_to_string(&path).expect("read"), broken);
+    }
+
+    /// No config yet: one is created with just our entry.
+    #[test]
+    fn missing_ide_config_is_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        InitCommand::configure_cursor(tmp.path()).expect("configure");
+        let doc = read_json(&tmp.path().join(".cursor").join("mcp.json"));
+        assert_eq!(doc["mcpServers"]["mesh-mcp"]["command"], "mesh-mcp");
+    }
 
     /// Runs `InitCommand::run(true, false)` inside a fresh temp dir containing
     /// `marker_files`, restores the original cwd afterward, and returns the

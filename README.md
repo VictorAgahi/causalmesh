@@ -64,12 +64,19 @@ the difference between "it works" and "it understands our architecture".
 claude mcp add mesh-mcp -- mesh-mcp run
 ```
 
-**Cursor / VS Code / Windsurf** — `.cursor/mcp.json` or `.vscode/mcp.json`:
+**Cursor / Windsurf** — `.cursor/mcp.json`:
 ```json
 { "mcpServers": { "mesh-mcp": { "command": "mesh-mcp", "args": ["run"] } } }
 ```
 
-(`mesh-mcp init --auto --write-ide-config` writes these two files for you.)
+**VS Code** — `.vscode/mcp.json` (VS Code keys servers under `servers`):
+```json
+{ "servers": { "mesh-mcp": { "type": "stdio", "command": "mesh-mcp", "args": ["run"] } } }
+```
+
+(`mesh-mcp init --auto --write-ide-config` writes both files for you. It only adds or replaces the
+`mesh-mcp` entry: your other MCP servers are kept, and a file that isn't valid JSON is left
+untouched.)
 
 ### 4. Ask it something
 

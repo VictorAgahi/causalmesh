@@ -1,4 +1,5 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
@@ -19,6 +20,37 @@ struct RawRpcCall {
     line_start: usize,
     line_end: usize,
     service_name: CompactStr,
+    /// Set only for a generated-client construction (`new XClient(...)`):
+    /// the caller node to synthesize when no declaration encloses the call
+    /// site. ts-proto clients are routinely built once at module level
+    /// (`const client = new AdServiceClient(ADDR, creds)`), where there is no
+    /// class/method to attribute the edge to — dropping those call sites was
+    /// the whole otel-demo `frontend -> *` recall gap (Plan 4 step 4.5).
+    module_level_caller: Option<SyntheticCaller>,
+}
+
+/// The node a module-level client construction is attributed to: named
+/// after the variable it is bound to (`client`), or after the client class
+/// when the construction isn't a plain `const x = new ...` binding.
+struct SyntheticCaller {
+    name: CompactStr,
+    line_start: usize,
+    line_end: usize,
+    signature: CompactStr,
+}
+
+/// Every binding a file's top-level `import` statements introduce — the
+/// "is this client class actually imported here?" gate for
+/// `new XClient(...)` detection. Keyed on the *local* name (what a `new`
+/// expression references), mapped to the name as exported by the source
+/// module (what identifies the generated client class), so an aliased
+/// `import { AdServiceClient as Ads }` still resolves `new Ads(...)`.
+#[derive(Default)]
+struct ImportBindings {
+    /// local name -> exported name (named and default imports).
+    named: HashMap<String, String>,
+    /// `import * as ns from '...'` local names.
+    namespaces: HashSet<String>,
 }
 
 /// Per-file invariants threaded through the recursive `visit_node` walk,
@@ -28,6 +60,7 @@ struct VisitCtx<'a> {
     repo_id: RepoId,
     package_name: &'a CompactStr,
     grpc_annotations: &'a [String],
+    import_bindings: &'a ImportBindings,
 }
 
 impl TypeScriptExtractor {
@@ -80,11 +113,13 @@ impl TypeScriptExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let package_name = mesh_core::detect_service_package(&file_path, None);
+        let import_bindings = Self::collect_import_bindings(root, source_bytes);
         let ctx = VisitCtx {
             file_path: &file_path,
             repo_id,
             package_name: &package_name,
             grpc_annotations,
+            import_bindings: &import_bindings,
         };
 
         let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
@@ -97,29 +132,187 @@ impl TypeScriptExtractor {
             &mut raw_rpc_calls,
             0,
         );
-        Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls);
+        Self::resolve_rpc_calls(&mut nodes, raw_rpc_calls, rpc_calls, &ctx);
         nodes
     }
 
-    /// Attaches each raw `getService<XServiceClient>(...)` call to its
-    /// smallest enclosing declaration, mirroring `go.rs::resolve_rpc_calls`.
-    /// A call site with no enclosing declaration has no sensible caller to
-    /// attribute a `CallsRpc` edge to, so it is simply dropped.
+    /// Attaches each raw RPC call site to its smallest enclosing declaration,
+    /// mirroring `go.rs::resolve_rpc_calls`. A `getService<...>(...)` call
+    /// with no enclosing declaration has no sensible caller and is dropped;
+    /// a module-level `new XClient(...)` construction instead gets a
+    /// synthetic `ServiceClass` node for its binding (see
+    /// [`RawRpcCall::module_level_caller`]).
     fn resolve_rpc_calls(
-        nodes: &[ContractNode],
+        nodes: &mut Vec<ContractNode>,
         raw_rpc_calls: Vec<RawRpcCall>,
         out: &mut Vec<(usize, CompactStr)>,
+        ctx: &VisitCtx,
     ) {
         for call in raw_rpc_calls {
             let enclosing = nodes
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| n.line_start <= call.line_start && n.line_end >= call.line_end)
-                .min_by_key(|(_, n)| n.line_end - n.line_start);
+                .min_by_key(|(_, n)| n.line_end - n.line_start)
+                .map(|(idx, _)| idx);
 
-            if let Some((idx, _)) = enclosing {
-                out.push((idx, call.service_name));
+            let idx = match (enclosing, call.module_level_caller) {
+                (Some(idx), _) => idx,
+                (None, Some(caller)) => {
+                    nodes.push(ContractNode {
+                        id: 0,
+                        name: caller.name,
+                        kind: NodeKind::ServiceClass,
+                        file_path: ctx.file_path.clone(),
+                        line_start: caller.line_start,
+                        line_end: caller.line_end,
+                        package: ctx.package_name.clone(),
+                        repo_id: ctx.repo_id,
+                        signature: Some(caller.signature),
+                        docstring: None,
+                    });
+                    nodes.len() - 1
+                }
+                (None, None) => continue,
+            };
+            out.push((idx, call.service_name));
+        }
+    }
+
+    /// Pre-pass over the file's top-level `import` statements (ES modules
+    /// only allow them there) collecting every local binding they introduce.
+    fn collect_import_bindings(root: Node, source: &[u8]) -> ImportBindings {
+        let mut bindings = ImportBindings::default();
+        let mut cursor = root.walk();
+        for stmt in root.children(&mut cursor) {
+            if stmt.kind() != "import_statement" {
+                continue;
             }
+            let mut stmt_cursor = stmt.walk();
+            for clause in stmt.children(&mut stmt_cursor) {
+                if clause.kind() != "import_clause" {
+                    continue;
+                }
+                let mut clause_cursor = clause.walk();
+                for part in clause.children(&mut clause_cursor) {
+                    match part.kind() {
+                        // `import AdServiceClient from '...'`
+                        "identifier" => {
+                            if let Ok(name) = part.utf8_text(source) {
+                                bindings.named.insert(name.to_string(), name.to_string());
+                            }
+                        }
+                        // `import * as demo from '...'`
+                        "namespace_import" => {
+                            let mut ns_cursor = part.walk();
+                            for child in part.named_children(&mut ns_cursor) {
+                                if child.kind() == "identifier" {
+                                    if let Ok(name) = child.utf8_text(source) {
+                                        bindings.namespaces.insert(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        // `import { AdServiceClient, CartServiceClient as Cart } from '...'`
+                        "named_imports" => {
+                            let mut spec_cursor = part.walk();
+                            for spec in part.children(&mut spec_cursor) {
+                                if spec.kind() != "import_specifier" {
+                                    continue;
+                                }
+                                let Some(exported) = spec
+                                    .child_by_field_name("name")
+                                    .and_then(|n| n.utf8_text(source).ok())
+                                else {
+                                    continue;
+                                };
+                                let local = spec
+                                    .child_by_field_name("alias")
+                                    .and_then(|n| n.utf8_text(source).ok())
+                                    .unwrap_or(exported);
+                                bindings
+                                    .named
+                                    .insert(local.to_string(), exported.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        bindings
+    }
+
+    /// Resolves a `new_expression`'s constructor to the gRPC service it
+    /// names, if and only if the constructed class is an *imported*
+    /// `<X>Client`: `new AdServiceClient(...)` with `AdServiceClient`
+    /// imported (named, aliased or default), or `new demo.AdServiceClient(...)`
+    /// with `demo` an imported binding. Returns `<X>` — deliberately not
+    /// checked against anything else here: whether `<X>` (or `<X>Service`)
+    /// is a real gRPC service is decided by `ContractGraph::reconcile_edges`
+    /// against the services actually declared in the graph, which is what
+    /// keeps an arbitrary imported `new S3Client()` from becoming an edge.
+    /// No import-path heuristic is involved (a path containing `proto` says
+    /// nothing: `prototype`, `protocol`, ...).
+    fn extract_client_construction_target(
+        ctor: Node,
+        ctx: &VisitCtx,
+        source: &[u8],
+    ) -> Option<String> {
+        let class_name = match ctor.kind() {
+            "identifier" => {
+                let local = ctor.utf8_text(source).ok()?;
+                ctx.import_bindings.named.get(local)?.as_str()
+            }
+            "member_expression" => {
+                let object = ctor.child_by_field_name("object")?;
+                if object.kind() != "identifier" {
+                    return None;
+                }
+                let object_name = object.utf8_text(source).ok()?;
+                if !ctx.import_bindings.namespaces.contains(object_name)
+                    && !ctx.import_bindings.named.contains_key(object_name)
+                {
+                    return None;
+                }
+                ctor.child_by_field_name("property")?
+                    .utf8_text(source)
+                    .ok()?
+            }
+            _ => return None,
+        };
+        let service = class_name.strip_suffix("Client")?;
+        // Generated client classes are PascalCase (`AdServiceClient`);
+        // this also rejects a bare `Client` (empty `<X>`).
+        if !service.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
+        Some(service.to_string())
+    }
+
+    /// The synthetic caller for a client construction that no declaration
+    /// encloses: named after the `const x = new XClient(...)` binding when
+    /// there is one, the client class otherwise.
+    fn module_level_caller(node: Node, ctor: Node, source: &[u8]) -> SyntheticCaller {
+        let ctor_text = ctor.utf8_text(source).unwrap_or("Client");
+        let declarator = node
+            .parent()
+            .filter(|p| p.kind() == "variable_declarator")
+            .and_then(|p| {
+                p.child_by_field_name("name")
+                    .filter(|n| n.kind() == "identifier")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|name| (p, name))
+            });
+        let (range_node, name) = match declarator {
+            Some((p, name)) => (p, name),
+            None => (node, ctor_text.rsplit('.').next().unwrap_or(ctor_text)),
+        };
+        SyntheticCaller {
+            name: CompactStr::new(name),
+            line_start: range_node.start_position().row + 1,
+            line_end: range_node.end_position().row + 1,
+            signature: CompactStr::new(format!("new {ctor_text}(...)")),
         }
     }
 
@@ -312,6 +505,7 @@ impl TypeScriptExtractor {
                                             line_start: node.start_position().row + 1,
                                             line_end: node.end_position().row + 1,
                                             service_name: CompactStr::new(service_name),
+                                            module_level_caller: None,
                                         });
                                     }
                                 }
@@ -346,8 +540,23 @@ impl TypeScriptExtractor {
                 }
             }
             // BullMQ: `new Queue('name')` is a producer-side topic/queue declaration.
+            // ts-proto / grpc-js generated clients: `new AdServiceClient(addr, creds)`
+            // with `AdServiceClient` imported is a client-construction call
+            // site, recorded like `getService<...>` above (Plan 4 step 4.5).
             "new_expression" => {
                 if let Some(ctor) = node.child_by_field_name("constructor") {
+                    if let Some(service_name) =
+                        Self::extract_client_construction_target(ctor, ctx, source)
+                    {
+                        raw_rpc_calls.push(RawRpcCall {
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            service_name: CompactStr::new(service_name),
+                            module_level_caller: Some(Self::module_level_caller(
+                                node, ctor, source,
+                            )),
+                        });
+                    }
                     if ctor.kind() == "identifier" {
                         if let Ok("Queue") = ctor.utf8_text(source) {
                             if let Some(args) = node.child_by_field_name("arguments") {
@@ -1131,5 +1340,189 @@ export class UserController {
             .find(|n| n.name == "updateUser")
             .expect("updateUser");
         assert_eq!(patch.kind, NodeKind::HttpEndpoint);
+    }
+
+    fn extract_rpc(file: &str, code: &str) -> (Vec<ContractNode>, Vec<(usize, CompactStr)>) {
+        let mut parser = Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        parser.set_language(&lang).unwrap();
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let tree = parser.parse(code, None).expect("parse");
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new(file),
+            code,
+            1,
+            &tree,
+            &mut imports,
+            &mut rpc_calls,
+            &[DEFAULT_GRPC_ANNOTATION.to_string()],
+        );
+        (nodes, rpc_calls)
+    }
+
+    /// Builds a graph declaring `services` (as a `.proto` would) plus one
+    /// TS file's nodes and RPC calls, reconciles it, and returns the
+    /// `(caller name, service name)` of every `CallsRpc` edge.
+    fn rpc_edges_against(services: &[&str], file: &str, code: &str) -> Vec<(String, String)> {
+        let (nodes, rpc_calls) = extract_rpc(file, code);
+        let mut graph = ContractGraph::new();
+        for service in services {
+            graph.add_node(ContractNode {
+                id: 0,
+                name: CompactStr::new(*service),
+                kind: NodeKind::GrpcService,
+                file_path: Arc::from(Path::new("pb/demo.proto")),
+                line_start: 1,
+                line_end: 1,
+                package: CompactStr::new("oteldemo"),
+                repo_id: 0,
+                signature: None,
+                docstring: None,
+            });
+        }
+        let ids: Vec<_> = nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        for (idx, target) in &rpc_calls {
+            graph.add_rpc_call(ids[*idx], target);
+        }
+        graph.reconcile_edges();
+        let mut edges: Vec<(String, String)> = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::CallsRpc)
+            .filter_map(|e| {
+                Some((
+                    graph.get_node(e.from)?.name.to_string(),
+                    graph.get_node(e.to)?.name.to_string(),
+                ))
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Plan 4 step 4.5 — the otel-demo frontend shape: a ts-proto client
+    /// imported from the generated file and built once at module level.
+    /// With `AdService` declared in the graph, the construction becomes a
+    /// `CallsRpc` edge from a synthetic caller named after the binding.
+    #[test]
+    fn imported_ts_proto_client_construction_links_to_declared_service() {
+        let code = r#"
+import { ChannelCredentials } from '@grpc/grpc-js';
+import { AdResponse, AdServiceClient } from '../../protos/demo';
+
+const { AD_ADDR = '' } = process.env;
+
+const client = new AdServiceClient(AD_ADDR, ChannelCredentials.createInsecure());
+"#;
+        let file = "src/frontend/gateways/rpc/Ad.gateway.ts";
+        let (nodes, rpc_calls) = extract_rpc(file, code);
+        let caller = nodes
+            .iter()
+            .position(|n| n.name == "client")
+            .expect("synthetic caller for the module-level client binding");
+        assert_eq!(nodes[caller].kind, NodeKind::ServiceClass);
+        assert_eq!(nodes[caller].line_start, 7);
+        assert_eq!(rpc_calls, vec![(caller, CompactStr::new("AdService"))]);
+
+        assert_eq!(
+            rpc_edges_against(&["AdService", "CartService"], file, code),
+            vec![("client".to_string(), "AdService".to_string())]
+        );
+    }
+
+    /// Inside a method, the construction is attributed to that method (no
+    /// synthetic node); aliased and namespace imports pass the import gate;
+    /// `<X>Client` for a declared `<X>Service` resolves too.
+    #[test]
+    fn client_construction_in_method_aliased_and_namespace_imports() {
+        let code = r#"
+import { CartServiceClient as Carts } from './gen/demo';
+import * as demo from './gen/demo';
+import { AdClient } from './gen/ad';
+
+export class Gateway {
+    connect() {
+        this.carts = new Carts(ADDR, creds);
+        this.checkout = new demo.CheckoutServiceClient(ADDR, creds);
+        this.ads = new AdClient(ADDR, creds);
+    }
+}
+"#;
+        let (nodes, _) = extract_rpc("gw.ts", code);
+        assert!(
+            !nodes.iter().any(|n| n
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.starts_with("new "))),
+            "an enclosed construction must not synthesize a caller node"
+        );
+        assert_eq!(
+            rpc_edges_against(
+                &["AdService", "CartService", "CheckoutService"],
+                "gw.ts",
+                code
+            ),
+            vec![
+                ("connect".to_string(), "AdService".to_string()),
+                ("connect".to_string(), "CartService".to_string()),
+                ("connect".to_string(), "CheckoutService".to_string()),
+            ]
+        );
+    }
+
+    /// An imported `new FooClient()` whose service is not declared in the
+    /// graph (an SDK client, a react-query `QueryClient`, ...) is no edge:
+    /// the declared services, not the import path, decide.
+    #[test]
+    fn imported_client_without_declared_service_is_not_an_edge() {
+        let code = r#"
+import { S3Client } from '@aws-sdk/client-s3';
+import { FooClient } from '../../protos/foo';
+
+const s3 = new S3Client({});
+const foo = new FooClient(ADDR);
+"#;
+        assert!(rpc_edges_against(&["AdService"], "src/frontend/x.ts", code).is_empty());
+    }
+
+    /// A `<X>Client` that is not imported (declared locally, or a global) is
+    /// never recorded, even when `<X>` is a declared service.
+    #[test]
+    fn non_imported_client_construction_is_not_recorded() {
+        let code = r#"
+class AdServiceClient {}
+const client = new AdServiceClient(ADDR);
+const other = new CartServiceClient(ADDR);
+"#;
+        let (_, rpc_calls) = extract_rpc("src/frontend/x.ts", code);
+        assert!(rpc_calls.is_empty(), "got: {rpc_calls:?}");
+        assert!(
+            rpc_edges_against(&["AdService", "CartService"], "src/frontend/x.ts", code).is_empty()
+        );
+    }
+
+    /// No import-path heuristic: an import from `./prototype` (which a
+    /// `proto` substring test would have matched) links nothing unless the
+    /// client names a declared service — and the path neither helps nor
+    /// hurts when it does.
+    #[test]
+    fn import_path_plays_no_role_in_client_detection() {
+        let code = r#"
+import { PrototypeClient } from './prototype';
+
+const proto = new PrototypeClient();
+"#;
+        assert!(rpc_edges_against(&["AdService"], "src/web/p.ts", code).is_empty());
+
+        let code = r#"
+import { AdServiceClient } from './prototype';
+
+const ads = new AdServiceClient(ADDR);
+"#;
+        assert_eq!(
+            rpc_edges_against(&["AdService"], "src/web/p.ts", code),
+            vec![("ads".to_string(), "AdService".to_string())]
+        );
     }
 }

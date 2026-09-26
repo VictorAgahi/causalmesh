@@ -766,6 +766,42 @@ hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are 
 cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
 were not loosened to make larger corpora pass.
 
+## Update (2026-09-26, Plan 4 step 4.5 — TypeScript generated-client recall, health filter, golden ratchet in CI)
+
+Measured with the release binary first on `PATH`, `scripts/golden/score.py <repo>` on the pinned
+corpus of `scripts/golden/repos.txt` (`~/.cache/mesh-golden`), same corpus before and after:
+
+| Corpus | Before (`02695de`, 6.0.1) | After (this step) |
+|---|---|---|
+| `online-boutique` | 100.0% precision / 100.0% recall (14/14) | 100.0% / 100.0% (14/14) |
+| `bank-of-anthos` | 100.0% / 100.0% (0 golden edges, 0 found) | 100.0% / 100.0% (0 / 0) |
+| `otel-demo` | 87.5% / 53.8% (7 of 8 found edges true, 7 of 13 golden) | 100.0% / 100.0% (13/13, 13 found) |
+
+- **`new <X>Client(...)`** (ts-proto / `@grpc/grpc-js` generated clients) is now a client call
+  site if and only if `<X>Client` is bound by one of the file's `import`s (named, aliased,
+  default, or as a member of an imported namespace) — and it only becomes a `CallsRpc` edge when
+  `<X>` (or, failing that, `<X>Service`) resolves against a gRPC service/method *declared in the
+  graph*, through the same `reconcile_edges` resolution `getService<XServiceClient>(...)` and Go's
+  `NewXServiceClient` use. No import-path heuristic: an imported `new S3Client()` or
+  `new QueryClient()` links nothing (otel-demo has two imported react-query `QueryClient`s; no edge).
+- otel-demo builds each client once at module level (`const client = new AdServiceClient(...)`),
+  where no class or method encloses the call site. Those constructions are now attributed to a
+  synthetic `ServiceClass` node named after the binding (`client`), instead of being dropped as
+  before — that drop, not the missing pattern alone, is what the 6 missed `frontend -> *` edges
+  needed. Cost measured on otel-demo: 8 synthetic nodes (the 6 gateways plus 2 react-query
+  `queryClient` bindings, which carry no edge).
+- **`grpc.health.v1.Health`** is filtered from `CallsRpc` resolution as infrastructure: by full
+  name, or a `Health` service declared in the `grpc.health.v1` proto package, or one inferred from
+  code with no `.proto` behind it (Go's `healthpb.RegisterHealthServer`). A repo's own
+  `service Health` in its own proto package is kept. This removes otel-demo's `checkout -> health`.
+- **Ratchet wired**: `.github/workflows/golden.yml` scores all three corpora on every PR (to
+  `main` and `p*/**`) and push to `main`, failing under online-boutique 1.0/1.0,
+  bank-of-anthos 1.0/1.0, otel-demo 1.0/1.0. This supersedes the "not yet wired in" note of the
+  Ratchet policy below, and resolves the two otel-demo gaps (TypeScript client construction,
+  `checkout -> health`) still listed under "What's NOT measured yet".
+- Determinism: two independent `mesh-mcp graph` runs on otel-demo give identical node and edge
+  sets (compared by content, not ids).
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

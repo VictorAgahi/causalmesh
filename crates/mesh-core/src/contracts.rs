@@ -811,39 +811,45 @@ impl ContractGraph {
         let mut rpc_edges = Vec::new();
         for (caller_id, target_rpc) in &self.rpc_calls {
             let target_str = target_rpc.as_str();
-            let target_lower = target_str.to_lowercase();
-            let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
-            let target_bare_lower = target_bare.to_lowercase();
-
-            // 1. Exact FQCN match has top priority and highest confidence.
-            // 2. Bare-name fallback: lower confidence.
-            // At either tier, disambiguate multiple candidates by caller package;
-            // a genuine tie (no candidate shares the caller's package, or more than
-            // one does) fans out to every tied candidate as `Ambiguous` rather than
-            // picking whichever one the index happened to list first.
+            // The standard gRPC health-checking protocol is infrastructure every
+            // server exposes, not a service-to-service dependency: an edge to
+            // it (a readiness probe in a test, a `NewHealthClient` in a
+            // sidecar) is noise in every blast-radius answer (Plan 4 step 4.5:
+            // otel-demo's spurious `checkout -> health`).
+            if Self::is_grpc_health_fqcn(target_str) {
+                continue;
+            }
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
-            let matches: Vec<(NodeId, EdgeConfidence)> =
-                if let Some(candidates) = proto_by_fqcn.get(&target_lower) {
-                    match &caller_package {
-                        Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Exact),
-                        None => candidates
-                            .ids
-                            .iter()
-                            .map(|&id| (id, EdgeConfidence::Exact))
-                            .collect(),
-                    }
-                } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
-                    match &caller_package {
-                        Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Heuristic),
-                        None => candidates
-                            .ids
-                            .iter()
-                            .map(|&id| (id, EdgeConfidence::Ambiguous))
-                            .collect(),
-                    }
-                } else {
-                    Vec::new()
-                };
+            let mut matches = Self::resolve_rpc_target(
+                target_str,
+                caller_package.as_ref(),
+                &proto_by_fqcn,
+                &proto_by_bare,
+            );
+            // A generated client names its service either way: ts-proto emits
+            // `AdServiceClient` for `service AdService` but `AdClient` for
+            // `service Ad`, and a caller may well spell the latter's target as
+            // `Ad` while the graph declares `AdService` (or vice versa). Tried
+            // only when the literal target resolves to nothing, and only
+            // against services/methods actually declared in the graph — never
+            // a way to invent an edge to an undeclared name.
+            if matches.is_empty() {
+                let bare = target_str.split('.').next_back().unwrap_or(target_str);
+                if !bare.is_empty() && !bare.to_ascii_lowercase().ends_with("service") {
+                    let with_suffix = format!("{target_str}Service");
+                    matches = Self::resolve_rpc_target(
+                        &with_suffix,
+                        caller_package.as_ref(),
+                        &proto_by_fqcn,
+                        &proto_by_bare,
+                    );
+                }
+            }
+            matches.retain(|(id, _)| {
+                self.nodes
+                    .get(id)
+                    .is_none_or(|n| !Self::is_grpc_health_service(n))
+            });
 
             for (target_id, confidence) in matches {
                 if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
@@ -858,6 +864,73 @@ impl ContractGraph {
             }
         }
         self.edges.extend(rpc_edges);
+    }
+
+    /// One RPC target resolved against the declared services/methods:
+    /// 1. exact FQCN match has top priority and highest confidence;
+    /// 2. bare-name fallback: lower confidence.
+    ///
+    /// At either tier, multiple candidates are disambiguated by caller package;
+    /// a genuine tie (no candidate shares the caller's package, or more than
+    /// one does) fans out to every tied candidate as `Ambiguous` rather than
+    /// picking whichever one the index happened to list first.
+    fn resolve_rpc_target(
+        target_str: &str,
+        caller_package: Option<&CompactStr>,
+        proto_by_fqcn: &HashMap<String, PackageBucket<'_>>,
+        proto_by_bare: &HashMap<String, PackageBucket<'_>>,
+    ) -> Vec<(NodeId, EdgeConfidence)> {
+        let target_lower = target_str.to_lowercase();
+        let target_bare = target_str.split('.').next_back().unwrap_or(target_str);
+        let target_bare_lower = target_bare.to_lowercase();
+        if let Some(candidates) = proto_by_fqcn.get(&target_lower) {
+            match caller_package {
+                Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Exact),
+                None => candidates
+                    .ids
+                    .iter()
+                    .map(|&id| (id, EdgeConfidence::Exact))
+                    .collect(),
+            }
+        } else if let Some(candidates) = proto_by_bare.get(&target_bare_lower) {
+            match caller_package {
+                Some(pkg) => candidates.pick_or_ambiguous(pkg, EdgeConfidence::Heuristic),
+                None => candidates
+                    .ids
+                    .iter()
+                    .map(|&id| (id, EdgeConfidence::Ambiguous))
+                    .collect(),
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `grpc.health.v1.Health` (or one of its methods) named by its full
+    /// proto name — unambiguous whatever the graph declares.
+    fn is_grpc_health_fqcn(target: &str) -> bool {
+        const HEALTH: &str = "grpc.health.v1.health";
+        target.len() >= HEALTH.len()
+            && target.is_char_boundary(HEALTH.len())
+            && target[..HEALTH.len()].eq_ignore_ascii_case(HEALTH)
+            && (target.len() == HEALTH.len() || target.as_bytes()[HEALTH.len()] == b'.')
+    }
+
+    /// Whether a resolved RPC target node is the standard gRPC health
+    /// service: a `Health` service/method declared in the `grpc.health.v1`
+    /// proto package, or a `Health` service a language extractor inferred
+    /// from code (e.g. Go's `healthpb.RegisterHealthServer(...)`), which with
+    /// no `.proto` of its own behind it is the stock health server. A
+    /// `service Health` the repo declares in its *own* proto package is a
+    /// real service and is kept.
+    fn is_grpc_health_service(node: &ContractNode) -> bool {
+        let service_segment = match node.kind {
+            NodeKind::GrpcService => node.name.split('.').next_back(),
+            NodeKind::GrpcMethod => node.name.rsplit('.').nth(1),
+            _ => None,
+        };
+        service_segment.is_some_and(|s| s.eq_ignore_ascii_case("health"))
+            && (node.package.as_str() == "grpc.health.v1" || !Self::is_proto_file(&node.file_path))
     }
 
     #[inline]
@@ -3044,5 +3117,153 @@ mod tests {
             .filter(|l| l.starts_with("node "))
             .count();
         assert_eq!(node_lines, 2);
+    }
+
+    fn calls_rpc_targets(g: &ContractGraph, from: NodeId) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = g
+            .all_edges()
+            .iter()
+            .filter(|e| e.from == from && e.kind == EdgeKind::CallsRpc)
+            .map(|e| e.to)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Plan 4 step 4.5: the stock gRPC health service is infrastructure,
+    /// never a service-to-service edge — whether it is inferred from code
+    /// (Go's `RegisterHealthServer`, no `.proto` behind it), declared by a
+    /// vendored `grpc/health/v1/health.proto`, or named by its full proto
+    /// name. A `service Health` the repo declares in its own proto package
+    /// is a real service and keeps its edge.
+    #[test]
+    fn grpc_health_service_is_filtered_as_infrastructure() {
+        use NodeKind::{GrpcMethod, GrpcService, ServiceClass};
+        let mut g = ContractGraph::new();
+        let inferred = g.add_node(memo_node(
+            "Health",
+            "checkout",
+            "src/checkout/main.go",
+            0,
+            GrpcService,
+        ));
+        let caller = g.add_node(memo_node(
+            "TestStartup",
+            "checkout",
+            "src/checkout/main_test.go",
+            0,
+            ServiceClass,
+        ));
+        g.add_rpc_call(caller, "Health");
+        let vendored = g.add_node(memo_node(
+            "Health.Check",
+            "grpc.health.v1",
+            "vendor/grpc/health/v1/health.proto",
+            1,
+            GrpcMethod,
+        ));
+        let probe = g.add_node(memo_node(
+            "probe",
+            "ops",
+            "src/ops/probe.go",
+            1,
+            ServiceClass,
+        ));
+        g.add_rpc_call(probe, "Health.Check");
+        let fq = g.add_node(memo_node("fq", "ops", "src/ops/fq.go", 1, ServiceClass));
+        g.add_rpc_call(fq, "grpc.health.v1.Health");
+        g.reconcile_edges();
+        assert!(
+            calls_rpc_targets(&g, caller).is_empty(),
+            "inferred Health: {:?}",
+            g.all_edges()
+        );
+        assert!(
+            calls_rpc_targets(&g, probe).is_empty(),
+            "vendored health.proto: {:?}",
+            g.all_edges()
+        );
+        assert!(calls_rpc_targets(&g, fq).is_empty());
+        let _ = (inferred, vendored);
+
+        // A repo's own `service Health` in its own proto package is kept.
+        let mut g = ContractGraph::new();
+        let own = g.add_node(memo_node(
+            "Health",
+            "acme.clinic",
+            "proto/clinic.proto",
+            0,
+            GrpcService,
+        ));
+        let caller = g.add_node(memo_node(
+            "book",
+            "frontend",
+            "src/frontend/book.ts",
+            0,
+            ServiceClass,
+        ));
+        g.add_rpc_call(caller, "Health");
+        g.reconcile_edges();
+        assert_eq!(calls_rpc_targets(&g, caller), vec![own]);
+    }
+
+    /// `<X>` resolves to a declared `<X>Service` when `<X>` itself is not
+    /// declared (ts-proto's `AdClient` for `service Ad` vs. a caller naming
+    /// `AdService`, and the reverse), and never to an undeclared name.
+    #[test]
+    fn rpc_target_falls_back_to_service_suffix_only_against_declared_services() {
+        use NodeKind::{GrpcService, ServiceClass};
+        let mut g = ContractGraph::new();
+        let ad = g.add_node(memo_node(
+            "AdService",
+            "oteldemo",
+            "pb/demo.proto",
+            0,
+            GrpcService,
+        ));
+        let cart = g.add_node(memo_node(
+            "Cart",
+            "oteldemo",
+            "pb/demo.proto",
+            0,
+            GrpcService,
+        ));
+        let cart_svc = g.add_node(memo_node(
+            "CartService",
+            "oteldemo",
+            "pb/other.proto",
+            0,
+            GrpcService,
+        ));
+        let c_ad = g.add_node(memo_node(
+            "ads",
+            "frontend",
+            "src/frontend/a.ts",
+            0,
+            ServiceClass,
+        ));
+        let c_cart = g.add_node(memo_node(
+            "cart",
+            "frontend",
+            "src/frontend/c.ts",
+            0,
+            ServiceClass,
+        ));
+        let c_foo = g.add_node(memo_node(
+            "foo",
+            "frontend",
+            "src/frontend/f.ts",
+            0,
+            ServiceClass,
+        ));
+        g.add_rpc_call(c_ad, "Ad");
+        // `Cart` is itself declared: the literal target wins, no fallback.
+        g.add_rpc_call(c_cart, "Cart");
+        g.add_rpc_call(c_foo, "Foo");
+        g.reconcile_edges();
+        assert_eq!(calls_rpc_targets(&g, c_ad), vec![ad]);
+        assert_eq!(calls_rpc_targets(&g, c_cart), vec![cart]);
+        assert!(calls_rpc_targets(&g, c_foo).is_empty());
+        let _ = cart_svc;
     }
 }

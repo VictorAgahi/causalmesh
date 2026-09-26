@@ -13,6 +13,11 @@
 #   SEQUENTIAL_RUNS  sequential runs per workspace (default: 5)
 #   CONCURRENT_RUNS  concurrent runs per workspace (default: 8)
 #
+# The fingerprint covers absolute file paths (node, doc section and property
+# source paths), so it is only comparable between runs over the same checkout
+# path: the same content checked out elsewhere, or on another machine or OS,
+# gives a different value. This gate compares runs within one checkout only.
+#
 # Every failure is reported, never silent: a failing mesh-mcp run prints its
 # command, exit code and captured stderr, and any other failing command is
 # reported by the ERR trap (command, line, exit code).
@@ -48,6 +53,25 @@ if [[ ! -x "$BIN" ]]; then
 fi
 if [[ ! -x "$BIN" ]]; then
   echo "✖ determinism.sh: mesh-mcp binary not found or not executable: $BIN" >&2
+  exit 1
+fi
+# Each run cds into its workspace, so a relative MESH_MCP_BIN must be made
+# absolute here or every run would fail with "No such file or directory".
+case "$BIN" in
+  /*) ;;
+  *) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" ;;
+esac
+
+for var in SEQUENTIAL_RUNS CONCURRENT_RUNS; do
+  case "${!var}" in
+    '' | *[!0-9]*)
+      echo "✖ determinism.sh: $var must be a non-negative integer, got '${!var}'" >&2
+      exit 1
+      ;;
+  esac
+done
+if [[ $((SEQUENTIAL_RUNS + CONCURRENT_RUNS)) -lt 2 ]]; then
+  echo "✖ determinism.sh: SEQUENTIAL_RUNS + CONCURRENT_RUNS must be at least 2 to compare fingerprints" >&2
   exit 1
 fi
 
@@ -98,15 +122,18 @@ fingerprint() {
 }
 
 status=0
+ws_index=0
 for ws in "${WORKSPACES[@]}"; do
+  ws_index=$((ws_index + 1))
   if [[ ! -d "$ws" ]]; then
     echo "✖ determinism.sh: workspace is not a directory: $ws" >&2
     status=1
     continue
   fi
   name="$(basename "$ws")"
-  runs="$OUT_DIR/$name"
-  logs="$OUT_DIR/$name.logs"
+  # Indexed, so two workspaces sharing a basename never share result/log files.
+  runs="$OUT_DIR/$ws_index-$name"
+  logs="$OUT_DIR/$ws_index-$name.logs"
   mkdir -p "$runs" "$logs"
   failed=0
 
@@ -141,7 +168,7 @@ for ws in "${WORKSPACES[@]}"; do
 
   distinct="$(sort -u "$runs"/* | wc -l | tr -d ' ')"
   if [[ "$distinct" == "1" ]]; then
-    echo "✔ $name: 1 fingerprint over $total runs ($(cut -d' ' -f2 "$runs/sequential-1" | cut -c1-16)…)"
+    echo "✔ $name: 1 fingerprint over $total runs ($(sort -u "$runs"/* | cut -d' ' -f2 | cut -c1-16)…)"
   else
     echo "✖ $name: $distinct distinct fingerprints over $total runs ($SEQUENTIAL_RUNS sequential + $CONCURRENT_RUNS concurrent)"
     sort "$runs"/* | uniq -c | sed 's/^/    /'

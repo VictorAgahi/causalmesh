@@ -20,6 +20,9 @@ pub struct TestSlowOpArgs {
     pub sleep_ms: u64,
 
     #[serde(default)]
+    // Accepted for W3C trace propagation, hidden from `tools/list`: the model
+    // cannot use it, and it cost every session ~200 schema tokens.
+    #[schemars(skip)]
     pub _meta: Option<RequestMeta>,
 }
 

@@ -100,8 +100,12 @@ def main():
             {"name": "smart_search", "arguments": {"query": search_query, "scope": ".", "fuzzy": False}},
             3,
         )
-        err = resp.get("error")
+        # A tool-level failure is an MCP CallToolResult with isError: true, not a
+        # JSON-RPC error (only protocol faults are); treat both as failures here.
         payload = resp.get("result")
+        err = resp.get("error") or (
+            payload.get("content", [{}])[0].get("text") if payload and payload.get("isError") else None
+        )
         size = len(json.dumps(payload)) if payload is not None else 0
         results["steps"]["smart_search"] = {"ms": round(ms, 1), "response_bytes": size, "error": err}
         if err:

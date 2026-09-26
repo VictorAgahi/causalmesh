@@ -195,7 +195,10 @@ Reverse dependency search across repository and microservice boundaries. Identif
 #### Description
 Comprehensive end-to-end tracing for gRPC service architectures. Correlates Protobuf definitions, Java/Go/Rust server implementations, and client stubs across all repositories.
 
-**Negative Constraints**: DO NOT USE for message brokers or asynchronous event streams (use analyze_impact).
+It then checks the `.proto` that defines the target for **wire-format breaking changes** against a
+Git base (see [Wire-format check](#wire-format-check) below).
+
+**Negative Constraints**: DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema
 ```json
@@ -205,7 +208,11 @@ Comprehensive end-to-end tracing for gRPC service architectures. Correlates Prot
   "properties": {
     "target": {
       "type": "string",
-      "description": "Name of the gRPC service (ex: 'UserService'), RPC method (ex: 'SignUp', 'AuthenticateUser'), or package."
+      "description": "Name of the gRPC service (ex: 'UserService'), RPC method (ex: 'SignUp', 'AuthenticateUser'), or package. A path ending in '.proto' (inside the workspace roots) runs the wire-format check on that file directly."
+    },
+    "base": {
+      "type": ["string", "null"],
+      "description": "Git revision to compare the .proto against for wire-format breaking changes (ex: 'main', 'origin/main', 'v1.4.0', a commit SHA). Omit to use the merge-base of HEAD with the first existing of origin/HEAD, origin/main, main (falling back to HEAD). NOT a file path; must not start with '-' or contain ':'."
     }
   },
   "additionalProperties": false
@@ -230,6 +237,70 @@ Comprehensive end-to-end tracing for gRPC service architectures. Correlates Prot
   - `src/guards/auth.guard.ts:L45`
 - **Service**: `services/order-service` (Java / Spring Boot)
   - `src/main/java/com/corp/order/config/AuthGrpcClient.java:L28`
+```
+
+#### Wire-format check
+
+The file checked is the `.proto` of the resolved proto definition, or `target` itself when it is a
+`.proto` path. The path goes through `ValidatedScope` (a path outside the roots is `-32602`).
+
+**Base.** An explicit `base` is resolved with `git rev-parse --verify --end-of-options <base>^{commit}`.
+Without `base`, the first existing ref of `origin/HEAD` → `origin/main` → `main` is taken and the
+base is `git merge-base HEAD <ref>`; with no such ref, or no merge-base, the base is `HEAD` (the
+working tree is compared with the last commit). Never `HEAD~1`. The report names the ref and the
+commit it used.
+
+**Execution.** `git` runs without a shell, one argument per argv entry, in the `.proto`'s own
+directory (each root can be its own repository), with a 5 s timeout per command and
+`GIT_DIR`/`GIT_WORK_TREE`-style variables removed. The base version is read in memory with
+`git show --no-textconv <sha>:<path>`: nothing is written to disk or to SQLite. Both versions go
+through the same parser guard as indexing (schema size budget, binary sniff, 1,024-byte lines,
+nesting ≤ 64, 500 ms parse budget); a version with syntax errors is reported as "not compared"
+rather than producing partial findings.
+
+**Rules** — each finding is tagged `WIRE_FORMAT_BREAKING_CHANGE`. Messages are matched by their
+path in the file (`Outer.Inner`); `oneof` members belong to the enclosing message's number space.
+
+| Rule | Reported when |
+|---|---|
+| Field number reused | Number N names a different field than in the base, or a number `reserved` in the base is used again |
+| Incompatible type | Same number and name, but the cardinality changed (singular ↔ `repeated`, map ↔ non-map) or the value types are not in the same group below |
+| Deleted without `reserved` | A field of the base is gone and neither its number (single, `N to M`, `N to max`) nor its name is `reserved` |
+
+**Compatibility table** (value types, and map keys/values):
+
+| Group | Interchangeable |
+|---|---|
+| varint | `int32`, `uint32`, `int64`, `uint64`, `bool`, enums declared in the same file (64-bit values are truncated when read as 32-bit) |
+| zig-zag | `sint32`, `sint64` |
+| 32-bit | `fixed32`, `sfixed32` |
+| 64-bit | `fixed64`, `sfixed64` |
+| length-delimited | `string` ↔ `bytes` (valid UTF-8 only), `bytes` ↔ message, a message ↔ the same message (`.pkg.Foo` = `Foo`) |
+
+Everything else is reported, including `float`/`double` against `fixed32`/`fixed64`, `sint*` against
+plain varints, `string` against a message and two different message types. `optional` ↔ plain
+singular is not a change. An enum imported from another file is not resolved and is treated as a
+message type.
+
+**Edge cases.**
+
+| Situation | Explicit `base` | No `base` |
+|---|---|---|
+| File absent from the base | "new file", no finding | same |
+| File not inside a Git repository | `isError` | one-line "skipped" note, trace kept |
+| `base` not found | `isError` | — (falls back to `HEAD`; a repository without commits is a "skipped" note) |
+| `git` not on the `PATH` | `isError` | one-line "skipped" note, trace kept |
+| `base` starting with `-`, containing `:` or whitespace | `isError` (`-32602`) before `git` runs | — |
+
+The implicit-base column keeps `analyze_grpc` usable on workspaces that are not Git checkouts:
+the trace is still valid there, only the comparison is impossible.
+
+```markdown
+### Wire-format check: `protos/user.proto`
+- **Base**: merge-base of `HEAD` and `origin/main` (`3f2c1a9b7d4e`), compared with the working tree
+- **Result**: 2 `WIRE_FORMAT_BREAKING_CHANGE`
+  - `WIRE_FORMAT_BREAKING_CHANGE` field number reused — `User` #2 (L6): was `email` (`string`), now `display_name` (`string`): data written by either side is read as the other field
+  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #5 (L10): `fax` (`string`) was removed; add `reserved 5;` and `reserved "fax";` so the number is never reused
 ```
 
 ---

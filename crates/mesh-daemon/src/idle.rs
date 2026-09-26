@@ -42,15 +42,24 @@ impl ClientCounter {
 /// Polls every `poll_interval` and cancels `token` if no clients have
 /// been connected for `idle_timeout` duration.
 ///
-/// The watchdog only activates after the first client has connected
-/// (to avoid immediate shutdown during startup latency).
+/// `startup_grace` is a *second*, independent deadline (P2 step 3.3): if no client has
+/// connected at all within `startup_grace` of this call, the daemon shuts down too — this is
+/// the orphaned-daemon guard, distinct from `idle_timeout`'s "had clients, now idle" case.
+/// `mesh-mcp run`'s `ensure_daemon_running` auto-spawns `meshd` ad-hoc (no launchd/systemd
+/// supervising it); if that spawn ever races or fails after the process itself started (the
+/// parent CLI exits, a config error prevents any tool ever calling in, the workspace path was
+/// wrong so no client ever finds this daemon's socket), the pre-3.3 watchdog's "only activates
+/// after the first client" rule meant such a daemon lived forever, unkillable except by PID —
+/// exactly the kind of zombie this mechanism exists to prevent for the *other* case.
 pub fn spawn_idle_watchdog(
     counter: ClientCounter,
     token: CancellationToken,
     idle_timeout: Duration,
     poll_interval: Duration,
+    startup_grace: Duration,
 ) {
     tokio::spawn(async move {
+        let started_at = std::time::Instant::now();
         let mut ever_had_client = false;
         let mut idle_since: Option<std::time::Instant> = None;
 
@@ -77,6 +86,15 @@ pub fn spawn_idle_watchdog(
                     token.cancel();
                     break;
                 }
+            } else if started_at.elapsed() >= startup_grace {
+                tracing::warn!(
+                    target: "meshd::idle",
+                    "No client connected within {:?} of startup. Initiating graceful shutdown \
+                     (orphaned-daemon guard).",
+                    startup_grace
+                );
+                token.cancel();
+                break;
             }
         }
     });
@@ -108,8 +126,9 @@ mod tests {
         spawn_idle_watchdog(
             counter.clone(),
             token.clone(),
-            Duration::from_millis(80), // idle timeout
-            Duration::from_millis(20), // poll interval
+            Duration::from_millis(80),  // idle timeout
+            Duration::from_millis(20),  // poll interval
+            Duration::from_secs(3_600), // startup grace: irrelevant here, kept well out of the way
         );
 
         // Give watchdog at least one poll cycle to observe the active client
@@ -127,22 +146,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_idle_watchdog_does_not_fire_if_never_had_client() {
+    async fn test_idle_watchdog_does_not_fire_before_startup_grace_elapses() {
         let counter = ClientCounter::new();
         let token = CancellationToken::new();
 
-        // Never had a client → watchdog must NOT fire
+        // Never had a client, but well within the (generous) startup grace → must NOT fire yet.
         spawn_idle_watchdog(
             counter,
             token.clone(),
             Duration::from_millis(30),
             Duration::from_millis(10),
+            Duration::from_secs(3_600),
         );
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !token.is_cancelled(),
-            "Watchdog must not fire without ever having a client"
+            "Watchdog must not fire before startup_grace elapses, even with no client ever"
+        );
+    }
+
+    /// P2 step 3.3's actual new behavior: a daemon that never gets a client at all (auto-spawn
+    /// raced or failed after the process started, wrong workspace path, ...) must eventually
+    /// shut itself down rather than living forever as an unreachable zombie — the gap the
+    /// pre-3.3 "only activates after the first client" rule left open.
+    #[tokio::test]
+    async fn test_idle_watchdog_fires_after_startup_grace_with_no_client_ever() {
+        let counter = ClientCounter::new();
+        let token = CancellationToken::new();
+
+        spawn_idle_watchdog(
+            counter,
+            token.clone(),
+            Duration::from_secs(3_600), // idle timeout: irrelevant, never had a client
+            Duration::from_millis(10),
+            Duration::from_millis(50), // startup grace
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            token.is_cancelled(),
+            "Watchdog must cancel the token once startup_grace elapses with no client ever \
+             connected"
+        );
+    }
+
+    /// A client connecting *after* startup but before `startup_grace` elapses must disarm the
+    /// startup-grace deadline entirely — it's the "orphaned, nobody will ever connect" case
+    /// this guards against, not a general "shut down anything idle at startup" policy.
+    #[tokio::test]
+    async fn test_startup_grace_does_not_fire_once_a_client_has_connected() {
+        let counter = ClientCounter::new();
+        let token = CancellationToken::new();
+
+        spawn_idle_watchdog(
+            counter.clone(),
+            token.clone(),
+            Duration::from_secs(3_600), // idle timeout: never goes idle again in this test
+            Duration::from_millis(10),
+            Duration::from_millis(50), // startup grace
+        );
+
+        // Client connects before the startup grace would otherwise fire.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        counter.increment();
+
+        // Wait well past when the startup grace alone would have fired.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !token.is_cancelled(),
+            "A client connecting within the startup grace must disarm it, not just delay it"
         );
     }
 }

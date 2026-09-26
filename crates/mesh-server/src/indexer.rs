@@ -7,15 +7,16 @@
 //! sequential.
 
 use mesh_core::{
-    expand_roots, AppState, BackgroundRescanEngine, Config, ContractGraph, DifferentialVfs,
-    DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth, MeshSnapshot,
-    PropertyRegistry, PropertySourceMatcher, RepoId, ValidatedScope,
+    expand_roots, sha256, AppState, BackgroundRescanEngine, CacheEntry, Config, ContractGraph,
+    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth,
+    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RepoId,
+    ValidatedScope,
 };
 use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
 };
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Crawl depth used for every full workspace scan.
@@ -42,6 +43,11 @@ struct FileFragment {
     code: FileIndex,
     docs: Vec<DocSection>,
     props: Option<PropertyRegistry>,
+    /// Set when `code` came from a fresh tree-sitter parse (a persistent-cache miss) rather
+    /// than a cache hit — the (key, serialized `FileIndex`) pair `run_scan_pass` should write
+    /// back once the whole parallel pass is done. `None` on a cache hit (nothing changed to
+    /// write) or when no cache is configured.
+    cache_write: Option<CacheEntry>,
 }
 
 /// `[engines.contracts.spring]` settings resolved once per scan, mirroring how
@@ -112,6 +118,14 @@ struct ScanConfig<'a> {
     spring: &'a SpringSettings,
     extract_cfg: &'a ExtractConfig,
     toggles: &'a EngineToggles,
+    /// Persistent content-hash cache for tree-sitter `FileIndex` fragments (P2 step 3.2).
+    /// `None` disables it — every file is parsed fresh, exactly the pre-3.2 behaviour.
+    cache: Option<&'a PersistentIndexCache>,
+    /// SHA-256 of `extract_cfg`'s `Debug` output, computed once per scan by
+    /// `WorkspaceIndexer::config_fingerprint` and folded into every cache key so a config
+    /// change (e.g. `proto_dirs`, `infer_string_topics`) invalidates stale entries instead of
+    /// serving extraction results computed under different rules.
+    config_fingerprint: [u8; 32],
 }
 
 pub struct WorkspaceIndexer;
@@ -141,6 +155,9 @@ impl WorkspaceIndexer {
                 // Skill paths are written relative to the config file; the server is
                 // spawned by an IDE with an arbitrary cwd.
                 cfg.resolve_skill_paths(&base);
+                // Same reason: relative tool scopes anchor on the workspace root,
+                // not on whatever CWD the IDE launched us from.
+                cfg.resolve_workspace_root(&base);
                 Ok((cfg, base))
             }
             None => {
@@ -149,7 +166,9 @@ impl WorkspaceIndexer {
                     env!("CARGO_PKG_VERSION"),
                     "\"\nroots = [\".\"]\n"
                 );
-                Ok((Config::load_from_str(default)?, PathBuf::from(".")))
+                let mut cfg = Config::load_from_str(default)?;
+                cfg.resolve_workspace_root(Path::new("."));
+                Ok((cfg, PathBuf::from(".")))
             }
         }
     }
@@ -196,9 +215,10 @@ impl WorkspaceIndexer {
         roots: &[PathBuf],
         pool: Option<&BackgroundRescanEngine>,
         vfs: Option<&mut DifferentialVfs>,
+        cache: Option<&PersistentIndexCache>,
     ) -> MeshSnapshot {
         let files = Self::crawl_all(config, roots);
-        Self::build_snapshot_from_files(config, roots, &files, pool, vfs)
+        Self::build_snapshot_from_files(config, roots, &files, pool, vfs, cache)
     }
 
     /// [`Self::build_snapshot`] over an explicit `(RepoId, path)` list instead of
@@ -210,18 +230,22 @@ impl WorkspaceIndexer {
         files: &[(RepoId, PathBuf)],
         pool: Option<&BackgroundRescanEngine>,
         vfs: Option<&mut DifferentialVfs>,
+        cache: Option<&PersistentIndexCache>,
     ) -> MeshSnapshot {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
         let toggles = Self::engine_toggles(config);
+        let config_fingerprint = Self::config_fingerprint(&extract_cfg);
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
             spring: &spring,
             extract_cfg: &extract_cfg,
             toggles: &toggles,
+            cache,
+            config_fingerprint,
         };
 
         let (fragments, health) = Self::run_scan_pass(files, roots, &scan_cfg, pool);
@@ -266,10 +290,24 @@ impl WorkspaceIndexer {
     /// Delegates to [`Self::build_snapshot`] — one indexing path for the CLI, the
     /// server and the daemon, instead of a second one (previously duplicated here)
     /// that could silently drift out of sync with it.
-    pub fn build_graph(config: &Config, roots: &[PathBuf]) -> (ContractGraph, usize) {
-        let snapshot = Self::build_snapshot(config, roots, None, None);
+    pub fn build_graph(
+        config: &Config,
+        roots: &[PathBuf],
+        cache: Option<&PersistentIndexCache>,
+    ) -> (ContractGraph, usize) {
+        let snapshot = Self::build_snapshot(config, roots, None, None, cache);
         let file_count = snapshot.health.files_scanned;
         (snapshot.contract_graph, file_count)
+    }
+
+    /// SHA-256 of `extract_cfg`'s `Debug` representation — a cheap, deterministic fingerprint
+    /// (field order and formatting are fixed by the derive) of every knob that changes what
+    /// `PolyglotIndexer::extract_with_config` produces for the same bytes. Computed once per
+    /// scan, not per file, and folded into every `PersistentIndexCache` key so editing
+    /// `[engines.contracts.*]` invalidates stale cache entries instead of silently serving
+    /// extraction results computed under different rules.
+    fn config_fingerprint(extract_cfg: &ExtractConfig) -> [u8; 32] {
+        sha256(format!("{extract_cfg:?}").as_bytes())
     }
 
     /// Runs `process_file` over `files` (optionally inside `pool`), returning the
@@ -347,6 +385,14 @@ impl WorkspaceIndexer {
             }
         }
 
+        if let Some(cache) = scan_cfg.cache {
+            let writes: Vec<CacheEntry> = fragments
+                .iter_mut()
+                .filter_map(|f| f.cache_write.take())
+                .collect();
+            cache.put_batch(&writes);
+        }
+
         (fragments, health)
     }
 
@@ -384,6 +430,189 @@ impl WorkspaceIndexer {
         let config = &state.config;
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);
+
+        let vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+        // Deleted: tracked by the VFS but no longer on disk. Only a full crawl's
+        // complete file surface can answer this by set difference — a targeted,
+        // path-driven reload (`reload_paths`) instead knows about a deletion
+        // directly, from a specific watcher-reported path that no longer stat()s.
+        let present: HashSet<&Path> = files.iter().map(|(_, p)| p.as_path()).collect();
+        let deleted: Vec<PathBuf> = vfs
+            .tracked_paths()
+            .filter(|p| !present.contains(p))
+            .map(Path::to_path_buf)
+            .collect();
+        drop(vfs);
+
+        Self::apply_incremental(state, "VFS differential", files, deleted);
+    }
+
+    /// Targeted reload driven directly by the file watcher's own reported paths —
+    /// no `crawl_all` walk of the whole tree to rediscover what might have
+    /// changed. Each path is resolved to the most specific containing root
+    /// (matching `crawl_all`'s own nested-root attribution) and checked against
+    /// that root's exclude patterns/`.gitignore` via
+    /// `FilesystemCrawler::is_path_excluded`; a path that check can't cheaply and
+    /// correctly resolve (see that function's doc comment — chiefly a nested
+    /// ignore file between the root and the file) falls back to a full
+    /// `reload()` rather than risk a wrong answer. A `.git/HEAD` or `.git/refs/*`
+    /// change (checkout, rebase, branch switch), or a path whose parent
+    /// directory is *also* gone (a `rm -rf` on a directory can coalesce into
+    /// fewer watcher events than one per contained file), can likewise alter an
+    /// arbitrary number of tracked files without each one necessarily producing
+    /// its own watcher event, so those also fall back to `reload()`.
+    pub fn reload_paths(state: &AppState, changed_paths: &[PathBuf]) {
+        if changed_paths.is_empty() {
+            return;
+        }
+        if changed_paths.iter().any(|p| Self::is_git_ref_change(p)) {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "Targeted reload: .git ref change in event set, falling back to full reload."
+            );
+            return Self::reload(state);
+        }
+
+        let config = &state.config;
+        let roots = &state.allowed_roots;
+
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut candidates: Vec<(RepoId, PathBuf)> = Vec::new();
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        // Compiling an `ExcludeMatcher` (and, inside `is_path_excluded`, parsing
+        // a root's ignore files) is not free; `schedule_reload` deliberately
+        // coalesces a whole debounce burst into one call here, so a batch of
+        // many paths under the same root must not redo that work per path.
+        let mut matcher_cache: HashMap<RepoId, ExcludeMatcher> = HashMap::new();
+
+        for raw in changed_paths {
+            // Canonicalize before resolving a root, so a symlink is matched (and,
+            // below, indexed) by where it actually points, not by the raw watched
+            // path — a symlink created inside a watched root pointing outside
+            // every allowed root must never be followed into indexing its
+            // target's content (RFC-001 Commandment 4: never follow symlinks
+            // out of the sandbox). A path that no longer exists can't be
+            // canonicalized; a deletion only needs to identify *that* a change
+            // happened under some watched root, never a symlink target, so it
+            // falls back to matching the raw reported path.
+            let canonical = dunce::canonicalize(raw);
+            let match_path: &Path = canonical.as_deref().unwrap_or(raw.as_path());
+            if !seen.insert(match_path.to_path_buf()) {
+                continue;
+            }
+
+            let Some((repo_id, root)) = Self::most_specific_root(match_path, roots) else {
+                tracing::debug!(
+                    target: "mesh::watcher",
+                    "Targeted reload: {} (resolved: {}) is outside every allowed root, dropping.",
+                    raw.display(),
+                    match_path.display()
+                );
+                continue;
+            };
+            let matcher = matcher_cache.entry(repo_id).or_insert_with(|| {
+                let exclusions = Self::exclude_patterns_for_root(
+                    &config.workspace.exclude_patterns,
+                    roots,
+                    root,
+                );
+                ExcludeMatcher::compile(&exclusions)
+            });
+            match FilesystemCrawler::is_path_excluded(root, match_path, matcher) {
+                Some(true) => continue,
+                None => {
+                    tracing::debug!(
+                        target: "mesh::watcher",
+                        "Targeted reload: could not cheaply resolve exclusion for {}, falling back to full reload.",
+                        match_path.display()
+                    );
+                    return Self::reload(state);
+                }
+                Some(false) => {}
+            }
+            if canonical.is_ok() {
+                candidates.push((repo_id, match_path.to_path_buf()));
+                continue;
+            }
+            // `raw` doesn't exist (canonicalize failed above). If its parent
+            // directory is *also* gone, a whole subtree likely vanished in one
+            // `rm -rf` and sibling files under it may never have reported their
+            // own deletion event — a plain per-path removal here would leave
+            // their VFS/graph entries stale until an unrelated future change
+            // happened to touch the same path again. Fall back to a full
+            // reload's crawl-vs-VFS set-difference sweep instead of guessing.
+            if raw.parent().is_some_and(|p| !p.exists()) {
+                tracing::debug!(
+                    target: "mesh::watcher",
+                    "Targeted reload: {}'s parent directory is also gone, falling back to full reload.",
+                    raw.display()
+                );
+                return Self::reload(state);
+            }
+            deleted.push(raw.clone());
+        }
+
+        if candidates.is_empty() && deleted.is_empty() {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "Targeted reload: no relevant candidates survived exclusion in the watcher event set."
+            );
+            return;
+        }
+
+        // Acquired only now, after every fallback-to-`reload()` branch above has
+        // already returned — `reload()` takes this same lock itself, and
+        // `std::sync::Mutex` is not reentrant.
+        let _guard = state
+            .reload_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::apply_incremental(state, "Targeted", candidates, deleted);
+    }
+
+    /// The `root` in `roots` that most specifically contains `path` (the longest
+    /// matching prefix) — the same attribution `crawl_all` gives an overlapping
+    /// file via `exclude_patterns_for_root`'s nested-root exclusion, reproduced
+    /// here for a single path without crawling anything.
+    fn most_specific_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<(RepoId, &'a Path)> {
+        roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| path.starts_with(root.as_path()))
+            .max_by_key(|(_, root)| root.as_os_str().len())
+            .map(|(idx, root)| (idx as RepoId, root.as_path()))
+    }
+
+    /// `.git/HEAD` or `.git/refs/...` — a branch checkout/rebase/switch can alter
+    /// an arbitrary number of tracked files without each one necessarily firing
+    /// its own watcher event (e.g. switching to a branch whose only difference
+    /// upstream is a ref pointer). `changed_paths` is not a reliable transcript
+    /// of what changed on disk in that case.
+    fn is_git_ref_change(path: &Path) -> bool {
+        let mut components = path.components().map(|c| c.as_os_str());
+        while let Some(c) = components.next() {
+            if c == ".git" {
+                let next = components.next();
+                return next == Some(std::ffi::OsStr::new("HEAD"))
+                    || next == Some(std::ffi::OsStr::new("refs"));
+            }
+        }
+        false
+    }
+
+    /// Shared tail of both `reload` and `reload_paths`: scan whatever candidate
+    /// surface the caller resolved (a full crawl's file list, or one path-driven
+    /// targeted set), diff it against the VFS, and — if anything really
+    /// changed — fold it into a freshly installed snapshot. `label` only
+    /// distinguishes the two callers in logs.
+    fn apply_incremental(
+        state: &AppState,
+        label: &str,
+        files: Vec<(RepoId, PathBuf)>,
+        deleted: Vec<PathBuf>,
+    ) {
+        let config = &state.config;
+        let roots = &state.allowed_roots;
         let patterns = Self::compiled_patterns(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
@@ -391,17 +620,9 @@ impl WorkspaceIndexer {
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Deleted: tracked by the VFS but no longer on disk.
-        let present: HashSet<&Path> = files.iter().map(|(_, p)| p.as_path()).collect();
-        let deleted: Vec<PathBuf> = vfs
-            .tracked_paths()
-            .filter(|p| !present.contains(p))
-            .map(Path::to_path_buf)
-            .collect();
-
         // Candidates: new or stat-changed. The metadata call is parallelized over
         // Rayon threads to maximize OS kernel page-cache stat speed.
-        let candidates: Vec<(RepoId, PathBuf)> = files
+        let mut candidates: Vec<(RepoId, PathBuf)> = files
             .par_iter()
             .filter(|(_, p)| match std::fs::metadata(p) {
                 Ok(m) => !vfs.is_unchanged_fast(p, &m),
@@ -410,18 +631,43 @@ impl WorkspaceIndexer {
             .map(|(r, p)| (*r, p.clone()))
             .collect();
 
+        // `reload_paths` classifies a path as `deleted` from a `stat` taken
+        // before `reload_lock` was acquired (its own caller can't hold the lock
+        // and still call `reload()` as a fallback without deadlocking — see that
+        // function's own comment). A file briefly absent in that window (an
+        // editor's atomic save, or a fast delete-then-recreate) can legitimately
+        // exist again by now; re-verified here, one last time, while `vfs` is
+        // still locked. One that exists again is treated as an ordinary
+        // candidate instead of a deletion — removing it from the graph would be
+        // wrong, and since it wouldn't be in `candidates` either, permanently
+        // wrong until some unrelated future change happened to touch it again.
+        let (deleted, resurrected): (Vec<PathBuf>, Vec<PathBuf>) = deleted
+            .into_iter()
+            .partition(|p| std::fs::metadata(p).is_err());
+        for p in resurrected {
+            if let Some((repo_id, _)) = Self::most_specific_root(&p, roots) {
+                candidates.push((repo_id, p));
+            }
+        }
+
         if candidates.is_empty() && deleted.is_empty() {
-            tracing::debug!(target: "mesh::watcher", "VFS differential: 0 files changed, skipping reload.");
+            tracing::debug!(target: "mesh::watcher", "{label}: 0 files changed, skipping reload.");
             return;
         }
 
         let doc_template = state.snapshot().doc_index.clone_settings();
+        // Incremental reload never consults the persistent cache: it's already only
+        // re-parsing files the differential VFS flagged as changed (P2 step 3.1), so
+        // there's nothing a content-hash cache would additionally skip here — step 3.2's
+        // goal is the cold-start full scan, not this path.
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
             spring: &spring,
             extract_cfg: &extract_cfg,
             toggles: &toggles,
+            cache: None,
+            config_fingerprint: [0u8; 32],
         };
         let (fragments, pass_health) =
             Self::run_scan_pass(&candidates, roots, &scan_cfg, Some(&state.rescan));
@@ -475,14 +721,16 @@ impl WorkspaceIndexer {
             .map(|f| f.path.as_path())
             .chain(deleted.iter().map(PathBuf::as_path));
         snapshot.contract_graph.patch_files(stale);
-        for f in &changed {
-            snapshot.doc_index.remove_file(&f.path);
-            snapshot.property_registry.remove_file(&f.path);
-        }
-        for p in &deleted {
-            snapshot.doc_index.remove_file(p);
-            snapshot.property_registry.remove_file(p);
-        }
+        // One pass per index for the whole batch, not one per file: a branch
+        // switch reloading k of N files was O(k·N) here.
+        let stale_files: HashSet<&Path> = changed
+            .iter()
+            .map(|f| f.path.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+            .collect();
+        snapshot.doc_index.remove_files(&stale_files);
+        snapshot.property_registry.remove_files(&stale_files);
+        drop(stale_files);
         let changed_count = changed.len();
         for frag in changed {
             Self::fold(frag, &mut snapshot);
@@ -496,7 +744,7 @@ impl WorkspaceIndexer {
 
         tracing::info!(
             target: "mesh::watcher",
-            "Incremental reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
+            "{label} reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
             deleted.len()
         );
     }
@@ -592,6 +840,7 @@ impl WorkspaceIndexer {
                 &root.to_string_lossy(),
                 roots,
                 &config.workspace.mount_aliases,
+                None,
             ) {
                 Ok(scope) => {
                     let exclusions = Self::exclude_patterns_for_root(
@@ -662,8 +911,8 @@ impl WorkspaceIndexer {
             patterns,
             doc_template,
             spring,
-            extract_cfg,
             toggles,
+            ..
         } = *cfg;
         let metadata = std::fs::metadata(path).map_err(|_| RejectKind::ReadError)?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
@@ -695,6 +944,7 @@ impl WorkspaceIndexer {
             code: FileIndex::default(),
             docs: Vec::new(),
             props: None,
+            cache_write: None,
         };
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -718,14 +968,28 @@ impl WorkspaceIndexer {
                     frag.props = Some(reg);
                 }
                 if toggles.contracts_enabled {
-                    frag.code =
-                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+                    let (code, cache_write) = Self::extract_with_cache(
+                        path,
+                        content,
+                        repo_id,
+                        &frag.signature.content_hash,
+                        cfg,
+                    );
+                    frag.code = code;
+                    frag.cache_write = cache_write;
                 }
             }
             _ => {
                 if toggles.contracts_enabled {
-                    frag.code =
-                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+                    let (code, cache_write) = Self::extract_with_cache(
+                        path,
+                        content,
+                        repo_id,
+                        &frag.signature.content_hash,
+                        cfg,
+                    );
+                    frag.code = code;
+                    frag.cache_write = cache_write;
                 }
             }
         }
@@ -736,6 +1000,58 @@ impl WorkspaceIndexer {
         }
 
         Ok(frag)
+    }
+
+    /// Tree-sitter extraction with an optional persistent-cache short-circuit (P2 step 3.2).
+    /// `content_hash` is the file's already-computed signature hash, so this costs nothing
+    /// beyond the lookup itself on either path.
+    ///
+    /// A cache hit deserializes and returns immediately, `cache_write: None` (nothing changed,
+    /// nothing to write back). A miss parses as before and, unless the parse itself failed
+    /// (`code.parse_failed`, retried by the caller — see `run_scan_pass`'s doc comment; caching
+    /// a failed parse would wrongly persist "no facts" past the retry), serializes the result
+    /// for `run_scan_pass` to batch-write once the whole parallel pass is done.
+    fn extract_with_cache(
+        path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        content_hash: &[u8; 32],
+        cfg: &ScanConfig,
+    ) -> (FileIndex, Option<CacheEntry>) {
+        let extract_cfg = cfg.extract_cfg;
+        let Some(cache) = cfg.cache else {
+            return (
+                PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg),
+                None,
+            );
+        };
+        let key =
+            PersistentIndexCache::key_for(path, content_hash, repo_id, &cfg.config_fingerprint);
+        if let Some(bytes) = cache.get(&key) {
+            if let Ok(cached) = serde_json::from_slice::<FileIndex>(&bytes) {
+                return (cached, None);
+            }
+            tracing::warn!(
+                target: "mesh::index_cache",
+                "{}: cached FileIndex failed to deserialize, re-parsing",
+                path.display()
+            );
+        }
+        let code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+        if code.parse_failed {
+            return (code, None);
+        }
+        match serde_json::to_vec(&code) {
+            Ok(bytes) => (code, Some((key, bytes))),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mesh::index_cache",
+                    "{}: failed to serialize FileIndex for caching: {e}",
+                    path.display()
+                );
+                (code, None)
+            }
+        }
     }
 
     /// `paths` is empty (default) → no restriction. Otherwise the file's path,
@@ -802,6 +1118,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -831,6 +1148,308 @@ mod tests {
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
     }
 
+    /// A cache-hit `build_snapshot` must produce byte-identical results to a cache-miss one:
+    /// this is the whole safety condition step 3.2 relies on (`fold`'s `NodeId` assignment
+    /// depends only on crawl order, never on whether a file's `FileIndex` came from a fresh
+    /// parse or a deserialized cache entry). Guards against a future change to `FileIndex`'s
+    /// serde shape, or to `extract_with_cache`'s plumbing, silently making a cache hit diverge
+    /// from a fresh parse.
+    #[test]
+    fn warm_cache_produces_identical_snapshot_to_cold_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("b.proto"),
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+        std::fs::write(root.join("doc.md"), "# Title\nsome text").expect("write md");
+
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+
+        let cold = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(cold.contract_graph.node_count(), 4);
+        assert_eq!(cold.doc_index.section_count(), 1);
+
+        // Second build over the exact same files/config, now served entirely from the cache
+        // this same `PersistentIndexCache` instance just populated.
+        let warm = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+
+        assert_eq!(cold.fingerprint(), warm.fingerprint());
+        assert_eq!(warm.contract_graph.node_count(), 4);
+        assert_eq!(warm.doc_index.section_count(), 1);
+    }
+
+    /// The path-driven `reload_paths` must produce the exact same result as the
+    /// crawl-driven `reload` for the same edit+delete, without ever calling
+    /// `crawl_all` — proving the watcher's own event paths are enough.
+    #[test]
+    fn reload_paths_handles_edit_and_delete_without_a_full_crawl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let a_path = root.join("a.proto");
+        let b_path = root.join("b.proto");
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            &b_path,
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 4);
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); rpc Z (R) returns (S); }",
+        )
+        .expect("rewrite a");
+        std::fs::remove_file(&b_path).expect("rm b");
+
+        // Only the two paths the watcher actually reported change — a directory
+        // never crawled at all is proof this didn't fall back to a full scan.
+        WorkspaceIndexer::reload_paths(&state, &[a_path, b_path]);
+        let view = state.snapshot();
+        assert_eq!(view.generation, 2);
+        assert_eq!(
+            view.contract_graph.node_count(),
+            3,
+            "a: service + 2 rpcs; b gone"
+        );
+        assert!(view.contract_graph.search_symbols("B", None).is_empty());
+        assert_eq!(
+            state.vfs.lock().expect("vfs").len(),
+            1,
+            "only a.proto remains tracked"
+        );
+    }
+
+    /// A brand-new file the watcher reports (a `Create` event) must be indexed by
+    /// `reload_paths` even though it was never part of any prior crawl or VFS entry.
+    #[test]
+    fn reload_paths_indexes_a_newly_created_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        let c_path = root.join("c.proto");
+        std::fs::write(
+            &c_path,
+            "syntax = \"proto3\"; package c; service C { rpc Z (R) returns (S); }",
+        )
+        .expect("write c");
+
+        WorkspaceIndexer::reload_paths(&state, &[c_path]);
+        let view = state.snapshot();
+        assert_eq!(view.contract_graph.node_count(), 2, "service + 1 rpc");
+    }
+
+    /// `reload_paths` stats a path *before* `reload_lock` is acquired (it must
+    /// return, not block, before falling back to `reload()`). If the file is
+    /// briefly absent at that moment (an editor's atomic save, or a fast
+    /// delete-then-recreate) but exists again by the time `apply_incremental`
+    /// actually runs under the lock, it must be re-indexed, not removed from
+    /// the graph and left stale.
+    #[test]
+    fn apply_incremental_reindexes_a_path_that_resurrected_before_the_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let a_path = root.join("a.proto");
+        std::fs::write(
+            &a_path,
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 2);
+
+        // Simulate the race directly: `apply_incremental` is handed `a_path` as
+        // already-deleted (as `reload_paths` would if its earlier stat had
+        // raced a delete), but the file is actually back on disk by the time
+        // this runs — exactly as it would be after a real resurrection.
+        WorkspaceIndexer::apply_incremental(&state, "Test", Vec::new(), vec![a_path]);
+
+        let view = state.snapshot();
+        assert_eq!(
+            view.contract_graph.node_count(),
+            2,
+            "a resurrected path must be re-indexed, not silently dropped from the graph"
+        );
+    }
+
+    /// `reload_paths` must not index a path that a real crawl would have pruned
+    /// via `exclude_patterns` — the same exclusion `crawl_all` applies, checked
+    /// here for one explicit path instead of by walking the tree.
+    #[test]
+    fn reload_paths_respects_exclude_patterns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\nexclude_patterns = [\"secrets/**\"]\n",
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        state.install_snapshot(MeshSnapshot::default());
+
+        std::fs::create_dir_all(root.join("secrets")).expect("mkdir");
+        let secret_path = root.join("secrets").join("leaked.proto");
+        std::fs::write(
+            &secret_path,
+            "syntax = \"proto3\"; package s; service Secret { rpc X (R) returns (S); }",
+        )
+        .expect("write");
+
+        WorkspaceIndexer::reload_paths(&state, &[secret_path]);
+        assert_eq!(
+            state.snapshot().contract_graph.node_count(),
+            0,
+            "an excluded path must not be indexed even when reported directly by the watcher"
+        );
+    }
+
+    /// A `.git/HEAD` change (branch checkout) can alter files without each one
+    /// necessarily producing its own watcher event, so `reload_paths` must fall
+    /// back to a full `reload` rather than trust the reported path set alone.
+    #[test]
+    fn reload_paths_falls_back_to_full_reload_on_git_ref_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        // No .proto path is in the event set at all — only a git ref path — yet
+        // the real on-disk file must still be picked up via the full-reload
+        // fallback, proving the fallback actually ran rather than silently
+        // no-oping on an event set with nothing indexable in it.
+        WorkspaceIndexer::reload_paths(&state, &[root.join(".git").join("HEAD")]);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 2);
+    }
+
+    /// A symlink created inside a watched root pointing at a file *outside*
+    /// every allowed root must never have its target indexed — reload_paths
+    /// canonicalizes before resolving a root specifically so this can't happen
+    /// (RFC-001 Commandment 4: never follow a symlink out of the sandbox).
+    #[cfg(unix)]
+    #[test]
+    fn reload_paths_never_indexes_a_symlink_escaping_every_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        let outside = base.join("outside.proto");
+        std::fs::write(
+            &outside,
+            "syntax = \"proto3\"; package secret; service Leaked { rpc X (R) returns (S); }",
+        )
+        .expect("write outside");
+        let link = root.join("leak.proto");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let state = make_state(&root);
+        state.install_snapshot(MeshSnapshot::default());
+
+        WorkspaceIndexer::reload_paths(&state, &[link]);
+        assert_eq!(
+            state.snapshot().contract_graph.node_count(),
+            0,
+            "a symlink resolving outside every allowed root must never be indexed"
+        );
+    }
+
+    /// A directory-level delete (`rm -rf service/`) can coalesce into fewer
+    /// watcher events than one per contained file. `reload_paths` detects this
+    /// via the deleted path's parent also being gone and falls back to a full
+    /// reload, which correctly sweeps every now-missing tracked file — not just
+    /// the one path the watcher happened to report.
+    #[test]
+    fn reload_paths_falls_back_to_full_reload_when_parent_directory_is_also_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("service")).expect("mkdir");
+        std::fs::write(
+            root.join("service/a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("service/b.proto"),
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().contract_graph.node_count(), 4);
+
+        // The whole directory is removed, but only `a.proto`'s deletion is in
+        // the reported event set — `b.proto`'s own event was "lost" (exactly
+        // what a coalesced directory-level delete can look like).
+        std::fs::remove_dir_all(root.join("service")).expect("rm -rf service");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("service/a.proto")]);
+
+        let view = state.snapshot();
+        assert_eq!(
+            view.contract_graph.node_count(),
+            0,
+            "the full-reload fallback must clean up b.proto's nodes too, not just a.proto's"
+        );
+    }
+
     /// `PropertyRegistry` provenance: deleting one of two properties files must remove
     /// exactly its keys on the next incremental reload, leaving the other file's keys intact.
     #[test]
@@ -848,6 +1467,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -908,6 +1528,7 @@ resolve_placeholders = true
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -937,7 +1558,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             0,
@@ -962,7 +1583,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.contract_graph.node_count(),
             0,
@@ -985,7 +1606,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             1,
@@ -1008,7 +1629,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             1,

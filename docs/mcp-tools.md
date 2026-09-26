@@ -7,7 +7,7 @@ This document specifies the six core Model Context Protocol (MCP) tools exposed 
 ## 1. Design Principles for AI Tool Ergonomics
 
 ### 1.1 Strict JSON Schema & `additionalProperties: false`
-All argument structures derive from `schemars::JsonSchema` with `#[serde(deny_unknown_fields)]`. Agents sending extraneous or misspelled arguments receive deterministic JSON-RPC `-32602` errors rather than silent failures.
+All argument structures derive from `schemars::JsonSchema` with `#[serde(deny_unknown_fields)]`. Agents sending extraneous or misspelled arguments receive a deterministic tool error (`isError: true`, see §3) naming the offending field, rather than a silent failure. Internal W3C trace context (`_meta.traceparent`/`tracestate`) is accepted on input but never advertised in `tools/list`.
 
 ### 1.2 Explicit Negative Constraints (Miller's Law)
 Tool descriptions explicitly declare what the tool **does not do** and instruct the agent when **not to use it**. This prevents cognitive loops and tool misuse.
@@ -58,6 +58,34 @@ Resolution order:
    deliberate: it means "no symbol by that name is declared here", not "the file doesn't
    mention it".
 
+Results are **ranked and paginated**: exact-name matches first, then prefix, then substring
+(ties: protocol declarations before plain classes, then path). A page holds at most `limit`
+files (default 20, max 100) starting at `offset`, and only that page's files are read and
+decapitated — a broad query over 30,000 files no longer parses every hit. Each result's rendered
+size is measured before it is accepted, so a page stops early rather than ever hitting the 48 KB
+truncation; when more results exist, the footer gives the exact `offset` to request next. The
+header's `showing a-b` range always ends where that `offset` resumes (files in the range that
+could not be read are reported as skipped), and an `offset` past the end says so explicitly.
+A `fuzzy` page reports its total as a lower bound (`≥N`) when the scan stopped early, and only
+announces "More results" after it has actually seen a further match. Index-backed pages are
+cached per `(query, scope as resolved, scope as spelled, include_body, fuzzy, limit, offset)`,
+dropped on every index reload (snapshot generation bump), and re-validated against the size and
+mtime of every file they read, so an on-disk edit the index has not yet picked up is never
+served from the cache.
+
+Line numbers (`L<start>-L<end>`) are original-file coordinates: an indexed hit is anchored on
+the symbol's recorded declaration line, and every decapitated line maps back to the original
+lines it came from (a stripped body spans its full extent). The anchor is only trusted when the
+original lines around it mention the query (or its `_`-insensitive form); otherwise — a stale
+index, an anchor past the end of the file — the snippet comes from a text search of the file as
+it is now, and a file that no longer mentions the query is dropped. A relative `scope` is
+resolved against the configured `workspace_root` first, then against the server process's
+working directory if it does not exist there; the sandbox jail applies to both. Case-insensitive
+matching uses Unicode case folding for non-ASCII queries.
+
+Python functions keep their docstring when decapitated; only the statements after it are
+replaced by `...`.
+
 **Negative Constraints**: Do NOT use for full-file inspection, documentation (`search_docs`), or
 mapping import hierarchies (`find_dependents`). Use `include_body: true` only to expand one
 specific implementation.
@@ -83,6 +111,14 @@ specific implementation.
     "fuzzy": {
       "type": "boolean",
       "description": "If true and the symbol index has no match, falls back to a full-text scan of the scope (slower). Defaults to false."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Maximum number of files returned in this page (1-100, default 20). DO NOT raise it to see everything; page with `offset` or narrow `scope` instead."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "Number of ranked files to skip (default 0), as given by a previous page's 'More results' footer."
     }
   },
   "additionalProperties": false
@@ -132,7 +168,7 @@ Reverse dependency search across repository and microservice boundaries. Identif
     },
     "granularity": {
       "type": "string",
-      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a JSON-RPC -32602 error, not a silent fallback to 'symbol'."
+      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a tool error (`isError: true`), not a silent fallback to 'symbol'."
     }
   },
   "additionalProperties": false
@@ -282,47 +318,87 @@ User-generated markdown documentation can contain prompt injections designed to 
 ### Tool 6: `visualize_mesh`
 
 #### Description
-Renders the whole indexed topology — services, contracts, gRPC endpoints, Kafka topics — as a
-diagram, either as Mermaid Markdown (pastable into a doc or PR description) or as a standalone
-interactive HTML page.
+Renders a **per-service aggregated** topology: every contract folds into its service (one per
+workspace root when there are several roots, one per package otherwise), every cross-service edge
+into one weighted link per `(from, to, kind)` (`CallsRpc ×7 (ambiguous)` — the weakest folded
+confidence is shown), and event-bus topics stay first-class nodes. The raw contract graph is never
+returned: at a few thousand nodes it no longer fits the 48 KB payload cap (the old flat HTML/JSON
+output came back cut mid-document, i.e. invalid).
 
-**Negative Constraints**: Do NOT use for a targeted question about one symbol or dependency —
-this renders the *entire* mesh, which is the wrong tool for "what depends on X" (use
-`find_dependents`) or "where is X implemented" (use `analyze_grpc`).
+Size is bounded like `smart_search`'s truncation: the best-connected `max_services` groups are
+drawn (default 40), the rest fold into one "other services" / "other topics" node, the view
+shrinks further on its own until it fits, and the footer lists the largest hidden groups plus the
+exact `visualize_mesh(service: "...")` call to zoom. A zoom draws that service's own contracts
+(best-connected first, capped) and the services they talk to. Mermaid, JSON and HTML all render
+this same view; JSON/HTML stay parseable documents (no prose appended). Names longer than 120
+bytes are shortened when drawn (never offered as zoom targets). For the complete graph,
+use the CLI: `mesh-mcp graph --format html -o graph.html`.
+
+**Negative Constraints**: Do NOT use for a targeted question about one symbol or dependency (use
+`find_dependents` / `analyze_grpc`). Do NOT raise `max_services` to see everything; zoom with
+`service`.
 
 #### JSON Schema
 ```json
 {
   "type": "object",
   "properties": {
-    "format": {
-      "type": "string",
-      "description": "Desired output format: 'mermaid' (returns GitHub-compatible Mermaid Markdown) or 'html' (returns standalone interactive HTML). Defaults to 'mermaid'."
-    }
+    "format": { "type": "string", "description": "'mermaid' (default), 'json' or 'html' — all render the aggregated per-service view." },
+    "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to." },
+    "max_services": { "type": ["integer", "null"], "description": "Groups drawn before folding into 'other' (1-200, default 40)." }
   },
   "additionalProperties": false
 }
 ```
 
-#### Sample Response
+#### Sample Response (otel-demo, 2,271 contracts / 247 edges → 32 groups, 2.2 KB)
 ```markdown
 ​```mermaid
 graph LR
-  ProtoRegistry["proto-registry"] -->|implements| BillingService
-  BillingService -->|produces| PaymentSettled[("payment.settled.v1")]
-  CheckoutWorker -->|consumes| PaymentSettled
+  g1["checkout<br/>30 interface · 4 gRPC service · 503 class"]
+  g5["product-catalog<br/>30 interface · 2 gRPC service · 469 class"]
+  g6["pb<br/>43 message · 10 gRPC service · 20 gRPC method"]
+  g9(["add_product_to_cart<br/>1 topic"])
+  g1 -- "CallsRpc (ambiguous)" --> g5
+  g1 -- "CallsRpc ×7 (ambiguous)" --> g6
+  g9 -. "Consumes" .-> g4
 ​```
+*2271 contracts, 247 edges folded into 32 of 32 groups (grouping: one service per root).*
+👉 Zoom into one service: `visualize_mesh(service: "shipping")`.
 ```
 
 ---
 
 ## 3. Error Codes & Diagnostic Handling
 
-MeshMCP maps all internal failure modes into standard JSON-RPC 2.0 error responses:
+MeshMCP follows the MCP specification (2024-11-05): **a failure inside a tool is a tool result,
+not a protocol error.** It comes back as a successful JSON-RPC response whose `CallToolResult`
+has `isError: true` and the message as text, so the client hands it to the model and the agent
+can correct its next call instead of the turn being aborted:
 
-| Code | Label | Cause | Agent Guidance |
-| :--- | :--- | :--- | :--- |
-| **`-32602`** | `InvalidParams` | Scope path escaped sandbox jail (`ValidatedScope`), or unknown parameters sent | Verify path exists within declared `roots` in `mesh-mcp.toml`. |
-| **`-32601`** | `MethodNotFound`| Unrecognized tool requested | Use one of the 6 registered tools (`smart_search`, etc.). |
-| **`-32603`** | `InternalError` | Tree-sitter timeout (15ms exceeded) or file > 384 KB | Reduce query scope or check file size. |
-| **`-32001`** | `GOVERNANCE_BLOCKED` | The call targets a subject matched by `[engines.policy.stop_rules]`, on a tool that declares itself capable of mutating that target (`McpTool::mutates()`). Returns a structured RSAH payload (see [governance-rsah.md](governance-rsah.md)). | Follow the returned `required_workflow`/`message_to_user` and report to the human. In practice this never fires today — every shipped tool is read-only, so `mutates()` is `false` everywhere; it activates automatically the day a mutating tool is added. |
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "isError": true, "content": [
+  { "type": "text", "text": "Sandbox escape attempt detected: /etc" } ] } }
+```
+
+| Tool error (`isError: true`) | Cause | Agent guidance |
+| :--- | :--- | :--- |
+| Invalid arguments | Unknown/misspelled field, wrong type, unknown enum value (`granularity`, `format`) | Fix the argument named in the message. |
+| Sandbox / scope | Scope escaped the `ValidatedScope` jail, or does not exist | Use a path inside the configured `roots` (relative paths resolve from `workspace_root`). |
+| Governance (RSAH) | Mutation of a subject matched by `[engines.policy.stop_rules]`; the text is the structured RSAH payload (see [governance-rsah.md](governance-rsah.md)) | Follow `required_workflow` / `message_to_user`, report to the human. |
+| Target not found | e.g. `visualize_mesh(service: ...)` naming no service | Re-list with the tool's default view. |
+| Still indexing | `meshd` has not finished its first scan | Retry shortly. |
+
+Only protocol faults remain JSON-RPC errors:
+
+| Code | Meaning |
+| :--- | :--- |
+| **`-32700`** | Parse error — the line is not JSON (`id: null`). |
+| **`-32600`** | Invalid Request — not a request object, or `jsonrpc` is not `"2.0"`. |
+| **`-32601`** | Method not found — unknown JSON-RPC method. |
+| **`-32602`** | Unknown tool name, or `tools/call` without `params` (per the MCP spec). |
+| **`-32603`** | Internal error — the tool task itself failed (panic). |
+
+A message without an `id` member is a JSON-RPC notification and never receives a reply, not even
+an error (an explicit `"id": null` is still a request). When a tool's output exceeds the 48 KB cap
+it is cut on a line boundary and any open code fence is closed before the truncation note.

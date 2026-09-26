@@ -6,6 +6,7 @@ use crate::governance::GovernanceEngine;
 use crate::health::IndexHealth;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
+use crate::search_cache::SearchCache;
 use crate::vfs::DifferentialVfs;
 use arc_swap::{ArcSwap, Guard};
 use std::path::PathBuf;
@@ -111,6 +112,12 @@ pub struct AppState {
     /// an optimization — correctness (never two `WorkspaceIndexer::reload` calls
     /// running at once) comes from `reload_lock` below, not from this flag.
     pub reload_pending: AtomicBool,
+    /// Watcher-reported paths accumulated for the next reload job to drain — see
+    /// `FileWatcherService::schedule_reload`. A burst that arrives while
+    /// `reload_pending` is already set still appends here instead of being
+    /// dropped, so a path-driven targeted reload (`WorkspaceIndexer::reload_paths`)
+    /// never silently misses a change just because it coalesced with another.
+    pub pending_reload_paths: Mutex<Vec<PathBuf>>,
     /// Held for the full duration of one `WorkspaceIndexer::reload` call, entirely
     /// on the single Rayon-pool thread that acquired it (a `std::sync::MutexGuard`
     /// never crosses threads here). Two reload closures can still both get spawned
@@ -120,6 +127,8 @@ pub struct AppState {
     /// snapshot at a time, so a slower first pass can never install a snapshot that
     /// clobbers a second, newer one that finished first (idempotence invariant I2).
     pub reload_lock: Mutex<()>,
+    /// `smart_search` result pages, invalidated on every snapshot generation bump.
+    pub search_cache: SearchCache,
 }
 
 impl AppState {
@@ -158,7 +167,9 @@ impl AppState {
             rescan,
             vfs: Mutex::new(DifferentialVfs::new()),
             reload_pending: AtomicBool::new(false),
+            pending_reload_paths: Mutex::new(Vec::new()),
             reload_lock: Mutex::new(()),
+            search_cache: SearchCache::default(),
         }
     }
 

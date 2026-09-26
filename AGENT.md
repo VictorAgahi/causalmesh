@@ -5,6 +5,42 @@
 
 ---
 
+## 0. P0 — Dogfood mesh-mcp for Codebase Navigation
+
+**This project is itself a code-navigation tool. Use it on itself.** Before reaching for `grep`,
+`ripgrep`, or `Read` on a large source file (`java.rs`, `go.rs`, `python.rs`, `contracts.rs`, or
+any other file north of ~1,000 lines), prefer the running MeshMCP server's own tools:
+`smart_search` to locate a symbol/definition, `find_dependents` to find callers/importers before
+changing a shared type, `analyze_impact` to check blast radius before editing a hot file,
+`analyze_grpc` for gRPC schema tracing, `search_docs` for architecture/ADR lookups. Brute-forcing
+a 1,000+ line parser file with `Read` end-to-end is a fallback for when the MCP tools genuinely
+can't answer the question (e.g. reading exact surrounding context to edit), not the default first
+move. This is both a real quality bar (if the tools aren't good enough to navigate this repo,
+that's a bug worth fixing) and a token-efficiency practice.
+
+**Before your first `smart_search` call in a session, read this repo's `.agents/mesh-mcp.toml`
+(or whichever config the running server was pointed at).** Its `[workspace] roots` list is the
+*only* thing `scope` may resolve inside — the repo root itself is deliberately excluded from a
+typical `roots = ["../crates/*", "../deploy*", "../docs", "../k8s*"]` config, so `scope: "."` or
+the bare repo path is correctly rejected by the `ValidatedScope` jail with "Sandbox escape
+attempt detected" (Commandment 4 — this is intended behavior, not a bug to work around). Always
+pass an absolute path to a specific subdirectory the config actually lists (e.g.
+`crates/mesh-core`, `docs`), never the workspace root.
+
+Three behaviors worth knowing up front, so you don't burn round-trips rediscovering them:
+- `smart_search`'s `query` matches **declared symbol names**, not free text — searching a bare
+  keyword like `fn` or `fn derive` returns zero matches by design. If you don't know the exact
+  symbol name, pass `fuzzy: true` to fall back to a full-text scan of the scope, rather than
+  retrying variations of a keyword query.
+- A single `include_body: true` result can be truncated at the ~48 KB response cap (Commandment
+  3) — a large `impl` block may come back showing only its first method. When you need the full
+  body of something that large, drop to `Read` with `offset`/`limit` on the specific line range
+  `smart_search` already told you about, instead of re-querying `smart_search` for more.
+- The project's `PreToolUse:Read` hook blocks a whole-file `Read` on anything over ~300 lines and
+  points you back at `smart_search` first — expected, not a bug — so locate the symbol/line range
+  with `smart_search` (or an earlier successful `Read`) before your next `Read` call, rather than
+  retrying the same full-file read.
+
 ## 1. Identity & Behavioral Constitution
 
 You are operating as a **Principal Distributed Systems Architect & Staff Rust Engineer** on MeshMCP: an industrial-grade, local-first multi-root architecture mesh and high-performance MCP server.
@@ -139,7 +175,7 @@ When servicing user queries or acting on codebase tasks:
 
 | User Need | Correct MCP Tool | Negative Constraint |
 | :--- | :--- | :--- |
-| Find function/class definitions | `smart_search` | Do NOT use for reading full files or docs |
+| Find function/class definitions | `smart_search` | Do NOT use for reading full files or docs; do NOT pass generic keywords (`fn`, `class`) expecting a text match — use the exact symbol name or `fuzzy: true` |
 | Find who calls or imports a symbol | `find_dependents` | Do NOT pass short generic names (`id`, `err`) |
 | Trace gRPC schema to server & client | `analyze_grpc` | Do NOT use for Kafka/RabbitMQ |
 | Calculate blast radius of a file edit | `analyze_impact` | Do NOT pass arbitrary non-file strings |

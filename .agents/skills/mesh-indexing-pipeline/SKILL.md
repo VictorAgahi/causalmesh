@@ -21,7 +21,11 @@ the wrong place.
 - **Pipeline entry point**: [`crates/mesh-server/src/indexer.rs`](../../../crates/mesh-server/src/indexer.rs)
   - `WorkspaceIndexer::discover_config()`: explicit path, then `.agents/mesh-mcp.toml`, then `mesh-mcp.toml`, then a built-in single-root default
   - `WorkspaceIndexer::resolve_roots()`: `expand_roots` with a warn-and-fallback to the base dir
-  - `WorkspaceIndexer::build_snapshot()`: full parallel scan → one `MeshSnapshot`
+  - `WorkspaceIndexer::build_snapshot()`: full parallel scan → one `MeshSnapshot`. Optional
+    `Option<&PersistentIndexCache>` (P2 step 3.2,
+    [`crates/mesh-core/src/index_cache.rs`](../../../crates/mesh-core/src/index_cache.rs)):
+    skips tree-sitter for a file whose (path, content hash, `RepoId`, extraction-config
+    fingerprint) all match a prior cached `FileIndex`. Passed at the two boot call sites only.
   - `WorkspaceIndexer::build_graph()`: graph-only convenience for `mesh-mcp graph`
   - `WorkspaceIndexer::reload()`: differential reload driven by the VFS, handles deletions
   - `WorkspaceIndexer::repo_names()`: display names indexed by `RepoId`
@@ -117,8 +121,14 @@ in [`crates/mesh-daemon/src/main.rs`](../../../crates/mesh-daemon/src/main.rs)).
 Both boot call sites pass `None`:
 
 ```rust
-WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs))
+WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs), index_cache.as_ref())
 ```
+
+(`index_cache`: an `Option<PersistentIndexCache>` — P2 step 3.2's persistent, content-hash-keyed
+`FileIndex` cache, `None` if it failed to open. Only the two boot call sites above pass a real
+one; `reload` doesn't take this parameter at all, per the table above — it already only
+re-parses differential-VFS-flagged changed files, so a content-hash cache has nothing additional
+to skip there.)
 
 `None` means the global Rayon pool. At boot a human is waiting on the first response and
 nothing else is running, so background-priority threads only make the wait longer — the

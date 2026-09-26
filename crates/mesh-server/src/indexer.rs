@@ -7,9 +7,10 @@
 //! sequential.
 
 use mesh_core::{
-    expand_roots, AppState, BackgroundRescanEngine, Config, ContractGraph, DifferentialVfs,
-    DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth, MeshSnapshot,
-    PropertyRegistry, PropertySourceMatcher, RepoId, ValidatedScope,
+    expand_roots, sha256, AppState, BackgroundRescanEngine, CacheEntry, Config, ContractGraph,
+    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth,
+    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RepoId,
+    ValidatedScope,
 };
 use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
@@ -42,6 +43,11 @@ struct FileFragment {
     code: FileIndex,
     docs: Vec<DocSection>,
     props: Option<PropertyRegistry>,
+    /// Set when `code` came from a fresh tree-sitter parse (a persistent-cache miss) rather
+    /// than a cache hit — the (key, serialized `FileIndex`) pair `run_scan_pass` should write
+    /// back once the whole parallel pass is done. `None` on a cache hit (nothing changed to
+    /// write) or when no cache is configured.
+    cache_write: Option<CacheEntry>,
 }
 
 /// `[engines.contracts.spring]` settings resolved once per scan, mirroring how
@@ -112,6 +118,14 @@ struct ScanConfig<'a> {
     spring: &'a SpringSettings,
     extract_cfg: &'a ExtractConfig,
     toggles: &'a EngineToggles,
+    /// Persistent content-hash cache for tree-sitter `FileIndex` fragments (P2 step 3.2).
+    /// `None` disables it — every file is parsed fresh, exactly the pre-3.2 behaviour.
+    cache: Option<&'a PersistentIndexCache>,
+    /// SHA-256 of `extract_cfg`'s `Debug` output, computed once per scan by
+    /// `WorkspaceIndexer::config_fingerprint` and folded into every cache key so a config
+    /// change (e.g. `proto_dirs`, `infer_string_topics`) invalidates stale entries instead of
+    /// serving extraction results computed under different rules.
+    config_fingerprint: [u8; 32],
 }
 
 pub struct WorkspaceIndexer;
@@ -141,6 +155,9 @@ impl WorkspaceIndexer {
                 // Skill paths are written relative to the config file; the server is
                 // spawned by an IDE with an arbitrary cwd.
                 cfg.resolve_skill_paths(&base);
+                // Same reason: relative tool scopes anchor on the workspace root,
+                // not on whatever CWD the IDE launched us from.
+                cfg.resolve_workspace_root(&base);
                 Ok((cfg, base))
             }
             None => {
@@ -149,7 +166,9 @@ impl WorkspaceIndexer {
                     env!("CARGO_PKG_VERSION"),
                     "\"\nroots = [\".\"]\n"
                 );
-                Ok((Config::load_from_str(default)?, PathBuf::from(".")))
+                let mut cfg = Config::load_from_str(default)?;
+                cfg.resolve_workspace_root(Path::new("."));
+                Ok((cfg, PathBuf::from(".")))
             }
         }
     }
@@ -196,9 +215,10 @@ impl WorkspaceIndexer {
         roots: &[PathBuf],
         pool: Option<&BackgroundRescanEngine>,
         vfs: Option<&mut DifferentialVfs>,
+        cache: Option<&PersistentIndexCache>,
     ) -> MeshSnapshot {
         let files = Self::crawl_all(config, roots);
-        Self::build_snapshot_from_files(config, roots, &files, pool, vfs)
+        Self::build_snapshot_from_files(config, roots, &files, pool, vfs, cache)
     }
 
     /// [`Self::build_snapshot`] over an explicit `(RepoId, path)` list instead of
@@ -210,18 +230,22 @@ impl WorkspaceIndexer {
         files: &[(RepoId, PathBuf)],
         pool: Option<&BackgroundRescanEngine>,
         vfs: Option<&mut DifferentialVfs>,
+        cache: Option<&PersistentIndexCache>,
     ) -> MeshSnapshot {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config);
         let toggles = Self::engine_toggles(config);
+        let config_fingerprint = Self::config_fingerprint(&extract_cfg);
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
             spring: &spring,
             extract_cfg: &extract_cfg,
             toggles: &toggles,
+            cache,
+            config_fingerprint,
         };
 
         let (fragments, health) = Self::run_scan_pass(files, roots, &scan_cfg, pool);
@@ -266,10 +290,24 @@ impl WorkspaceIndexer {
     /// Delegates to [`Self::build_snapshot`] — one indexing path for the CLI, the
     /// server and the daemon, instead of a second one (previously duplicated here)
     /// that could silently drift out of sync with it.
-    pub fn build_graph(config: &Config, roots: &[PathBuf]) -> (ContractGraph, usize) {
-        let snapshot = Self::build_snapshot(config, roots, None, None);
+    pub fn build_graph(
+        config: &Config,
+        roots: &[PathBuf],
+        cache: Option<&PersistentIndexCache>,
+    ) -> (ContractGraph, usize) {
+        let snapshot = Self::build_snapshot(config, roots, None, None, cache);
         let file_count = snapshot.health.files_scanned;
         (snapshot.contract_graph, file_count)
+    }
+
+    /// SHA-256 of `extract_cfg`'s `Debug` representation — a cheap, deterministic fingerprint
+    /// (field order and formatting are fixed by the derive) of every knob that changes what
+    /// `PolyglotIndexer::extract_with_config` produces for the same bytes. Computed once per
+    /// scan, not per file, and folded into every `PersistentIndexCache` key so editing
+    /// `[engines.contracts.*]` invalidates stale cache entries instead of silently serving
+    /// extraction results computed under different rules.
+    fn config_fingerprint(extract_cfg: &ExtractConfig) -> [u8; 32] {
+        sha256(format!("{extract_cfg:?}").as_bytes())
     }
 
     /// Runs `process_file` over `files` (optionally inside `pool`), returning the
@@ -345,6 +383,14 @@ impl WorkspaceIndexer {
                 }
                 Err(reason) => Self::record_rejection(&mut health, reason),
             }
+        }
+
+        if let Some(cache) = scan_cfg.cache {
+            let writes: Vec<CacheEntry> = fragments
+                .iter_mut()
+                .filter_map(|f| f.cache_write.take())
+                .collect();
+            cache.put_batch(&writes);
         }
 
         (fragments, health)
@@ -610,12 +656,18 @@ impl WorkspaceIndexer {
         }
 
         let doc_template = state.snapshot().doc_index.clone_settings();
+        // Incremental reload never consults the persistent cache: it's already only
+        // re-parsing files the differential VFS flagged as changed (P2 step 3.1), so
+        // there's nothing a content-hash cache would additionally skip here — step 3.2's
+        // goal is the cold-start full scan, not this path.
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
             spring: &spring,
             extract_cfg: &extract_cfg,
             toggles: &toggles,
+            cache: None,
+            config_fingerprint: [0u8; 32],
         };
         let (fragments, pass_health) =
             Self::run_scan_pass(&candidates, roots, &scan_cfg, Some(&state.rescan));
@@ -669,14 +721,16 @@ impl WorkspaceIndexer {
             .map(|f| f.path.as_path())
             .chain(deleted.iter().map(PathBuf::as_path));
         snapshot.contract_graph.patch_files(stale);
-        for f in &changed {
-            snapshot.doc_index.remove_file(&f.path);
-            snapshot.property_registry.remove_file(&f.path);
-        }
-        for p in &deleted {
-            snapshot.doc_index.remove_file(p);
-            snapshot.property_registry.remove_file(p);
-        }
+        // One pass per index for the whole batch, not one per file: a branch
+        // switch reloading k of N files was O(k·N) here.
+        let stale_files: HashSet<&Path> = changed
+            .iter()
+            .map(|f| f.path.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+            .collect();
+        snapshot.doc_index.remove_files(&stale_files);
+        snapshot.property_registry.remove_files(&stale_files);
+        drop(stale_files);
         let changed_count = changed.len();
         for frag in changed {
             Self::fold(frag, &mut snapshot);
@@ -786,6 +840,7 @@ impl WorkspaceIndexer {
                 &root.to_string_lossy(),
                 roots,
                 &config.workspace.mount_aliases,
+                None,
             ) {
                 Ok(scope) => {
                     let exclusions = Self::exclude_patterns_for_root(
@@ -856,8 +911,8 @@ impl WorkspaceIndexer {
             patterns,
             doc_template,
             spring,
-            extract_cfg,
             toggles,
+            ..
         } = *cfg;
         let metadata = std::fs::metadata(path).map_err(|_| RejectKind::ReadError)?;
         // Commandment 2: check the size budget *before* reading, so an oversized file
@@ -889,6 +944,7 @@ impl WorkspaceIndexer {
             code: FileIndex::default(),
             docs: Vec::new(),
             props: None,
+            cache_write: None,
         };
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -912,14 +968,28 @@ impl WorkspaceIndexer {
                     frag.props = Some(reg);
                 }
                 if toggles.contracts_enabled {
-                    frag.code =
-                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+                    let (code, cache_write) = Self::extract_with_cache(
+                        path,
+                        content,
+                        repo_id,
+                        &frag.signature.content_hash,
+                        cfg,
+                    );
+                    frag.code = code;
+                    frag.cache_write = cache_write;
                 }
             }
             _ => {
                 if toggles.contracts_enabled {
-                    frag.code =
-                        PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg)
+                    let (code, cache_write) = Self::extract_with_cache(
+                        path,
+                        content,
+                        repo_id,
+                        &frag.signature.content_hash,
+                        cfg,
+                    );
+                    frag.code = code;
+                    frag.cache_write = cache_write;
                 }
             }
         }
@@ -930,6 +1000,58 @@ impl WorkspaceIndexer {
         }
 
         Ok(frag)
+    }
+
+    /// Tree-sitter extraction with an optional persistent-cache short-circuit (P2 step 3.2).
+    /// `content_hash` is the file's already-computed signature hash, so this costs nothing
+    /// beyond the lookup itself on either path.
+    ///
+    /// A cache hit deserializes and returns immediately, `cache_write: None` (nothing changed,
+    /// nothing to write back). A miss parses as before and, unless the parse itself failed
+    /// (`code.parse_failed`, retried by the caller — see `run_scan_pass`'s doc comment; caching
+    /// a failed parse would wrongly persist "no facts" past the retry), serializes the result
+    /// for `run_scan_pass` to batch-write once the whole parallel pass is done.
+    fn extract_with_cache(
+        path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        content_hash: &[u8; 32],
+        cfg: &ScanConfig,
+    ) -> (FileIndex, Option<CacheEntry>) {
+        let extract_cfg = cfg.extract_cfg;
+        let Some(cache) = cfg.cache else {
+            return (
+                PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg),
+                None,
+            );
+        };
+        let key =
+            PersistentIndexCache::key_for(path, content_hash, repo_id, &cfg.config_fingerprint);
+        if let Some(bytes) = cache.get(&key) {
+            if let Ok(cached) = serde_json::from_slice::<FileIndex>(&bytes) {
+                return (cached, None);
+            }
+            tracing::warn!(
+                target: "mesh::index_cache",
+                "{}: cached FileIndex failed to deserialize, re-parsing",
+                path.display()
+            );
+        }
+        let code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+        if code.parse_failed {
+            return (code, None);
+        }
+        match serde_json::to_vec(&code) {
+            Ok(bytes) => (code, Some((key, bytes))),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mesh::index_cache",
+                    "{}: failed to serialize FileIndex for caching: {e}",
+                    path.display()
+                );
+                (code, None)
+            }
+        }
     }
 
     /// `paths` is empty (default) → no restriction. Otherwise the file's path,
@@ -996,6 +1118,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1023,6 +1146,47 @@ mod tests {
         assert_eq!(view.contract_graph.node_count(), 3);
         assert!(view.contract_graph.search_symbols("B", None).is_empty());
         assert_eq!(state.vfs.lock().expect("vfs").len(), 2);
+    }
+
+    /// A cache-hit `build_snapshot` must produce byte-identical results to a cache-miss one:
+    /// this is the whole safety condition step 3.2 relies on (`fold`'s `NodeId` assignment
+    /// depends only on crawl order, never on whether a file's `FileIndex` came from a fresh
+    /// parse or a deserialized cache entry). Guards against a future change to `FileIndex`'s
+    /// serde shape, or to `extract_with_cache`'s plumbing, silently making a cache hit diverge
+    /// from a fresh parse.
+    #[test]
+    fn warm_cache_produces_identical_snapshot_to_cold_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("b.proto"),
+            "syntax = \"proto3\"; package b; service B { rpc Y (R) returns (S); }",
+        )
+        .expect("write b");
+        std::fs::write(root.join("doc.md"), "# Title\nsome text").expect("write md");
+
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+
+        let cold = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(cold.contract_graph.node_count(), 4);
+        assert_eq!(cold.doc_index.section_count(), 1);
+
+        // Second build over the exact same files/config, now served entirely from the cache
+        // this same `PersistentIndexCache` instance just populated.
+        let warm = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+
+        assert_eq!(cold.fingerprint(), warm.fingerprint());
+        assert_eq!(warm.contract_graph.node_count(), 4);
+        assert_eq!(warm.doc_index.section_count(), 1);
     }
 
     /// The path-driven `reload_paths` must produce the exact same result as the
@@ -1053,6 +1217,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1130,6 +1295,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1264,6 +1430,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1300,6 +1467,7 @@ mod tests {
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1360,6 +1528,7 @@ resolve_placeholders = true
                 &state.allowed_roots,
                 Some(&state.rescan),
                 Some(&mut vfs),
+                None,
             )
         };
         state.install_snapshot(snap);
@@ -1389,7 +1558,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             0,
@@ -1414,7 +1583,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.contract_graph.node_count(),
             0,
@@ -1437,7 +1606,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             1,
@@ -1460,7 +1629,7 @@ resolve_placeholders = true
         )
         .expect("config");
         let snapshot =
-            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None);
+            WorkspaceIndexer::build_snapshot(&cfg, std::slice::from_ref(&root), None, None, None);
         assert_eq!(
             snapshot.doc_index.section_count(),
             1,

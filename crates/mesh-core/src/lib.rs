@@ -7,8 +7,11 @@ pub mod crawler;
 pub mod docs;
 pub mod governance;
 pub mod health;
+pub mod index_cache;
+pub mod paths;
 pub mod properties;
 pub mod rescan;
+pub mod search_cache;
 pub mod security;
 pub mod socket;
 pub mod state;
@@ -24,12 +27,15 @@ pub use config::{
     ReadGovernanceMode, WorkspaceConfig,
 };
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
-pub use crawler::{ExcludeMatcher, FilesystemCrawler};
+pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::IndexHealth;
+pub use index_cache::{sha256, CacheEntry, IndexCacheError, PersistentIndexCache};
+pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;
+pub use search_cache::{file_stamp, CachedSearch, FileStamp, SearchCache, SearchCacheKey};
 pub use security::{SecurityError, ValidatedScope};
 pub use socket::{cleanup_stale_socket, socket_path, socket_path_for, workspace_id};
 #[cfg(windows)]

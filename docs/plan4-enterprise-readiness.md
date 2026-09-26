@@ -1,11 +1,12 @@
 # Plan 4 (P3) — Préparation d'un pilote entreprise
 
-> **Statut** : proposition, révisée le 2026-09-26 à partir d'une première version qui a été
-> confrontée au code. Chaque jalon part d'un **constat vérifié dans le code** (état 6.0.0, c'est-à-dire
-> les branches Plan 3 `p2/3.0` → `p2/3.6`, PR #26 → #31, pas encore mergées dans `main` au moment de
-> l'écriture) et se termine sur une **métrique mesurable** et reproductible. Les chiffres sans source
-> de la première version (« conviction 35 % → 95 % », « batterie 100 % → 0 % en 2 h »,
-> « cache de 20 à 40 Go ») ont été retirés : ils seront remplacés par des mesures, ou pas du tout.
+> **Statut** : proposition, révisée le 2026-09-26 à partir d'une première version confrontée au
+> code, puis complétée par une revue externe dont les points ouverts sont tranchés dans
+> « Décisions verrouillées ». Chaque jalon part d'un **constat vérifié dans le code** (état 6.0.0,
+> Plan 3 mergé dans `main` avec CI verte sur `1f1ffe1`) et se termine sur une **métrique
+> mesurable** et reproductible. Les chiffres sans source de la première version (« conviction
+> 35 % → 95 % », « batterie 100 % → 0 % en 2 h », « cache de 20 à 40 Go ») ont été retirés : ils
+> seront remplacés par des mesures, ou pas du tout.
 
 ---
 
@@ -55,8 +56,8 @@ après 4.0.
 ### 4.0 — CI sur les PR empilées, puis merge du Plan 3
 
 **Constat.** `.github/workflows/ci.yml` se déclenche sur `push`/`pull_request` vers `main` seulement.
-Les PR du Plan 3 (#26 → #31) ciblent chacune la branche précédente : aucune n'a jamais eu de CI. Les
-validations ont été faites en local, en profil release.
+Les PR du Plan 3 (#26 → #31) ciblaient chacune la branche précédente et n'ont eu de CI qu'une fois
+mergées dans `main` (verte en 6.0.0). Le merge du Plan 3 est fait ; il reste le filtre.
 
 **Travail.**
 - Déclencher `ci.yml` sur toutes les PR (`pull_request:` sans filtre de branche), ou au moins sur
@@ -291,6 +292,26 @@ opt-in et limitée à des chemins explicites, sans désactivation globale.
 **Sortie.** Décision fondée sur les données du pilote.
 
 ---
+
+## Décisions verrouillées (revue du 2026-09-26)
+
+Une revue externe du plan a soulevé 7 points ouverts. Chacun a été vérifié dans le code avant
+d'être tranché : quatre sont retenus tels quels, trois sont retenus avec correction.
+
+| Jalon | Question | Décision | Vérification / correction |
+|---|---|---|---|
+| **4.0** | Filtre de déclenchement de la CI | `pull_request: branches: ["main", "p*/**"]`. La matrice existante ne change pas : tests sur ubuntu/macos/windows, déterminisme et release sur ubuntu/macos (`ci.yml:47`, `:76`, `:103`). | Le Plan 3 a été mergé le 2026-09-26 : `main` passe en CI en 6.0.0 (run vert sur `1f1ffe1`). Pour les prochaines piles, GitHub reroute d'office une PR empilée vers `main` quand sa branche de base est supprimée après merge. Avec des merge commits, pas de doublons. Seul un squash-merge demande `git rebase --onto main <ancienne-base> <branche>`, puis un push de la branche rebasée. |
+| **4.1** | Diagnostics sous 48 KB | La note de diagnostic est **réservée avant** la troncature des résultats : les résultats se partagent `48 KB − note`, et la note est toujours ajoutée intacte en dernier. Liste bornée (par exemple 20 fichiers, puis « et N autres »). | Même mécanique que la note de troncature de la 3.6 (comptée avant la coupe). **Filtrée sur le scope** de la requête : un `smart_search` sur `crates/mesh-core` ne cite jamais un rejet de `crates/mesh-server`. |
+| **4.2** | Sous-modules et worktrees Git | Pour chaque racine, résoudre le vrai répertoire Git : si `.git` est un **fichier** (sous-module, ou `git worktree`), suivre son pointeur `gitdir:`. Les verrous (`index.lock`, `HEAD`, `rebase-*`) sont surveillés dans ce répertoire. | Verrou orphelin : `index.lock` plus vieux que 30 s **et** aucun processus `git` de l'utilisateur en cours (lecture de la table des processus, sans `lsof`, trop coûteux). On logue un avertissement et on reprend. |
+| **4.4** | Moment de l'éviction | Contrôle du quota **à l'ouverture et après chaque rechargement** ayant écrit plus de 100 entrées dans le cache. | Un démon qui tourne toute la semaine n'est ouvert qu'une fois : sans contrôle en cours de route, la base grossit jusqu'au redémarrage suivant. |
+| **4.5** | Détection `@grpc/grpc-js` | Une `new_expression` `new <X>Client(...)` crée une arête gRPC **si et seulement si** (1) `<X>Client` est importé dans le fichier et (2) `<X>` (ou `<X>Service`) correspond à un service gRPC **déclaré dans le graphe** (proto indexé). | **Correction** : otel-demo n'importe pas depuis un `*_grpc_pb`, mais depuis `'../../protos/demo'` (fichier `demo.ts` généré par ts-proto, `src/frontend/gateways/rpc/*.gateway.ts:5`). Une heuristique sur le chemin d'import (« contient `proto` ») est trop large : `prototype`, `protocol`… La résolution contre les services déclarés est ce qui empêche un `new FooClient()` quelconque de devenir une arête. |
+| **4.6b** | Version « avant » du `.proto` | Git uniquement : argument `base: Option<String>`, contenu lu par `git show <base>:<chemin>`, en mémoire, sans écriture disque ni persistance SQLite. | **Correction du défaut** : `base` vaut par défaut le merge-base de `HEAD` et de la branche par défaut distante (`origin/HEAD`) ; à défaut, `HEAD`, ce qui compare le working tree au dernier commit. **Pas `HEAD~1`**, qui comparerait au commit précédent au lieu de la branche de base. Fichier absent dans `base` : aucune rupture, fichier nouveau. Hors dépôt Git : `isError` explicite. |
+| **4.7** | Configuration d'IDE | **Fusion non destructive** : lire le JSON existant, n'ajouter ou remplacer que l'entrée `mesh-mcp`, et garder tous les autres serveurs. Si le fichier est malformé, ne rien écrire et le signaler. | **Bug existant, à corriger sans attendre 4.7** : `init --write-ide-config` réécrit aujourd'hui `.cursor/mcp.json` et `.vscode/mcp.json` avec un contenu neuf (`crates/mesh-server/src/cli/init.rs:303`, `:322`) et **efface les autres serveurs MCP** de l'utilisateur. À vérifier au passage : la clé racine attendue par VS Code (`servers` et non `mcpServers`). |
+| **4.10** | Seccomp et threads | Filtre posé avec `SECCOMP_FILTER_FLAG_TSYNC`, qui l'applique à tous les threads existants : workers et pool bloquant Tokio, pool rayon, threads de `notify`. | `meshd` démarre sous `#[tokio::main]` (`crates/mesh-daemon/src/main.rs:56`) et doit binder son socket avant de se confiner : poser le filtre avant le runtime n'est donc pas praticable sans restructurer `main`. Test : une connexion TCP tentée depuis un thread créé **avant** le confinement échoue aussi avec `EPERM`. |
+
+Palier de budgets de 4.3 retenu : **5k / 50k / 200k fichiers**, chacun avec ses propres budgets
+de boot, de pic mémoire et de latence. Le palier 200k part des mesures de la 6.0.0 (15 à 17 s,
+630 à 830 MB), pas de l'objectif de 80 MB de la première version.
 
 ## Branches et dépendances
 

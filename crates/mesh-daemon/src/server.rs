@@ -7,123 +7,30 @@
 
 use crate::idle::ClientCounter;
 use mesh_core::AppState;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-// ── Minimal inline JSON-RPC types (avoids circular dep with mesh-server) ─────
-
-#[derive(Debug, Deserialize)]
-struct RpcRequest {
-    pub id: Option<Value>,
-    pub method: String,
-    pub params: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct RpcResponse {
-    pub jsonrpc: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct RpcError {
-    pub code: i64,
-    pub message: String,
-}
-
-impl RpcResponse {
-    fn success(id: Option<Value>, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    fn error(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            id,
-            result: None,
-            error: Some(RpcError {
-                code,
-                message: message.into(),
-            }),
-        }
-    }
-}
-
 // ── JSON-RPC dispatcher (platform-independent) ───────────────────────────────
 
 async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
-    use mesh_server::tools::ToolRegistry;
+    use mesh_server::protocol::{classify, Incoming};
 
-    let req: RpcRequest = match serde_json::from_str(line) {
-        Ok(r) => r,
-        Err(e) => {
-            let resp = RpcResponse::error(None, -32700, format!("Parse error: {e}"));
-            return serde_json::to_string(&resp).ok();
+    let response = match classify(line) {
+        // `generation` starts at 0 and is only ever bumped by
+        // `install_snapshot`, which the initial ingestion task calls exactly
+        // once when its first scan completes — so 0 uniquely means "meshd
+        // hasn't finished indexing this workspace yet", never a legitimately
+        // empty one. `respond` answers `tools/call` with a retryable tool error
+        // then, which is what lets the socket accept connections (and
+        // `initialize`/`ping` succeed) before ingestion finishes.
+        Incoming::Request(req) => {
+            let still_indexing = state.snapshot().generation == 0;
+            mesh_server::respond(req, state, still_indexing).await
         }
-    };
-
-    let id = req.id.clone();
-
-    let response = match req.method.as_str() {
-        "initialize" => RpcResponse::success(
-            id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "mesh-mcp", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        ),
-        "notifications/initialized" => return None,
-        "ping" => RpcResponse::success(id, json!({})),
-        "tools/list" => {
-            let tools = ToolRegistry::list_tools();
-            RpcResponse::success(id, json!({ "tools": tools }))
-        }
-        "tools/call" if state.snapshot().generation == 0 => {
-            // `generation` starts at 0 and is only ever bumped by
-            // `install_snapshot`, which the initial ingestion task calls
-            // exactly once when its first scan completes — so 0 uniquely
-            // means "meshd hasn't finished indexing this workspace yet",
-            // never a legitimately empty one. Answering here explicitly
-            // instead of proceeding against the still-default empty
-            // snapshot is what lets the socket accept connections (and
-            // `initialize`/`ping` succeed) immediately, before ingestion
-            // finishes, rather than not existing at all until it does.
-            RpcResponse::error(
-                id,
-                -32000,
-                "meshd is still indexing this workspace; retry shortly",
-            )
-        }
-        "tools/call" => {
-            if let Some(params) = req.params {
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                match ToolRegistry::call_tool(tool_name, arguments, state.clone()).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err((code, msg)) => RpcResponse::error(id, code.into(), msg),
-                }
-            } else {
-                RpcResponse::error(id, -32602, "Missing params for tools/call")
-            }
-        }
-        unknown => RpcResponse::error(id, -32601, format!("Method not found: {unknown}")),
+        // JSON-RPC 2.0 §4.1: a notification never gets a reply.
+        Incoming::Notification(_) => return None,
+        Incoming::Reject(err) => err,
     };
 
     serde_json::to_string(&response).ok()
@@ -518,11 +425,23 @@ mod unix_tests {
         stream.write_all(call.as_bytes()).await.unwrap();
         let n = stream.read(&mut buf).await.unwrap();
         let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
-        assert_eq!(resp["error"]["code"], -32000);
-        assert!(resp["error"]["message"]
+        // A retryable tool error the agent can read, not a JSON-RPC error.
+        assert!(resp["error"].is_null(), "{resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("indexing"));
+
+        // A notification (no `id`) gets no reply at all: the next frame read
+        // must be the answer to the ping sent right after it.
+        let frames = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n";
+        stream.write_all(frames.as_bytes()).await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(text.lines().count(), 1, "exactly one reply: {text}");
+        let resp: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(resp["id"], 3);
 
         token.cancel();
     }

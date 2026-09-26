@@ -5,11 +5,93 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [Unreleased]
+## [6.0.0] — 2026-09-26
 
-Plan 3 (P2): scale. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
+**Plan 3 (P2) complete: scale, and MCP protocol compliance.** Major version because of the step
+3.6 breaking changes below (tool errors are `isError` results; `visualize_mesh` returns an
+aggregated view). Verified on the final build: `scripts/determinism.sh` green, golden corpus
+unchanged (online-boutique 100%/100%, otel-demo 87.5%/53.8%, bank-of-anthos 100%/100%), nightly
+5k budgets hold with reload 207 ms — details in `docs/quality.md` ("Plan 3 closeout").
+
+Plan 3 (P2): scale. Step 3.6 — MCP protocol compliance (tool errors as `isError`, notifications,
+fence-safe truncation, lean schemas) and a per-service `visualize_mesh`. Step 3.5 — `derive()`
+without quadratic passes, streaming YAML. Step 3.4 — `smart_search` pagination/early-stop/cache and
+exact line anchoring. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
 Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 — real incremental
 reload, driven by the watcher's own paths.
+
+### Breaking Changes (P2 step 3.6 — MCP protocol compliance)
+- **Tool failures are MCP tool results, not JSON-RPC errors.** A failure *inside* a tool — invalid
+  or unknown arguments, a scope outside the sandbox jail, a missing target, an RSAH governance
+  refusal, `meshd` still indexing — now returns a successful JSON-RPC response whose
+  `CallToolResult` has `isError: true` and the message as text content, as the MCP specification
+  (2024-11-05) requires. Previously these were JSON-RPC errors `-32602` / `-32001` / `-32000`,
+  which clients (Claude Code, Cursor, Windsurf) treat as a protocol failure that aborts the agent's
+  turn instead of letting the model read the message and correct its call. **Clients must read
+  `result.isError`**; `error` is now reserved for protocol faults: `-32700` parse error, `-32600`
+  invalid request (not a request object / `jsonrpc` not `"2.0"`, newly enforced), `-32601` unknown
+  method, `-32602` unknown tool or missing `tools/call` params, `-32603` internal error. There is no
+  compatibility flag.
+- **`visualize_mesh` returns a per-service aggregated view** in every format (Mermaid, JSON, HTML)
+  instead of the raw contract graph, which at a few thousand nodes exceeded the 48 KB cap and came
+  back cut mid-document. New arguments `service` (zoom into one service) and `max_services`. The
+  complete graph remains available from the CLI (`mesh-mcp graph`).
+
+### Fixed (P2 step 3.6)
+- JSON-RPC notifications (no `id`) never receive a reply — not even an error with `"id": null` —
+  in both the stdio server and `meshd` (JSON-RPC 2.0 §4.1). Both now share one request classifier
+  and one responder.
+- The 48 KB output cap cuts on a line boundary and closes any open Markdown code fence.
+- `_meta` (W3C trace context) is accepted but no longer advertised in `tools/list`
+  (7,696 → 5,524 bytes of tool schemas, ~540 tokens per session).
+
+### Fixed (P2 step 3.6 review)
+- **Stored XSS in the `visualize_mesh` / `mesh-mcp graph` HTML page**: a scanned name containing
+  `</script>` closed the inline JSON element; the JSON is now `\u003c`-escaped, the workspace name
+  HTML-escaped, and the side panel's `innerHTML` escapes node names.
+- **Mermaid label injection**: names are escaped with Mermaid entity codes (`#quot;`, `#lt;`,
+  `#gt;`, `#35;`, `#96;`) and newlines flattened, instead of a partial character strip that let a
+  newline or `"]` start a new statement.
+- **48 KB cap now holds for the whole payload**: the truncation note is budgeted before the cut,
+  the closing fence is counted, and a hint echoing an unbounded argument is capped (512 bytes) and
+  flattened to one line. Fence detection follows CommonMark (`~~~`, 4+-backtick fences, a
+  ```` ```rust ```` line inside a block is content, 4-space indent is not a fence).
+- **`visualize_mesh`**: the zoom ranked neighbour services by their global degree instead of their
+  links to the zoomed service (a hub linked once crowded out a service linked fifty times); a zoom prefers an exact-case match over a case-insensitive one;
+  the footer never suggests zooming into a topic; names are shortened to 120 bytes when drawn, so
+  one huge topic literal cannot push even the smallest view past the cap; JSON/HTML never get a
+  skill footer appended; the O(contracts + edges) fold runs once per call instead of once per
+  shrink iteration.
+- The `docs/mcp-tools.md` schema drift test resolved its path from the crate directory, where the
+  file never exists, and passed vacuously; it now compares every documented property set with the
+  advertised schema. A test covers `_meta` acceptance on every tool.
+
+
+### Changed (P2 step 3.5 — `derive()` without quadratic passes, streaming YAML)
+- **`ContractGraph::reconcile_edges` has no quadratic pass left**: the `Implements` pass indexes
+  gRPC handlers by every key its unchanged match predicate can succeed on instead of comparing every
+  proto method with every handler; import resolution is memoized per (target, importer repo);
+  `patch_files` groups index removals per key. AsyncAPI/OpenAPI line recovery is one pass per file.
+  200k files + 48k contract mix, cold: boot **307.8 s → 17.0 s**; peak footprint 809 → 829 MB;
+  plain 200k unchanged.
+- **Streaming YAML**: Spring property files flatten through a serde visitor (no `serde_yaml::Value`
+  tree), byte-identical to before; a multi-document file now contributes its first (default-profile)
+  document instead of being rejected outright. AsyncAPI/OpenAPI specs are read as key-only shapes.
+- Doc sections keep a lowercase copy only for non-ASCII content.
+- `scripts/bench/gen_synthetic.py --contracts` adds an imports/protos/gRPC/YAML/Markdown mix.
+
+### Added (P2 step 3.4 — `smart_search` at scale, exact line anchoring)
+- **`smart_search` pagination**: `limit` (default 20, max 100) / `offset`; only the requested
+  page's files are read and decapitated, each result's rendered size is measured before it is
+  accepted (no silent drop past the 48 KB cap), and the footer names the exact next `offset`.
+  Pages are cached per snapshot generation (and re-validated against file mtime/size).
+  30k files, cold: p50/p95 **~860/~2,600 ms → 57/112 ms** (budget 300/800).
+- **Exact line numbers**: snippets are anchored on the symbol's tree-sitter line through a
+  decapitated→original line map; the old text re-matching (which could attribute a symbol at line
+  800 to an identical line 15) is gone. Pattern/AsyncAPI/OpenAPI nodes record real lines.
+- **Python docstrings survive decapitation**; only the statements after them become `...`.
+- **Relative scopes resolve from `workspace_root`** (then the process CWD), not only the CWD an
+  IDE happened to launch the server in.
 
 ### Added (P2 step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
 - **Watchers now respect `.gitignore`/`exclude_patterns` at registration, not just after an event

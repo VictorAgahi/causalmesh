@@ -720,6 +720,52 @@ section left open, and eliminating an orphaned-daemon failure mode.
   sections. There is no global memory budget for docs or properties. Spec item 1 is therefore
   delivered for YAML's tree, not for Markdown, and not as a budget.
 
+## Plan 3 closeout (2026-09-26, 6.0.0 — final verification after steps 3.0–3.6)
+
+All numbers below come from the release build of `6.0.0` (branch `p2/3.6-visualize-and-mcp-compliance`),
+on this machine, with a fresh `HOME` per run so the persistent index cache (step 3.2) is cold, and
+compared against step 3.4's head (`835361f`) as the reference where a before/after exists.
+
+**Regression suites**
+
+| suite | result |
+|---|---|
+| `scripts/determinism.sh` (Plan 1) | ✔ `polyglot-shop` 1 fingerprint / 13 runs; ✔ `volontariapp-fixture` 1 fingerprint / 13 runs (5 sequential + 8 concurrent each) |
+| `scripts/golden/score.py online-boutique` (Plan 2) | 14/14 — **100% precision / 100% recall** (unchanged) |
+| `scripts/golden/score.py otel-demo` | 7/13 — **87.5% / 53.8%**, identical to the reference binary and to the last recorded value: the known TypeScript `@grpc/grpc-js` client gap + the `checkout -> health` extra edge, not a regression |
+| `scripts/golden/score.py bank-of-anthos` | 0/0 — vacuous 100% / 100% (gRPC-free, nothing fabricated) |
+| nightly `scale_bench.py` (5k files, 8 roots, `budgets.json`) | ✔ no violation, 3 runs + 1 run outside the repo: boot 0.5–1.1 s (budget 3 s), RSS peak 48–49 MB (300), search p50 4.4–9.7 ms (300), p95 7.6–24.2 ms (800), reload **207 ms** (3 s; reference 210 ms) |
+
+**Re-verified on the final tree** (after merging the step 3.5 and 3.6 review fixes, `047d6b3`):
+`determinism.sh` gives the same two fingerprints (`27c5fb5d…`, `a40bf20f…`); golden unchanged
+(100/100, 87.5/53.8, 100/100); nightly 5k outside the repo, 2 runs: boot 0.30–0.31 s, RSS peak
+49 MB, search p50 2.2–2.4 ms / p95 3.7–7.8 ms, reload 205–209 ms, no violation.
+
+**`reload_ms: None` explained, not a regression.** Every corpus generated under `target/`
+(git-ignored by this repo's `/target` rule) reported `reload_ms: None` — for the reference binary
+too. Step 3.3's watcher honours `.gitignore` files *above* the watched root, so edits inside a
+git-ignored directory are, correctly, never watched and the harness's reload probe times out. The
+same 5k corpus generated outside the repository (`~/bench-repos/mesh-synth-5k`) reloads in 207 ms.
+Scale corpora must therefore not live under an ignored path; the step 3.4/3.5 notes that called
+this "a harness issue to investigate" are resolved by this.
+
+**Scale, end to end (cold)**
+
+| measurement | before (first number in Plan 3) | 6.0.0 |
+|---|---|---|
+| `smart_search` 30k files, single root, p50 / p95 | 905 / 3,342 ms (`04f213c`) | 57 / 112 ms |
+| boot, 200k files + 48k contract mix | 307.8 s (step 3.4 head) | 17.0 s |
+| peak footprint, same corpus | 809 MB | 829 MB |
+| boot / peak footprint, 200k plain files | 13.9 s / 630 MB | 15.3 s / 637 MB |
+| `visualize_mesh`, 248k nodes | raw graph over 48 KB, cut mid-document (invalid HTML/JSON) | 4.3 KB mermaid / 16.9 KB json / 40.4 KB html, all valid |
+| `visualize_mesh` latency, 248k nodes (mermaid / json / html / zoom) | 516 / 522 / 1,034 / 1,603 ms (`000fa3f`) | 124 / 111 / 101 / 222 ms (step 3.6 review: the fold runs once, the shrink loop only re-selects) |
+| `tools/list` schemas | 7,696 bytes | 5,524 bytes (~540 tokens/session less) |
+
+**Still over budget, recorded not hidden**: the nightly budgets are derived from the 5k corpus and
+hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are far above them; that
+cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
+were not loosened to make larger corpora pass.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

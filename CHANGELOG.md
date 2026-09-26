@@ -5,7 +5,13 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [Unreleased]
+## [6.0.0] — 2026-09-26
+
+**Plan 3 (P2) complete: scale, and MCP protocol compliance.** Major version because of the step
+3.6 breaking changes below (tool errors are `isError` results; `visualize_mesh` returns an
+aggregated view). Verified on the final build: `scripts/determinism.sh` green, golden corpus
+unchanged (online-boutique 100%/100%, otel-demo 87.5%/53.8%, bank-of-anthos 100%/100%), nightly
+5k budgets hold with reload 207 ms — details in `docs/quality.md` ("Plan 3 closeout").
 
 Plan 3 (P2): scale. Step 3.6 — MCP protocol compliance (tool errors as `isError`, notifications,
 fence-safe truncation, lean schemas) and a per-service `visualize_mesh`. Step 3.5 — `derive()`
@@ -39,6 +45,32 @@ reload, driven by the watcher's own paths.
 - `_meta` (W3C trace context) is accepted but no longer advertised in `tools/list`
   (7,696 → 5,524 bytes of tool schemas, ~540 tokens per session).
 
+
+### Changed (P2 step 3.5 — `derive()` without quadratic passes, streaming YAML)
+- **`ContractGraph::reconcile_edges` has no quadratic pass left**: the `Implements` pass indexes
+  gRPC handlers by every key its unchanged match predicate can succeed on instead of comparing every
+  proto method with every handler; import resolution is memoized per (target, importer repo);
+  `patch_files` groups index removals per key. AsyncAPI/OpenAPI line recovery is one pass per file.
+  200k files + 48k contract mix, cold: boot **307.8 s → 17.0 s**; peak footprint 809 → 829 MB;
+  plain 200k unchanged.
+- **Streaming YAML**: Spring property files flatten through a serde visitor (no `serde_yaml::Value`
+  tree), byte-identical to before; a multi-document file now contributes its first (default-profile)
+  document instead of being rejected outright. AsyncAPI/OpenAPI specs are read as key-only shapes.
+- Doc sections keep a lowercase copy only for non-ASCII content.
+- `scripts/bench/gen_synthetic.py --contracts` adds an imports/protos/gRPC/YAML/Markdown mix.
+
+### Added (P2 step 3.4 — `smart_search` at scale, exact line anchoring)
+- **`smart_search` pagination**: `limit` (default 20, max 100) / `offset`; only the requested
+  page's files are read and decapitated, each result's rendered size is measured before it is
+  accepted (no silent drop past the 48 KB cap), and the footer names the exact next `offset`.
+  Pages are cached per snapshot generation (and re-validated against file mtime/size).
+  30k files, cold: p50/p95 **~860/~2,600 ms → 57/112 ms** (budget 300/800).
+- **Exact line numbers**: snippets are anchored on the symbol's tree-sitter line through a
+  decapitated→original line map; the old text re-matching (which could attribute a symbol at line
+  800 to an identical line 15) is gone. Pattern/AsyncAPI/OpenAPI nodes record real lines.
+- **Python docstrings survive decapitation**; only the statements after them become `...`.
+- **Relative scopes resolve from `workspace_root`** (then the process CWD), not only the CWD an
+  IDE happened to launch the server in.
 
 ### Added (P2 step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
 - **Watchers now respect `.gitignore`/`exclude_patterns` at registration, not just after an event

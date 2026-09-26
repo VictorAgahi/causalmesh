@@ -377,25 +377,23 @@ impl PropertyRegistry {
     ///
     /// Streams the first YAML document's events straight into flat
     /// `(dotted.key, value)` pairs through a serde visitor — no
-    /// `serde_yaml::Value` tree is ever built (`serde_yaml` still buffers the
-    /// document's event list; see `yaml_flatten`). Only the first document is read:
+    /// `serde_yaml::Value` tree and no buffered event list: the events come one
+    /// at a time from [`crate::yaml_stream`], whose per-file alias budget also
+    /// bounds anchor/alias expansion (plan 4.9). Only the first document is read:
     /// in a multi-document Spring file (`---` profile sections) it is the default
     /// profile, and merging later profile documents over it would report
     /// profile-specific overrides as the base value. (`serde_yaml::from_str`,
     /// used before, rejected multi-document files outright, ingesting nothing.)
     /// The pairs are only inserted once the document parsed cleanly, so a
     /// malformed file still contributes nothing rather than a partial prefix.
-    pub fn ingest_yaml_str(&mut self, content: &str) -> Result<(), serde_yaml::Error> {
-        let Some(document) = serde_yaml::Deserializer::from_str(content).next() else {
-            return Ok(());
-        };
+    pub fn ingest_yaml_str(&mut self, content: &str) -> Result<(), crate::yaml_stream::Error> {
         let mut pairs: Vec<(String, String)> = Vec::new();
-        serde::de::DeserializeSeed::deserialize(
+        crate::yaml_stream::first_document(
+            content,
             yaml_flatten::FlattenSeed {
                 prefix: String::new(),
                 out: &mut pairs,
             },
-            document,
         )?;
         for (key, value) in pairs {
             self.insert_sanitized(&key, &value);
@@ -413,11 +411,11 @@ impl PropertyRegistry {
 /// `Mapping` did. The one intended difference is multi-document input (see
 /// `ingest_yaml_str`).
 ///
-/// "Streaming" is relative to the `Value` tree only: `serde_yaml` 0.9 still
-/// loads the document's whole event list before any visitor runs, so peak
-/// memory is that event list plus the flat pairs. What bounds it is the
-/// indexer's per-file size budget (`AstGuard::within_size_budget`), not this
-/// visitor.
+/// Driven by [`crate::yaml_stream`] (one event at a time; `serde_yaml` 0.9
+/// buffered the whole document's event list first, 24-34x the file size), so
+/// peak memory is the flat pairs plus the parser's scanner state and any
+/// anchored node's recorded events, the latter capped by the stream's per-file
+/// alias budget.
 mod yaml_flatten {
     use serde::de::{
         self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
@@ -659,15 +657,12 @@ anchors:
   copy: *b
 "#;
         let mut streamed = Vec::new();
-        let doc = serde_yaml::Deserializer::from_str(yaml)
-            .next()
-            .expect("doc");
-        serde::de::DeserializeSeed::deserialize(
+        crate::yaml_stream::first_document(
+            yaml,
             yaml_flatten::FlattenSeed {
                 prefix: String::new(),
                 out: &mut streamed,
             },
-            doc,
         )
         .expect("stream");
         let dom: serde_yaml::Value = serde_yaml::from_str(yaml).expect("dom");
@@ -680,6 +675,115 @@ anchors:
         assert!(streamed
             .iter()
             .any(|(k, v)| k == "anchors.copy.url" && v == "http://x"));
+    }
+
+    /// The flattener fed by `serde_yaml` (the pre-4.9 driver) and by
+    /// `yaml_stream` must agree: same pairs, or both reject the document.
+    fn assert_drivers_agree(yaml: &str) {
+        let mut old = Vec::new();
+        let old_res = match serde_yaml::Deserializer::from_str(yaml).next() {
+            Some(doc) => serde::de::DeserializeSeed::deserialize(
+                yaml_flatten::FlattenSeed {
+                    prefix: String::new(),
+                    out: &mut old,
+                },
+                doc,
+            )
+            .map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        let mut new = Vec::new();
+        let new_res = crate::yaml_stream::first_document(
+            yaml,
+            yaml_flatten::FlattenSeed {
+                prefix: String::new(),
+                out: &mut new,
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        match (&old_res, &new_res) {
+            (Ok(()), Ok(())) => assert_eq!(new, old, "{yaml:.200}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "drivers disagree on {yaml:.200}: serde_yaml {old_res:?}, stream {new_res:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn stream_driver_matches_serde_yaml_driver() {
+        let cases = [
+            "defaults: &d\n  timeout: 3000\n  pool: {min: 2}\nsvc:\n  <<: *d\n  url: http://x\n",
+            "a: &x 1\nb: *x\nc: [*x]\nd: {e: *x}\n",
+            "spring:\n  profiles: dev\n---\nspring:\n  profiles: prod\n",
+            "a: 0x10\nb: 1e3\nc: 007\nd: '12'\ne: !!str 5\nf: .nan\n",
+            "a: |\n  multi\n  line\nb: >-\n  folded\n  text\n",
+            "# only a comment\n",
+            "",
+            "- a\n- b\n",
+            "a: 1\n...\n",
+            "a: [1, 2\n",
+        ];
+        for yaml in cases {
+            assert_drivers_agree(yaml);
+        }
+    }
+
+    /// Plan 4.9: an alias fan-out that `serde_yaml` would flatten into
+    /// anchor-size x alias-count pairs is refused by the per-file budget, and
+    /// the refused file ingests nothing.
+    #[test]
+    fn alias_fan_out_is_refused_and_ingests_nothing() {
+        let mut yaml = String::from("base: &big\n");
+        for i in 0..2000 {
+            yaml.push_str(&format!("  k{i}: v\n"));
+        }
+        yaml.push_str("services:\n");
+        for i in 0..2000 {
+            yaml.push_str(&format!("  p{i}: *big\n"));
+        }
+        let mut reg = PropertyRegistry::new();
+        assert!(matches!(
+            reg.ingest_yaml_str(&yaml),
+            Err(crate::yaml_stream::Error::BudgetExceeded { .. })
+        ));
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// Opt-in equivalence sweep over a directory of real YAML (e.g. the golden
+    /// corpora): `MESH_YAML_EQUIV_DIR=~/.cache/mesh-golden cargo test --release
+    /// -p mesh-core stream_driver_matches_on_dir -- --ignored`.
+    #[test]
+    #[ignore]
+    fn stream_driver_matches_on_dir() {
+        let Ok(dir) = std::env::var("MESH_YAML_EQUIV_DIR") else {
+            return;
+        };
+        let mut seen = 0usize;
+        for entry in ignore::WalkBuilder::new(dir)
+            .hidden(false)
+            .build()
+            .flatten()
+        {
+            let path = entry.path();
+            let is_yaml = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "yml" || e == "yaml");
+            if !is_yaml || entry.file_type().is_some_and(|t| !t.is_file()) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            if text.len() > 1536 * 1024 {
+                continue;
+            }
+            assert_drivers_agree(&text);
+            seen += 1;
+        }
+        eprintln!("compared {seen} YAML files");
     }
 
     /// A multi-document Spring file used to be rejected wholesale; now its first
@@ -718,15 +822,12 @@ anchors:
                 out
             });
             let mut streamed = Vec::new();
-            let doc = serde_yaml::Deserializer::from_str(yaml)
-                .next()
-                .expect("doc");
-            let result = serde::de::DeserializeSeed::deserialize(
+            let result = crate::yaml_stream::first_document(
+                yaml,
                 yaml_flatten::FlattenSeed {
                     prefix: String::new(),
                     out: &mut streamed,
                 },
-                doc,
             );
             match dom {
                 Ok(expected) => {

@@ -648,7 +648,7 @@ impl PolyglotIndexer {
                 .any(|f| spec_file_matches(&path_str, f))
         };
         if is_asyncapi {
-            if let Ok(spec) = serde_yaml::from_str::<spec_shape::AsyncApiShape>(content) {
+            if let Ok(spec) = spec_shape::from_yaml::<spec_shape::AsyncApiShape>(content) {
                 let lines = YamlLines::new(content);
                 let mut seek = lines.seeker(lines.key_line("channels", 1, usize::MAX));
                 for name_str in spec.channels.0.iter().map(String::as_str) {
@@ -708,7 +708,7 @@ impl PolyglotIndexer {
                 .any(|f| spec_file_matches(&path_str, f))
         };
         if is_openapi {
-            if let Ok(spec) = serde_yaml::from_str::<spec_shape::OpenApiShape>(content) {
+            if let Ok(spec) = spec_shape::from_yaml::<spec_shape::OpenApiShape>(content) {
                 let lines = YamlLines::new(content);
                 // Pass 1: each path's line, in document order (one forward scan).
                 let mut seek = lines.seeker(lines.key_line("paths", 1, usize::MAX));

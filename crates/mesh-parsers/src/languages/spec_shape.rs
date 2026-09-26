@@ -14,6 +14,12 @@
 //! tags (`!Tag {..}`), so every view here unwraps a tagged node to its content
 //! too.
 //!
+//! The views are driven by [`from_yaml`], i.e. `mesh_core::yaml_stream`
+//! (plan 4.9): libyaml events pulled one at a time rather than `serde_yaml`'s
+//! whole-document event list (24-29x a 1.5 MB spec), and a per-file budget on
+//! anchor/alias expansion (an alias fan-out used to grow `paths` as anchor size x
+//! alias count: a 30 KB `openapi.yaml` measured at 1.85 GB).
+//!
 //! One deliberate difference from the `Value` tree: a duplicate mapping key
 //! somewhere in the document (typically deep inside a schema) no longer
 //! rejects the whole spec. A duplicated channel/path key is reported once per
@@ -22,6 +28,14 @@
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::fmt;
+
+/// Reads a spec view from a single-document YAML stream (same contract as
+/// `serde_yaml::from_str`) through the streaming, budgeted driver.
+pub(crate) fn from_yaml<'a, T: Deserialize<'a>>(
+    content: &'a str,
+) -> Result<T, mesh_core::yaml_stream::Error> {
+    mesh_core::yaml_stream::from_str(content)
+}
 
 /// No `derive(Deserialize)` on the two root shapes: a derived struct also
 /// accepts a *sequence* (fields by position), so a root `- {a: 1}` list would
@@ -274,15 +288,14 @@ channels:
   users.updated: {}
 topics: [a, 1, {b: c}, d]
 "#;
-        let shape: AsyncApiShape = serde_yaml::from_str(yaml).expect("shape");
+        let shape: AsyncApiShape = from_yaml(yaml).expect("shape");
         assert_eq!(shape.channels.0, ["orders.created", "users.updated"]);
         assert_eq!(shape.topics.0, ["a", "d"]);
     }
 
     #[test]
     fn wrong_shaped_fields_are_empty_not_errors() {
-        let shape: AsyncApiShape =
-            serde_yaml::from_str("channels: [x, y]\ntopics: {a: b}\n").expect("shape");
+        let shape: AsyncApiShape = from_yaml("channels: [x, y]\ntopics: {a: b}\n").expect("shape");
         assert!(shape.channels.0.is_empty());
         assert!(shape.topics.0.is_empty());
     }
@@ -293,15 +306,14 @@ topics: [a, 1, {b: c}, d]
     fn tags_are_transparent_and_non_mapping_roots_are_empty() {
         let yaml =
             "!Spec\nchannels: !Chans\n  ? !K orders\n  : {}\n  users: {}\ntopics: !T [a, !S b]\n";
-        let shape: AsyncApiShape = serde_yaml::from_str(yaml).expect("shape");
+        let shape: AsyncApiShape = from_yaml(yaml).expect("shape");
         assert_eq!(shape.channels.0, ["orders", "users"]);
         assert_eq!(shape.topics.0, ["a", "b"]);
 
-        let listed: AsyncApiShape =
-            serde_yaml::from_str("- {a: 1}\n- [x, y]\n").expect("list root");
+        let listed: AsyncApiShape = from_yaml("- {a: 1}\n- [x, y]\n").expect("list root");
         assert!(listed.channels.0.is_empty());
         assert!(listed.topics.0.is_empty());
-        let scalar: OpenApiShape = serde_yaml::from_str("just text").expect("scalar root");
+        let scalar: OpenApiShape = from_yaml("just text").expect("scalar root");
         assert!(scalar.paths.0.is_empty());
     }
 
@@ -336,7 +348,7 @@ topics: [a, 1, {b: c}, d]
                         .collect()
                 })
                 .unwrap_or_default();
-            let shape: AsyncApiShape = serde_yaml::from_str(doc).expect("shape");
+            let shape: AsyncApiShape = from_yaml(doc).expect("shape");
             assert_eq!(shape.channels.0, keys, "channels of {doc:?}");
             assert_eq!(shape.topics.0, items, "topics of {doc:?}");
         }
@@ -355,7 +367,7 @@ paths:
   : {get: {}}
 components: {schemas: {User: {type: object}}}
 "#;
-        let shape: OpenApiShape = serde_yaml::from_str(yaml).expect("shape");
+        let shape: OpenApiShape = from_yaml(yaml).expect("shape");
         assert_eq!(
             shape.paths.0,
             vec![
@@ -366,5 +378,92 @@ components: {schemas: {User: {type: object}}}
                 ("/health".to_string(), vec![]),
             ]
         );
+    }
+
+    /// Both drivers must produce the same views (or both fail).
+    fn assert_drivers_agree(yaml: &str) {
+        let a_old = serde_yaml::from_str::<AsyncApiShape>(yaml).map(|s| (s.channels.0, s.topics.0));
+        let a_new = from_yaml::<AsyncApiShape>(yaml).map(|s| (s.channels.0, s.topics.0));
+        match (&a_old, &a_new) {
+            (Ok(x), Ok(y)) => assert_eq!(x, y, "asyncapi view of {yaml:.200}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("asyncapi drivers disagree on {yaml:.200}: {a_old:?} vs {a_new:?}"),
+        }
+        let o_old = serde_yaml::from_str::<OpenApiShape>(yaml).map(|s| s.paths.0);
+        let o_new = from_yaml::<OpenApiShape>(yaml).map(|s| s.paths.0);
+        match (&o_old, &o_new) {
+            (Ok(x), Ok(y)) => assert_eq!(x, y, "openapi view of {yaml:.200}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("openapi drivers disagree on {yaml:.200}: {o_old:?} vs {o_new:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_driver_matches_serde_yaml_driver() {
+        let docs = [
+            "paths:\n  /a: &ops {get: {}, post: {}}\n  /b: *ops\n",
+            "channels:\n  a: &c {x: 1}\n  b: *c\ntopics: &t [x, y]\n",
+            "openapi: 3.0.0\npaths: {}\n---\npaths: {/x: {get: {}}}\n",
+            "",
+            "paths:\n  /a: {get: [unclosed\n",
+            "paths:\n  /a:\n    get: {}\n  /a:\n    put: {}\n",
+        ];
+        for doc in docs {
+            assert_drivers_agree(doc);
+        }
+    }
+
+    /// Plan 4.9 security bound: one anchored mapping replayed under many paths
+    /// is refused by the per-file budget instead of materializing
+    /// anchor-size x alias-count method keys.
+    #[test]
+    fn alias_fan_out_in_paths_is_refused() {
+        let mut yaml = String::from("openapi: 3.0.0\nx-base: &big\n");
+        for i in 0..2000 {
+            yaml.push_str(&format!("  m{i}: {{}}\n"));
+        }
+        yaml.push_str("paths:\n");
+        for i in 0..2000 {
+            yaml.push_str(&format!("  /p{i}: *big\n"));
+        }
+        assert!(matches!(
+            from_yaml::<OpenApiShape>(&yaml),
+            Err(mesh_core::yaml_stream::Error::BudgetExceeded { .. })
+        ));
+    }
+
+    /// Opt-in sweep over real YAML (`MESH_YAML_EQUIV_DIR=~/.cache/mesh-golden
+    /// cargo test --release -p mesh-parsers spec_views_match_on_dir -- --ignored`).
+    #[test]
+    #[ignore]
+    fn spec_views_match_on_dir() {
+        let Ok(dir) = std::env::var("MESH_YAML_EQUIV_DIR") else {
+            return;
+        };
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        let mut seen = 0usize;
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                let path = entry.path();
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file()
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e == "yml" || e == "yaml")
+                {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        assert_drivers_agree(&text);
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("compared {seen} YAML files");
     }
 }

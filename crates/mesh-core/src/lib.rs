@@ -25,7 +25,7 @@ pub use config::{
     ReadGovernanceMode, WorkspaceConfig,
 };
 pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
-pub use crawler::{ExcludeMatcher, FilesystemCrawler};
+pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::IndexHealth;

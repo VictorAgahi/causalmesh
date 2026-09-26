@@ -1,5 +1,10 @@
+use crate::crawler::{ExcludeMatcher, FilesystemCrawler};
 use crate::state::AppState;
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use notify_debouncer_mini::{
+    new_debouncer, new_debouncer_opt, Config as DebouncerConfig, Debouncer,
+};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -14,12 +19,58 @@ use tokio_util::sync::CancellationToken;
 /// `mesh-core` cannot depend on.
 pub type ReloadFn = Arc<dyn Fn(&AppState, &[PathBuf]) + Send + Sync>;
 
+/// Either watcher backend `spawn` can end up running: per-directory native watches (inotify/
+/// FSEvents/ReadDirectoryChangesW) in the common case, or a polling backend when a workspace
+/// has more watchable directories than `FileWatcherService::MAX_WATCHED_DIRS` — native watch
+/// registration has a real per-process/per-user OS ceiling (Linux's `fs.inotify.max_user_watches`
+/// most concretely), and a workspace that would exceed it must degrade to polling rather than
+/// fail to start or silently stop watching partway through a giant tree.
+enum AnyDebouncer {
+    Native(Debouncer<RecommendedWatcher>),
+    Poll(Debouncer<PollWatcher>),
+}
+
+impl AnyDebouncer {
+    fn watcher(&mut self) -> &mut dyn Watcher {
+        match self {
+            AnyDebouncer::Native(d) => d.watcher(),
+            AnyDebouncer::Poll(d) => d.watcher(),
+        }
+    }
+}
+
 /// In-kernel filesystem watcher service providing debounced change notifications
 /// and atomic snapshot reloading per RFC-001 Commandment 7.
 pub struct FileWatcherService;
 
 impl FileWatcherService {
     pub const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(150);
+
+    /// Above this many individually watchable directories across all roots, `spawn` gives up
+    /// on per-directory native registration and falls back to `POLL_FALLBACK_INTERVAL` polling
+    /// instead (P2 step 3.3). Deliberately conservative: some CI/container images and older
+    /// Linux defaults leave `fs.inotify.max_user_watches` far below the 8192+ many desktop
+    /// distros now ship, and macOS's FSEvents backend doesn't need per-directory registration
+    /// to work correctly at all (see `plan_watch_dirs`'s use here), so this cap exists purely
+    /// to protect the Linux case rather than being tuned to any single platform's true limit.
+    pub const MAX_WATCHED_DIRS: usize = 4096;
+
+    /// Poll interval used only in the capped fallback above. Coarser than
+    /// `DEBOUNCE_INTERVAL` on purpose: polling a huge tree (the only workspaces that ever
+    /// reach this fallback) every 150ms would itself be real, avoidable CPU/IO cost.
+    pub const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
+
+    /// Walks `root` for directories to individually watch (gitignore/`exclude_patterns`-aware,
+    /// `FilesystemCrawler::plan_watch_dirs`), consuming from `budget` (shared across every
+    /// root in one `spawn` call, so the *combined* directory count across all roots is what's
+    /// capped against `MAX_WATCHED_DIRS`, not each root independently).
+    fn plan_root(
+        root: &Path,
+        matcher: &ExcludeMatcher,
+        budget: usize,
+    ) -> crate::crawler::WatchPlan {
+        FilesystemCrawler::plan_watch_dirs(root, matcher, Some(10), budget)
+    }
 
     /// Spawns the debounced file watcher actor in a background thread
     pub fn spawn(
@@ -28,12 +79,70 @@ impl FileWatcherService {
         reload: ReloadFn,
     ) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut debouncer = new_debouncer(Self::DEBOUNCE_INTERVAL, tx)?;
 
+        let matcher = ExcludeMatcher::compile(&state.config.workspace.exclude_patterns);
+        let mut watched_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut per_root_dirs: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+        let mut capped = false;
         for root in state.allowed_roots.iter() {
-            if root.exists() {
-                debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
-                tracing::info!(target: "mesh::watcher", "FileWatcher watching root: {}", root.display());
+            if !root.exists() {
+                continue;
+            }
+            let budget = Self::MAX_WATCHED_DIRS.saturating_sub(watched_dirs.len());
+            let plan = Self::plan_root(root, &matcher, budget);
+            if plan.capped {
+                capped = true;
+                break;
+            }
+            watched_dirs.extend(plan.dirs.iter().cloned());
+            per_root_dirs.push((root.clone(), plan.dirs));
+        }
+
+        let mut debouncer = if capped {
+            tracing::warn!(
+                target: "mesh::watcher",
+                "Workspace has more than {} watchable directories; falling back to polling \
+                 every {:?} instead of native per-directory watches.",
+                Self::MAX_WATCHED_DIRS,
+                Self::POLL_FALLBACK_INTERVAL,
+            );
+            let config = DebouncerConfig::default()
+                .with_timeout(Self::DEBOUNCE_INTERVAL)
+                .with_notify_config(
+                    NotifyConfig::default().with_poll_interval(Self::POLL_FALLBACK_INTERVAL),
+                );
+            AnyDebouncer::Poll(new_debouncer_opt::<_, PollWatcher>(config, tx)?)
+        } else {
+            AnyDebouncer::Native(new_debouncer(Self::DEBOUNCE_INTERVAL, tx)?)
+        };
+
+        if capped {
+            // Polling backend: one recursive watch per root, same as this service's
+            // behaviour before step 3.3. `PollWatcher` re-scans the whole tree on its own
+            // interval rather than relying on per-directory kernel registration, so it
+            // needs no gitignore-aware directory enumeration to sidestep an OS watch limit
+            // that doesn't apply to it in the first place — that's the entire reason this
+            // fallback exists.
+            for root in state.allowed_roots.iter() {
+                if root.exists() {
+                    debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+                    tracing::info!(target: "mesh::watcher", "FileWatcher (polling) watching root: {}", root.display());
+                }
+            }
+        } else {
+            for (root, dirs) in &per_root_dirs {
+                for dir in dirs {
+                    if let Err(e) = debouncer.watcher().watch(dir, RecursiveMode::NonRecursive) {
+                        tracing::warn!(target: "mesh::watcher", "Failed to watch {}: {e}", dir.display());
+                    }
+                }
+                tracing::info!(
+                    target: "mesh::watcher",
+                    "FileWatcher watching {} director{} under root: {}",
+                    dirs.len(),
+                    if dirs.len() == 1 { "y" } else { "ies" },
+                    root.display()
+                );
 
                 // Watch .git/HEAD for branch checkouts / rebases
                 let git_head = root.join(".git").join("HEAD");
@@ -45,10 +154,24 @@ impl FileWatcherService {
             }
         }
 
+        // `Arc<Mutex<_>>`, not owned outright by the loop thread: a native backend's `.watch()`
+        // call is not the cheap syscall it is on Linux (inotify) everywhere — macOS's FSEvents
+        // backend stops and restarts its whole event stream on every single `.watch()` call,
+        // which this crate's own `stop()` implements as a busy-wait for the stream's background
+        // runloop to become idle. Measured on this machine: a single dynamic registration took
+        // over 11 seconds under load. Doing that inline on the thread that also has to keep
+        // draining `rx` would stall every *other* pending reload for however long that takes.
+        // The `Mutex` lets `Self::register_new_directories` dispatch the actual `.watch()` calls
+        // onto `state.rescan`'s background pool instead, so the event-receive loop below is
+        // never blocked by them (see there for the synchronous/deferred split).
+        let debouncer = Arc::new(std::sync::Mutex::new(debouncer));
+
         let handle = std::thread::Builder::new()
             .name("mesh-file-watcher".to_string())
             .spawn(move || {
-                let _watcher = debouncer;
+                let debouncer_keepalive = debouncer;
+                let mut watched_dirs = watched_dirs;
+                let roots = state.allowed_roots.clone();
 
                 loop {
                     if cancel_token.is_cancelled() {
@@ -58,6 +181,80 @@ impl FileWatcherService {
 
                     match rx.recv_timeout(Duration::from_millis(300)) {
                         Ok(Ok(events)) => {
+                            // Native (non-polling) mode only: a directory this run didn't know
+                            // about at startup (created after `spawn`, e.g. `mkdir`, a branch
+                            // checkout, an archive extraction) has no watch registered on it yet
+                            // — unlike the old single-recursive-watch design, per-directory
+                            // registration doesn't track new subdirectories automatically. Any
+                            // event path that is now a directory, isn't already watched, and
+                            // isn't itself excluded gets a fresh watch; `plan_root` also picks
+                            // up any of *its* qualifying subdirectories in case a whole subtree
+                            // (not just one empty directory) appeared in a single burst. The
+                            // polling backend needs none of this — it re-scans everything on its
+                            // own interval regardless of what's registered.
+                            if !capped {
+                                for ev in &events {
+                                    if watched_dirs.len() >= Self::MAX_WATCHED_DIRS {
+                                        tracing::warn!(
+                                            target: "mesh::watcher",
+                                            "Reached {} watched directories; new subdirectories \
+                                             under {} will not be individually watched until the \
+                                             next restart.",
+                                            Self::MAX_WATCHED_DIRS,
+                                            ev.path.display()
+                                        );
+                                        break;
+                                    }
+                                    if watched_dirs.contains(&ev.path) || !ev.path.is_dir() {
+                                        continue;
+                                    }
+                                    let Some(root) =
+                                        roots.iter().find(|r| ev.path.starts_with(r.as_path()))
+                                    else {
+                                        continue;
+                                    };
+                                    let budget = Self::MAX_WATCHED_DIRS - watched_dirs.len();
+                                    // Enumeration (a filesystem walk, no OS watch API involved)
+                                    // is cheap — measured under 1ms here — and stays synchronous
+                                    // so `watched_dirs` bookkeeping (below) doesn't race a second
+                                    // event for the same new directory arriving before the
+                                    // deferred `.watch()` calls below have run.
+                                    let plan = Self::plan_root(&ev.path, &matcher, budget);
+                                    if plan.capped {
+                                        continue;
+                                    }
+                                    let new_dirs: Vec<PathBuf> = plan
+                                        .dirs
+                                        .into_iter()
+                                        .filter(|d| watched_dirs.insert(d.clone()))
+                                        .collect();
+                                    if new_dirs.is_empty() {
+                                        continue;
+                                    }
+                                    tracing::debug!(
+                                        target: "mesh::watcher",
+                                        "Registering {} new director{} under {} (root {}) in the background.",
+                                        new_dirs.len(),
+                                        if new_dirs.len() == 1 { "y" } else { "ies" },
+                                        ev.path.display(),
+                                        root.display()
+                                    );
+                                    let debouncer_for_task = debouncer_keepalive.clone();
+                                    state.rescan.spawn(move || {
+                                        let mut guard = debouncer_for_task
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        for dir in &new_dirs {
+                                            if let Err(e) =
+                                                guard.watcher().watch(dir, RecursiveMode::NonRecursive)
+                                            {
+                                                tracing::warn!(target: "mesh::watcher", "Failed to watch new directory {}: {e}", dir.display());
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+
                             let relevant_paths: Vec<PathBuf> = events
                                 .iter()
                                 .map(|ev| ev.path.clone())

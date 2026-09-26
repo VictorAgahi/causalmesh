@@ -407,6 +407,88 @@ for large workspaces, using a content-hash key rather than Plan 1's `NodeId`.
   last boot) or cache behavior once `index-cache.db` itself grows large across many distinct
   workspaces sharing the same machine-wide path — no eviction/size cap exists yet.
 
+## Update (2026-09-26, step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
+
+Two independent pieces: closing the nested-`.gitignore` watcher gap `docs/quality.md`'s step 3.1
+section left open, and eliminating an orphaned-daemon failure mode.
+
+- **`FilesystemCrawler::plan_watch_dirs`** (`crates/mesh-core/src/crawler.rs`): every directory
+  a watcher should individually register, using the exact same `ignore::WalkBuilder` construction
+  (`follow_links(false)`, `git_ignore(true)`, sorted) as a full crawl — including its nested-
+  `.gitignore` stacking, since the `ignore` crate discovers and chains ignore files from a walk
+  root's ancestors up to a repository boundary regardless of where that root sits. Stops early
+  and returns `capped: true` (with an empty `dirs`, never a misleading partial list) past a
+  caller-given directory-count budget.
+- **`FileWatcherService::spawn`** (`crates/mesh-core/src/watcher.rs`) now registers one
+  `RecursiveMode::NonRecursive` native watch per planned directory instead of one
+  `RecursiveMode::Recursive` watch per root. A genuinely excluded subtree (gitignored, or
+  `[workspace] exclude_patterns`) never gets a watch registered on it at all — closing the gap
+  `FilesystemCrawler::is_path_excluded`'s own doc describes (a nested `.gitignore` forcing
+  `reload_paths`'s full-crawl fallback because a single incoming path can't cheaply reproduce the
+  gitignore stacking a full walk gets right) for the common case: if the file was never watched,
+  `reload_paths` is never even asked about it.
+- **Above `MAX_WATCHED_DIRS` (4096, combined across all roots)**: falls back to a `PollWatcher`
+  backend (`notify::PollWatcher`, polling every 2s) with one plain recursive watch per root —
+  `PollWatcher` re-scans the tree itself on its own interval, so it needs no per-directory
+  registration and isn't subject to the OS watch-descriptor ceiling (concretely, Linux's
+  `fs.inotify.max_user_watches`) the per-directory design exists to respect. The cap is
+  deliberately conservative rather than tuned to any one platform: macOS's FSEvents backend
+  doesn't need per-directory registration to work correctly at all (see below), so this cap
+  exists purely to protect the Linux case.
+- **New directories after startup**: per-directory registration doesn't automatically track
+  subdirectories created after `spawn` the way the old single-recursive-watch design did. The
+  event loop detects a changed path that is now a directory, isn't already watched and isn't
+  itself excluded, and registers it (plus any of its own qualifying subdirectories, via the same
+  `plan_watch_dirs`, in case a whole subtree appeared in one burst).
+- **Real finding, not a test bug**: measured on this machine, a single dynamic `.watch()` call
+  took **over 11 seconds** under this test suite's own CPU load. `notify`'s macOS FSEvents backend
+  stops and restarts its *entire* event stream on every `.watch()` call (`FsEventWatcher::stop()`
+  busy-waits via `thread::yield_now()` for the stream's background runloop to go idle) — inotify
+  on Linux has no equivalent cost (`inotify_add_watch` is a cheap syscall). Doing this inline on
+  the same thread that drains the debouncer's channel would have stalled *every* pending reload
+  for however long that took. Fixed by deferring the actual `.watch()` calls to
+  `state.rescan`'s background pool (`Arc<Mutex<AnyDebouncer>>`) — the event-receive loop computes
+  the (cheap, filesystem-walk-only, measured under 1ms) watch *plan* synchronously so
+  `watched_dirs` bookkeeping can't race a second event for the same new directory, but the slow
+  OS registration itself never blocks it.
+- **Honest limitation, test made `#[ignore]`d rather than fixed further**: the end-to-end dynamic-
+  registration test (`new_subdirectory_created_after_startup_is_still_watched`) budgets 20s to
+  absorb the ~11s macOS registration cost above, which is reliable in isolation but became flaky
+  under `cargo test --workspace`'s additional parallel-test CPU contention — not wrong, just
+  timing-sensitive in a way this codebase's other tests aren't. `plan_watch_dirs_*` in
+  `mesh-core::crawler` covers the same decision (which directories, respecting excludes)
+  synchronously and deterministically; the ignored test remains for manually re-confirming real
+  wall-clock behavior (`cargo test -p mesh-server --lib -- --ignored
+  new_subdirectory_created_after_startup_is_still_watched`).
+- **Daemon idle watchdog, startup-grace guard** (`crates/mesh-daemon/src/idle.rs`): the pre-3.3
+  watchdog only ever activated *after* the first client connected — a daemon that never got one
+  at all (an `ensure_daemon_running` auto-spawn racing or failing after the process itself
+  started, a wrong workspace path so no client ever finds its socket) lived forever, unreachable
+  except by PID. `spawn_idle_watchdog` now takes a second, independent `startup_grace` deadline
+  (60s, `mesh-daemon/src/main.rs`'s `STARTUP_GRACE` constant): if no client has connected at all
+  within that window, the daemon shuts itself down the same graceful way idle-after-use does.
+  Spawned unconditionally now (previously gated behind `idle_timeout_minutes > 0`) — disabling
+  the idle-*after-use* policy (`idle_timeout_minutes = 0`) no longer also disables this orphan
+  guard; internally it's just an effectively-infinite idle timeout passed alongside the real
+  60s startup grace.
+- **`meshd` auto-spawn output, no longer discarded** (`crates/mesh-server/src/main.rs`):
+  `ensure_daemon_running`/`ensure_daemon_running_windows` redirected `Stdio::null()` for the
+  child's stdout/stderr, so a crash before `meshd`'s own `tracing` subscriber initializes (or a
+  Rust panic, which writes to stderr directly, bypassing `tracing` entirely) was unobservable.
+  Now redirected to a rotating, per-workspace log (`open_daemon_log`/`rotate_and_open_log`,
+  `~/.cache/mesh-mcp/logs/meshd-<workspace_id>.log`, keeping up to 5 previous runs as `.1`–`.5`)
+  — workspace-scoped the same way `socket_path_for` already is, so concurrent daemons for
+  different workspaces never interleave into the same file. Verified live: a real `meshd`
+  auto-spawn's stdout was captured in the rotated log file exactly as the unit tests predict
+  (see below), including the new "startup grace: 60s" log line confirming the watchdog wiring.
+- Verified: `cargo test --workspace` (363 passed, 1 ignored; +10 new since step 3.2's 353: 3
+  `plan_watch_dirs_*` gitignore/cap cases, 1 registration-time-exclusion end-to-end test
+  (`excluded_directory_never_triggers_a_reload`), 1 `#[ignore]`d dynamic-registration end-to-end
+  test, 2 idle-watchdog startup-grace cases, 4 `rotate_and_open_log` rotation cases),
+  `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all -- --check`
+  (clean), `scripts/determinism.sh` on both fixtures ("1 fingerprint over 13 runs" each,
+  unaffected — this step never touches `build_snapshot`/`crawl_scope_with`'s own indexing path).
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*
@@ -434,6 +516,17 @@ for large workspaces, using a content-hash key rather than Plan 1's `NodeId`.
   unboundedly as distinct workspaces/paths/configs accumulate entries on a shared machine over
   time. Only the "same workspace, second boot" scenario is measured so far — not a mixed
   cache-hit-rate cold start, nor long-run db size under many different repos.
+- `FileWatcherService`'s `MAX_WATCHED_DIRS` cap (step 3.3) has not been measured against a real
+  200,000+ file repository to confirm the `PollWatcher` fallback actually engages and stays
+  responsive at that scale — only proven at the unit level (`plan_watch_dirs_reports_capped_
+  without_a_partial_list`) with a synthetic 10-directory tree well under the 4096 threshold.
+  Similarly, the dynamic-registration path's real ~11s-per-call FSEvents cost on macOS under load
+  (see step 3.3's section above) has not been characterized on Linux (inotify) or Windows
+  (ReadDirectoryChangesW) — only asserted to be cheaper by architecture, not measured.
+- `open_daemon_log`'s rotation (step 3.3) is tested at the algorithm level (`rotate_and_open_log`
+  against a temp directory) but not exercised concurrently — two `meshd` auto-spawns for the
+  *same* workspace racing `ensure_daemon_running` at the same moment (unlikely, since the socket
+  check should prevent it, but not proven) could interleave their rotation logic.
 
 ## Ratchet policy
 

@@ -336,6 +336,86 @@ impl FilesystemCrawler {
         files.dedup();
         files
     }
+
+    /// Every directory under `root` a watcher should individually register (P2 step 3.3):
+    /// nested-`.gitignore`-aware (the `ignore` crate discovers and chains ignore files from
+    /// `root`'s ancestors up to a repository boundary, the same way `git` itself does, so this
+    /// is correct even when called again later on a freshly created subdirectory rather than
+    /// the original workspace root — see `FileWatcherService`'s dynamic re-registration) and
+    /// `exclude_patterns`-aware, using the exact same walker configuration as
+    /// [`Self::crawl_scope_with`] (`follow_links(false)`, `git_ignore(true)`, sorted). A
+    /// directory that would be excluded from a crawl is never returned here either, so a
+    /// watcher built from this list never receives events for a genuinely ignored subtree in
+    /// the first place — closing the gap `is_path_excluded`'s doc describes (a nested
+    /// `.gitignore` between a root and a changed path forcing a full-crawl fallback), rather
+    /// than reactively filtering events after they arrive.
+    ///
+    /// Symlinked directories are skipped (consistent with `follow_links(false)`): a watcher
+    /// covering a symlink's target is a separate, deliberately unhandled case, not silently
+    /// broken by this change (the pre-existing recursive-watch behaviour didn't traverse
+    /// symlinks either, since none of the native backends follow them for a recursive watch).
+    ///
+    /// Stops as soon as more than `cap` directories are found (`WatchPlan::capped == true`,
+    /// `dirs` empty) rather than enumerating a huge tree fully just to discard the result —
+    /// the caller's job on a capped plan is to fall back to a coarser watch strategy, not to
+    /// inspect which directories were found.
+    pub fn plan_watch_dirs(
+        root: &Path,
+        matcher: &ExcludeMatcher,
+        max_depth: Option<usize>,
+        cap: usize,
+    ) -> WatchPlan {
+        let mut builder = WalkBuilder::new(root);
+        builder.follow_links(false);
+        builder.max_depth(Some(max_depth.unwrap_or(10)));
+        builder.git_ignore(true);
+        builder.hidden(false);
+        builder.sort_by_file_name(std::ffi::OsStr::cmp);
+
+        let root_for_filter = root.to_path_buf();
+        let matcher_clone = matcher.clone();
+        builder.filter_entry(move |entry| {
+            let rel = match entry.path().strip_prefix(&root_for_filter) {
+                Ok(r) => r,
+                Err(_) => return true,
+            };
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            !matcher_clone.is_excluded_with_root(rel, Some(&root_for_filter))
+        });
+
+        let mut dirs = Vec::new();
+        for result in builder.build() {
+            let Ok(entry) = result else { continue };
+            if entry.path_is_symlink() {
+                continue;
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                dirs.push(entry.path().to_path_buf());
+                if dirs.len() > cap {
+                    return WatchPlan {
+                        dirs: Vec::new(),
+                        capped: true,
+                    };
+                }
+            }
+        }
+        WatchPlan {
+            dirs,
+            capped: false,
+        }
+    }
+}
+
+/// Result of [`FilesystemCrawler::plan_watch_dirs`]. `capped == true` means the tree has more
+/// than the caller's `cap` watchable directories; `dirs` is empty in that case rather than a
+/// truncated, misleading partial list — the caller's job is to pick a coarser watch strategy,
+/// not to watch "some but not all" of a tree it couldn't fully enumerate within budget.
+#[derive(Debug, Clone)]
+pub struct WatchPlan {
+    pub dirs: Vec<PathBuf>,
+    pub capped: bool,
 }
 
 #[cfg(test)]
@@ -601,6 +681,73 @@ mod tests {
             FilesystemCrawler::is_path_excluded(&root, &root, &matcher),
             Some(false),
             "path == root must short-circuit instead of walking a parent outside root"
+        );
+    }
+
+    /// P2 step 3.3: an excluded directory (here, a nested `.gitignore`'s own rule, not just a
+    /// static `exclude_patterns` entry) must never appear in the watch plan — this is the
+    /// property `FileWatcherService` relies on to never register a watch inside it at all.
+    #[test]
+    fn plan_watch_dirs_excludes_gitignored_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        // `ignore::WalkBuilder`'s `git_ignore(true)` only honors `.gitignore` when
+        // `require_git` (default true) finds a real `.git` directory — matching how a real
+        // workspace actually looks, and the existing `.git/info/exclude` test's own fixture.
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(root.join("kept")).expect("mkdir kept");
+        std::fs::create_dir_all(root.join("build/inner")).expect("mkdir build/inner");
+        std::fs::write(root.join(".gitignore"), "build/\n").expect("write gitignore");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 100);
+        assert!(!plan.capped);
+        assert!(plan.dirs.iter().any(|d| d.ends_with("kept")));
+        assert!(
+            !plan.dirs.iter().any(|d| d.ends_with("build") || d.ends_with("inner")),
+            "a gitignored directory (and its own contents) must never be planned for watching: {:?}",
+            plan.dirs
+        );
+    }
+
+    /// A nested `.gitignore` — strictly between `root` and the excluded directory, not `root`'s
+    /// own top-level one — is exactly the case `is_path_excluded`'s doc says it cannot cheaply
+    /// resolve for a single incoming path. `plan_watch_dirs` sidesteps that limitation entirely
+    /// by walking (once, at watch-registration time) with the same `ignore::WalkBuilder` gitignore
+    /// stacking a full crawl already gets right, rather than reproducing it per-event.
+    #[test]
+    fn plan_watch_dirs_excludes_nested_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(root.join("service/build")).expect("mkdir");
+        std::fs::write(root.join("service/.gitignore"), "build/\n")
+            .expect("write nested gitignore");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 100);
+        assert!(plan.dirs.iter().any(|d| d.ends_with("service")));
+        assert!(
+            !plan.dirs.iter().any(|d| d.ends_with("build")),
+            "a directory excluded by a nested (non-root) .gitignore must not be planned either: {:?}",
+            plan.dirs
+        );
+    }
+
+    #[test]
+    fn plan_watch_dirs_reports_capped_without_a_partial_list() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        for i in 0..10 {
+            std::fs::create_dir_all(root.join(format!("d{i}"))).expect("mkdir");
+        }
+        let matcher = ExcludeMatcher::compile(&[]);
+        // root itself + 10 subdirectories = 11 directories; cap at 3 must trip.
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 3);
+        assert!(plan.capped);
+        assert!(
+            plan.dirs.is_empty(),
+            "a capped plan must not return a partial, misleading directory list"
         );
     }
 }

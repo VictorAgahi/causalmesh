@@ -7,8 +7,55 @@ at 3.0.0 — there is no reconstructed history before it.
 
 ## [Unreleased]
 
-Plan 3 (P2): scale. Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 —
-real incremental reload, driven by the watcher's own paths.
+Plan 3 (P2): scale. Step 3.3 — watcher registration-time filtering, daemon watchdog hardening.
+Step 3.2 — persistent content-hash cache for cold-start indexing. Step 3.1 — real incremental
+reload, driven by the watcher's own paths.
+
+### Added (P2 step 3.3 — watcher registration-time filtering, daemon watchdog hardening)
+- **Watchers now respect `.gitignore`/`exclude_patterns` at registration, not just after an event
+  arrives**: `FilesystemCrawler::plan_watch_dirs` (`crates/mesh-core/src/crawler.rs`) walks each
+  root once (the same nested-gitignore-aware `ignore::WalkBuilder` construction a full crawl
+  already uses) to decide which directories to individually watch; `FileWatcherService::spawn`
+  registers one `RecursiveMode::NonRecursive` watch per surviving directory instead of one
+  `RecursiveMode::Recursive` watch per root. A genuinely excluded subtree (`node_modules`,
+  gitignored build output, ...) never gets a watch at all — closing the nested-`.gitignore` gap
+  step 3.1 documented in `docs/quality.md` for the common case, rather than reactively filtering
+  events downstream.
+- **Watch-count cap with a transparent polling fallback**: above `MAX_WATCHED_DIRS` (4096,
+  combined across all roots), `spawn` falls back to a `notify::PollWatcher` backend (2s interval,
+  one plain recursive watch per root) instead of per-directory native registration — protects
+  Linux's `fs.inotify.max_user_watches` ceiling on very large workspaces without needing
+  gitignore-aware enumeration at all, since `PollWatcher` re-scans the tree itself.
+- **New directories created after startup are still watched**: per-directory registration doesn't
+  automatically track new subdirectories the way the old single-recursive-watch design did. The
+  event loop detects a newly-created, non-excluded directory and registers it (plus any of its own
+  qualifying subdirectories) dynamically.
+- **Real finding**: a dynamic `.watch()` call on macOS (`notify`'s FSEvents backend stops and
+  restarts its whole event stream per call) measured over 11 seconds under this machine's own
+  test-suite load. Fixed by deferring those calls to `state.rescan`'s background pool
+  (`Arc<Mutex<AnyDebouncer>>`) instead of running them inline on the thread that also drains the
+  debouncer's channel — the fast, filesystem-walk-only *planning* step stays synchronous, only the
+  slow OS registration itself is deferred, so other pending reloads are never stalled behind it.
+- **Idle watchdog gains an unconditional startup-grace deadline** (`crates/mesh-daemon/src/
+  idle.rs`, `spawn_idle_watchdog`'s new `startup_grace` parameter, 60s in `meshd`'s `main.rs`): a
+  daemon that never gets a single client at all (an `ensure_daemon_running` auto-spawn racing or
+  failing after the process started, a wrong workspace path) now shuts itself down the same
+  graceful way idle-after-use does, instead of living forever as an unreachable zombie. Spawned
+  unconditionally now (previously gated behind `idle_timeout_minutes > 0`), so disabling the
+  idle-*after-use* policy no longer also disables this orphan guard.
+- **`meshd` auto-spawn output is no longer discarded**: `ensure_daemon_running`/
+  `ensure_daemon_running_windows` (`crates/mesh-server/src/main.rs`) redirected `Stdio::null()`,
+  making a crash before `meshd`'s own `tracing` subscriber initializes unobservable. Now redirected
+  to a rotating, per-workspace log (`~/.cache/mesh-mcp/logs/meshd-<workspace_id>.log`, up to 5
+  previous runs kept as `.1`–`.5`).
+- Verified: `cargo test --workspace` (363 passed, 1 ignored — a real end-to-end dynamic-watch test
+  whose ~11s-per-call macOS registration cost made it reliable in isolation but flaky under the
+  full suite's parallel CPU contention; the same decision logic is covered synchronously and
+  deterministically by `plan_watch_dirs_*`), `cargo clippy --workspace --all-targets -- -D
+  warnings` (clean), `cargo fmt --all -- --check` (clean), `scripts/determinism.sh` on both
+  fixtures (unaffected — this step never touches the indexing path itself). See `docs/quality.md`
+  for the full reasoning, the honest limitations (no measurement yet at real 200k+-file scale or
+  on Linux/Windows watch backends), and the live-smoke-test confirmation.
 
 ### Added (P2 step 3.2 — persistent SQLite/WAL content-hash cache for cold-start indexing)
 - **`PersistentIndexCache`** (`crates/mesh-core/src/index_cache.rs`): a SQLite-in-WAL-mode cache

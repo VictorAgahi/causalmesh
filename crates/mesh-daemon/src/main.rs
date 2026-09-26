@@ -158,18 +158,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Idle watchdog ─────────────────────────────────────────────────────────
+    // Always spawned (P2 step 3.3), regardless of `idle_timeout_minutes`: the startup-grace
+    // deadline below is a separate, unconditional guarantee against an orphaned zombie daemon
+    // (`ensure_daemon_running` auto-spawns `meshd` ad-hoc, no launchd/systemd — if that spawn
+    // races or a client never finds this daemon's socket at all, this is what eventually cleans
+    // it up), not the opt-in "shut down once idle after real use" policy `idle_timeout_minutes`
+    // controls. `idle_timeout_minutes == 0` disables *that* policy (an effectively-infinite idle
+    // timeout below) without weakening the orphan guard.
+    const STARTUP_GRACE: Duration = Duration::from_secs(60);
     let counter = idle::ClientCounter::new();
+    let idle_timeout = if args.idle_timeout_minutes > 0 {
+        Duration::from_secs(args.idle_timeout_minutes * 60)
+    } else {
+        Duration::from_secs(u64::MAX)
+    };
+    idle::spawn_idle_watchdog(
+        counter.clone(),
+        cancel_token.clone(),
+        idle_timeout,
+        Duration::from_secs(10),
+        STARTUP_GRACE,
+    );
     if args.idle_timeout_minutes > 0 {
-        idle::spawn_idle_watchdog(
-            counter.clone(),
-            cancel_token.clone(),
-            Duration::from_secs(args.idle_timeout_minutes * 60),
-            Duration::from_secs(10),
-        );
         tracing::info!(
             target: "meshd",
-            "Idle watchdog active: shutdown after {} min with no clients.",
-            args.idle_timeout_minutes
+            "Idle watchdog active: shutdown after {} min with no clients (startup grace: {:?}).",
+            args.idle_timeout_minutes,
+            STARTUP_GRACE
+        );
+    } else {
+        tracing::info!(
+            target: "meshd",
+            "Idle-after-use shutdown disabled; startup-grace orphan guard still active ({:?}).",
+            STARTUP_GRACE
         );
     }
 

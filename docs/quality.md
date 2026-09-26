@@ -785,11 +785,23 @@ corpus of `scripts/golden/repos.txt` (`~/.cache/mesh-golden`), same corpus befor
   `NewXServiceClient` use. No import-path heuristic: an imported `new S3Client()` or
   `new QueryClient()` links nothing (otel-demo has two imported react-query `QueryClient`s; no edge).
 - otel-demo builds each client once at module level (`const client = new AdServiceClient(...)`),
-  where no class or method encloses the call site. Those constructions are now attributed to a
-  synthetic `ServiceClass` node named after the binding (`client`), instead of being dropped as
-  before — that drop, not the missing pattern alone, is what the 6 missed `frontend -> *` edges
-  needed. Cost measured on otel-demo: 8 synthetic nodes (the 6 gateways plus 2 react-query
-  `queryClient` bindings, which carry no edge).
+  where no class or method encloses the call site. Such a construction is now attributed to every
+  declaration of the file that *references* the binding (`client.getAds(...)` in `listAds`,
+  `{ client }` shorthand included; `this.client` is a property, not a reference) instead of being
+  dropped as before — that drop, not the missing pattern alone, is what the 6 missed
+  `frontend -> *` edges needed. No node is created for the purpose: a first version of this step
+  synthesized a `ServiceClass` node named after the binding, which cost 8 nodes on otel-demo (6
+  homonymous `client`s, plus 2 react-query `queryClient`s that carried an `Imports` edge but no
+  gRPC edge — any imported `new S3Client()` would have become a node too). Now a construction
+  that resolves to no declared service leaves no node and no edge (only the pending, unresolved
+  `rpc_calls` entry any undeclared `getService<...>` target leaves), and the callers are real
+  declarations with their own names (`listAds`, `getCart`, `placeOrder`, ...). `mesh-mcp graph`
+  on otel-demo against the synthetic-node version: exactly those 8 nodes gone, their `CallsRpc`
+  and `Imports` edges replaced by 14 `CallsRpc` edges from the gateway methods; `polyglot-shop`
+  and `volontariapp-fixture` unchanged. Known limit: a module-level client referenced only from
+  code the TypeScript extractor has no node for (a top-level `function`, an arrow-function
+  `const`) or not referenced in its own file at all (`export const ads = new AdServiceClient()`)
+  is dropped — no carrier, and a synthesized one is what the review rejected.
 - **`grpc.health.v1.Health`** is filtered from `CallsRpc` resolution as infrastructure: by full
   name, or a `Health` service declared in the `grpc.health.v1` proto package, or one inferred from
   code with no `.proto` behind it (Go's `healthpb.RegisterHealthServer`). A repo's own
@@ -800,7 +812,8 @@ corpus of `scripts/golden/repos.txt` (`~/.cache/mesh-golden`), same corpus befor
   Ratchet policy below, and resolves the two otel-demo gaps (TypeScript client construction,
   `checkout -> health`) still listed under "What's NOT measured yet".
 - Determinism: two independent `mesh-mcp graph` runs on otel-demo give identical node and edge
-  sets (compared by content, not ids).
+  sets (compared by content, not ids); `mesh-mcp graph --format fingerprint` is identical over 5
+  fresh-`HOME` runs.
 
 ## What's NOT measured yet
 

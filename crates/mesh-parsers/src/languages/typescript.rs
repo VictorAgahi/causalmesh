@@ -1,5 +1,5 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
@@ -20,23 +20,26 @@ struct RawRpcCall {
     line_start: usize,
     line_end: usize,
     service_name: CompactStr,
-    /// Set only for a generated-client construction (`new XClient(...)`):
-    /// the caller node to synthesize when no declaration encloses the call
-    /// site. ts-proto clients are routinely built once at module level
-    /// (`const client = new AdServiceClient(ADDR, creds)`), where there is no
-    /// class/method to attribute the edge to — dropping those call sites was
-    /// the whole otel-demo `frontend -> *` recall gap (Plan 4 step 4.5).
-    module_level_caller: Option<SyntheticCaller>,
+    /// Set only for a generated-client construction bound to a variable
+    /// (`const client = new XClient(...)`). ts-proto clients are routinely
+    /// built once at module level, where no declaration encloses the call
+    /// site — dropping those was the whole otel-demo `frontend -> *` recall
+    /// gap (Plan 4 step 4.5). When nothing encloses the construction, the
+    /// call is attributed instead to every declaration that *references*
+    /// the binding (the methods that actually issue the RPCs), never to a
+    /// node synthesized for the purpose: a construction whose target turns
+    /// out not to be a declared service (`new S3Client()`,
+    /// `new QueryClient()`) then leaves no trace in the graph, because an
+    /// unresolved `rpc_calls` entry is simply dropped by `reconcile_edges`.
+    binding: Option<ClientBinding>,
 }
 
-/// The node a module-level client construction is attributed to: named
-/// after the variable it is bound to (`client`), or after the client class
-/// when the construction isn't a plain `const x = new ...` binding.
-struct SyntheticCaller {
-    name: CompactStr,
-    line_start: usize,
-    line_end: usize,
-    signature: CompactStr,
+/// The variable a client construction is bound to.
+struct ClientBinding {
+    name: String,
+    /// Start byte of the declarator's name identifier — the binding site
+    /// itself, which is not a reference to it.
+    decl_start_byte: usize,
 }
 
 /// Every binding a file's top-level `import` statements introduce — the
@@ -132,50 +135,91 @@ impl TypeScriptExtractor {
             &mut raw_rpc_calls,
             0,
         );
-        Self::resolve_rpc_calls(&mut nodes, raw_rpc_calls, rpc_calls, &ctx);
+        Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);
         nodes
     }
 
     /// Attaches each raw RPC call site to its smallest enclosing declaration,
-    /// mirroring `go.rs::resolve_rpc_calls`. A `getService<...>(...)` call
-    /// with no enclosing declaration has no sensible caller and is dropped;
-    /// a module-level `new XClient(...)` construction instead gets a
-    /// synthetic `ServiceClass` node for its binding (see
-    /// [`RawRpcCall::module_level_caller`]).
+    /// mirroring `go.rs::resolve_rpc_calls`. A call site with no enclosing
+    /// declaration has no sensible caller of its own: a `getService<...>(...)`
+    /// one is dropped, and a bound `const client = new XClient(...)` one is
+    /// attributed to the declarations referencing `client` (see
+    /// [`RawRpcCall::binding`]) — or dropped if there are none. No node is
+    /// ever created here.
     fn resolve_rpc_calls(
-        nodes: &mut Vec<ContractNode>,
+        nodes: &[ContractNode],
         raw_rpc_calls: Vec<RawRpcCall>,
         out: &mut Vec<(usize, CompactStr)>,
-        ctx: &VisitCtx,
+        root: Node,
+        source: &[u8],
     ) {
         for call in raw_rpc_calls {
-            let enclosing = nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.line_start <= call.line_start && n.line_end >= call.line_end)
-                .min_by_key(|(_, n)| n.line_end - n.line_start)
-                .map(|(idx, _)| idx);
-
-            let idx = match (enclosing, call.module_level_caller) {
-                (Some(idx), _) => idx,
-                (None, Some(caller)) => {
-                    nodes.push(ContractNode {
-                        id: 0,
-                        name: caller.name,
-                        kind: NodeKind::ServiceClass,
-                        file_path: ctx.file_path.clone(),
-                        line_start: caller.line_start,
-                        line_end: caller.line_end,
-                        package: ctx.package_name.clone(),
-                        repo_id: ctx.repo_id,
-                        signature: Some(caller.signature),
-                        docstring: None,
-                    });
-                    nodes.len() - 1
-                }
-                (None, None) => continue,
+            if let Some(idx) = Self::smallest_enclosing(nodes, call.line_start, call.line_end) {
+                out.push((idx, call.service_name));
+                continue;
+            }
+            let Some(binding) = call.binding else {
+                continue;
             };
-            out.push((idx, call.service_name));
+            // Ordered set: one entry per referencing declaration, in node
+            // order, so the output is independent of reference order.
+            let mut callers = BTreeSet::new();
+            for line in Self::binding_reference_lines(root, source, &binding) {
+                if let Some(idx) = Self::smallest_enclosing(nodes, line, line) {
+                    callers.insert(idx);
+                }
+            }
+            for idx in callers {
+                out.push((idx, call.service_name.clone()));
+            }
+        }
+    }
+
+    /// Index of the smallest declaration whose line range covers
+    /// `line_start..=line_end`.
+    fn smallest_enclosing(
+        nodes: &[ContractNode],
+        line_start: usize,
+        line_end: usize,
+    ) -> Option<usize> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.line_start <= line_start && n.line_end >= line_end)
+            .min_by_key(|(_, n)| n.line_end - n.line_start)
+            .map(|(idx, _)| idx)
+    }
+
+    /// 1-based lines of every reference to `binding` in the file: an
+    /// `identifier` (`client.getAds(...)`) or object shorthand
+    /// (`{ client }`) spelling its name, other than the binding site itself.
+    /// Property names (`this.client`, `x.client`) are `property_identifier`
+    /// nodes and never match. Name-based, not scope-resolved: a local that
+    /// shadows the binding counts as a reference too, which can only ever
+    /// attribute the call to another declaration of the same file.
+    /// Iterative walk, so no recursion-depth concern on deep files.
+    fn binding_reference_lines(root: Node, source: &[u8], binding: &ClientBinding) -> Vec<usize> {
+        let mut lines = Vec::new();
+        let mut cursor = root.walk();
+        loop {
+            let node = cursor.node();
+            if matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+                && node.start_byte() != binding.decl_start_byte
+                && node.utf8_text(source).is_ok_and(|t| t == binding.name)
+            {
+                lines.push(node.start_position().row + 1);
+            }
+            if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                continue;
+            }
+            loop {
+                if !cursor.goto_parent() {
+                    return lines;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
     }
 
@@ -290,30 +334,18 @@ impl TypeScriptExtractor {
         Some(service.to_string())
     }
 
-    /// The synthetic caller for a client construction that no declaration
-    /// encloses: named after the `const x = new XClient(...)` binding when
-    /// there is one, the client class otherwise.
-    fn module_level_caller(node: Node, ctor: Node, source: &[u8]) -> SyntheticCaller {
-        let ctor_text = ctor.utf8_text(source).unwrap_or("Client");
-        let declarator = node
+    /// The variable a client construction is directly bound to
+    /// (`const client = new XClient(...)`), if any.
+    fn client_binding(node: Node, source: &[u8]) -> Option<ClientBinding> {
+        let name = node
             .parent()
-            .filter(|p| p.kind() == "variable_declarator")
-            .and_then(|p| {
-                p.child_by_field_name("name")
-                    .filter(|n| n.kind() == "identifier")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(|name| (p, name))
-            });
-        let (range_node, name) = match declarator {
-            Some((p, name)) => (p, name),
-            None => (node, ctor_text.rsplit('.').next().unwrap_or(ctor_text)),
-        };
-        SyntheticCaller {
-            name: CompactStr::new(name),
-            line_start: range_node.start_position().row + 1,
-            line_end: range_node.end_position().row + 1,
-            signature: CompactStr::new(format!("new {ctor_text}(...)")),
-        }
+            .filter(|p| p.kind() == "variable_declarator")?
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier")?;
+        Some(ClientBinding {
+            name: name.utf8_text(source).ok()?.to_string(),
+            decl_start_byte: name.start_byte(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -505,7 +537,7 @@ impl TypeScriptExtractor {
                                             line_start: node.start_position().row + 1,
                                             line_end: node.end_position().row + 1,
                                             service_name: CompactStr::new(service_name),
-                                            module_level_caller: None,
+                                            binding: None,
                                         });
                                     }
                                 }
@@ -552,9 +584,7 @@ impl TypeScriptExtractor {
                             line_start: node.start_position().row + 1,
                             line_end: node.end_position().row + 1,
                             service_name: CompactStr::new(service_name),
-                            module_level_caller: Some(Self::module_level_caller(
-                                node, ctor, source,
-                            )),
+                            binding: Self::client_binding(node, source),
                         });
                     }
                     if ctor.kind() == "identifier" {
@@ -1401,33 +1431,190 @@ export class UserController {
         edges
     }
 
-    /// Plan 4 step 4.5 — the otel-demo frontend shape: a ts-proto client
-    /// imported from the generated file and built once at module level.
-    /// With `AdService` declared in the graph, the construction becomes a
-    /// `CallsRpc` edge from a synthetic caller named after the binding.
-    #[test]
-    fn imported_ts_proto_client_construction_links_to_declared_service() {
-        let code = r#"
+    /// The otel-demo `src/frontend/gateways/rpc/Ad.gateway.ts` shape: a
+    /// ts-proto client imported from the generated file, built once at
+    /// module level, used from an object-literal method.
+    const AD_GATEWAY: &str = r#"
 import { ChannelCredentials } from '@grpc/grpc-js';
 import { AdResponse, AdServiceClient } from '../../protos/demo';
 
 const { AD_ADDR = '' } = process.env;
 
 const client = new AdServiceClient(AD_ADDR, ChannelCredentials.createInsecure());
+
+const AdGateway = () => ({
+  listAds(contextKeys: string[]) {
+    return new Promise<AdResponse>((resolve, reject) =>
+      client.getAds({ contextKeys: contextKeys }, (error, response) => (error ? reject(error) : resolve(response)))
+    );
+  },
+});
+
+export default AdGateway();
 "#;
+
+    /// Declares `services` (as a `.proto` would), indexes each `(path, code)`
+    /// TS file through the real per-file pipeline (`PolyglotIndexer`, so the
+    /// `Imports` attribution runs too) and reconciles.
+    fn index_against(services: &[&str], files: &[(&str, &str)]) -> ContractGraph {
+        let mut graph = ContractGraph::new();
+        for service in services {
+            graph.add_node(ContractNode {
+                id: 0,
+                name: CompactStr::new(*service),
+                kind: NodeKind::GrpcService,
+                file_path: Arc::from(Path::new("pb/demo.proto")),
+                line_start: 1,
+                line_end: 1,
+                package: CompactStr::new("oteldemo"),
+                repo_id: 0,
+                signature: None,
+                docstring: None,
+            });
+        }
+        for (file, code) in files {
+            crate::languages::PolyglotIndexer::index_file(Path::new(file), code, 1, &mut graph);
+        }
+        graph.reconcile_edges();
+        graph
+    }
+
+    /// Plan 4 step 4.5 — a module-level construction resolving to a declared
+    /// service is attributed to the declaration that uses the client
+    /// (`listAds`), not to a node synthesized for the binding: the file's
+    /// node set is exactly its declarations.
+    #[test]
+    fn imported_ts_proto_client_construction_links_to_declared_service() {
         let file = "src/frontend/gateways/rpc/Ad.gateway.ts";
-        let (nodes, rpc_calls) = extract_rpc(file, code);
-        let caller = nodes
-            .iter()
-            .position(|n| n.name == "client")
-            .expect("synthetic caller for the module-level client binding");
-        assert_eq!(nodes[caller].kind, NodeKind::ServiceClass);
-        assert_eq!(nodes[caller].line_start, 7);
-        assert_eq!(rpc_calls, vec![(caller, CompactStr::new("AdService"))]);
+        let (nodes, rpc_calls) = extract_rpc(file, AD_GATEWAY);
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["listAds"], "no synthetic node for `client`");
+        assert_eq!(rpc_calls, vec![(0, CompactStr::new("AdService"))]);
 
         assert_eq!(
-            rpc_edges_against(&["AdService", "CartService"], file, code),
-            vec![("client".to_string(), "AdService".to_string())]
+            rpc_edges_against(&["AdService", "CartService"], file, AD_GATEWAY),
+            vec![("listAds".to_string(), "AdService".to_string())]
+        );
+    }
+
+    /// Review finding (PR #39): a module-level `new XClient()` that resolves
+    /// to no declared service — an SDK client, react-query's `QueryClient` —
+    /// leaves no trace at all: no node, no `CallsRpc`, no `Imports` edge.
+    #[test]
+    fn module_level_client_without_declared_service_leaves_no_trace() {
+        let code = r#"
+import { S3Client } from '@aws-sdk/client-s3';
+import { QueryClient } from '@tanstack/react-query';
+
+const s3 = new S3Client({});
+const queryClient = new QueryClient();
+"#;
+        let graph = index_against(&["AdService"], &[("src/frontend/pages/_app.tsx", code)]);
+        let names: Vec<&str> = graph.all_nodes().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["AdService"]);
+        assert_eq!(graph.edge_count(), 0, "{:?}", graph.all_edges());
+
+        // Used from a declaration, the client adds no node or edge either:
+        // the graph is the one the file yields without the construction. Its
+        // pending `rpc_call` (`put -> "S3"`) is the only difference — the
+        // same unresolved state any `getService<...>` call to an undeclared
+        // service leaves, re-resolved on every `reconcile_edges` should a
+        // matching service ever be declared.
+        let used = r#"
+import { S3Client } from '@aws-sdk/client-s3';
+
+const s3 = new S3Client({});
+
+export const Store = () => ({
+  put(key: string) {
+    return s3.send(key);
+  },
+});
+"#;
+        let without = used.replace("const s3 = new S3Client({});", "");
+        let lines = |code: &str| {
+            let mut lines =
+                index_against(&["AdService"], &[("src/web/store.ts", code)]).canonical_lines();
+            lines.retain(|l| !l.starts_with("rpc_call "));
+            lines
+        };
+        assert_eq!(lines(used), lines(&without));
+    }
+
+    /// Several otel-demo gateways each bind `const client = new
+    /// <X>ServiceClient(...)`: every file's call lands on its own, real
+    /// declaration (distinct file, distinct name) — never on N homonymous
+    /// `client` nodes — and the result does not depend on indexing order.
+    #[test]
+    fn same_binding_name_in_two_files_yields_distinct_stable_callers() {
+        let cart = AD_GATEWAY
+            .replace("AdServiceClient", "CartServiceClient")
+            .replace("AdResponse", "Cart")
+            .replace("listAds", "getCart")
+            .replace("getAds", "getCart");
+        let ad_file = "src/frontend/gateways/rpc/Ad.gateway.ts";
+        let cart_file = "src/frontend/gateways/rpc/Cart.gateway.ts";
+        let services = ["AdService", "CartService"];
+
+        let graph = index_against(&services, &[(ad_file, AD_GATEWAY), (cart_file, &cart)]);
+        let mut edges: Vec<(String, String, String)> = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::CallsRpc)
+            .filter_map(|e| {
+                let from = graph.get_node(e.from)?;
+                Some((
+                    from.file_path.to_string_lossy().into_owned(),
+                    from.name.to_string(),
+                    graph.get_node(e.to)?.name.to_string(),
+                ))
+            })
+            .collect();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                (ad_file.into(), "listAds".into(), "AdService".into()),
+                (cart_file.into(), "getCart".into(), "CartService".into()),
+            ]
+        );
+        assert!(!graph.all_nodes().any(|n| n.name == "client"));
+
+        let reversed = index_against(&services, &[(cart_file, &cart), (ad_file, AD_GATEWAY)]);
+        assert_eq!(graph.canonical_lines(), reversed.canonical_lines());
+    }
+
+    /// Every declaration referencing the binding (plain or shorthand) is a
+    /// caller, once; a property named like it (`this.client`) is not a
+    /// reference; a construction nothing declared references is dropped
+    /// rather than given a node of its own.
+    #[test]
+    fn module_level_client_attributed_to_each_referencing_declaration() {
+        let code = r#"
+import { CartServiceClient, AdServiceClient } from './gen/demo';
+
+const client = new CartServiceClient(ADDR);
+const unused = new AdServiceClient(ADDR);
+
+export class CartStore {
+    add(item) {
+        client.addItem(item);
+        return client.getCart();
+    }
+    deps() {
+        return { client };
+    }
+    other() {
+        return this.client;
+    }
+}
+"#;
+        assert_eq!(
+            rpc_edges_against(&["AdService", "CartService"], "src/web/cart.ts", code),
+            vec![
+                ("add".to_string(), "CartService".to_string()),
+                ("deps".to_string(), "CartService".to_string()),
+            ]
         );
     }
 
@@ -1519,10 +1706,16 @@ const proto = new PrototypeClient();
 import { AdServiceClient } from './prototype';
 
 const ads = new AdServiceClient(ADDR);
+
+export const Ads = () => ({
+  list() {
+    return ads.getAds();
+  },
+});
 "#;
         assert_eq!(
             rpc_edges_against(&["AdService"], "src/web/p.ts", code),
-            vec![("ads".to_string(), "AdService".to_string())]
+            vec![("list".to_string(), "AdService".to_string())]
         );
     }
 }

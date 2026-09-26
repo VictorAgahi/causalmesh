@@ -390,6 +390,8 @@ impl WorkspaceIndexer {
                 .iter_mut()
                 .filter_map(|f| f.cache_write.take())
                 .collect();
+            // Also flushes this pass's batched `last_accessed_at` bumps, and enforces the
+            // cache quota when more than `QUOTA_CHECK_MIN_WRITES` entries were written.
             cache.put_batch(&writes);
         }
 
@@ -656,18 +658,17 @@ impl WorkspaceIndexer {
         }
 
         let doc_template = state.snapshot().doc_index.clone_settings();
-        // Incremental reload never consults the persistent cache: it's already only
-        // re-parsing files the differential VFS flagged as changed (P2 step 3.1), so
-        // there's nothing a content-hash cache would additionally skip here — step 3.2's
-        // goal is the cold-start full scan, not this path.
+        // The workspace's persistent cache, when attached (plan 4 step 4.4): a branch
+        // switch back to already-seen content is a lookup instead of a re-parse, and
+        // `put_batch` re-checks the cache quota after any reload writing > 100 entries.
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
             spring: &spring,
             extract_cfg: &extract_cfg,
             toggles: &toggles,
-            cache: None,
-            config_fingerprint: [0u8; 32],
+            cache: state.index_cache.get(),
+            config_fingerprint: Self::config_fingerprint(&extract_cfg),
         };
         let (fragments, pass_health) =
             Self::run_scan_pass(&candidates, roots, &scan_cfg, Some(&state.rescan));

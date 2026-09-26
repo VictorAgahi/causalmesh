@@ -51,6 +51,32 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub engines: EnginesConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+/// `[cache]`: the per-workspace persistent index cache
+/// (`~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Quota for this workspace's cache database (file + WAL), in MiB. Checked on open and
+    /// after every scan that wrote more than 100 entries; over quota, least recently used
+    /// entries are evicted down to 80 % of it. `0` is treated as 1.
+    #[serde(default = "default_cache_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_size_mb: default_cache_max_size_mb(),
+        }
+    }
+}
+
+fn default_cache_max_size_mb() -> u64 {
+    crate::index_cache::DEFAULT_MAX_SIZE_MB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +496,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_section_defaults_parses_and_rejects_unknown_keys() {
+        let base = "[workspace]\nname = \"w\"\nroots = [\".\"]\n";
+        let cfg = Config::load_from_str(base).expect("no [cache]");
+        assert_eq!(cfg.cache.max_size_mb, 2048);
+        let cfg = Config::load_from_str(&format!("{base}[cache]\nmax_size_mb = 10\n"))
+            .expect("[cache] max_size_mb");
+        assert_eq!(cfg.cache.max_size_mb, 10);
+        assert!(Config::load_from_str(&format!("{base}[cache]\nmax_size = 10\n")).is_err());
+    }
 
     #[test]
     fn test_skill_paths_resolve_against_config_dir() {

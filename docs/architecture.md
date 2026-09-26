@@ -272,6 +272,28 @@ still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket 
 longer a race against a large repo's indexing time, since the socket now exists independently of
 how long that indexing takes.
 
+### 8.2 One parse cache per workspace, under a quota (plan 4 step 4.4)
+
+The persistent parse cache (`PersistentIndexCache`, `crates/mesh-core/src/index_cache.rs`) is
+scoped the same way as the socket: `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`
+(SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`). It is opened once per process by
+`AppState::open_index_cache` and shared by the boot scan and every incremental reload, so a
+branch switch back to already-seen content is a lookup instead of a re-parse.
+
+- **Quota**: `[cache] max_size_mb` (default 2048), counting database + WAL. Enforced on open and
+  after every scan batch that wrote more than 100 entries or left the files over quota.
+- **Eviction**: least recently used first, 1,000 entries per transaction, until live pages fit in
+  80 % of the quota; then `PRAGMA incremental_vacuum` and a `TRUNCATE` checkpoint give the space
+  back to the filesystem.
+- **Recency**: `file_index_access(cache_key, last_accessed_at)`, a narrow side table indexed on
+  `last_accessed_at`. Reads only record the key in memory; the timestamps are written in the
+  scan's single write transaction. Keeping the timestamp out of the ~1 KB payload row avoids
+  rewriting every payload page on a warm boot.
+- **Counters**: `PersistentIndexCache::stats()` exposes hits, misses, swallowed SQLite errors and
+  evicted entries since open.
+
+The pre-4.4 machine-wide `~/.cache/mesh-mcp/index-cache.db` is no longer read.
+
 ---
 
 ## 9. Cryptographic Audit Trail (SOC2 & EU AI Act)

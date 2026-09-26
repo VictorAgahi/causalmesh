@@ -479,11 +479,17 @@ rely on them.
 | `[engines.policy.stop_rules]` | **wired** (evaluated in tool dispatch and git pre-commit hook) |
 | `[engines.policy.skills]` | **wired** |
 | `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` | **wired** — `enabled=false` turns off stop rules/skills; `enforce_git_hooks` gates hook installation; `cryptographic_audit_trail` gates audit logging |
+| `[cache]` `max_size_mb` | **wired** — quota (MiB, default `2048`) of this workspace's parse cache `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`, database + WAL. Checked on open and after every scan writing more than 100 entries; over quota, least recently used entries are evicted down to 80 % of it |
 
 Practical consequence: **all configuration sections actively control their respective indexing and governance behavior**. Secret masking and prompt-injection sanitisation are enabled by default and can be configured per section.
 
 There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
 a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.
+
+The parse cache is a disposable performance cache, one SQLite file per workspace (same
+`workspace_id` as the daemon socket, so it also changes with the binary version). Deleting it is
+always safe: the next boot re-parses everything. Versions before 6.1.0 used a single
+machine-wide `~/.cache/mesh-mcp/index-cache.db`; it is no longer read and can be deleted.
 
 A complete annotated example lives in [`mesh-mcp.toml`](mesh-mcp.toml) at the repo root.
 

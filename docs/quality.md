@@ -736,6 +736,11 @@ compared against step 3.4's head (`835361f`) as the reference where a before/aft
 | `scripts/golden/score.py bank-of-anthos` | 0/0 — vacuous 100% / 100% (gRPC-free, nothing fabricated) |
 | nightly `scale_bench.py` (5k files, 8 roots, `budgets.json`) | ✔ no violation, 3 runs + 1 run outside the repo: boot 0.5–1.1 s (budget 3 s), RSS peak 48–49 MB (300), search p50 4.4–9.7 ms (300), p95 7.6–24.2 ms (800), reload **207 ms** (3 s; reference 210 ms) |
 
+**Re-verified on the final tree** (after merging the step 3.5 and 3.6 review fixes, `047d6b3`):
+`determinism.sh` gives the same two fingerprints (`27c5fb5d…`, `a40bf20f…`); golden unchanged
+(100/100, 87.5/53.8, 100/100); nightly 5k outside the repo, 2 runs: boot 0.30–0.31 s, RSS peak
+49 MB, search p50 2.2–2.4 ms / p95 3.7–7.8 ms, reload 205–209 ms, no violation.
+
 **`reload_ms: None` explained, not a regression.** Every corpus generated under `target/`
 (git-ignored by this repo's `/target` rule) reported `reload_ms: None` — for the reference binary
 too. Step 3.3's watcher honours `.gitignore` files *above* the watched root, so edits inside a

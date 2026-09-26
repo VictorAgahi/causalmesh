@@ -21,7 +21,7 @@ impl GraphCommand {
             return Self::print_fingerprint(&config, &allowed_roots, output_path);
         }
 
-        let (graph, file_count) = WorkspaceIndexer::build_graph(&config, &allowed_roots);
+        let (graph, file_count) = WorkspaceIndexer::build_graph(&config, &allowed_roots, None);
 
         eprintln!(
             "✔ Scanned {file_count} files across {} roots: {} contracts/nodes, {} causal links/edges.",
@@ -80,7 +80,7 @@ impl GraphCommand {
         allowed_roots: &[PathBuf],
         output_path: Option<&Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = WorkspaceIndexer::build_snapshot(config, allowed_roots, None, None);
+        let snapshot = WorkspaceIndexer::build_snapshot(config, allowed_roots, None, None, None);
         let rendered = snapshot.fingerprint().to_string();
 
         if let Some(out) = output_path {

@@ -97,11 +97,13 @@ fn build_on_pool(
         .num_threads(threads)
         .build()
         .expect("rayon pool")
-        .install(|| WorkspaceIndexer::build_snapshot_from_files(config, roots, files, None, None))
+        .install(|| {
+            WorkspaceIndexer::build_snapshot_from_files(config, roots, files, None, None, None)
+        })
 }
 
 fn full_fingerprint(config: &Config, roots: &[PathBuf]) -> SnapshotFingerprint {
-    WorkspaceIndexer::build_snapshot(config, roots, None, None).fingerprint()
+    WorkspaceIndexer::build_snapshot(config, roots, None, None, None).fingerprint()
 }
 
 /// An `AppState` whose snapshot and VFS come from a full build, ready for
@@ -112,7 +114,13 @@ fn indexed_state(config: Config, roots: Vec<PathBuf>) -> Arc<AppState> {
     let state = Arc::new(AppState::new(config, roots, audit, rescan));
     let snapshot = {
         let mut vfs = state.vfs.lock().expect("vfs lock");
-        WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs))
+        WorkspaceIndexer::build_snapshot(
+            &state.config,
+            &state.allowed_roots,
+            None,
+            Some(&mut vfs),
+            None,
+        )
     };
     state.install_snapshot(snapshot);
     state
@@ -280,7 +288,7 @@ fn reconcile_is_idempotent() {
         let config = config(&["."]);
         let roots = resolved_roots(&config, &base);
         let mut graph =
-            WorkspaceIndexer::build_snapshot(&config, &roots, None, None).contract_graph;
+            WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None).contract_graph;
         let once = graph.fingerprint();
         graph.reconcile_edges();
         assert_eq!(
@@ -299,7 +307,7 @@ fn overlapping_roots_index_each_file_once() {
     let (_tmp, base) = workspace_copy(&determinism_fixture());
     let config = config(&[".", "./services/*"]);
     let roots = resolved_roots(&config, &base);
-    let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None);
+    let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
 
     let mut seen: HashMap<(PathBuf, usize, String, String), usize> = HashMap::new();
     for node in snapshot.contract_graph.all_nodes() {

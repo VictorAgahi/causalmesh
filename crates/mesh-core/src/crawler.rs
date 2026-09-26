@@ -146,6 +146,86 @@ impl ExcludeMatcher {
 }
 
 impl FilesystemCrawler {
+    /// Whether one specific, already-known path under `root` would be excluded from
+    /// a `crawl_scope_with(root, matcher, ..)` walk — without re-walking the tree to
+    /// find out. Combines `matcher` (the compiled `exclude_patterns`, including
+    /// nested-root exclusion) with the same `.gitignore` semantics a full crawl
+    /// applies (`git_ignore(true)`), so a file-watcher-driven targeted reload can
+    /// reuse a full crawl's exact exclusion decision for one path in O(path depth)
+    /// stat calls instead of an O(repo size) walk.
+    ///
+    /// Only `root`'s own top-level `.gitignore`/`.ignore`/`.git/info/exclude` are
+    /// honored. If any directory strictly between `root` and `path` carries its
+    /// *own* nested `.gitignore` or `.ignore`, this can't cheaply and correctly
+    /// reproduce `ignore::WalkBuilder`'s per-directory gitignore stacking (each
+    /// nested file's patterns are scoped to its own subtree, composing with every
+    /// ancestor's) — rather than risk a false "not excluded" for a file a full
+    /// crawl would have pruned, this returns `None` so the caller falls back to a
+    /// full crawl. Nested ignore files are real but comparatively rare next to a
+    /// single root-level one; this is a deliberate, documented scope limit, not a
+    /// silent gap. A user's *global* `core.excludesFile` (outside this repo
+    /// entirely) is not consulted at all — detecting its configured path would
+    /// mean reading git config, which this deliberately does not attempt; a path
+    /// excluded only by a global excludesfile is a known, narrower gap than the
+    /// nested-ignore-file fallback above (no signal this function can cheaply
+    /// check for forces a fallback for it).
+    pub fn is_path_excluded(root: &Path, path: &Path, matcher: &ExcludeMatcher) -> Option<bool> {
+        let rel = path.strip_prefix(root).ok()?;
+        if matcher.is_excluded_with_root(rel, Some(root)) {
+            return Some(true);
+        }
+        // `path == root` (e.g. a coalesced watcher event landing on the root
+        // directory itself) has no ancestor strictly between it and `root` to
+        // walk — and no parent to start that walk from without leaving `root`.
+        if rel.as_os_str().is_empty() {
+            return Some(false);
+        }
+
+        let mut dir = path.parent()?.to_path_buf();
+        while dir != root {
+            if !dir.starts_with(root) {
+                // Walked off `root` without matching it by value — `path` wasn't
+                // really a descendant despite `strip_prefix` succeeding (e.g. a
+                // `..`-relative or otherwise unnormalized input path). Bail out
+                // rather than stat directories outside the workspace jail.
+                return None;
+            }
+            if dir.join(".gitignore").is_file() || dir.join(".ignore").is_file() {
+                return None;
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let mut had_source = false;
+        for name in [".gitignore", ".ignore"] {
+            let p = root.join(name);
+            if p.is_file() {
+                if builder.add(&p).is_some() {
+                    return None; // unparseable ignore file — don't guess
+                }
+                had_source = true;
+            }
+        }
+        let git_exclude = root.join(".git").join("info").join("exclude");
+        if git_exclude.is_file() {
+            if builder.add(&git_exclude).is_some() {
+                return None;
+            }
+            had_source = true;
+        }
+        if !had_source {
+            return Some(false);
+        }
+        let gitignore = match builder.build() {
+            Ok(gi) => gi,
+            Err(_) => return None,
+        };
+        Some(gitignore.matched(path, path.is_dir()).is_ignore())
+    }
+
     /// Crawls a validated scope enforcing `follow_links(false)` and maximum depth limit.
     pub fn crawl_scope(
         scope: &ValidatedScope,
@@ -156,27 +236,32 @@ impl FilesystemCrawler {
         Self::crawl_scope_with(scope, &matcher, max_depth)
     }
 
+    /// The `WalkBuilder` settings every walk in this file shares: never follow symlinks
+    /// (sandbox-breakout prevention), respect `.gitignore`, scan hidden dirs like `.github`
+    /// (`.git` itself is still excluded — see `ExcludeMatcher::is_excluded_with_root`), and sort
+    /// by filename. `ignore::WalkBuilder` otherwise yields entries in whatever order the OS/
+    /// filesystem returns them (readdir order, not guaranteed stable — ext4, APFS and NTFS all
+    /// differ, and even one filesystem can reorder entries after a rename); sorting makes every
+    /// walk reproducible, which every consumer of a walk's output (VFS diffing, doctor's
+    /// dead-config reporting, `WorkspaceIndexer`'s sequential parse retry, `plan_watch_dirs`'
+    /// directory list) benefits from regardless of what it does with the result.
+    fn base_walk_builder(root: &Path, max_depth: Option<usize>) -> WalkBuilder {
+        let mut builder = WalkBuilder::new(root);
+        builder.follow_links(false);
+        builder.max_depth(Some(max_depth.unwrap_or(10)));
+        builder.git_ignore(true);
+        builder.hidden(false);
+        builder.sort_by_file_name(std::ffi::OsStr::cmp);
+        builder
+    }
+
     pub fn crawl_scope_with(
         scope: &ValidatedScope,
         matcher: &ExcludeMatcher,
         max_depth: Option<usize>,
     ) -> Vec<PathBuf> {
         let root = scope.as_path();
-        let mut builder = WalkBuilder::new(root);
-
-        // Invariant: NEVER follow symlinks (prevents sandbox breakout attacks)
-        builder.follow_links(false);
-        builder.max_depth(Some(max_depth.unwrap_or(10)));
-        builder.git_ignore(true);
-        builder.hidden(false); // Scan hidden folders like .github, .agents, but exclude .git
-                               // `ignore::WalkBuilder` otherwise yields directory entries in whatever order the
-                               // OS/filesystem returns them (readdir order, not guaranteed stable — ext4, APFS
-                               // and NTFS all differ, and even one filesystem can reorder entries after a rename).
-                               // Sorting by filename makes the crawl itself reproducible; `canonical_lines()`
-                               // downstream still doesn't depend on it, but every other consumer of this file
-                               // list (VFS diffing, doctor's dead-config reporting, the sequential parse retry
-                               // in `WorkspaceIndexer`) benefits from a stable, reviewable order.
-        builder.sort_by_file_name(std::ffi::OsStr::cmp);
+        let mut builder = Self::base_walk_builder(root, max_depth);
 
         // Prune excluded directories at the walker level so `node_modules/` is never descended.
         let root_for_filter = root.to_path_buf();
@@ -256,6 +341,119 @@ impl FilesystemCrawler {
         files.dedup();
         files
     }
+
+    /// Every directory under `root` a watcher should individually register (P2 step 3.3):
+    /// nested-`.gitignore`-aware (the `ignore` crate discovers and chains ignore files from
+    /// `root`'s ancestors up to a repository boundary, the same way `git` itself does, so this
+    /// is correct even when called again later on a freshly created subdirectory rather than
+    /// the original workspace root — see `FileWatcherService`'s dynamic re-registration) and
+    /// `exclude_patterns`-aware, using the exact same walker configuration as
+    /// [`Self::crawl_scope_with`] (`follow_links(false)`, `git_ignore(true)`, sorted). A
+    /// directory that would be excluded from a crawl is never returned here either, so a
+    /// watcher built from this list never receives events for a genuinely ignored subtree in
+    /// the first place — closing the gap `is_path_excluded`'s doc describes (a nested
+    /// `.gitignore` between a root and a changed path forcing a full-crawl fallback), rather
+    /// than reactively filtering events after they arrive.
+    ///
+    /// Symlinked directories are skipped (consistent with `follow_links(false)`): a watcher
+    /// covering a symlink's target is a separate, deliberately unhandled case, not silently
+    /// broken by this change (the pre-existing recursive-watch behaviour didn't traverse
+    /// symlinks either, since none of the native backends follow them for a recursive watch).
+    ///
+    /// Stops as soon as more than `cap` directories are found (`WatchPlan::capped == true`,
+    /// `dirs` empty) rather than enumerating a huge tree fully just to discard the result —
+    /// the caller's job on a capped plan is to fall back to a coarser watch strategy, not to
+    /// inspect which directories were found.
+    pub fn plan_watch_dirs(
+        root: &Path,
+        matcher: &ExcludeMatcher,
+        max_depth: Option<usize>,
+        cap: usize,
+    ) -> WatchPlan {
+        Self::plan_watch_dirs_from(root, root, matcher, max_depth, cap)
+    }
+
+    /// [`Self::plan_watch_dirs`], but the walk starts at `walk_root` while every exclusion
+    /// check (`exclude_patterns`, including a root-anchored pattern like `/vendor`) is computed
+    /// relative to `matcher_root` instead of `walk_root` itself.
+    ///
+    /// This split exists for `FileWatcherService`'s dynamic re-registration: when a directory
+    /// created *after* startup needs planning, `walk_root` is that new directory, but
+    /// `exclude_patterns` are authored against the real workspace root and must stay anchored
+    /// there — calling `plan_watch_dirs(new_dir, ...)` directly would (a) silently always keep
+    /// `new_dir` itself (a walk's own root is never passed to `filter_entry` at all — `ignore`'s
+    /// own documented behaviour — so nothing ever checks whether `new_dir` is itself excluded)
+    /// and (b) evaluate every pattern relative to `new_dir` instead of the workspace root,
+    /// breaking any root-anchored pattern's meaning. Both are real bugs a first version of this
+    /// step shipped with; this function (and its explicit `walk_root`-inclusion check below) is
+    /// the fix, not the original two-argument `plan_watch_dirs` with a different first argument.
+    pub fn plan_watch_dirs_from(
+        walk_root: &Path,
+        matcher_root: &Path,
+        matcher: &ExcludeMatcher,
+        max_depth: Option<usize>,
+        cap: usize,
+    ) -> WatchPlan {
+        // `ignore::WalkBuilder`'s `filter_entry` is never invoked on the walk's own root (only
+        // on entries found *inside* it), so when `walk_root != matcher_root` — the dynamic case
+        // — nothing below would otherwise ever check whether `walk_root` itself is excluded.
+        if let Ok(root_rel) = walk_root.strip_prefix(matcher_root) {
+            if !root_rel.as_os_str().is_empty()
+                && matcher.is_excluded_with_root(root_rel, Some(matcher_root))
+            {
+                return WatchPlan {
+                    dirs: Vec::new(),
+                    capped: false,
+                };
+            }
+        }
+
+        let mut builder = Self::base_walk_builder(walk_root, max_depth);
+
+        let matcher_root_for_filter = matcher_root.to_path_buf();
+        let matcher_clone = matcher.clone();
+        builder.filter_entry(move |entry| {
+            let rel = match entry.path().strip_prefix(&matcher_root_for_filter) {
+                Ok(r) => r,
+                Err(_) => return true,
+            };
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            !matcher_clone.is_excluded_with_root(rel, Some(&matcher_root_for_filter))
+        });
+
+        let mut dirs = Vec::new();
+        for result in builder.build() {
+            let Ok(entry) = result else { continue };
+            if entry.path_is_symlink() {
+                continue;
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                dirs.push(entry.path().to_path_buf());
+                if dirs.len() > cap {
+                    return WatchPlan {
+                        dirs: Vec::new(),
+                        capped: true,
+                    };
+                }
+            }
+        }
+        WatchPlan {
+            dirs,
+            capped: false,
+        }
+    }
+}
+
+/// Result of [`FilesystemCrawler::plan_watch_dirs`]. `capped == true` means the tree has more
+/// than the caller's `cap` watchable directories; `dirs` is empty in that case rather than a
+/// truncated, misleading partial list — the caller's job is to pick a coarser watch strategy,
+/// not to watch "some but not all" of a tree it couldn't fully enumerate within budget.
+#[derive(Debug, Clone)]
+pub struct WatchPlan {
+    pub dirs: Vec<PathBuf>,
+    pub capped: bool,
 }
 
 #[cfg(test)]
@@ -412,5 +610,260 @@ mod tests {
         let matcher = ExcludeMatcher::compile(&["${workspace_root}/docs/**".to_string()]);
         let rel = Path::new("docs/readme.md");
         assert!(matcher.is_excluded(rel));
+    }
+
+    #[test]
+    fn test_is_path_excluded_matches_exclude_matcher() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).expect("mkdir");
+        let path = root.join("node_modules/pkg/index.js");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&["node_modules".to_string()]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_root_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::write(root.join(".gitignore"), "*.generated.go\n").expect("write gitignore");
+        let path = root.join("client.generated.go");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "root .gitignore pattern must be honored without a full crawl"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_kept_file_is_some_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        let path = root.join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&path, "fn main() {}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_falls_back_on_nested_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("services/billing")).expect("mkdir");
+        // A .gitignore anywhere strictly between root and the file's own
+        // directory is a nested one this fast check can't safely resolve.
+        std::fs::write(root.join("services/.gitignore"), "*.tmp\n").expect("write");
+        let path = root.join("services/billing/Widget.java");
+        std::fs::write(&path, "class Widget {}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            None,
+            "a nested .gitignore between root and the file must force a fall back, not a false negative"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_root_ignore_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::write(root.join(".ignore"), "*.local.json\n").expect("write .ignore");
+        let path = root.join("config.local.json");
+        std::fs::write(&path, "{}").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "root .ignore pattern must be honored, matching ignore::WalkBuilder's default ignore(true)"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_honors_git_info_exclude() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join(".git/info")).expect("mkdir");
+        std::fs::write(root.join(".git/info/exclude"), "*.scratch\n").expect("write");
+        let path = root.join("notes.scratch");
+        std::fs::write(&path, "x").expect("write");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &path, &matcher),
+            Some(true),
+            "a repo-local .git/info/exclude pattern must be honored"
+        );
+    }
+
+    #[test]
+    fn test_is_path_excluded_root_itself_is_not_excluded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        let matcher = ExcludeMatcher::compile(&[]);
+        assert_eq!(
+            FilesystemCrawler::is_path_excluded(&root, &root, &matcher),
+            Some(false),
+            "path == root must short-circuit instead of walking a parent outside root"
+        );
+    }
+
+    /// P2 step 3.3: an excluded directory (here, a nested `.gitignore`'s own rule, not just a
+    /// static `exclude_patterns` entry) must never appear in the watch plan — this is the
+    /// property `FileWatcherService` relies on to never register a watch inside it at all.
+    #[test]
+    fn plan_watch_dirs_excludes_gitignored_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        // `ignore::WalkBuilder`'s `git_ignore(true)` only honors `.gitignore` when
+        // `require_git` (default true) finds a real `.git` directory — matching how a real
+        // workspace actually looks, and the existing `.git/info/exclude` test's own fixture.
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(root.join("kept")).expect("mkdir kept");
+        std::fs::create_dir_all(root.join("build/inner")).expect("mkdir build/inner");
+        std::fs::write(root.join(".gitignore"), "build/\n").expect("write gitignore");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 100);
+        assert!(!plan.capped);
+        assert!(plan.dirs.iter().any(|d| d.ends_with("kept")));
+        assert!(
+            !plan.dirs.iter().any(|d| d.ends_with("build") || d.ends_with("inner")),
+            "a gitignored directory (and its own contents) must never be planned for watching: {:?}",
+            plan.dirs
+        );
+    }
+
+    /// A nested `.gitignore` — strictly between `root` and the excluded directory, not `root`'s
+    /// own top-level one — is exactly the case `is_path_excluded`'s doc says it cannot cheaply
+    /// resolve for a single incoming path. `plan_watch_dirs` sidesteps that limitation entirely
+    /// by walking (once, at watch-registration time) with the same `ignore::WalkBuilder` gitignore
+    /// stacking a full crawl already gets right, rather than reproducing it per-event.
+    #[test]
+    fn plan_watch_dirs_excludes_nested_gitignore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(root.join("service/build")).expect("mkdir");
+        std::fs::write(root.join("service/.gitignore"), "build/\n")
+            .expect("write nested gitignore");
+
+        let matcher = ExcludeMatcher::compile(&[]);
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 100);
+        assert!(plan.dirs.iter().any(|d| d.ends_with("service")));
+        assert!(
+            !plan.dirs.iter().any(|d| d.ends_with("build")),
+            "a directory excluded by a nested (non-root) .gitignore must not be planned either: {:?}",
+            plan.dirs
+        );
+    }
+
+    #[test]
+    fn plan_watch_dirs_reports_capped_without_a_partial_list() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        for i in 0..10 {
+            std::fs::create_dir_all(root.join(format!("d{i}"))).expect("mkdir");
+        }
+        let matcher = ExcludeMatcher::compile(&[]);
+        // root itself + 10 subdirectories = 11 directories; cap at 3 must trip.
+        let plan = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 3);
+        assert!(plan.capped);
+        assert!(
+            plan.dirs.is_empty(),
+            "a capped plan must not return a partial, misleading directory list"
+        );
+    }
+
+    /// Regression for a real bug caught by `/code-review`: `plan_watch_dirs_from` must anchor
+    /// every `exclude_patterns` check to `matcher_root`, not to `walk_root` — a first version of
+    /// dynamic re-registration called `plan_watch_dirs(new_dir, ...)` directly, which silently
+    /// always kept `new_dir` itself (a walk's own root is never passed to `filter_entry`) even
+    /// when `new_dir`'s own name matched an exclude pattern.
+    #[test]
+    fn plan_watch_dirs_from_excludes_the_walk_root_itself_when_it_matches_a_pattern() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matcher_root = dunce::canonicalize(temp.path()).expect("canon");
+        let new_dir = matcher_root.join("node_modules");
+        std::fs::create_dir_all(new_dir.join("pkg")).expect("mkdir");
+
+        let matcher = ExcludeMatcher::compile(&["**/node_modules/**".to_string()]);
+        let plan = FilesystemCrawler::plan_watch_dirs_from(
+            &new_dir,
+            &matcher_root,
+            &matcher,
+            Some(10),
+            100,
+        );
+        assert!(
+            plan.dirs.is_empty(),
+            "a walk root that itself matches an exclude pattern must plan nothing, not silently \
+             keep itself: {:?}",
+            plan.dirs
+        );
+    }
+
+    /// Regression for the same bug: a root-anchored pattern's meaning must stay relative to the
+    /// real workspace root even when the walk itself starts somewhere deeper (the dynamic
+    /// re-registration case) — evaluating it relative to `walk_root` instead would silently
+    /// change which paths it matches.
+    #[test]
+    fn plan_watch_dirs_from_anchors_patterns_to_matcher_root_not_walk_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matcher_root = dunce::canonicalize(temp.path()).expect("canon");
+        // Excluded only at the true root's "vendor", never at some other "vendor" nested deeper.
+        std::fs::create_dir_all(matcher_root.join("vendor")).expect("mkdir root vendor");
+        std::fs::create_dir_all(matcher_root.join("svc/vendor")).expect("mkdir nested vendor");
+        std::fs::create_dir_all(matcher_root.join("svc/keep")).expect("mkdir nested keep");
+
+        let matcher = ExcludeMatcher::compile(&["/vendor/**".to_string()]);
+        let plan = FilesystemCrawler::plan_watch_dirs_from(
+            matcher_root.join("svc").as_path(),
+            &matcher_root,
+            &matcher,
+            Some(10),
+            100,
+        );
+        assert!(
+            plan.dirs.iter().any(|d| d.ends_with("keep")),
+            "a directory not matching the root-anchored pattern must still be planned: {:?}",
+            plan.dirs
+        );
+        assert!(
+            plan.dirs.iter().any(|d| d.ends_with("svc/vendor")),
+            "svc/vendor is NOT the true root's top-level vendor/ the pattern is anchored to, so \
+             it must be kept — excluding it would mean the pattern got evaluated relative to \
+             walk_root (\"svc\", making its relative path look like bare \"vendor\") instead of \
+             the real matcher_root: {:?}",
+            plan.dirs
+        );
+    }
+
+    #[test]
+    fn plan_watch_dirs_and_plan_watch_dirs_from_agree_when_roots_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(temp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        let matcher = ExcludeMatcher::compile(&[]);
+
+        let via_shorthand = FilesystemCrawler::plan_watch_dirs(&root, &matcher, Some(10), 100);
+        let via_explicit =
+            FilesystemCrawler::plan_watch_dirs_from(&root, &root, &matcher, Some(10), 100);
+        assert_eq!(via_shorthand.dirs, via_explicit.dirs);
+        assert_eq!(via_shorthand.capped, via_explicit.capped);
     }
 }

@@ -58,7 +58,8 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// of a placeholder `1` (P2 step 3.4 review).
 /// v3: one database per workspace, `file_index_access.last_accessed_at` LRU side table,
 /// `auto_vacuum = INCREMENTAL` (plan 4 step 4.4).
-const SCHEMA_VERSION: u8 = 3;
+/// v4: `file_index_access.payload_rowid`, the LRU tie-breaker (step 4.4 review).
+const SCHEMA_VERSION: u8 = 4;
 
 /// `[cache] max_size_mb` default: 2 GiB per workspace.
 pub const DEFAULT_MAX_SIZE_MB: u64 = 2048;
@@ -297,10 +298,11 @@ impl PersistentIndexCache {
                      );
                      CREATE TABLE file_index_access (
                          cache_key BLOB PRIMARY KEY,
-                         last_accessed_at INTEGER NOT NULL
+                         last_accessed_at INTEGER NOT NULL,
+                         payload_rowid INTEGER NOT NULL
                      ) WITHOUT ROWID;
                      CREATE INDEX file_index_access_lru
-                         ON file_index_access (last_accessed_at, cache_key);
+                         ON file_index_access (last_accessed_at, payload_rowid);
                      PRAGMA user_version = {SCHEMA_VERSION};"
                 ))?;
                 tx.commit()?;
@@ -419,10 +421,12 @@ impl PersistentIndexCache {
             {
                 let upsert_access = |tx: &rusqlite::Transaction, key: &[u8; 32]| {
                     tx.execute(
-                        "INSERT INTO file_index_access (cache_key, last_accessed_at) \
-                         VALUES (?1, ?2) \
-                         ON CONFLICT(cache_key) DO UPDATE SET last_accessed_at = excluded.last_accessed_at",
-                        params![key.as_slice(), now],
+                        "INSERT INTO file_index_access (cache_key, last_accessed_at, payload_rowid) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(cache_key) DO UPDATE SET \
+                             last_accessed_at = excluded.last_accessed_at, \
+                             payload_rowid = excluded.payload_rowid",
+                        params![key.as_slice(), now, tx.last_insert_rowid()],
                     )
                 };
                 for (key, payload) in entries {
@@ -526,10 +530,18 @@ impl PersistentIndexCache {
         let target = self.max_size_bytes / 100 * EVICTION_TARGET_PERCENT;
         let mut evicted = 0u64;
         while Self::live_bytes(conn) > target {
+            // Read and delete in one write transaction: another process sharing this
+            // workspace's database may be writing or evicting at the same time.
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            // Ties on `last_accessed_at` (every entry one scan wrote or hit shares its
+            // timestamp) break on the payload's rowid, i.e. its storage order, so a batch
+            // frees whole pages. Breaking them on the random `cache_key` spread every
+            // batch's deletions over all pages: no page ever emptied, `live_bytes` barely
+            // moved, and the loop evicted the entire cache instead of its oldest 20 %.
             let keys: Vec<Vec<u8>> = {
-                let mut stmt = conn.prepare_cached(
+                let mut stmt = tx.prepare_cached(
                     "SELECT cache_key FROM file_index_access \
-                     ORDER BY last_accessed_at, cache_key LIMIT ?1",
+                     ORDER BY last_accessed_at, payload_rowid LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![EVICTION_BATCH as i64], |r| r.get(0))?;
                 rows.collect::<Result<_, _>>()?
@@ -537,18 +549,18 @@ impl PersistentIndexCache {
             if keys.is_empty() {
                 // Only payload rows without an access row can remain (never written by
                 // this version): drop them oldest-first the same way.
-                let removed = conn.execute(
-                    "DELETE FROM file_index_cache WHERE cache_key IN (
-                         SELECT cache_key FROM file_index_cache ORDER BY updated_at, cache_key LIMIT ?1)",
+                let removed = tx.execute(
+                    "DELETE FROM file_index_cache WHERE rowid IN (
+                         SELECT rowid FROM file_index_cache ORDER BY updated_at, rowid LIMIT ?1)",
                     params![EVICTION_BATCH as i64],
                 )?;
+                tx.commit()?;
                 if removed == 0 {
                     break;
                 }
                 evicted += removed as u64;
                 continue;
             }
-            let tx = conn.unchecked_transaction()?;
             for key in &keys {
                 tx.execute(
                     "DELETE FROM file_index_cache WHERE cache_key = ?1",

@@ -315,3 +315,27 @@ fn processes_sharing_one_workspace_cache_hit_zero_sqlite_errors() {
     }
 }
 
+#[test]
+fn partially_evicted_cache_indexes_exactly_like_no_cache() {
+    // 1500 files, ~1.7 MB of cache entries, under a 1 MB quota: every scan writes the
+    // entries the previous one evicted and hits the ones it kept.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = dunce::canonicalize(tmp.path()).expect("canon").join("ws");
+    write_workspace(&root, 1500, 0);
+    let config = config_for(&root);
+    let roots = WorkspaceIndexer::resolve_roots(&config, &root);
+    let reference = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
+    let db = tmp.path().join("cache").join("index-cache.db");
+    let cache = PersistentIndexCache::open(db, 1024 * 1024).expect("open cache");
+    for pass in 0..4 {
+        let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(
+            snap.fingerprint(),
+            reference.fingerprint(),
+            "pass {pass}: {:?}",
+            cache.stats()
+        );
+    }
+    let stats = cache.stats();
+    assert!(stats.hits > 0 && stats.evicted > 0 && stats.errors == 0, "{stats:?}");
+}

@@ -231,6 +231,17 @@ fn daemon_version_mismatch_is_reported_and_fix_stops_the_live_daemon() {
     std::fs::create_dir_all(meta_path.parent().unwrap()).expect("mkdir");
     std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).expect("write meta");
 
+    // `--fix` only ever signals a PID once something is confirmed actually
+    // listening on this exact workspace's socket (step 4.7 review, guards
+    // against a stale record's PID having been reused by an unrelated
+    // process) — a real live daemon's meta always comes with a live socket,
+    // so this stands in for that.
+    let sock_dir = home.path().join(".cache").join("mesh");
+    std::fs::create_dir_all(&sock_dir).expect("mkdir");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(sock_dir.join(format!("meshd-{workspace_id}.sock")))
+            .expect("bind stand-in socket");
+
     let checks = run_doctor(home.path(), &config, false);
     let check = find(&checks, "Daemon version").expect("daemon version check present");
     assert_eq!(check["status"], "warn", "{check:?}");
@@ -437,22 +448,25 @@ fn audit_db_corruption_is_reported_but_never_fixed() {
     );
 }
 
-/// The plan's own combined exit criterion, literally: an orphaned socket, a
-/// corrupt cache, and a daemon of another version, all at once — `doctor
-/// --fix` handles every one of them, and a second `doctor` is clean.
+/// The plan's own combined exit criterion, adapted to one real constraint
+/// `doctor` runs into that the plan's wording glosses over: a single
+/// workspace has exactly one socket, so "an orphaned socket" and "a live
+/// daemon of another version" can never both be true for it at the same
+/// time — a live daemon's own socket is, by definition, not orphaned (and
+/// since the 4.7 review, `--fix` only ever signals a PID once the socket
+/// confirms *something* is actually listening, precisely to rule out
+/// treating a merely-recorded PID as if it still had a live socket). The
+/// orphaned-socket case is covered on its own in
+/// `orphaned_socket_is_reported_and_removed_by_fix`; this test combines the
+/// two that legitimately coexist — a corrupt cache and a live, reachable,
+/// wrong-version daemon — plus confirms a second `doctor` run is clean.
 #[test]
-fn orphaned_socket_corrupt_cache_and_stale_daemon_together_are_all_fixed_at_once() {
+fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() {
     let home = tempfile::tempdir().expect("home");
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
     let workspace_id = mesh_core::workspace_id(&canonical_project);
-
-    // Orphaned socket.
-    let sock_dir = home.path().join(".cache").join("mesh");
-    std::fs::create_dir_all(&sock_dir).expect("mkdir");
-    let sock_path = sock_dir.join(format!("meshd-{workspace_id}.sock"));
-    drop(std::os::unix::net::UnixListener::bind(&sock_path).expect("bind then orphan"));
 
     // Corrupt workspace cache.
     let db_path = home
@@ -465,7 +479,9 @@ fn orphaned_socket_corrupt_cache_and_stale_daemon_together_are_all_fixed_at_once
     std::fs::create_dir_all(db_path.parent().unwrap()).expect("mkdir");
     std::fs::write(&db_path, b"not a sqlite database").expect("corrupt db");
 
-    // Daemon of another version (a real, alive stand-in process for the PID).
+    // Daemon of another version: a real, alive stand-in process for the PID,
+    // with a real, live socket bound for this workspace (see the test's doc
+    // comment for why both must be live together).
     let mut child = Command::new("sleep")
         .arg("30")
         .spawn()
@@ -482,15 +498,19 @@ fn orphaned_socket_corrupt_cache_and_stale_daemon_together_are_all_fixed_at_once
         .join(format!("{workspace_id}.meta"));
     std::fs::create_dir_all(meta_path.parent().unwrap()).expect("mkdir");
     std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).expect("write meta");
+    let sock_dir = home.path().join(".cache").join("mesh");
+    std::fs::create_dir_all(&sock_dir).expect("mkdir");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(sock_dir.join(format!("meshd-{workspace_id}.sock")))
+            .expect("bind stand-in socket");
 
-    // One `--fix` run treats all three.
+    // One `--fix` run treats both.
     let checks = run_doctor(home.path(), &config, true);
-    for name in ["Orphaned socket", "Index cache", "Daemon version"] {
+    for name in ["Index cache", "Daemon version"] {
         let check = find(&checks, name).expect(name);
         assert_eq!(check["fixed"], true, "{name}: {check:?}");
     }
 
-    assert!(!sock_path.exists());
     assert!(!db_path.exists());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while child.try_wait().ok().flatten().is_none() {
@@ -501,9 +521,11 @@ fn orphaned_socket_corrupt_cache_and_stale_daemon_together_are_all_fixed_at_once
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    // A second doctor run is clean: nothing left to report or fix.
+    // A second doctor run is clean: nothing left to report or fix (the
+    // socket permission check may still fire, `_listener`'s bind mode isn't
+    // owner-only by default, but that's not what this test is about).
     let checks = run_doctor(home.path(), &config, false);
-    for name in ["Orphaned socket", "Index cache", "Daemon version"] {
+    for name in ["Index cache", "Daemon version"] {
         assert!(
             find(&checks, name).is_none(),
             "{name} must not be reported after everything was fixed: {checks:?}"

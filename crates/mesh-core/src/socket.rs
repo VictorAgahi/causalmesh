@@ -238,6 +238,45 @@ pub fn terminate_process(pid: u32) -> bool {
     }
 }
 
+/// Whether *something* is actually live and listening on `workspace_id`'s own
+/// socket or named pipe right now (plan 4 step 4.7 review). A stale
+/// [`DaemonMeta`] only ever names the real daemon's PID until a crash, an
+/// unclean shutdown, or a reboot: after that its `pid` field is just a number
+/// that may since have been reused by an unrelated process. Bare
+/// [`process_is_alive`] cannot tell the two apart; this can, in practice —
+/// meshd's socket path already encodes the workspace id, so an unrelated
+/// process would have to both reuse the exact recycled PID *and* happen to be
+/// bound to this exact, workspace-specific path, not merely exist. `doctor
+/// --fix` only calls [`terminate_process`] when this also returns `true`,
+/// narrowing (though on Windows, not fully eliminating, since a named pipe
+/// instance is consumed by one connect — see the caller) the PID-reuse risk
+/// to something that would require deliberate malice, already outside this
+/// tool's threat model (the same trust boundary `kill`/`OpenProcess` already
+/// rely on: same-machine, same-user processes).
+pub fn daemon_is_reachable(workspace_id: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path_for(workspace_id)).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        // Not verified by compiling for Windows in this session (no MSVC
+        // toolchain available) — same caveat as `terminate_process`'s Windows
+        // branch. `File::open` on a `\\.\pipe\...` path performs the same
+        // `CreateFile` connect a named pipe client uses.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_name_for(workspace_id))
+            .is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = workspace_id;
+        false
+    }
+}
+
 pub fn cleanup_stale_socket(path: &Path) {
     if !path.exists() {
         return;

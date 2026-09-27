@@ -620,11 +620,29 @@ impl DoctorCommand {
             // Same-user enforcement is the OS's, not ours: `kill`/`OpenProcess`
             // fail on a PID this user does not own, never terminates a
             // stranger's process (see `terminate_process`'s own doc).
-            let alive = mesh_core::socket::process_is_alive(meta.pid);
-            // A dead PID (a crashed daemon, or one that already stopped) has
-            // nothing left to terminate; the stale record itself is the whole
-            // fix, and removing it is unconditionally safe.
-            let fixed = !alive || mesh_core::socket::terminate_process(meta.pid);
+            //
+            // A stale record survives a crash, an unclean shutdown, or a
+            // reboot — not just the instant between this check and the signal
+            // below — so `meta.pid` may since have been reused by an unrelated
+            // process (step 4.7 review). `terminate_process` is only ever
+            // called once `daemon_is_reachable` also confirms *something* is
+            // live on this exact workspace's socket right now: a PID-reuse
+            // coincidence would additionally have to bind that exact,
+            // workspace-scoped path, which plain reuse cannot produce.
+            let reachable = mesh_core::socket::daemon_is_reachable(workspace_id);
+            let fixed = if reachable {
+                // Re-checked immediately before signaling: narrows, though
+                // does not eliminate, the window between this and the kill
+                // call itself.
+                mesh_core::socket::process_is_alive(meta.pid)
+                    && mesh_core::socket::terminate_process(meta.pid)
+            } else {
+                // Nothing is listening: whatever `meta.pid` is now, it is not
+                // actively serving this workspace, so there is nothing to
+                // terminate — the stale record itself is the whole fix, and
+                // removing it is unconditionally safe.
+                true
+            };
             if fixed {
                 // `terminate_process` sends SIGTERM/`TerminateProcess`, neither
                 // of which the daemon can catch to clean up after itself (only

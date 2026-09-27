@@ -2,9 +2,7 @@
 //!
 //! Re-exports canonical implementation from `mesh_core::socket`.
 
-pub use mesh_core::socket::{
-    cleanup_stale_socket, remove_daemon_meta, socket_path_for, workspace_id, write_daemon_meta,
-};
+pub use mesh_core::socket::{cleanup_stale_socket, socket_path_for, workspace_id};
 
 #[cfg(windows)]
 pub use mesh_core::socket::pipe_name_for;

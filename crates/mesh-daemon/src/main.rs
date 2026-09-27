@@ -241,25 +241,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IPC server (blocking until cancelled) ─────────────────────────────────
-    // Recorded so `doctor` can compare this daemon's version to its own and,
-    // on `--fix`, stop exactly this PID (plan 4 step 4.7). Written just before
-    // the accept loop rather than strictly after bind succeeds (`run_uds_server`/
-    // `run_named_pipe_server` block until shutdown, so there is no earlier
-    // return to hook): a reader sees this PID moments before its socket, never
-    // after, and `process_is_alive` is the actual liveness check either way.
-    socket::write_daemon_meta(&workspace_id, env!("CARGO_PKG_VERSION"));
-
+    // `write_daemon_meta`/`remove_daemon_meta` (plan 4 step 4.7) run inside
+    // `run_uds_server`/`run_named_pipe_server` themselves, only once bind/pipe
+    // creation actually succeeds — never here, before it's known this process
+    // is the one that will actually serve this workspace's socket (a losing
+    // side of a bind race must never overwrite the winner's record with its
+    // own, already-exiting PID).
     #[cfg(unix)]
-    server::run_uds_server(&sock_path, state, cancel_token, counter)
-        .await
-        .map_err(|e| e.to_string())?;
+    server::run_uds_server(
+        &sock_path,
+        state,
+        cancel_token,
+        counter,
+        &workspace_id,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     #[cfg(windows)]
-    server::run_named_pipe_server(&pipe_name, state, cancel_token, counter)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    socket::remove_daemon_meta(&workspace_id);
+    server::run_named_pipe_server(
+        &pipe_name,
+        state,
+        cancel_token,
+        counter,
+        &workspace_id,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     // Clean up socket on exit (Unix only — named pipes are released by the OS
     // once the last handle closes, there is no file to remove on Windows).

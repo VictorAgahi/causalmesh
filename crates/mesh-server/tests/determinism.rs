@@ -499,3 +499,46 @@ fn cached_builds_and_reloads_match_uncached() {
         }
     }
 }
+
+// ── Checkout independence (plan 4.12f) ──────────────────────────────────────
+
+/// Indexes `polyglot-shop` copied at `rel` under a fresh temp dir, with the
+/// example's own `mesh-mcp.toml` (six roots), and returns its fingerprint.
+fn polyglot_copy_fingerprint(tmp: &Path, rel: &str) -> (PathBuf, SnapshotFingerprint) {
+    let src = manifest_dir().join("../../examples/polyglot-shop");
+    let root = dunce::canonicalize(tmp).expect("canonicalize").join(rel);
+    copy_dir(&src, &root);
+    let toml = std::fs::read_to_string(root.join("mesh-mcp.toml")).expect("read config");
+    let config = Config::load_from_str(&toml).expect("config");
+    let roots = resolved_roots(&config, &root);
+    assert!(roots.len() > 1, "fixture must be multi-root: {roots:?}");
+    (root.clone(), full_fingerprint(&config, &roots))
+}
+
+/// The same tree checked out in two directories of different depth and name
+/// fingerprints the same; a real content change still moves the fingerprint.
+#[test]
+fn fingerprint_is_independent_of_the_checkout_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_, shallow) = polyglot_copy_fingerprint(tmp.path(), "a");
+    let (deep_root, deep) = polyglot_copy_fingerprint(tmp.path(), "b/c/d/other-name");
+    assert!(shallow.nodes > 0, "fixture must index nodes: {shallow}");
+    assert_eq!(
+        shallow, deep,
+        "fingerprint depends on the checkout directory"
+    );
+
+    let proto = deep_root.join("proto/payment.proto");
+    let mut text = std::fs::read_to_string(&proto).expect("read proto");
+    text.push_str("\nservice RefundService {\n  rpc Refund (RefundRequest) returns (RefundReply);\n}\nmessage RefundRequest {}\nmessage RefundReply {}\n");
+    std::fs::write(&proto, text).expect("write proto");
+    let config = Config::load_from_str(
+        &std::fs::read_to_string(deep_root.join("mesh-mcp.toml")).expect("read config"),
+    )
+    .expect("config");
+    let changed = full_fingerprint(&config, &resolved_roots(&config, &deep_root));
+    assert_ne!(
+        shallow.graph, changed.graph,
+        "a content change must move the fingerprint"
+    );
+}

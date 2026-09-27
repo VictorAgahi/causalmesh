@@ -278,6 +278,7 @@ impl WorkspaceIndexer {
         let mut snapshot = MeshSnapshot {
             doc_index: Self::doc_index_for(config),
             health,
+            roots: roots.into(),
             ..MeshSnapshot::default()
         };
         let mut vfs = vfs;

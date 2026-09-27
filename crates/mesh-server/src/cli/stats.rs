@@ -11,7 +11,7 @@ pub struct ToolStats {
     /// Calls whose audit status is not `SUCCESS`: exactly the calls answered with
     /// `isError: true` (`ToolRegistry::invoke` audits `ERROR` for every `Err`).
     pub errors: usize,
-    /// Calls with a recorded latency (only calls made by 6.1.0+ are timed).
+    /// Calls with a recorded latency (only calls made by 7.0.0+ are timed).
     pub latency_samples: usize,
     pub p50_us: Option<u64>,
     pub p95_us: Option<u64>,
@@ -222,7 +222,7 @@ impl StatsCommand {
         if !summary.latency_recorded {
             let _ = writeln!(
                 o,
-                "  (latency not recorded by this audit db: it predates MeshMCP 6.1.0)"
+                "  (latency not recorded by this audit db: it predates MeshMCP 7.0.0)"
             );
         }
 
@@ -243,7 +243,7 @@ impl StatsCommand {
             None => {
                 let _ = writeln!(
                     o,
-                    "Index cache: not recorded by this audit db (it predates MeshMCP 6.1.0)"
+                    "Index cache: not recorded by this audit db (it predates MeshMCP 7.0.0)"
                 );
             }
         }
@@ -264,7 +264,7 @@ impl StatsCommand {
             None => {
                 let _ = writeln!(
                     o,
-                    "Daemon: restarts not recorded by this audit db (it predates MeshMCP 6.1.0)"
+                    "Daemon: restarts not recorded by this audit db (it predates MeshMCP 7.0.0)"
                 );
             }
         }

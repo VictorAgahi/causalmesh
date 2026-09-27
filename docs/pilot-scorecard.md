@@ -13,16 +13,16 @@ agent **without** MeshMCP?
 
 ## 2. Setup
 
-| Item | Value (fill in) |
-|---|---|
-| Pilot team / repositories (names, commit SHAs) | |
-| Workspace size (repos, files indexed: `mesh-mcp doctor`) | |
-| Agent tool and version (e.g. Claude Code x.y.z) | |
-| Model id (identical in both conditions) | |
-| MeshMCP version (`mesh-mcp --version`) | |
-| Machine (OS, CPU, RAM) | |
-| Install command used (`scripts/install_pilot.sh …`) | |
-| Dates of the runs | |
+| Item                                                     | Value (fill in) |
+| ----------------------------------------------------------| -----------------|
+| Pilot team / repositories (names, commit SHAs)           |                 |
+| Workspace size (repos, files indexed: `mesh-mcp doctor`) |                 |
+| Agent tool and version (e.g. Claude Code x.y.z)          |                 |
+| Model id (identical in both conditions)                  |                 |
+| MeshMCP version (`mesh-mcp --version`)                   |                 |
+| Machine (OS, CPU, RAM)                                   |                 |
+| Install command used (`scripts/install_pilot.sh …`)      |                 |
+| Dates of the runs                                        |                 |
 
 ## 3. Tasks
 

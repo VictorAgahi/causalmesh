@@ -1,5 +1,6 @@
 use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
 use mesh_core::{expand_roots, AuditLogger, Config, PersistentIndexCache, PropertyRegistry};
+use mesh_parsers::AstGuard;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use notify::Watcher;
 use std::path::{Path, PathBuf};

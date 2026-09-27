@@ -61,6 +61,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v4: `file_index_access.payload_rowid`, the LRU tie-breaker (step 4.4 review).
 const SCHEMA_VERSION: u8 = 4;
 
+/// How long a cache statement waits for another connection's lock (other processes of the
+/// same workspace share the database) before failing with `SQLITE_BUSY`.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `[cache] max_size_mb` default: 2 GiB per workspace.
 pub const DEFAULT_MAX_SIZE_MB: u64 = 2048;
 
@@ -238,7 +242,7 @@ impl PersistentIndexCache {
         db_path: Option<PathBuf>,
         max_size_bytes: u64,
     ) -> Result<Self, IndexCacheError> {
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // Must precede the first table creation to take effect without a VACUUM; a no-op on
         // a database that already has tables (handled by the version check below).
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
@@ -514,14 +518,33 @@ impl PersistentIndexCache {
 
     fn checkpoint(conn: &Connection) {
         // Best effort: a reader in another process can hold the WAL; the size check then
-        // simply counts the WAL too.
+        // simply counts the WAL too. Run without the busy handler: a `TRUNCATE` checkpoint
+        // waits through it for every reader of an older snapshot *while blocking new
+        // writers*, so with `BUSY_TIMEOUT` it held another process's cache writes off for up
+        // to that same timeout, and they failed with `SQLITE_BUSY`. Without it, the
+        // checkpoint copies what it can and returns at once.
+        if conn.busy_timeout(std::time::Duration::ZERO).is_err() {
+            return;
+        }
         let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |_| Ok(()));
+        let _ = conn.busy_timeout(BUSY_TIMEOUT);
     }
 
     /// Brings the database under its quota: if database + WAL exceed it, deletes the least
     /// recently used entries in batches of [`EVICTION_BATCH`] until live data fits in 80 % of
     /// the quota, then releases the freed pages (`PRAGMA incremental_vacuum`) and truncates
     /// the WAL. Called by `open` and by `put_batch`; public for callers and tests.
+    /// Entries to delete for `live` bytes of pages to fit in `target`: the excess divided by
+    /// the average entry footprint, rounded up, between 1 and [`EVICTION_BATCH`]. Pages only
+    /// return to the freelist once empty, so one step can fall short; the caller loops with
+    /// the remaining (smaller) excess rather than overshooting.
+    fn eviction_batch(live: u64, target: u64, entries: u64) -> i64 {
+        let excess = live.saturating_sub(target);
+        let per_entry = (live / entries.max(1)).max(1);
+        let wanted = excess.div_ceil(per_entry).clamp(1, EVICTION_BATCH as u64);
+        i64::try_from(wanted).unwrap_or(1)
+    }
+
     pub fn enforce_quota(&self) -> Result<QuotaOutcome, IndexCacheError> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let conn = &inner.conn;
@@ -538,10 +561,22 @@ impl PersistentIndexCache {
         }
         let target = self.max_size_bytes / 100 * EVICTION_TARGET_PERCENT;
         let mut evicted = 0u64;
-        while Self::live_bytes(conn) > target {
+        loop {
             // Read and delete in one write transaction: another process sharing this
             // workspace's database may be writing or evicting at the same time.
             let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let live = Self::live_bytes(&tx);
+            if live <= target {
+                break;
+            }
+            // Delete only about as many entries as the excess needs, never a full
+            // `EVICTION_BATCH` by default: with fixed batches, missing the target by a few
+            // bytes after one batch deleted a whole second one, which on a cache of
+            // 1.5 batches meant all of it (and whether a run kept 500 entries or none
+            // hinged on the payload sizes, i.e. on the length of the workspace path).
+            let entries: i64 =
+                tx.query_row("SELECT count(*) FROM file_index_access", [], |r| r.get(0))?;
+            let batch = Self::eviction_batch(live, target, u64::try_from(entries).unwrap_or(0));
             // Ties on `last_accessed_at` (every entry one scan wrote or hit shares its
             // timestamp) break on the payload's rowid, i.e. its storage order, so a batch
             // frees whole pages. Breaking them on the random `cache_key` spread every
@@ -552,7 +587,7 @@ impl PersistentIndexCache {
                     "SELECT cache_key FROM file_index_access \
                      ORDER BY last_accessed_at, payload_rowid LIMIT ?1",
                 )?;
-                let rows = stmt.query_map(params![EVICTION_BATCH as i64], |r| r.get(0))?;
+                let rows = stmt.query_map(params![batch], |r| r.get(0))?;
                 rows.collect::<Result<_, _>>()?
             };
             if keys.is_empty() {
@@ -837,6 +872,73 @@ mod tests {
             rows(&cache, "file_index_access"),
             "every payload row keeps exactly one access row"
         );
+    }
+
+    /// Regression (CI flake after step 4.4): 1 500 entries against a 1 MiB quota, the shape
+    /// of `mesh-server`'s `partially_evicted_cache_indexes_exactly_like_no_cache`. With fixed
+    /// 1 000-entry batches, whether one batch reached the 80 % target depended on the payload
+    /// size (the absolute paths inside it): a few bytes short and the second batch deleted
+    /// everything. Every payload size must now land under the target with entries kept.
+    #[test]
+    fn eviction_stops_near_target_whatever_the_entry_size() {
+        const QUOTA: u64 = 1024 * 1024;
+        let target = QUOTA / 100 * EVICTION_TARGET_PERCENT;
+        for payload_len in (900..=1400).step_by(25) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache =
+                PersistentIndexCache::open(dir.path().join("index-cache.db"), QUOTA).expect("open");
+            for round in 0..3u32 {
+                let batch: Vec<CacheEntry> = (0..1500u32)
+                    .map(|i| (key(round * 10_000 + i), vec![(i % 251) as u8; payload_len]))
+                    .collect();
+                cache.put_batch(&batch);
+                let size = cache.size_bytes();
+                let kept = u64::try_from(rows(&cache, "file_index_cache")).expect("count");
+                assert!(
+                    size <= target,
+                    "payload {payload_len} round {round}: {size} bytes > target {target}"
+                );
+                // Trimmed to about the target, not emptied (an empty database is ~24 KB).
+                assert!(
+                    kept > 0 && size >= target * 3 / 4,
+                    "payload {payload_len} round {round}: only {kept} entries kept ({size} bytes)"
+                );
+            }
+            assert_eq!(cache.stats().errors, 0);
+        }
+    }
+
+    /// Regression (Windows CI flake after step 4.4): a `TRUNCATE` checkpoint waits, through
+    /// the busy handler, for every reader of an older snapshot and blocks new writers while
+    /// it waits. Run with the 5 s `busy_timeout`, one process's quota check held the write
+    /// lock for up to 5 s and another process's cache write (same 5 s budget) gave up with
+    /// `SQLITE_BUSY`. The checkpoint is best effort and must not wait on anyone.
+    #[test]
+    fn checkpoint_never_blocks_writers_behind_a_stale_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index-cache.db");
+        let writer = PersistentIndexCache::open(path.clone(), 1 << 30).expect("open writer");
+        writer.put_batch(&[(key(0), vec![0u8; 512])]);
+        // Another process in the middle of a read: its snapshot goes stale on the next write.
+        let reader = Connection::open(&path).expect("reader");
+        reader.execute_batch("BEGIN;").expect("begin");
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM file_index_cache", [], |r| r.get(0))
+            .expect("read");
+        writer.put_batch(&[(key(1), vec![1u8; 512])]);
+
+        let started = std::time::Instant::now();
+        let checker = PersistentIndexCache::open(path.clone(), 1 << 30).expect("open checker");
+        let _ = checker.enforce_quota().expect("quota check");
+        let waited = started.elapsed();
+        writer.put_batch(&[(key(2), vec![2u8; 512])]);
+        reader.execute_batch("COMMIT;").expect("commit");
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "open + quota check waited {waited:?} on a reader (holding writers off meanwhile)"
+        );
+        assert_eq!(writer.stats().errors, 0);
+        assert_eq!(checker.stats().errors, 0);
     }
 
     #[test]

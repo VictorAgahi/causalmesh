@@ -4,7 +4,7 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `a873f52`.
+> **Dernière mise à jour** : 2026-09-27 — `main` = `c234960` (passation vers la session cloud).
 
 ---
 
@@ -17,10 +17,10 @@
 | 4.5 recall gRPC TS + golden CI | ✅ mergé | #39 | — | — |
 | 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
-| 4.4-fix éviction intermittente | 🔧 en cours | `p3/4.4-fix-eviction` (pas encore poussée) | — | cause racine, correctif, preuve N/N, PR |
+| 4.4-fix éviction intermittente | 🔍 PR draft, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1), N/N sous charge Linux fait, N/N macOS/Windows en cours (reruns du même run CI), repro sur l'ancien code faite ; passer en ready après |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
-| 4.9 mémoire YAML/Markdown | 🔍 en review | #42 `p3/4.9-yaml-md-memory` | `9af9ecc` | fin de review adversariale, puis merge |
-| 4.1 diagnostics d'indexation | ⏸️ démarré puis arrêté (quota) | `p3/4.1-index-diagnostics` (draft PR éventuelle) | — | reprendre depuis la branche si elle existe, sinon tout |
+| 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
+| 4.1 diagnostics d'indexation | 🔍 PR draft, verte | #46 `p3/4.1-index-diagnostics` | `4767a9c` | code quasi complet, `main` intégré, changelog ajouté, clippy/fmt/déterminisme verts ; reste la review adversariale complète |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
@@ -37,16 +37,32 @@ Légende : ✅ mergé · 🔍 PR prête, review en cours · 🔧 correctif en co
 
 ## 2. Problèmes ouverts sur `main` ou dans les PR
 
-### 2.1 Éviction du cache intermittente (4.4, sur `main`) — MAJOR
+### 2.1 Éviction du cache intermittente (4.4, sur `main`) — MAJOR, correctif en PR #47
 `crates/mesh-server/tests/index_cache_quota.rs:340`, test `partially_evicted_cache_indexes_exactly_like_no_cache`.
 Il a échoué une fois en CI macOS (run 36304190590, tentative 1, job 108577531925) avec
 `CacheStats { hits: 0, misses: 6000, errors: 0, evicted: 6000 }`, puis il est passé à la relance.
 C'est exactement le symptôme d'origine : l'éviction vide tout le cache au lieu de redescendre à 80 %.
-Le correctif de la review (départage par `payload_rowid`, schéma v4, transaction `IMMEDIATE`) n'est
-donc pas déterministe. Pistes : la taille mesurée (base + WAL) ne baisse pas tant que le WAL n'est pas
-checkpointé, et la boucle continue d'évincer ; `incremental_vacuum` ; horodatages égaux ; timing
-macOS. **Exigence** : cause prouvée, correctif sans assouplir le test (≤ 80 % du quota **et** entrées
-conservées), N/N runs verts sous charge.
+
+**Cause prouvée** : l'éviction supprimait des lots fixes de 1 000 entrées ; un lot ratait la cible de
+80 % de quelques octets (selon la taille des entrées, elle-même dépendante de la longueur du chemin
+absolu du workspace — un `TMPDIR` long en CI macOS change cette taille), et le lot suivant vidait tout
+le reste du cache. Reproduit à 100 % sur l'ancien code (`d2a63c9^`, commit `d64d0ac`, PR #40) avec un
+`TMPDIR` long sous Linux : 8/8 échecs, même signature `CacheStats { hits: 0, misses: 6000, errors: 0,
+evicted: 6000 }`.
+
+**Correctif** (`d2a63c9`, PR #47) : chaque étape d'éviction supprime environ autant d'entrées que
+l'excès l'exige (au plus 1 000), jamais un lot fixe. Un nouveau test unitaire balaie les tailles
+d'entrée (900 à 1400 octets) sur 3 tours. Un second correctif, dans le même commit : le checkpoint WAL
+`TRUNCATE` tournait sous le `busy_timeout` de 5 s et bloquait les écrivains des autres processus
+pendant qu'il attendait un lecteur — piste probable du flake Windows `SQLITE_BUSY` (`errors: 1`,
+2.3) ; il tourne maintenant sans le busy handler.
+
+**Preuves rassemblées (session cloud)** : 14 tests unitaires de `mesh-core::index_cache` verts ; les
+6 tests d'intégration de `index_cache_quota.rs` verts ; 12/12 runs de la suite complète sous charge
+avec un `TMPDIR` long sous Linux ; clippy et fmt verts. CI GitHub verte sur les trois OS de la matrice
+(`Test Suite (ubuntu|macos|windows-latest)`) ; reruns supplémentaires du même run CI en cours pour un
+compte N/N par OS macOS/Windows (les runs disponibles n'exposent qu'un rerun du workflow entier, pas
+un rerun ciblé par job). Reste : clore le compte N/N par OS, puis passer #47 en ready.
 
 ### 2.2 Coût mémoire de `props` (4.9, PR #42)
 Il reste entre 12× et 25× la taille du fichier, au-dessus du seuil de 4×. Le coût vient du
@@ -151,9 +167,11 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 
 ## 6. Ordre de reprise recommandé
 
-1. Merger #42 (4.9) quand sa review est verte (#43 et #44 sont mergées).
-2. Correctif de l'éviction intermittente (§2.1).
-3. 4.1, puis sa review complète.
+1. ✅ #42 (4.9) mergé.
+2. Correctif de l'éviction intermittente (§2.1) : fait, PR #47 draft, verte ; passer en ready puis
+   merger avec l'accord de l'utilisateur.
+3. 4.1 (#46) : code et hygiène (clippy/fmt/changelog/déterminisme) faits ; reste la review
+   adversariale complète, puis merge.
 4. 4.12b–e, avec une review groupée.
 5. 4.7, puis sa review complète.
 6. 4.10, puis sa review complète.

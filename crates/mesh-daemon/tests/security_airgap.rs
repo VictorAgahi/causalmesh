@@ -5,7 +5,7 @@
 //! process (this test binary re-executed on an `#[ignore]`d test, selected by
 //! an environment variable), never in the shared test process.
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[path = "../src/sandbox.rs"]
 #[allow(dead_code)]

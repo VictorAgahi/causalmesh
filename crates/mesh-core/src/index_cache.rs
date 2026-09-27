@@ -184,10 +184,19 @@ impl PersistentIndexCache {
     /// [`Self::workspace_db_path`]) with a quota of `max_size_mb`.
     pub fn open_for_workspace(base_dir: &Path, max_size_mb: u64) -> Result<Self, IndexCacheError> {
         let id = crate::socket::workspace_id(base_dir);
-        Self::open(
-            Self::workspace_db_path(&id),
-            Self::quota_bytes_from_mb(max_size_mb),
-        )
+        let db_path = Self::workspace_db_path(&id);
+        // `workspaces/` itself lists every indexed workspace's id: owner-only, like the
+        // per-workspace directory `open` creates under it.
+        if let Some(workspaces) = db_path.parent().and_then(Path::parent) {
+            std::fs::create_dir_all(workspaces)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(workspaces, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        Self::open(db_path, Self::quota_bytes_from_mb(max_size_mb))
     }
 
     /// Opens (creating if absent) the cache database at `db_path` with a quota of
@@ -733,6 +742,31 @@ mod tests {
     /// Plan 4 step 4.4 exit criterion: inserting past a 10 MB test quota brings the database
     /// (file + WAL) back to at most 80 % of the quota, evicting least recently used entries
     /// first.
+    #[cfg(unix)]
+    #[test]
+    fn database_directory_and_wal_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("workspaces")
+            .join("abc")
+            .join("index-cache.db");
+        let cache = PersistentIndexCache::open(path.clone(), 1 << 30).expect("open");
+        cache.put_batch(&[(key(1), vec![1u8; 64])]);
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(path.parent().expect("dir")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_os_string();
+            side.push(suffix);
+            let side = PathBuf::from(side);
+            if side.exists() {
+                assert_eq!(mode(&side), 0o600, "{}", side.display());
+            }
+        }
+    }
+
     #[test]
     fn inserts_past_a_10mb_quota_shrink_back_under_80_percent() {
         const QUOTA: u64 = 10 * 1024 * 1024;
@@ -788,6 +822,13 @@ mod tests {
             "size {size} after eviction must be <= 80% of {QUOTA} (max seen {max_seen})"
         );
         assert_eq!(size, file_len(&path) + file_len(&wal_path(&path)));
+        // LRU trimming, not a wipe: what survives still fills most of the 80 % target
+        // (1 KB payloads, so at least half of it is ~4 000 entries).
+        let kept = rows(&cache, "file_index_cache");
+        assert!(
+            u64::try_from(kept).expect("count") * 1024 >= QUOTA / 100 * 80 / 2,
+            "eviction must stop near its target, not empty the cache: {kept} entries kept"
+        );
         for &i in &hot {
             assert!(cache.get(&key(i)).is_some(), "hot entry {i} was evicted");
         }

@@ -401,12 +401,7 @@ fn concurrent_reloads_converge_to_full_build() {
 
 /// `AppState` with a file-backed persistent cache of `quota` bytes attached, then fully
 /// built through it, the way `run --standalone` and `meshd` boot.
-fn cached_state(
-    config: Config,
-    roots: Vec<PathBuf>,
-    db: &Path,
-    quota: u64,
-) -> Arc<AppState> {
+fn cached_state(config: Config, roots: Vec<PathBuf>, db: &Path, quota: u64) -> Arc<AppState> {
     let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
     let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
     let state = Arc::new(AppState::new(config, roots, audit, rescan));
@@ -477,7 +472,10 @@ fn cached_builds_and_reloads_match_uncached() {
     let cfg = config(&["."]);
     let roots = resolved_roots(&cfg, &base);
     for (label, quota) in [("unbounded", u64::MAX), ("tiny", 1)] {
-        let db = tmp.path().join(format!("reload-{label}")).join("index-cache.db");
+        let db = tmp
+            .path()
+            .join(format!("reload-{label}"))
+            .join("index-cache.db");
         let state = cached_state(config(&["."]), roots.clone(), &db, quota);
         let mut rng = Lcg(0x5eed_0044);
         for step in 0..20 {

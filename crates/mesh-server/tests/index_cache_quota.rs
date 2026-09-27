@@ -337,5 +337,8 @@ fn partially_evicted_cache_indexes_exactly_like_no_cache() {
         );
     }
     let stats = cache.stats();
-    assert!(stats.hits > 0 && stats.evicted > 0 && stats.errors == 0, "{stats:?}");
+    assert!(
+        stats.hits > 0 && stats.evicted > 0 && stats.errors == 0,
+        "{stats:?}"
+    );
 }

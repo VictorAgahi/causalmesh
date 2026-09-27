@@ -4,7 +4,8 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `c234960` (passation vers la session cloud).
+> **Dernière mise à jour** : 2026-09-27 — `main` = `98e9414` ; texte du §4.13 (plan4-enterprise-readiness.md)
+> et §3.5 ci-dessous réécrits après relecture adversariale (sous-agent, avant tout code) — voir §3.5.
 
 ---
 
@@ -26,7 +27,7 @@
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
 | 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ⏳ à faire | — | — | tout |
 | 4.12f empreinte sans chemins absolus | ⏳ à faire (après 4.9) | — | — | tout (§3.3) |
-| 4.13 retours terrain (scope multi-racines, calibrage IDE, résilience stdio) | ⏳ à faire (après 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
+| 4.13 retours terrain (scope multi-racines `smart_search.rs`, budget payload mesuré, stdio — texte corrigé après relecture) | ⏳ à faire (après #49, #46, 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
 | 4.10 sandbox réseau Linux | ⏳ à faire (après 4.7) | — | — | tout |
 | 4.8 install pilote + `stats` | ⏳ à faire (après 4.7) | — | — | partie agent seulement (§5) |
 | 4.11 masquage des secrets | 🧑 humain | — | — | aucun code (§5) |
@@ -146,21 +147,36 @@ les p50/p95 réels, le taux d'`isError`, le taux de hit du cache d'index (compte
 `PersistentIndexCache::stats()` déjà exposés par 4.4) et les redémarrages du démon, sur un audit de
 fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 
-### 3.5 4.13 — retours terrain (REX pilote réel `meta`)
-Frictions identifiées lors de l'audit réel sur architecture NestJS multi-roots :
-1. **Scope multi-racines (`security.rs`, `smart_search.rs`)** : dans un workspace avec plusieurs racines
-   (`roots = ["ms-event", "ms-post", …]`), `anchor` vaut `meta`. Un appel avec `scope: "."` résout sur
-   ce dossier parent, qui ne commence par aucune racine -> `SandboxEscapeAttempt` (`-32602`) injustifié.
-   Correctif : `ValidatedScope` valide un scope englobant égal à `resolved_workspace_root` comme
-   `WorkspaceWide`. `SmartSearchArgs.scope` devient `Option<CompactStr>` (par défaut `None`), autorisant
-   l'agent à chercher globalement sans connaître la topologie exacte des sous-dossiers.
-2. **Calibrage du payload sous 4 Ko (`smart_search.rs`)** : `DEFAULT_LIMIT` passe de 20 à **8**.
-   À 8 signatures décapitées, le Markdown pèse 2,2 à 3,6 Ko, restant systématiquement sous la limite
-   d'interception de l'IDE (~4 Ko), évitant le débordement dans `.system_generated/.../output.txt` et
-   préservant le gain d'1 roundtrip direct pour l'agent.
-3. **Résilience du proxy stdio (`main.rs`)** : éliminer toute rupture abrupte ou crash produisant
-   l'erreur `EOF`. Émettre une réponse JSON-RPC d'erreur explicite et tolérer un délai de readiness plus
-   long, avec repli automatique en mode `standalone` in-process si le démon tarde.
+### 3.5 4.13 — retours terrain (REX pilote réel `meta`), texte du plan corrigé après relecture
+Relecture adversariale du texte d'origine (sous-agent, avant tout code) : les trois frictions sont
+réelles, mais deux des trois correctifs proposés étaient mal calibrés. Le plan (§4.13 de
+`plan4-enterprise-readiness.md`) a été réécrit en conséquence ; ce qui suit résume l'état corrigé.
+1. **Scope multi-racines (`smart_search.rs` seul, pas `security.rs`)** : le faux positif
+   `SandboxEscapeAttempt` sur `scope: "."` dans un workspace multi-racines est confirmé. Mais le
+   correctif initial (« tout ancêtre englobant toutes les racines » validé par `ValidatedScope`) ouvre
+   une brèche réelle : `/` ou `$HOME` « englobent » aussi tout avec une seule racine, et il existe un
+   test (`test_parent_directory_access_strictly_rejected`) qui exige justement ce rejet. Correctif
+   retenu : ne jamais toucher le jail ; dans `smart_search` seulement, traiter `None`/`"."`/`"*"`/le
+   `resolved_workspace_root` exact comme global **avant** l'appel au jail. Le chemin indexé n'a rien à
+   fusionner (`search_symbols(query, None)` couvre déjà tout l'index) ; seul le mode fuzzy doit boucler
+   sur les racines.
+2. **Budget payload — mesurer avant de choisir un chiffre** : le constat (payload IDE qui déborde) est
+   plausible mais **aucun chiffre n'est mesuré** sur ce dépôt (ni la taille réelle à `limit=20`, ni le
+   seuil d'interception d'un IDE donné) — la proposition initiale (`DEFAULT_LIMIT` 20→8, "2,2 à 3,6 Ko")
+   violait la règle du projet « aucun chiffre inventé ». Un compte fixe n'est de toute façon pas le bon
+   levier : une entrée peut à elle seule pomper ~3,8 Ko. Correctif retenu : mesurer d'abord sur les 3
+   corpus golden, puis réutiliser l'infrastructure de budget en octets déjà là
+   (`search_page_entry_budget`, le paramètre `budget` de `collect_indexed_page`/`collect_fuzzy_page`)
+   avec un budget de page par défaut calibré sur la mesure, plutôt qu'un nombre d'entrées arbitraire.
+3. **Résilience du proxy stdio (`main.rs`) — repli déjà en place, périmètre restreint** : le repli
+   transparent en `run_standalone` sur échec de `ensure_daemon_running` **existe déjà**. Le vrai risque
+   d'EOF est ailleurs : une course où le `connect` du proxy échoue juste après un `ensure_daemon_running`
+   réussi, et le démon qui meurt en cours de session. Le second cas ne se répare pas sans changer
+   l'architecture du proxy (zero-copy, sans trame) — deux options possibles (EOF propre journalisé, ou
+   un vrai relais NDJSON avec suivi des requêtes en vol), à trancher avant le code ; la seconde est un
+   changement de design qui mériterait sa propre sous-étape, pas un sous-point de 4.13. Le délai de
+   500 ms n'est pas la cause du symptôme (meshd ouvre son socket avant d'indexer depuis P0 1.8) : ne
+   pas y toucher.
 
 ---
 
@@ -222,7 +238,8 @@ Frictions identifiées lors de l'audit réel sur architecture NestJS multi-roots
 4. 4.12b–e, avec une review groupée (PR #49 ouverte).
 5. 4.7, puis sa review complète.
 6. 4.10, puis sa review complète.
-7. 4.13 (retours terrain scope multi-racines, calibrage IDE, résilience stdio).
+7. 4.13 (retours terrain — texte du plan corrigé après relecture adversariale, §3.5 ; nécessite aussi
+   #49 et #46 mergées, en plus de 4.7 ci-dessus).
 8. 4.6a.
 9. 4.8 (partie agent).
 10. 4.12f.

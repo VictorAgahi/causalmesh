@@ -66,7 +66,7 @@ l'utilisateur.
 | **4.10** | Sandbox réseau du démon (Linux) | Agent | `EPERM` sur connexion sortante |
 | **4.11** | Masquage des secrets dans les fixtures | **Humain** (données du pilote) | Décision fondée sur les données |
 | **4.12** | Dette : déterminisme CI, audit, fences, homonymes | Agent | Un test de non-régression par point |
-| **4.13** | Retours terrain : scope multi-racines, calibrage payload IDE, résilience stdio | Agent | Scope '.' et '*' acceptés ; payload par défaut ≤ 4 KB ; 0 EOF sur timeout démon |
+| **4.13** | Retours terrain : scope multi-racines, budget payload mesuré, résilience stdio restreinte | Agent | Scope '.' et '*' acceptés (jail inchangé) ; budget de page mesuré et documenté ; 0 EOF sur les deux cas retenus |
 
 ---
 
@@ -89,11 +89,11 @@ Fichiers de code touchés par jalon (en plus des fragments `changelog.d/`) :
 | 4.9 | `crates/mesh-core/src/properties.rs`, `docs.rs`, `crates/mesh-parsers/src/languages/spec_shape.rs` |
 | 4.10 | `crates/mesh-daemon/src/sandbox.rs` (nouveau), `crates/mesh-daemon/src/main.rs`, `Cargo.toml` (dépendance) |
 | 4.12 | `scripts/determinism.sh`, `crates/mesh-server/src/tools/mod.rs`, `crates/mesh-parsers/src/markdown.rs`, `crates/mesh-server/src/indexer.rs` (`repo_names`), `crates/mesh-server/src/lib.rs` |
-| 4.13 | `crates/mesh-core/src/security.rs`, `crates/mesh-server/src/tools/smart_search.rs`, `crates/mesh-server/src/main.rs` |
+| 4.13 | `crates/mesh-server/src/tools/smart_search.rs`, `crates/mesh-server/src/main.rs`, `crates/mesh-parsers/src/markdown.rs` (budget/en-tête), `crates/mesh-core/src/contracts.rs`/`crawler.rs` (si boucle fuzzy multi-racines). **Pas** `security.rs` (le jail n'est pas modifié). |
 
 Recouvrements : `indexer.rs` (4.1, 4.4, 4.12) ; `mesh-daemon/src/main.rs` (4.4, 4.7, 4.10) ;
-`mesh-server/src/main.rs` (4.4, 4.7, 4.13) ; `cli/doctor.rs` (4.1, 4.7) ; `markdown.rs` (4.6a, 4.12) ;
-`smart_search.rs` (4.1, 4.13).
+`mesh-server/src/main.rs` (4.4, 4.7, 4.13) ; `cli/doctor.rs` (4.1, 4.7) ;
+`markdown.rs` (4.6a, 4.12, 4.13) ; `smart_search.rs` (4.1, 4.12c, 4.13).
 Deux jalons qui se recouvrent ne tournent jamais en même temps.
 
 **Vagues** (au plus 3 jalons simultanés) :
@@ -105,7 +105,7 @@ Deux jalons qui se recouvrent ne tournent jamais en même temps.
 | 2 | 4.1 ∥ 4.6b ∥ 4.9 | 4.4 mergé (pour 4.1) |
 | 3 | 4.2 ∥ 4.6a ∥ 4.3 | 4.5 mergé (pour 4.6a) |
 | 4 | 4.7 ∥ 4.12b–e | 4.1 et 4.4 mergés |
-| 5 | 4.10 ∥ 4.8 (partie agent) ∥ 4.13 | 4.7 mergé (pour main.rs) et 4.1 mergé (pour smart_search.rs) |
+| 5 | 4.10 ∥ 4.8 (partie agent) ∥ 4.13 | 4.7 mergé (`main.rs`, aucun conflit de fichier avec 4.10/4.8) ; 4.13 attend en plus 4.12b–e mergé (`markdown.rs`, `format_search_entry`) et 4.1 mergé (`smart_search.rs`, note de rejet) |
 | Clôture | consolidation, version 6.1.0, suites de régression | tout mergé |
 
 Après chaque merge, les branches encore ouvertes intègrent `main` (rebase si la branche n'a pas
@@ -437,69 +437,110 @@ Sortie : test.
 
 ---
 
-### 4.13 — Retours terrain : ergonomie du scope multi-racines, calibrage payload IDE et résilience stdio
+### 4.13 — Retours terrain : ergonomie du scope multi-racines, budget payload IDE et résilience stdio
 
 **Constat vérifié dans le code & REX terrain.**
-Le retour d'expérience d'un pilote réel sur une architecture NestJS multi-services (dépôt `meta`)
-a mis en lumière 3 frictions opérationnelles qui freinent l'usage de MeshMCP en conditions réelles :
+Le retour d'expérience d'un pilote réel sur une architecture NestJS multi-services (dépôt `meta`) a
+signalé 3 frictions. Réécrit après relecture adversariale du texte d'origine (agent dédié, avant tout
+code) : les trois constats sont réels, mais deux des trois correctifs proposés initialement étaient
+mal calibrés — trop larges pour le premier, sans mesure pour le second. Voir chaque point ci-dessous.
 
-1. **Faux positif d'évasion de bac à sable sur `scope: "."`** :
+1. **Faux positif d'évasion de bac à sable sur `scope: "."`** — confirmé.
    Dans un workspace multi-racines (`roots = ["ms-event", "ms-post", …]`), le chemin canonique de `.`
-   est la racine globale du projet (`resolved_workspace_root`), parent direct des racines déclarées.
-   Or, `ValidatedScope::resolve_with_aliases` (`crates/mesh-core/src/security.rs:107-118`) vérifie
-   `canonical_check.starts_with(&root_check)`. Le dossier parent ne commençant par aucun de ses
-   enfants, l'appel lève `SecurityError::SandboxEscapeAttempt` (`-32602`) ! De plus, `SmartSearchArgs.scope`
-   (`crates/mesh-server/src/tools/smart_search.rs:29`) est un champ obligatoire : l'agent est obligé
-   de deviner la topologie exacte des sous-dossiers racines pour pouvoir chercher.
-2. **Débordement du payload par défaut et rupture du roundtrip unique** :
-   Dans `smart_search.rs:68`, `DEFAULT_LIMIT = 20`. Sur des symboles fréquents (`Worker`,
-   `PostProcessor`), 20 signatures décapitées avec décorateurs pèsent entre 5 Ko et 9 Ko. Bien que
-   largement sous le plafond MCP de 48 Ko, les environnements d'agents (Antigravity, Claude Code,
-   Cursor) interceptent toute réponse d'outil dépassant ~4 à 5 Ko pour l'écrire dans un fichier
-   temporaire (`output.txt`). L'agent est alors contraint d'émettre un appel `view_file` supplémentaire,
-   ce qui détruit l'avantage concurrentiel d'1 tour de MeshMCP (face aux 3 tours de `ripgrep`),
-   double la latence et invalide le cache de prompt (KV cache).
-3. **Erreur `EOF` sur le cycle de vie stdio** :
-   Lorsque l'IDE démarre `mesh-mcp` en mode proxy stdio (`crates/mesh-server/src/main.rs:146-165`),
-   si le démon `meshd` met du temps à initialiser son ingestion ou si le handshake UDS échoue,
-   le proxy se termine brutalement ou ferme `stdout`. Le client MCP reçoit alors une erreur `EOF`
-   opaque (`calling "tools/call": EOF`) au lieu d'une erreur JSON-RPC gérée, poussant l'agent à
-   abandonner le serveur.
+   est `resolved_workspace_root`, parent direct des racines déclarées. `ValidatedScope::resolve_with_aliases`
+   (`crates/mesh-core/src/security.rs`, jail check) exige `canonical_check.starts_with(&root_check)` :
+   le parent ne commence par aucun enfant, l'appel lève `SecurityError::SandboxEscapeAttempt` (`-32602`).
+   `SmartSearchArgs.scope` (`crates/mesh-server/src/tools/smart_search.rs:29`) est un champ obligatoire :
+   l'agent doit deviner la topologie exacte des racines pour chercher globalement.
+2. **Budget payload par défaut et interception IDE** — constat réel, chiffres non mesurés.
+   `DEFAULT_LIMIT = 20` (`smart_search.rs:68`). Sur des symboles fréquents, 20 signatures décapitées
+   peuvent peser plusieurs Ko, et certains environnements d'agent redirigent une réponse d'outil trop
+   grosse vers un fichier temporaire, cassant l'avantage du roundtrip unique. **Aucun chiffre de ce
+   point n'a encore été mesuré sur ce dépôt** (ni la taille réelle à `limit=20`, ni le seuil exact
+   d'interception d'un IDE donné) : à mesurer avant tout changement de valeur par défaut, comme l'exige
+   §1 (« Aucun chiffre inventé »).
+3. **Erreur `EOF` sur le cycle de vie stdio** — partiellement confirmé, le repli standalone existe déjà.
+   Le repli transparent en `run_standalone` sur échec de `ensure_daemon_running` **est déjà en place**
+   (`crates/mesh-server/src/main.rs`, la branche `Err(e) => { tracing::warn!(...) }` tombe directement
+   dans `run_standalone` juste après). Le risque d'EOF réel n'est donc pas au démarrage mais (a) une
+   course où `run_proxy_mode`'s propre `connect(...)` échoue après que `ensure_daemon_running` a réussi,
+   et (b) le démon qui meurt **en cours de session** : le `select!` du proxy se termine et le process
+   sort, sans réponse JSON-RPC. Le délai de 500 ms n'est pas la cause d'un « boot lent » : depuis P0
+   1.8, `meshd` ouvre son socket avant d'indexer et répond « still indexing » entre-temps ; l'allonger
+   ne corrige rien.
 
 **Travail.**
-1. **Scope multi-racines et global (`ValidatedScope` & `smart_search`)** :
-   - Dans `crates/mesh-core/src/security.rs` : si le chemin canonique correspond au `resolved_workspace_root`
-     (ou à un ancêtre direct englobant l'intégralité des `allowed_roots`), valider le scope sans lever
-     d'évasion sandbox. Introduire `ValidatedScope::is_workspace_wide(&self, allowed_roots: &[PathBuf]) -> bool`.
-   - Dans `crates/mesh-server/src/tools/smart_search.rs` :
-     - Passer `SmartSearchArgs.scope` en `Option<CompactStr>` (par défaut `None`), avec description mise à jour :
-       *"Target repository or directory path (OPTIONAL). Defaults to all configured workspace roots if omitted, '.' or '*'."*
-     - Dans `run` : si `scope` est `None`, `"."` ou `"*"`, la recherche ne restreint pas les résultats
-       à une racine unique mais filtre sur l'ensemble des fichiers indexés dans `state.allowed_roots`.
-2. **Calibrage du budget payload par défaut sous 4 Ko** :
-   - Dans `smart_search.rs:68` : passer `DEFAULT_LIMIT` de 20 à **8** (le plafond `MAX_LIMIT = 100`
-     reste disponible pour l'agent via `limit: N` explicite).
-   - À 8 signatures décapitées, le payload Markdown moyen se situe entre **2,2 Ko et 3,6 Ko** (toujours
-     inférieur au seuil d'interception de 4 Ko de l'IDE), garantissant l'affichage 100 % in-line.
-   - Message de pagination clair en fin de résultat : *"More results: N remaining (use `offset: 8`)"*.
-3. **Résilience stdio et repli transparent (zéro EOF)** :
-   - Dans `crates/mesh-server/src/main.rs` :
-     - Éliminer toute fermeture abrupte de `stdout`. Si la communication avec le socket `meshd` est
-       rompue ou introuvable en mode proxy, émettre immédiatement une réponse JSON-RPC valide d'erreur
-       interne (`-32603` ou `isError: true` formaté) sur `stdout` avant toute sortie.
-     - Augmenter le délai de garde et le backoff dans `ensure_daemon_running` pour tolérer un boot
-       légèrement plus long sur les dépôts multi-racines volumineux.
-     - Si le démon ne répond pas après le délai de grâce, basculer automatiquement de manière
-       transparente en mode `run_standalone` in-process pour honorer la requête plutôt que d'échouer.
+1. **Scope multi-racines et global — sans toucher au jail (`smart_search` seul, pas `security.rs`)** :
+   - Ne pas modifier `ValidatedScope::resolve_with_aliases` ni sa vérification `starts_with` : le test
+     `test_parent_directory_access_strictly_rejected` existe précisément pour ce comportement, et
+     « tout ancêtre englobant toutes les racines » ouvrirait une brèche réelle (avec une seule racine,
+     `/` ou `$HOME` « englobent » déjà tout).
+   - Dans `crates/mesh-server/src/tools/smart_search.rs` : passer `SmartSearchArgs.scope` en
+     `Option<CompactStr>` (défaut `None`), description mise à jour en conséquence. Avant tout appel à
+     `resolve_with_aliases`, traiter `None`, `"."`, `"*"` et le `resolved_workspace_root` exact comme
+     « global », **sans passer par le jail** pour ce cas précis.
+   - Chemin indexé : `ContractGraph::search_symbols(query, None)` (`contracts.rs:1317`) cherche déjà
+     dans tous les fichiers indexés en un seul passage — aucune fusion multi-racines à écrire ici.
+   - Chemin fuzzy (résultats hors index) : c'est le seul qui doit vraiment boucler. Itérer chaque racine
+     de `state.allowed_roots` avec `FilesystemCrawler::crawl_scope`, fusionner en ordre déterministe
+     (trier par racine puis par chemin), en respectant le budget de page existant.
+   - Champs qui dépendent aujourd'hui de `args.scope` comme chaîne brute et doivent gérer le cas global
+     explicitement : `subject()` (sujet d'audit), `truncation_hint`, `SearchCacheKey.raw_scope`,
+     `search_page_entry_budget`/`format_search_page` (en-tête), et le filtre `starts_with` du
+     `gap_note` (note de fichiers rejetés, 4.1).
+2. **Mesurer d'abord le payload, budgéter en octets plutôt qu'en nombre d'entrées** :
+   - Sur les 3 corpus golden (et si possible un extrait du dépôt réel du pilote), mesurer la taille
+     Markdown réelle d'une page `smart_search` à `limit=20` sur 3-5 requêtes représentatives des
+     symboles les plus fréquents. Publier les chiffres (aucun n'est encore mesuré).
+   - Le code a déjà une infrastructure de budget en octets pour la pagination
+     (`MarkdownFormatter::search_page_entry_budget`, `collect_indexed_page`/`collect_fuzzy_page`
+     prennent un `budget`) : **réutiliser ce mécanisme**, pas un nombre d'entrées fixe. Ajouter un
+     budget de page par défaut plus petit (constante nommée, à calibrer sur la mesure ci-dessus, pas
+     arbitrairement 4 Ko) passé à travers ce même paramètre `budget`, avec le nombre d'entrées comme
+     plafond secondaire seulement.
+   - Mettre à jour la description du schéma `limit` (qui documente encore « default 20 ») pour refléter
+     le nouveau comportement.
+   - Séquencement : #49 (déjà fusionné à ce stade) a changé `format_search_entry` (clôture de bloc de
+     code variable) — mesurer après ce changement, pas avant.
+3. **Résilience stdio, restreinte à ce qui est réellement réparable sans changer l'architecture du proxy** :
+   - **(a)** Dans `ensure_daemon_running`/`ensure_daemon_running_windows` : si la connexion échoue
+     juste après un `ensure_daemon_running` réussi (course), basculer en `run_standalone` au lieu de
+     remonter une erreur qui ferme `stdout`.
+   - **(b)** Pour une mort du démon en cours de session, deux options **distinctes**, à trancher avant
+     le code (pas dans le même sous-pas que (a)) :
+     - (i) accepter un EOF propre mais journalisé sur `stderr` (changement minime, cohérent avec le
+       design actuel du proxy zero-copy) ; ou
+     - (ii) faire du proxy un vrai relais avec trame (lire des lignes NDJSON, suivre les requêtes en
+       vol, répondre `-32603` pour chacune à la mort du démon) — un changement de design réel, qui
+       renonce au copy-zéro actuel (« < 2 MiB, zero-copy »), et qui devrait être *sa propre sous-étape*
+       si retenu, pas un sous-point de 4.13.
+   - Ne pas toucher au délai de 500 ms ni au backoff : ils ne sont pas la cause du symptôme observé.
+   - Appliquer le choix retenu aux deux plateformes (`ensure_daemon_running`/`run_proxy_mode` et leurs
+     équivalents Windows).
+
+**Fichiers touchés (mis à jour)** : `crates/mesh-server/src/tools/smart_search.rs`,
+`crates/mesh-server/src/main.rs`, `crates/mesh-parsers/src/markdown.rs` (budget/en-tête sur scope
+global), `crates/mesh-core/src/contracts.rs` et `crawler.rs` (si la boucle fuzzy multi-racines le
+demande), `scripts/bench/` ou un script ad hoc pour la mesure du point 2. **Pas** `security.rs`.
+
+**Prérequis (mis à jour)** : #47 et #50 mergées (`main.rs` partagé) ; #49 mergée (`markdown.rs`,
+`format_search_entry`, mesuré après elle) ; #46 mergée (le `gap_note` de 4.1 doit rester correct sur
+un scope global).
 
 **Sortie.**
-- Test d'intégration multi-racines : sur un workspace configuré avec 3 racines distinctes,
-  `smart_search` avec `scope: "."`, `scope: "*"` ou `scope: None` renvoie les résultats répartis sur
-  les 3 racines sans erreur de sandbox.
-- Test d'empreinte payload : une requête `smart_search` sur un terme générique avec la limite par défaut
-  (8) produit une sortie Markdown strictement $\le$ 4 096 octets.
-- Test de résilience stdio : un process proxy dont le socket démon est tué en cours de route renvoie
-  une réponse JSON-RPC propre ou bascule en standalone sans provoquer de fermeture `EOF` sur son `stdout`.
+- Test d'intégration multi-racines : sur un workspace à 3 racines distinctes, `smart_search` avec
+  `scope: "."`, `scope: "*"` ou `scope: None` renvoie des résultats des 3 racines sans erreur de
+  sandbox ; `scope` explicite sur une racine unique reste inchangé (comportement identique à avant) ;
+  un scope hors des racines (`/`, `$HOME`, un dossier parent qui n'est pas exactement le workspace
+  root) reste rejeté, dans les deux configurations (une racine, plusieurs racines) ; `mount_aliases`
+  continuent de fonctionner ; le mode fuzzy multi-racines ne renvoie jamais un fichier hors des racines
+  configurées.
+- Mesure publiée : taille Markdown réelle à `limit=20` sur les 3 corpus golden (chiffres Linux si
+  mesurés en cloud, étiquetés comme tels) ; budget de page par défaut choisi à partir de cette mesure,
+  documenté avec la commande qui l'a produite.
+- Test de résilience stdio : selon l'option retenue au point 3(b), un test couvrant exactement ce
+  comportement (repli standalone sur échec de connexion post-`ensure_daemon_running`, et soit l'EOF
+  propre journalisé soit la réponse `-32603` par requête en vol).
 
 ---
 

@@ -3,7 +3,10 @@
 smart_search p50/p95 against a single workspace, with pass/fail budgets.
 
 Unlike mcp_client.py (one-shot functional smoke test), this script:
-  - samples RSS of the running mesh-mcp process via `ps`,
+  - reports the server's peak memory after it exits: macOS `/usr/bin/time -l`
+    "peak memory footprint" (not `ps` RSS, which macOS memory compression
+    makes meaningless: an idle 900 MB server read 12 MB two minutes later),
+    Linux `getrusage(RUSAGE_CHILDREN).ru_maxrss` (the kernel's max RSS),
   - runs smart_search N times and reports p50/p95, not a single sample,
   - measures incremental reload latency end-to-end: touches a tracked file
     and polls smart_search until the new symbol is visible, using the real
@@ -12,6 +15,11 @@ Unlike mcp_client.py (one-shot functional smoke test), this script:
 
 Usage:
   scale_bench.py <repo_dir> <config_path> [--queries N] [--budget-json path]
+                 [--no-budget] [--no-reload]
+
+--no-budget measures without checking any budget (tier_bench.py compares the
+median of several runs instead). --no-reload skips the reload probe, which
+appends to a file: required on a repository that must not be modified.
 
 Exit code is 0 iff every measured metric is within budget (or no budget file
 given). Always prints one JSON line with the raw measurements to stdout.
@@ -20,8 +28,10 @@ import argparse
 import json
 import os
 import re
+import resource
 import subprocess
 import sys
+import tempfile
 import time
 
 TIMEOUT_S = float(os.environ.get("MESH_BENCH_TIMEOUT", "30"))
@@ -59,12 +69,26 @@ def call(proc, method, params, req_id):
     return resp, (time.monotonic() - t0) * 1000
 
 
-def rss_mb(pid):
-    try:
-        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True)
-        return int(out.strip()) / 1024.0
-    except Exception:
-        return None
+_SCAN_RE = re.compile(r"Workspace scan complete: (\d+) files, (\d+) contract nodes")
+_FOOTPRINT_RE = re.compile(r"^\s*(\d+)\s+peak memory footprint\s*$", re.MULTILINE)
+
+
+def peak_memory_mb(stderr_text):
+    """Peak memory of the (already exited and reaped) server, in MB, and its source.
+
+    macOS: the "peak memory footprint" line `/usr/bin/time -l` prints on exit
+    (bytes). Linux: `ru_maxrss` of the reaped children (KiB); the server is the
+    only child this process spawns. None when neither is available.
+    """
+    if sys.platform == "darwin":
+        m = _FOOTPRINT_RE.search(stderr_text)
+        if m:
+            return int(m.group(1)) / (1024.0 * 1024.0), "time -l peak memory footprint"
+        return None, "time -l peak memory footprint (missing)"
+    maxrss_kib = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if maxrss_kib > 0:
+        return maxrss_kib / 1024.0, "getrusage ru_maxrss"
+    return None, "getrusage ru_maxrss (zero)"
 
 
 def percentile(values, pct):
@@ -167,6 +191,8 @@ def main():
     ap.add_argument("config_path")
     ap.add_argument("--queries", type=int, default=30)
     ap.add_argument("--budget-json", default=None)
+    ap.add_argument("--no-budget", action="store_true")
+    ap.add_argument("--no-reload", action="store_true")
     args = ap.parse_args()
 
     mesh_mcp_bin = os.environ.get(
@@ -174,23 +200,30 @@ def main():
         os.path.join(os.path.dirname(__file__), "..", "..", "target", "release", "mesh-mcp"),
     )
 
-    budgets = dict(DEFAULT_BUDGETS)
-    if args.budget_json:
+    budgets = {} if args.no_budget else dict(DEFAULT_BUDGETS)
+    if args.budget_json and not args.no_budget:
         with open(args.budget_json) as f:
             budgets.update(json.load(f))
 
     env = os.environ.copy()
-    env["MESH_SOCKET_PATH"] = f"/tmp/mesh-scale-{os.path.basename(args.repo_dir)}.sock"
+    env.setdefault("MESH_SOCKET_PATH", f"/tmp/mesh-scale-{os.path.basename(args.repo_dir)}.sock")
 
     result = {"repo": os.path.basename(args.repo_dir), "ok": False, "budgets": budgets}
 
+    cmd = [mesh_mcp_bin, "--config", args.config_path, "run", "--standalone"]
+    if sys.platform == "darwin":
+        cmd = ["/usr/bin/time", "-l"] + cmd
+    # stderr goes to a file, not a pipe: a server that logs more than a pipe
+    # buffer at 200k files would otherwise block on write, and `time -l`
+    # appends its report there on exit.
+    stderr_file = tempfile.TemporaryFile(mode="w+")
     boot_t0 = time.monotonic()
     proc = subprocess.Popen(
-        [mesh_mcp_bin, "--config", args.config_path, "run", "--standalone"],
+        cmd,
         cwd=args.repo_dir,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr_file,
         text=True,
         bufsize=1,
         env=env,
@@ -207,7 +240,6 @@ def main():
             raise RuntimeError(f"initialize failed: {resp['error']}")
         boot_ms = (time.monotonic() - boot_t0) * 1000
         result["boot_ms"] = round(boot_ms, 1)
-        result["rss_after_boot_mb"] = rss_mb(proc.pid)
 
         resp, _ms = call(proc, "tools/list", {}, 2)
         if resp.get("error"):
@@ -218,9 +250,6 @@ def main():
 
         queries = ["Service", "Handler", "Worker", "Component", "handle", "new"]
         latencies = []
-        max_rss = result["rss_after_boot_mb"] or 0
-        rss_samples_ok = 1 if result["rss_after_boot_mb"] is not None else 0
-        rss_samples_total = 1
         for i in range(args.queries):
             q = queries[i % len(queries)]
             scope = scopes[i % len(scopes)]
@@ -232,27 +261,16 @@ def main():
             if resp.get("error") or resp.get("result", {}).get("isError"):
                 raise RuntimeError(f"smart_search({q!r}) failed: {resp.get('error') or resp['result']}")
             latencies.append(ms)
-            rss_samples_total += 1
-            sample = rss_mb(proc.pid)
-            if sample is not None:
-                rss_samples_ok += 1
-                max_rss = max(max_rss, sample)
 
         result["search_p50_ms"] = round(percentile(latencies, 50), 1)
         result["search_p95_ms"] = round(percentile(latencies, 95), 1)
-        # `ps` failing on every single sample (missing binary, sandboxed CI
-        # image, PID reuse) must not silently read as "0 MB, under budget" —
-        # that's a broken measurement, not a good one. Only report a peak (and
-        # let the budget check run) if at least one sample actually worked.
-        rss_measurement_failed = rss_samples_ok == 0
-        result["rss_peak_mb"] = round(max_rss, 1) if rss_samples_ok > 0 else None
 
         # Incremental reload: append a uniquely-named symbol to a generated
         # file, then poll smart_search until it's visible (FileWatcherService
         # -> WorkspaceIndexer::reload_paths, debounced). Scope must be the
         # specific root the target file lives under (see discover_scopes).
         reload_scope = scopes[0]
-        target = find_a_generated_file(reload_scope)
+        target = None if args.no_reload else find_a_generated_file(reload_scope)
         reload_ms = None
         if target:
             marker = f"ScaleBenchMarker{int(time.time() * 1000)}"
@@ -276,32 +294,53 @@ def main():
             if found:
                 reload_ms = round((time.monotonic() - reload_t0) * 1000, 1)
         result["reload_ms"] = reload_ms
+        # A probe that ran but never saw its symbol is a failed measurement,
+        # not a pass (a corpus under a git-ignored path is the usual cause).
+        result["reload_probe_failed"] = target is not None and reload_ms is None
+    except Exception as e:
+        result["error"] = str(e)
+    finally:
+        try:
+            send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            # Peak memory is only known once the server has exited on its own
+            # (stdin EOF): killing it would also kill `time -l`'s report.
+            proc.wait(timeout=float(os.environ.get("MESH_BENCH_EXIT_TIMEOUT", "120")))
+        except Exception:
+            proc.kill()
+            proc.wait()
+        stderr_file.seek(0)
+        stderr_text = stderr_file.read()
+        stderr_file.close()
 
+    # indexer.rs logs one "Workspace scan complete: N files, M contract nodes"
+    # line at boot: the number of files actually indexed (what a tier means).
+    m = _SCAN_RE.search(stderr_text)
+    if m:
+        result["files_indexed"] = int(m.group(1))
+        result["contract_nodes"] = int(m.group(2))
+    peak, source = peak_memory_mb(stderr_text)
+    result["rss_peak_mb"] = round(peak, 1) if peak is not None else None
+    result["rss_peak_source"] = source
+
+    if "error" not in result:
         violations = []
-        if rss_measurement_failed:
-            violations.append(f"rss_peak_mb=unmeasurable ({rss_samples_total} `ps` samples all failed)")
+        # An unmeasurable peak must not read as "0 MB, under budget".
+        if result["rss_peak_mb"] is None:
+            violations.append(f"rss_peak_mb=unmeasurable ({source})")
+        if result.get("reload_probe_failed"):
+            violations.append("reload_ms=unmeasured (probe symbol never became visible)")
         for key, budget in budgets.items():
             val = result.get(key)
             if val is not None and val > budget:
                 violations.append(f"{key}={val} exceeds budget {budget}")
         result["violations"] = violations
         result["ok"] = not violations
-    except Exception as e:
-        result["error"] = str(e)
-    finally:
-        try:
-            send(proc, {"jsonrpc": "2.0", "id": 999, "method": "shutdown", "params": {}})
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-        if not result.get("ok"):
-            try:
-                result["stderr_tail"] = proc.stderr.read()[-2000:]
-            except Exception:
-                pass
+    if not result.get("ok"):
+        result["stderr_tail"] = stderr_text[-2000:]
 
     print(json.dumps(result))
     sys.exit(0 if result.get("ok") else 1)

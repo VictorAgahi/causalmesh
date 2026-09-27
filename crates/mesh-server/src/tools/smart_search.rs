@@ -1,4 +1,5 @@
 use crate::protocol::RequestMeta;
+use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{
     file_stamp, AppState, CachedSearch, CompactStr, ContractNode, FileStamp, FilesystemCrawler,
@@ -96,7 +97,7 @@ enum SearchScope {
 impl SearchScope {
     fn resolve(raw: Option<&str>, state: &AppState) -> Result<Self, ToolError> {
         let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
-        if Self::is_global(raw, workspace_root) {
+        if Self::is_global(raw, workspace_root, &state.allowed_roots) {
             return Ok(Self::Global);
         }
         ValidatedScope::resolve_with_aliases(
@@ -114,7 +115,12 @@ impl SearchScope {
     /// the roots (`/`, `$HOME`, a parent of the workspace) still goes through
     /// the jail and is rejected. A global search never reads outside the
     /// configured roots, so this does not widen what can be read.
-    fn is_global(raw: Option<&str>, workspace_root: Option<&Path>) -> bool {
+    ///
+    /// A path that lexically sits inside a configured root but resolves out of
+    /// it (a symlink in a root pointing back at the workspace root) is *not*
+    /// global: it is a symlink escape, and the jail must reject it with
+    /// `-32602` like any other (Commandment 4, 4.13 review).
+    fn is_global(raw: Option<&str>, workspace_root: Option<&Path>, roots: &[PathBuf]) -> bool {
         let Some(raw) = raw else {
             return true;
         };
@@ -130,7 +136,16 @@ impl SearchScope {
         } else {
             candidate.to_path_buf()
         };
-        dunce::canonicalize(candidate).is_ok_and(|c| same_path(&c, root))
+        let Ok(canonical) = dunce::canonicalize(&candidate) else {
+            return false;
+        };
+        if !same_path(&canonical, root) {
+            return false;
+        }
+        let lexical = path_clean::clean(&candidate);
+        !roots
+            .iter()
+            .any(|r| starts_with_folded(&lexical, r) && !starts_with_folded(&canonical, r))
     }
 
     fn label<'a>(&self, raw: Option<&'a str>) -> &'a str {
@@ -139,6 +154,22 @@ impl SearchScope {
             Self::Scoped(_) => raw.unwrap_or_default(),
         }
     }
+}
+
+/// Case-folded form of a path, as the jail compares them (NFC, then
+/// lowercase on macOS/Windows).
+fn folded(p: &Path) -> PathBuf {
+    let p = mesh_core::security::to_nfc_path(p);
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        PathBuf::from(p.to_string_lossy().to_lowercase())
+    } else {
+        p
+    }
+}
+
+/// `path.starts_with(prefix)` with the jail's case folding.
+fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
+    folded(path).starts_with(folded(prefix))
 }
 
 /// Canonical path equality with the jail's case folding (macOS/Windows).
@@ -167,7 +198,7 @@ impl McpTool for SmartSearchTool {
 
     fn truncation_hint(args: &Self::Args, state: &AppState) -> Option<String> {
         let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
-        if SearchScope::is_global(args.scope.as_deref(), workspace_root) {
+        if SearchScope::is_global(args.scope.as_deref(), workspace_root, &state.allowed_roots) {
             let mut roots: Vec<String> = state
                 .allowed_roots
                 .iter()
@@ -242,9 +273,14 @@ impl McpTool for SmartSearchTool {
         // Files inside this scope the indexer rejected (plan 4 step 4.1): named in
         // a note appended last, whose size is reserved *before* the page is laid
         // out, so results share `48 KB − note` and the note is never cut.
-        let gap_note = snapshot.health.scope_note(|p| match scope_path {
-            Some(scope) => p.starts_with(scope),
-            None => state.allowed_roots.iter().any(|r| p.starts_with(r)),
+        // Only source files a search would have covered are named (images,
+        // lockfiles and prose are left to `mesh-mcp doctor`).
+        let gap_note = snapshot.health.scope_note(|p| {
+            is_indexable_source(p)
+                && match scope_path {
+                    Some(scope) => p.starts_with(scope),
+                    None => state.allowed_roots.iter().any(|r| p.starts_with(r)),
+                }
         });
         let budget = MarkdownFormatter::search_page_entry_budget(query, scope_label)
             .saturating_sub(gap_note.as_ref().map_or(0, String::len))
@@ -1364,6 +1400,54 @@ mod tests {
         assert!(note.contains("read the file directly"), "{note}");
     }
 
+    /// 4.13 review: the note names only source files a search would have
+    /// covered. An image the indexer rejected — oversized or binary — stays out
+    /// of it (it cost 1.8-1.9 KB on every golden-corpus page), next to an
+    /// oversized source file that is still named; `doctor`'s list keeps both.
+    #[tokio::test]
+    async fn rejected_image_is_not_named_in_the_note() {
+        let (_tmp, root) = py_workspace();
+        std::fs::create_dir_all(root.join("img")).expect("mkdir");
+        std::fs::write(root.join("svc.py"), "class Widget:\n    pass\n").expect("write");
+        let big_py = root.join("big.py");
+        write_oversized(&big_py);
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.resize(2048, 0);
+        std::fs::write(root.join("img/logo.png"), &png).expect("write png");
+        std::fs::write(root.join("img/hero.png"), vec![0u8; 450 * 1024]).expect("write png");
+        let state = make_state(&root, "");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        let health = state.snapshot().health.clone();
+        let rejected: Vec<String> = health
+            .rejected
+            .iter()
+            .map(|r| {
+                r.path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            rejected,
+            ["big.py", "hero.png", "logo.png"],
+            "doctor keeps all"
+        );
+        assert!(health.render_summary(10).contains("logo.png"));
+
+        let text = invoke_search(&state, "Widget", &root).await;
+        assert!(text.contains("class Widget"), "{text}");
+        assert!(
+            text.contains("1 file(s) in this scope are not indexed"),
+            "{text}"
+        );
+        assert!(text.contains("big.py"), "{text}");
+        assert!(!text.contains(".png"), "{text}");
+        let images_only = invoke_search(&state, "Widget", &root.join("img")).await;
+        assert!(!images_only.contains("not indexed"), "{images_only}");
+    }
+
     /// A rejected file outside the query's scope never shows up in its note.
     #[tokio::test]
     async fn rejected_file_outside_scope_is_not_mentioned() {
@@ -1571,6 +1655,55 @@ mod tests {
                     .any(|r| Path::new(f).starts_with(r)),
                 "{f} escaped the roots"
             );
+        }
+    }
+
+    /// 4.13 review: every spelling that *normalizes* to the workspace root is
+    /// global (`./`, `./.`, `a/..`, an absolute path through `..`, a symlink
+    /// outside the roots, other case on macOS); one that normalizes to its
+    /// parent is rejected; and a symlink *inside* a root pointing back at the
+    /// workspace root is a symlink escape, rejected with -32602 — not global.
+    #[cfg(unix)]
+    #[test]
+    fn normalized_workspace_root_spellings_and_symlink_escape() {
+        let (tmp, ws, state) = multi_root_state(&|_| String::new());
+        let outside_link = dunce::canonicalize(tmp.path())
+            .expect("canon")
+            .join("ws_link");
+        std::os::unix::fs::symlink(&ws, &outside_link).expect("symlink");
+        let ws_str = ws.to_string_lossy().into_owned();
+        let mut globals = vec![
+            "./".to_string(),
+            "./.".to_string(),
+            "a/..".to_string(),
+            format!("{ws_str}/b/.."),
+            outside_link.to_string_lossy().into_owned(),
+        ];
+        if cfg!(target_os = "macos") {
+            globals.push(ws_str.to_uppercase());
+        }
+        for scope in &globals {
+            let res = SmartSearchTool::run(&with_scope("Widget", Some(scope), false), &state);
+            assert!(
+                res.is_ok(),
+                "scope {scope} rejected: {:?}",
+                res.as_ref().err()
+            );
+            let out = res.expect("global scope");
+            let mut names = file_names(&out);
+            names.sort();
+            assert_eq!(names, ["svc_a.py", "svc_b.py", "svc_c.py"], "scope {scope}");
+        }
+        for scope in ["./..", "a/../.."] {
+            let res = SmartSearchTool::run(&with_scope("Widget", Some(scope), true), &state);
+            assert!(res.is_err(), "scope {scope} must be rejected");
+        }
+        std::os::unix::fs::symlink(&ws, ws.join("a/up")).expect("symlink in root");
+        for scope in ["a/up".to_string(), format!("{ws_str}/a/up")] {
+            let res = SmartSearchTool::run(&with_scope("Widget", Some(&scope), true), &state);
+            assert!(res.is_err(), "{scope} escaped as global");
+            let err = res.err().expect("rejected");
+            assert_eq!(err.0, -32602, "scope {scope}: {err:?}");
         }
     }
 

@@ -1049,6 +1049,80 @@ guarantees that the cost stays proportional to the file.
   extra row is the `invoice-generated-topic` hub, which has no consumer). Golden (3 corpora) stays
   100 % / 100 %; `scripts/determinism.sh`: 1 fingerprint / 13 runs on both workspaces.
 
+## 2026-09-27 — `smart_search` page payload (plan 4 step 4.13)
+
+A pilot on a multi-service NestJS workspace reported agent environments diverting large tool
+responses to a temporary file. No IDE interception threshold was measured here; what was
+measured is the real Markdown size of one default `smart_search` page, to size a byte budget
+from data instead of lowering `limit` arbitrarily.
+
+**Command** (release binary, `run --standalone`, isolated `HOME`, private short
+`MESH_SOCKET_PATH`, one config per corpus with the corpus as its only root, `scope` = the corpus
+path, `limit: 20`; macOS arm64):
+
+```bash
+cargo build --release -p mesh-server
+MESH_MCP_BIN=target/release/mesh-mcp python3 scripts/bench/search_payload.py --limit 20
+```
+
+Queries: `Service`, `Request`, `Handler`, `Client`, `get` — frequent identifier fragments in all
+three golden corpora (`~/.cache/mesh-golden`). "Entry bytes" are the rendered result entries;
+"not-indexed note" is the step 4.1 note (on these corpora it lists `.png` files) reported
+separately; the remainder is header and footer.
+
+**Before** (`main` at `b625f81`: entries capped only by `limit` 20 and the 48 KB budget):
+
+| corpus | query | page bytes | of which not-indexed note | entries | total matches | entry bytes | largest entry |
+|---|---|---:|---:|---:|---:|---:|---:|
+| online-boutique | `Service` | 15418 | 1797 | 20 | 25 | 13259 | 1147 |
+| online-boutique | `Request` | 7545 | 1797 | 13 | 13 | 5497 | 632 |
+| online-boutique | `Handler` | 8312 | 1797 | 7 | 7 | 6265 | 1146 |
+| online-boutique | `Client` | 7812 | 1797 | 7 | 7 | 5766 | 903 |
+| online-boutique | `get` | 12313 | 1797 | 20 | 35 | 10158 | 1185 |
+| bank-of-anthos | `Service` | 3303 | 1885 | 2 | 2 | 1169 | 707 |
+| bank-of-anthos | `Request` | 3015 | 1885 | 2 | 2 | 881 | 445 |
+| bank-of-anthos | `Handler` | 2134 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `Client` | 2133 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `get` | 8495 | 1885 | 13 | 13 | 6364 | 709 |
+| otel-demo | `Service` | 13569 | 1767 | 20 | 22 | 11446 | 1140 |
+| otel-demo | `Request` | 7244 | 1767 | 11 | 11 | 5232 | 747 |
+| otel-demo | `Handler` | 4284 | 1767 | 2 | 2 | 2273 | 1140 |
+| otel-demo | `Client` | 8301 | 1767 | 10 | 10 | 6290 | 1106 |
+| otel-demo | `get` | 9861 | 1767 | 20 | 46 | 7742 | 867 |
+
+**After** (entries capped at `DEFAULT_PAGE_BUDGET_BYTES` = 8 KiB, `limit` 20 as secondary cap):
+
+| corpus | query | page bytes | of which not-indexed note | entries | total matches | entry bytes | largest entry |
+|---|---|---:|---:|---:|---:|---:|---:|
+| online-boutique | `Service` | 9756 | 1797 | 11 | 25 | 7597 | 1147 |
+| online-boutique | `Request` | 7545 | 1797 | 13 | 13 | 5497 | 632 |
+| online-boutique | `Handler` | 8312 | 1797 | 7 | 7 | 6265 | 1146 |
+| online-boutique | `Client` | 7812 | 1797 | 7 | 7 | 5766 | 903 |
+| online-boutique | `get` | 10119 | 1797 | 16 | 35 | 7964 | 1185 |
+| bank-of-anthos | `Service` | 3303 | 1885 | 2 | 2 | 1169 | 707 |
+| bank-of-anthos | `Request` | 3015 | 1885 | 2 | 2 | 881 | 445 |
+| bank-of-anthos | `Handler` | 2134 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `Client` | 2133 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `get` | 8495 | 1885 | 13 | 13 | 6364 | 709 |
+| otel-demo | `Service` | 9935 | 1767 | 11 | 22 | 7812 | 1140 |
+| otel-demo | `Request` | 7244 | 1767 | 11 | 11 | 5232 | 747 |
+| otel-demo | `Handler` | 4284 | 1767 | 2 | 2 | 2273 | 1140 |
+| otel-demo | `Client` | 8301 | 1767 | 10 | 10 | 6290 | 1106 |
+| otel-demo | `get` | 9861 | 1767 | 20 | 46 | 7742 | 867 |
+
+**Why 8 KiB.** Before, every page that `limit` did not cut carried at most 6.4 KB of entries
+(`bank-of-anthos` / `get`: 13 entries, 6,364 bytes), the three pages `limit` did cut carried
+7.7–13.3 KB, and the largest single entry was 1,185 bytes. 8 KiB leaves every unsaturated page
+byte-identical, brings the heaviest page from 15,418 to 9,756 bytes (−37 %; its entries from
+13,259 to 7,597), and still holds six entries at the worst measured entry size. The rest of the
+result set stays one `offset` away, as the footer says. Not measured: the pilot's own workspace,
+and the actual threshold at which any given IDE diverts a response.
+
+**Side finding (not fixed here).** On all three corpora the step 4.1 not-indexed note costs
+1.8–1.9 KB on *every* page, including empty ones, listing image files (`.png`) the indexer was
+never meant to parse. It is outside the 8 KiB entry budget by design (4.1 guarantees it is never
+cut), but is now the second-largest part of a typical page.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

@@ -22,11 +22,12 @@ pub struct SmartSearchArgs {
     )]
     pub query: CompactStr,
 
+    #[serde(default)]
     #[schemars(
-        with = "String",
-        description = "Target repository or directory path (MANDATORY). Must resolve within configured allowed roots."
+        with = "Option<String>",
+        description = "Repository or directory to search, resolved within the configured roots. Omit it (or pass \".\" or \"*\") to search every configured root at once. DO NOT guess a parent directory of the roots: only the exact workspace root counts as global, any other path outside the roots is rejected."
     )]
-    pub scope: CompactStr,
+    pub scope: Option<CompactStr>,
 
     #[serde(default)]
     #[schemars(
@@ -42,7 +43,7 @@ pub struct SmartSearchArgs {
 
     #[serde(default)]
     #[schemars(
-        description = "Maximum number of files returned in this page (1-100, default 20). Results are ranked: exact symbol matches first. DO NOT raise it to see everything; page with `offset` or narrow `scope` instead."
+        description = "Upper bound on files returned in this page (1-100, default 20). A page also stops at about 8 KB of results, whichever comes first, so a page may hold fewer entries than `limit`. Results are ranked: exact symbol matches first. DO NOT raise it to see everything; page with the `offset` given in the 'More results' footer or narrow `scope` instead."
     )]
     pub limit: Option<u32>,
 
@@ -68,6 +69,90 @@ const MAX_SNIPPET_LINE_BYTES: usize = 256;
 const DEFAULT_LIMIT: u32 = 20;
 /// Hard ceiling on `limit`: even at the snippet cap, a page stays near the 48 KB budget.
 const MAX_LIMIT: u32 = 100;
+/// Bytes of rendered result entries one page may carry (plan 4 step 4.13). The
+/// entry count (`limit`) is only the secondary cap. Calibrated on the measured
+/// sizes of a default (`limit` 20) page over the three golden corpora
+/// (`scripts/bench/search_payload.py`, `docs/quality.md` 2026-09-27): every
+/// page that was not cut by `limit` carried at most 6.4 KB of entries, the
+/// pages `limit` did cut carried 7.7-13.3 KB, and the largest single entry was
+/// 1.2 KB. 8 KiB leaves every unsaturated page unchanged, brings the heaviest
+/// measured page from 15.4 KB down to 9.8 KB, and still fits six worst-case
+/// entries. Header, footer and the 4.1 not-indexed note come on top of it.
+const DEFAULT_PAGE_BUDGET_BYTES: usize = 8 * 1024;
+/// Header and audit label of a search over every configured root.
+const GLOBAL_SCOPE_LABEL: &str = "* (all configured roots)";
+
+/// What a `scope` argument designates.
+enum SearchScope {
+    /// Every configured root: `scope` omitted, `"."`, `"*"`, or the exact
+    /// workspace root. Decided *before* the jail, which rightly rejects the
+    /// workspace root when it is only the parent of several roots — see
+    /// [`SearchScope::is_global`].
+    Global,
+    /// A path the jail validated inside one root.
+    Scoped(ValidatedScope),
+}
+
+impl SearchScope {
+    fn resolve(raw: Option<&str>, state: &AppState) -> Result<Self, ToolError> {
+        let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
+        if Self::is_global(raw, workspace_root) {
+            return Ok(Self::Global);
+        }
+        ValidatedScope::resolve_with_aliases(
+            raw.unwrap_or_default(),
+            &state.allowed_roots,
+            &state.config.workspace.mount_aliases,
+            workspace_root,
+        )
+        .map(Self::Scoped)
+        .map_err(|e| (e.jsonrpc_code(), e.to_string()))
+    }
+
+    /// `None`, `"."`, `"*"`, or a path whose canonical form is exactly the
+    /// resolved workspace root. Nothing else: an ancestor that merely encloses
+    /// the roots (`/`, `$HOME`, a parent of the workspace) still goes through
+    /// the jail and is rejected. A global search never reads outside the
+    /// configured roots, so this does not widen what can be read.
+    fn is_global(raw: Option<&str>, workspace_root: Option<&Path>) -> bool {
+        let Some(raw) = raw else {
+            return true;
+        };
+        if matches!(raw.trim(), "." | "./" | "*") {
+            return true;
+        }
+        let Some(root) = workspace_root else {
+            return false;
+        };
+        let candidate = Path::new(raw);
+        let candidate = if candidate.is_relative() {
+            root.join(candidate)
+        } else {
+            candidate.to_path_buf()
+        };
+        dunce::canonicalize(candidate).is_ok_and(|c| same_path(&c, root))
+    }
+
+    fn label<'a>(&self, raw: Option<&'a str>) -> &'a str {
+        match self {
+            Self::Global => GLOBAL_SCOPE_LABEL,
+            Self::Scoped(_) => raw.unwrap_or_default(),
+        }
+    }
+}
+
+/// Canonical path equality with the jail's case folding (macOS/Windows).
+fn same_path(a: &Path, b: &Path) -> bool {
+    let (a, b) = (
+        mesh_core::security::to_nfc_path(a),
+        mesh_core::security::to_nfc_path(b),
+    );
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
 
 pub struct SmartSearchTool;
 
@@ -80,15 +165,31 @@ impl McpTool for SmartSearchTool {
         args._meta.as_ref()
     }
 
-    fn truncation_hint(args: &Self::Args, _state: &AppState) -> Option<String> {
+    fn truncation_hint(args: &Self::Args, state: &AppState) -> Option<String> {
+        let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
+        if SearchScope::is_global(args.scope.as_deref(), workspace_root) {
+            let mut roots: Vec<String> = state
+                .allowed_roots
+                .iter()
+                .map(|r| format!("`{}`", r.display()))
+                .collect();
+            roots.sort();
+            roots.truncate(8);
+            return Some(format!(
+                "Query '{}' across all configured roots returned max payload. Refine query or set `scope` to one root: {}.",
+                args.query,
+                roots.join(", ")
+            ));
+        }
         Some(format!(
             "Query '{}' in scope '{}' returned max payload. Refine query or specify a narrower subdirectory scope.",
-            args.query, args.scope
+            args.query,
+            args.scope.as_deref().unwrap_or_default()
         ))
     }
 
     fn subject(args: &Self::Args) -> Option<&str> {
-        Some(args.scope.as_str())
+        Some(args.scope.as_deref().unwrap_or(GLOBAL_SCOPE_LABEL))
     }
 
     /// Index-first: the contract graph already knows every declared symbol, its
@@ -97,13 +198,13 @@ impl McpTool for SmartSearchTool {
     /// The full crawl + parse of the scope is the opt-in `fuzzy` fallback. Pages
     /// are cached per snapshot generation (see [`mesh_core::SearchCache`]).
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
-        let validated_scope = ValidatedScope::resolve_with_aliases(
-            args.scope.as_str(),
-            &state.allowed_roots,
-            &state.config.workspace.mount_aliases,
-            state.config.workspace.resolved_workspace_root.as_deref(),
-        )
-        .map_err(|e| (e.jsonrpc_code(), e.to_string()))?;
+        let raw_scope = args.scope.as_deref();
+        let target = SearchScope::resolve(raw_scope, state)?;
+        let scope_label = target.label(raw_scope);
+        let scope_path: Option<&Path> = match &target {
+            SearchScope::Global => None,
+            SearchScope::Scoped(v) => Some(v.as_path()),
+        };
 
         // Note: smart_search is a read-only discovery tool. Read access to guarded contract
         // scopes (such as proto-registry) is permitted so agents can inspect schemas and signatures.
@@ -120,8 +221,9 @@ impl McpTool for SmartSearchTool {
 
         let cache_key = SearchCacheKey {
             query: args.query.clone(),
-            scope: validated_scope.as_path().to_path_buf(),
-            raw_scope: args.scope.clone(),
+            // Every global spelling renders the same page (same label).
+            scope: scope_path.map(Path::to_path_buf).unwrap_or_default(),
+            raw_scope: scope_label.into(),
             include_body: args.include_body,
             fuzzy,
             limit,
@@ -140,25 +242,29 @@ impl McpTool for SmartSearchTool {
         // Files inside this scope the indexer rejected (plan 4 step 4.1): named in
         // a note appended last, whose size is reserved *before* the page is laid
         // out, so results share `48 KB − note` and the note is never cut.
-        let scope_path = validated_scope.as_path();
-        let gap_note = snapshot.health.scope_note(|p| p.starts_with(scope_path));
-        let budget = MarkdownFormatter::search_page_entry_budget(query, args.scope.as_str())
-            .saturating_sub(gap_note.as_ref().map_or(0, String::len));
+        let gap_note = snapshot.health.scope_note(|p| match scope_path {
+            Some(scope) => p.starts_with(scope),
+            None => state.allowed_roots.iter().any(|r| p.starts_with(r)),
+        });
+        let budget = MarkdownFormatter::search_page_entry_budget(query, scope_label)
+            .saturating_sub(gap_note.as_ref().map_or(0, String::len))
+            .min(DEFAULT_PAGE_BUDGET_BYTES);
         let ranked = Self::rank_indexed_files(
-            snapshot
-                .contract_graph
-                .search_symbols(query, Some(validated_scope.as_path())),
+            snapshot.contract_graph.search_symbols(query, scope_path),
             query,
         );
 
         let (matches, page, file_stamps) = if !ranked.is_empty() {
             Self::collect_indexed_page(&ranked, &matcher, args.include_body, offset, limit, budget)
         } else if fuzzy {
-            let files = FilesystemCrawler::crawl_scope(
-                &validated_scope,
-                &state.config.workspace.exclude_patterns,
-                Some(8),
-            );
+            let files = match &target {
+                SearchScope::Scoped(scope) => FilesystemCrawler::crawl_scope(
+                    scope,
+                    &state.config.workspace.exclude_patterns,
+                    Some(8),
+                ),
+                SearchScope::Global => Self::crawl_all_roots(state),
+            };
             let (matches, page) = Self::collect_fuzzy_page(
                 &files,
                 &matcher,
@@ -176,8 +282,7 @@ impl McpTool for SmartSearchTool {
         drop(snapshot);
 
         let files_accessed: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
-        let mut text =
-            MarkdownFormatter::format_search_page(query, args.scope.as_str(), &matches, &page);
+        let mut text = MarkdownFormatter::format_search_page(query, scope_label, &matches, &page);
         if let Some(note) = &gap_note {
             text.push_str(note);
         }
@@ -267,6 +372,31 @@ fn normalize_name(s: &str) -> String {
 }
 
 impl SmartSearchTool {
+    /// Fuzzy candidates of a global search: every configured root, each one
+    /// re-validated by the jail and crawled like an explicit scope, merged in a
+    /// deterministic order (root path, then file path). A file reachable from
+    /// two nested roots is kept once.
+    fn crawl_all_roots(state: &AppState) -> Vec<PathBuf> {
+        let mut roots: Vec<&PathBuf> = state.allowed_roots.iter().collect();
+        roots.sort();
+        let mut seen = std::collections::HashSet::new();
+        let mut files = Vec::new();
+        for root in roots {
+            let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &state.allowed_roots)
+            else {
+                continue;
+            };
+            let mut part = FilesystemCrawler::crawl_scope(
+                &scope,
+                &state.config.workspace.exclude_patterns,
+                Some(8),
+            );
+            part.sort();
+            files.extend(part.into_iter().filter(|p| seen.insert(p.clone())));
+        }
+        files
+    }
+
     /// Ranks a symbol match for relevance ordering: (match_rank, kind_rank), both
     /// ascending (lower is better). `match_rank` distinguishes an exact symbol-name
     /// match from a prefix match from a plain substring match; `kind_rank` breaks
@@ -691,7 +821,7 @@ mod tests {
     fn args(scope: &str) -> SmartSearchArgs {
         SmartSearchArgs {
             query: "AuthController".into(),
-            scope: scope.into(),
+            scope: Some(scope.into()),
             include_body: false,
             fuzzy: Some(true),
             limit: None,
@@ -750,7 +880,7 @@ mod tests {
     fn search(query: &str, scope: &Path, fuzzy: bool) -> SmartSearchArgs {
         SmartSearchArgs {
             query: query.into(),
-            scope: scope.to_string_lossy().as_ref().into(),
+            scope: Some(scope.to_string_lossy().as_ref().into()),
             include_body: false,
             fuzzy: Some(fuzzy),
             limit: None,
@@ -936,7 +1066,7 @@ mod tests {
         let state = Arc::new(AppState::new(config, vec![root.clone()], audit, rescan));
 
         let mut a = search("Anchored", Path::new("pkg/sub"), true);
-        a.scope = "pkg/sub".into();
+        a.scope = Some("pkg/sub".into());
         let out = SmartSearchTool::run(&a, &state).expect("relative scope must resolve");
         assert_eq!(out.files_accessed.len(), 1, "{}", out.text);
     }
@@ -1120,16 +1250,22 @@ mod tests {
         crate::indexer::WorkspaceIndexer::reload(&state);
         let plain = search("Spelled", &root, false);
         let mut dotted = plain.clone();
-        dotted.scope = format!("{}/.", root.to_string_lossy()).as_str().into();
+        dotted.scope = Some(format!("{}/.", root.to_string_lossy()).as_str().into());
         let a = SmartSearchTool::run(&plain, &state).expect("plain");
         let b = SmartSearchTool::run(&dotted, &state).expect("dotted");
         assert!(
-            a.text.contains(&format!("(Scope: `{}`)", plain.scope)),
+            a.text.contains(&format!(
+                "(Scope: `{}`)",
+                plain.scope.as_deref().expect("scope")
+            )),
             "{}",
             a.text
         );
         assert!(
-            b.text.contains(&format!("(Scope: `{}`)", dotted.scope)),
+            b.text.contains(&format!(
+                "(Scope: `{}`)",
+                dotted.scope.as_deref().expect("scope")
+            )),
             "{}",
             b.text
         );
@@ -1297,5 +1433,251 @@ mod tests {
         assert!(!invoke_search(&state, "Keep", &root)
             .await
             .contains("not indexed"));
+    }
+    // ── Plan 4 step 4.13: global scope over several roots, default page budget ──
+
+    /// `ws/{a,b,c}` declared as three roots, `ws` as the workspace root (the
+    /// pilot's layout: the workspace root is only the roots' parent).
+    fn multi_root_state(
+        extra_toml: &dyn Fn(&Path) -> String,
+    ) -> (tempfile::TempDir, PathBuf, Arc<AppState>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = dunce::canonicalize(tmp.path()).expect("canon").join("ws");
+        let mut roots = Vec::new();
+        for name in ["a", "b", "c"] {
+            let root = ws.join(name);
+            std::fs::create_dir_all(&root).expect("mkdir");
+            std::fs::write(
+                root.join(format!("svc_{name}.py")),
+                format!(
+                    "# needle_token\nclass Widget{}:\n    pass\n",
+                    name.to_uppercase()
+                ),
+            )
+            .expect("write");
+            roots.push(root);
+        }
+        // Inside the workspace root but in no configured root.
+        std::fs::create_dir_all(ws.join("outside")).expect("mkdir");
+        std::fs::write(
+            ws.join("outside/o.py"),
+            "# needle_token\nclass WidgetOut:\n    pass\n",
+        )
+        .expect("write");
+        std::fs::write(
+            ws.join("top.py"),
+            "# needle_token\nclass WidgetTop:\n    pass\n",
+        )
+        .expect("write");
+        let esc = |p: &Path| p.to_string_lossy().replace('\\', "\\\\");
+        let extra_toml = extra_toml(&ws);
+        let cfg_str = format!(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nworkspace_root = \"{}\"\nroots = [{}]\n{extra_toml}",
+            esc(&ws),
+            roots
+                .iter()
+                .map(|r| format!("\"{}\"", esc(r)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut config = Config::load_from_str(&cfg_str).expect("config");
+        config.resolve_workspace_root(Path::new("/"));
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(config, roots, audit, rescan));
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        (tmp, ws, state)
+    }
+
+    fn with_scope(query: &str, scope: Option<&str>, fuzzy: bool) -> SmartSearchArgs {
+        SmartSearchArgs {
+            query: query.into(),
+            scope: scope.map(Into::into),
+            include_body: false,
+            fuzzy: Some(fuzzy),
+            limit: None,
+            offset: None,
+            _meta: None,
+        }
+    }
+
+    fn file_names(out: &ToolOutput) -> Vec<String> {
+        out.files_accessed
+            .iter()
+            .map(|f| {
+                Path::new(f)
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn global_scope_spellings_search_every_root() {
+        let (_tmp, ws, state) = multi_root_state(&|_| String::new());
+        let ws_str = ws.to_string_lossy().into_owned();
+        for scope in [None, Some("."), Some("*"), Some(ws_str.as_str())] {
+            let out = SmartSearchTool::run(&with_scope("Widget", scope, false), &state);
+            assert!(out.is_ok(), "scope {scope:?} rejected: {:?}", out.err());
+            let out = out.expect("global scope");
+            let mut names = file_names(&out);
+            names.sort();
+            assert_eq!(
+                names,
+                ["svc_a.py", "svc_b.py", "svc_c.py"],
+                "scope {scope:?}:\n{}",
+                out.text
+            );
+            assert!(
+                out.text
+                    .contains(&format!("(Scope: `{GLOBAL_SCOPE_LABEL}`)")),
+                "{}",
+                out.text
+            );
+        }
+        assert_eq!(
+            SmartSearchTool::subject(&with_scope("Widget", None, false)),
+            Some(GLOBAL_SCOPE_LABEL)
+        );
+        let hint =
+            SmartSearchTool::truncation_hint(&with_scope("Widget", Some("*"), false), &state)
+                .expect("hint");
+        assert!(hint.contains("all configured roots"), "{hint}");
+        assert!(hint.contains(&ws.join("b").display().to_string()), "{hint}");
+    }
+
+    /// Without the index, the fuzzy scan walks each root in order (root, then
+    /// path) and never returns a file outside the configured roots — not the
+    /// workspace root's own files, not a sibling directory of the roots.
+    #[test]
+    fn global_fuzzy_merges_roots_in_order_and_stays_inside_them() {
+        let (_tmp, _ws, state) = multi_root_state(&|_| String::new());
+        let out = SmartSearchTool::run(&with_scope("needle_token", None, true), &state)
+            .expect("global fuzzy");
+        assert_eq!(
+            file_names(&out),
+            ["svc_a.py", "svc_b.py", "svc_c.py"],
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("WidgetOut") && !out.text.contains("WidgetTop"));
+        for f in &out.files_accessed {
+            assert!(
+                state
+                    .allowed_roots
+                    .iter()
+                    .any(|r| Path::new(f).starts_with(r)),
+                "{f} escaped the roots"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_single_root_scope_is_unchanged() {
+        let (_tmp, ws, state) = multi_root_state(&|_| String::new());
+        let b = ws.join("b").to_string_lossy().into_owned();
+        let out =
+            SmartSearchTool::run(&with_scope("Widget", Some(&b), false), &state).expect("root b");
+        assert_eq!(file_names(&out), ["svc_b.py"]);
+        assert!(
+            out.text.contains(&format!("(Scope: `{b}`)")),
+            "{}",
+            out.text
+        );
+        let rel = SmartSearchTool::run(&with_scope("Widget", Some("c"), false), &state)
+            .expect("relative root c");
+        assert_eq!(file_names(&rel), ["svc_c.py"]);
+    }
+
+    /// Only the *exact* workspace root is global: `/`, `$HOME` and a parent of
+    /// the workspace still hit the jail, with several roots and with one.
+    #[test]
+    fn enclosing_ancestors_stay_rejected() {
+        let (_tmp, ws, multi) = multi_root_state(&|_| String::new());
+        let (_tmp1, single_root) = py_workspace();
+        std::fs::write(single_root.join("w.py"), "class Widget:\n    pass\n").expect("write");
+        let esc = single_root.to_string_lossy().replace('\\', "\\\\");
+        let mut config = Config::load_from_str(&format!(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nworkspace_root = \"{esc}\"\nroots = [\"{esc}\"]\n"
+        ))
+        .expect("config");
+        config.resolve_workspace_root(Path::new("/"));
+        let single = Arc::new(AppState::new(
+            config,
+            vec![single_root.clone()],
+            Arc::new(AuditLogger::new_in_memory().expect("audit")),
+            Arc::new(BackgroundRescanEngine::new().expect("rescan")),
+        ));
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        for (state, parent) in [(&multi, ws.parent()), (&single, single_root.parent())] {
+            let parent = parent.expect("parent").to_string_lossy().into_owned();
+            for scope in ["/", home.as_str(), parent.as_str(), "..", "../.."] {
+                let res = SmartSearchTool::run(&with_scope("Widget", Some(scope), true), state);
+                assert!(res.is_err(), "scope {scope} must be rejected");
+                let err = res.err().expect("rejected");
+                assert!(
+                    err.0 == -32602 || err.1.contains("not found"),
+                    "scope {scope}: {err:?}"
+                );
+            }
+        }
+        // The single-root workspace's own root is global and fine.
+        crate::indexer::WorkspaceIndexer::reload(&single);
+        let out = SmartSearchTool::run(&with_scope("Widget", Some("."), false), &single)
+            .expect("single root '.'");
+        assert_eq!(file_names(&out), ["w.py"]);
+    }
+
+    #[test]
+    fn mount_aliases_still_resolve_with_several_roots() {
+        let (_tmp, ws, state) = multi_root_state(&|ws| {
+            format!(
+                "\n[workspace.mount_aliases]\n\"/workspace/b\" = \"{}\"\n",
+                ws.join("b").to_string_lossy().replace('\\', "\\\\")
+            )
+        });
+        let _ = ws;
+        let out = SmartSearchTool::run(&with_scope("Widget", Some("/workspace/b"), false), &state)
+            .expect("aliased root");
+        assert_eq!(file_names(&out), ["svc_b.py"]);
+        let unaliased =
+            SmartSearchTool::run(&with_scope("Widget", Some("/workspace/a"), false), &state);
+        assert!(unaliased.is_err(), "no alias for /workspace/a");
+    }
+
+    /// A default page stops at [`DEFAULT_PAGE_BUDGET_BYTES`] of entries even
+    /// though `limit` (20) is not reached, and says where to resume.
+    #[test]
+    fn default_page_stops_at_the_byte_budget() {
+        let (_tmp, root) = py_workspace();
+        for i in 0..20 {
+            let mut src = format!("class Heavy{i:02}:\n");
+            for j in 0..12 {
+                src.push_str(&format!("    field_{j} = \"{}\"\n", "v".repeat(60)));
+            }
+            std::fs::write(root.join(format!("h{i:02}.py")), src).expect("write");
+        }
+        let state = make_state(&root, "");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        let out = SmartSearchTool::run(&search("Heavy", &root, false), &state).expect("page");
+        let shown = out.files_accessed.len();
+        assert!(shown > 1 && shown < 20, "{shown} entries");
+        let entries: usize = out
+            .text
+            .split("### [")
+            .skip(1)
+            .map(|e| e.len() + "### [".len())
+            .sum();
+        assert!(
+            entries <= DEFAULT_PAGE_BUDGET_BYTES + 200,
+            "{entries} bytes"
+        );
+        assert!(
+            out.text.contains(&format!("`offset: {shown}`")),
+            "{}",
+            out.text
+        );
     }
 }

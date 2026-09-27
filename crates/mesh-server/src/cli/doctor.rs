@@ -499,6 +499,7 @@ impl DoctorCommand {
         checks
     }
 
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn check_socket(
         workspace: &Option<(PathBuf, String)>,
         fix: bool,

@@ -220,6 +220,13 @@ fn child_index_shared_workspace() {
     let Some(ws) = std::env::var_os(CHILD_ENV) else {
         return;
     };
+    // The parent captures this process's stderr and prints it only on failure: without a
+    // subscriber, `PersistentIndexCache::record_error`'s `tracing::warn!` goes nowhere, and a
+    // failure shows a bare error count with no SQLite error text to diagnose it from.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter("warn")
+        .try_init();
     let ws = PathBuf::from(ws);
     let go = PathBuf::from(std::env::var_os(GO_ENV).expect("go file"));
     let quota_mb: u64 = std::env::var(SHARED_QUOTA_MB_ENV)

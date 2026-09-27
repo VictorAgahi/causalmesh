@@ -491,6 +491,7 @@ impl DoctorCommand {
 
         Self::check_socket(&workspace, fix, &mut checks);
         Self::check_daemon_version(&workspace, fix, &mut checks);
+        Self::check_daemon_sandbox(&workspace, &mut checks);
         Self::check_legacy_global_cache(fix, &mut checks);
         Self::check_workspace_cache(&workspace, fix, &mut checks);
         Self::check_audit_db(&mut checks);
@@ -657,6 +658,52 @@ impl DoctorCommand {
         checks.push(check);
     }
 
+    /// Plan 4 step 4.10: whether the running `meshd` actually confined itself.
+    /// By default it only logs a warning and keeps serving when the kernel
+    /// refuses its seccomp filter, so this is where the degraded mode shows.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables, clippy::ptr_arg))]
+    fn check_daemon_sandbox(workspace: &Option<(PathBuf, String)>, checks: &mut Vec<DoctorCheck>) {
+        #[cfg(target_os = "linux")]
+        {
+            const NAME: &str = "Daemon network sandbox";
+            let Some((_, workspace_id)) = workspace else {
+                return;
+            };
+            let Some(meta) = mesh_core::socket::read_daemon_meta(workspace_id) else {
+                return;
+            };
+            // Only a PID confirmed to serve this workspace's socket right now
+            // (same PID-reuse guard as `check_daemon_version`).
+            if !mesh_core::socket::daemon_is_reachable(workspace_id) {
+                return;
+            }
+            let daemon = std::fs::read_to_string(format!("/proc/{}/status", meta.pid));
+            let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            checks.push(match daemon.map(|d| seccomp_confined(&d, &own)) {
+                Ok(Some(true)) => DoctorCheck::ok(
+                    NAME,
+                    format!(
+                        "meshd (pid {}) runs under its seccomp filter (no AF_INET/AF_INET6 sockets)",
+                        meta.pid
+                    ),
+                ),
+                Ok(Some(false)) => DoctorCheck::warn(
+                    NAME,
+                    format!(
+                        "meshd (pid {}) is NOT confined: the kernel refused its seccomp filter (see \
+                         its log), or it predates plan 4 step 4.10. Set MESH_DAEMON_SANDBOX=required \
+                         to make meshd refuse to start instead",
+                        meta.pid
+                    ),
+                ),
+                Ok(None) | Err(_) => DoctorCheck::info(
+                    NAME,
+                    format!("could not read the seccomp state of meshd (pid {})", meta.pid),
+                ),
+            });
+        }
+    }
+
     fn check_legacy_global_cache(fix: bool, checks: &mut Vec<DoctorCheck>) {
         let path = PersistentIndexCache::legacy_global_db_path();
         if !path.exists() {
@@ -804,5 +851,57 @@ impl DoctorCommand {
             }
         }
         ok
+    }
+}
+
+/// Whether a process whose `/proc/<pid>/status` is `daemon` carries a seccomp
+/// filter of its own, beyond those this process (`own`, same container or
+/// session) already inherits — a container runtime's default filter must not
+/// pass for `meshd`'s. `None` when `daemon` has no `Seccomp:` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn seccomp_confined(daemon: &str, own: &str) -> Option<bool> {
+    let field = |status: &str, key: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    let mode = field(daemon, "Seccomp:")?;
+    if mode != 2 {
+        return Some(false);
+    }
+    // `Seccomp_filters` exists since Linux 5.9; older kernels only tell the mode.
+    match (
+        field(daemon, "Seccomp_filters:"),
+        field(own, "Seccomp_filters:"),
+    ) {
+        (Some(daemon_filters), Some(own_filters)) => Some(daemon_filters > own_filters),
+        _ => Some(true),
+    }
+}
+
+#[cfg(test)]
+mod sandbox_check_tests {
+    use super::seccomp_confined;
+
+    #[test]
+    fn seccomp_confined_reads_mode_and_filter_count() {
+        let unconfined = "Name:\tmeshd\nSeccomp:\t0\nSeccomp_filters:\t0\n";
+        let confined = "Name:\tmeshd\nSeccomp:\t2\nSeccomp_filters:\t1\n";
+        let own_bare = "Seccomp:\t0\nSeccomp_filters:\t0\n";
+        assert_eq!(seccomp_confined(unconfined, own_bare), Some(false));
+        assert_eq!(seccomp_confined(confined, own_bare), Some(true));
+        // Inside a container whose runtime already applies one filter to
+        // everything: mode 2 alone does not prove meshd confined itself.
+        let own_container = "Seccomp:\t2\nSeccomp_filters:\t1\n";
+        assert_eq!(seccomp_confined(confined, own_container), Some(false));
+        let confined_in_container = "Seccomp:\t2\nSeccomp_filters:\t2\n";
+        assert_eq!(
+            seccomp_confined(confined_in_container, own_container),
+            Some(true)
+        );
+        // Pre-5.9 kernel: no filter count, the mode is all there is.
+        assert_eq!(seccomp_confined("Seccomp:\t2\n", ""), Some(true));
+        assert_eq!(seccomp_confined("Name:\tmeshd\n", own_bare), None);
     }
 }

@@ -2,7 +2,12 @@
 //!
 //! Re-exports canonical implementation from `mesh_core::socket`.
 
-pub use mesh_core::socket::{cleanup_stale_socket, socket_path_for, workspace_id};
+pub use mesh_core::socket::workspace_id;
+
+// Only `meshd`'s Unix path uses these (its Windows build speaks named pipes);
+// the unit tests below exercise them on every OS.
+#[cfg(any(unix, test))]
+pub use mesh_core::socket::{cleanup_stale_socket, socket_path_for};
 
 #[cfg(windows)]
 pub use mesh_core::socket::pipe_name_for;

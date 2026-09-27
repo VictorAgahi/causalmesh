@@ -798,7 +798,9 @@ mod tests {
         let e = logger
             .record_entry("s", None, "smart_search", "{}", "SUCCESS", vec![], 0)
             .expect("entry");
-        logger.record_tool_latency(e.entry_seq, 1234).expect("latency");
+        logger
+            .record_tool_latency(e.entry_seq, 1234)
+            .expect("latency");
         logger.record_index_cache_pass(1, 2, 0).expect("cache");
         logger.record_process_start("meshd", "/ws").expect("start");
         assert!(AuditLogger::verify_db(&db).expect("verify"));

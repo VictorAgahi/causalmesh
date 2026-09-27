@@ -523,10 +523,16 @@ mod tests {
 
         // meshd: 3 starts on /ws/a, 1 on /ws/b; a standalone mesh-mcp start is not a daemon.
         for _ in 0..3 {
-            logger.record_process_start("meshd", "/ws/a").expect("start");
+            logger
+                .record_process_start("meshd", "/ws/a")
+                .expect("start");
         }
-        logger.record_process_start("meshd", "/ws/b").expect("start");
-        logger.record_process_start("mesh-mcp", "/ws/a").expect("start");
+        logger
+            .record_process_start("meshd", "/ws/b")
+            .expect("start");
+        logger
+            .record_process_start("mesh-mcp", "/ws/a")
+            .expect("start");
 
         let entries = AuditLogger::read_entries(&db_file, None).expect("entries");
         let metrics = AuditLogger::read_metrics(&db_file, None).expect("metrics");
@@ -576,10 +582,15 @@ mod tests {
         assert!(out.contains("0.300ms"), "{out}");
         assert!(out.contains("50.0%"), "{out}");
         assert!(
-            out.contains("Index cache: hit rate 70.0% (35 hits / 50 lookups over 2 indexing passes"),
+            out.contains(
+                "Index cache: hit rate 70.0% (35 hits / 50 lookups over 2 indexing passes"
+            ),
             "{out}"
         );
-        assert!(out.contains("Daemon: 2 restarts (4 meshd starts over 2 workspaces"), "{out}");
+        assert!(
+            out.contains("Daemon: 2 restarts (4 meshd starts over 2 workspaces"),
+            "{out}"
+        );
         assert!(!out.to_lowercase().contains("tokens saved:"), "{out}");
         eprint!("{out}");
     }

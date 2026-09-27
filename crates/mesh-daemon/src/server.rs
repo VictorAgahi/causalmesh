@@ -938,9 +938,16 @@ mod windows_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_named_pipe_server(&pipe_name_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_named_pipe_server(
+                &pipe_name_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

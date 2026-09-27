@@ -49,3 +49,49 @@ jobs:
         with:
           name: scale-bench-5k
           path: /tmp/scale-bench-5k.json
+
+  # Step 4.3: the 50k tier. Budgets are compared against the median of 3 cold
+  # runs (fresh HOME per run), the same statistic they were derived from
+  # (scripts/bench/budgets-50k.json, "linux" section = GitHub ubuntu-latest
+  # numbers, not the macOS ones). The 200k tier stays manual (docs/quality.md).
+  # Corpus: ~195 MB plain + ~242 MB contract mix under /tmp, generated here.
+  scale-bench-50k:
+    name: "Scale Bench (synthetic, 50k files, 3 cold runs)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Rust stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Rust Cache"
+        uses: Swatinem/rust-cache@v2
+
+      - name: "Compile Release Binary with Thin LTO & mimalloc"
+        run: cargo build --workspace --release
+
+      - name: "50k plain: 3 cold runs against budgets-50k.json"
+        env:
+          MESH_MCP_BIN: ${{ github.workspace }}/target/release/mesh-mcp
+        run: |
+          df -h /tmp
+          python3 scripts/bench/tier_bench.py --files 50000 --runs 3 --propose \
+            --budget-json scripts/bench/budgets-50k.json --out /tmp/tier-50k-plain.json
+
+      - name: "50k contract mix: 3 cold runs against budgets-50k.json"
+        if: success() || failure()
+        env:
+          MESH_MCP_BIN: ${{ github.workspace }}/target/release/mesh-mcp
+        run: |
+          python3 scripts/bench/tier_bench.py --files 50000 --contracts --runs 3 --propose \
+            --budget-json scripts/bench/budgets-50k.json --out /tmp/tier-50k-contracts.json
+          df -h /tmp
+
+      - name: "Upload bench results"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-bench-50k
+          path: /tmp/tier-50k-*.json

@@ -26,7 +26,8 @@ skill lists the invariants a change must not break and how to check.
 - **Snapshot**: [`crates/mesh-core/src/state.rs`](../../../crates/mesh-core/src/state.rs)
   (`ArcSwap<MeshSnapshot>`, `snapshot()`, `install_snapshot()`)
 - **Parser cache**: [`crates/mesh-parsers/src/guard.rs`](../../../crates/mesh-parsers/src/guard.rs)
-  (`AstGuard::with_parser`, thread-local `[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]`)
+  (`AstGuard::parse_with` for indexing and `AstGuard::with_parser` for on-demand decapitation,
+  each with a thread-local `[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]`)
 - **Precompiled patterns**: [`crates/mesh-parsers/src/languages/mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs)
   (`CompiledPattern::compile_all`)
 - **Compiled excludes**: [`crates/mesh-core/src/crawler.rs`](../../../crates/mesh-core/src/crawler.rs) (`ExcludeMatcher`)
@@ -34,8 +35,10 @@ skill lists the invariants a change must not break and how to check.
   (`within_size_budget`) and [`crates/mesh-core/src/vfs.rs`](../../../crates/mesh-core/src/vfs.rs) (`is_unchanged_fast`)
 - **Blocking boundary**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
   (`spawn_blocking` in `ToolRegistry::invoke`) and [`crates/mesh-core/src/rescan.rs`](../../../crates/mesh-core/src/rescan.rs)
-- **Measurement**: [`crates/mesh-server/benches/real_benchmarks.rs`](../../../crates/mesh-server/benches/real_benchmarks.rs)
-  and `test_real_benchmarks_regression_budgets` in
+- **Measurement**: [`docs/benchmarks.md`](../../../docs/benchmarks.md) (every harness),
+  `scripts/bench/scale_bench.py` + `scripts/bench/budgets.json` (nightly budgets),
+  [`crates/mesh-server/benches/real_benchmarks.rs`](../../../crates/mesh-server/benches/real_benchmarks.rs)
+  (micro-benchmarks) and `test_real_benchmarks_regression_budgets` in
   [`crates/mesh-server/tests/integration_tests.rs`](../../../crates/mesh-server/tests/integration_tests.rs)
 
 ---
@@ -65,7 +68,7 @@ files) or clone the `Arc`.
 
 ### 2.3 Never linear-scan the graph
 
-`ContractGraph` carries six secondary indices precisely so no query walks `nodes`.
+`ContractGraph` carries seven secondary indices precisely so no query walks `nodes`.
 `nodes.values().find(...)` in a query or in `reconcile_edges` is a bug, not a style issue:
 `reconcile_edges` is documented as linear in nodes + edges and used to be O(E²).
 
@@ -77,7 +80,7 @@ Use the index that matches the key you have:
 | package / module id | `package_to_nodes` |
 | a file | `get_nodes_for_file()` / `file_to_nodes` |
 | `package/Name` for an RPC | `fqcn_to_node` |
-| an import string | `resolve_import_target()` |
+| an import string | `resolve_import_targets()` (private, used by `reconcile_edges`) |
 | a topic (lowercased) | `topic_producers` / `topic_consumers` |
 
 Edge de-duplication goes through `HashSet<(NodeId, NodeId, EdgeKind)>`, seeded once:
@@ -108,12 +111,13 @@ per-file `format!("{:?}").to_lowercase()`. Precompute at index time, not per req
 
 ### 2.5 Build expensive objects once
 
-- **Tree-sitter parsers**: `AstGuard::with_parser(lang_kind, |parser| ...)` keeps one
-  parser per language per thread in a `thread_local!`; `Parser::new` + `set_language` is
-  C-FFI allocation and grammar binding. `create_bounded_parser` is the constructor behind
-  it and is the right call only in `verify_all_parsers`-style checks — never per file.
-  `with_parser` also calls `parser.reset()` afterwards, because a timed-out parse leaves
-  the parser mid-state.
+- **Tree-sitter parsers**: `AstGuard::parse_with(lang_kind, content, timeout, |tree| ...)`
+  (indexing) and `AstGuard::with_parser(lang_kind, |parser| ...)` (on-demand decapitation)
+  each keep one parser per language per thread in a `thread_local!`; `Parser::new` +
+  `set_language` is C-FFI allocation and grammar binding. `create_bounded_parser` is the
+  constructor behind them and is the right call only in `verify_all_parsers`-style checks —
+  never per file. Both call `parser.reset()` afterwards, because a timed-out parse leaves the
+  parser mid-state. Parse each file once and hand the `&Tree` to the extractor.
 - **Regexes**: `CompiledPattern::compile_all(&[CustomPatternConfig])` once per run, then
   `PolyglotIndexer::extract_custom_patterns`. `apply_custom_patterns` recompiles on every
   call — its own doc comment says to prefer the compiled path.
@@ -141,7 +145,8 @@ paid only for files that already look changed.
 
 ### 2.7 Borrow query results, do not clone nodes
 
-`GrpcTrace<'g>` and `ImpactFlow<'g>` hold `Vec<&'g ContractNode>`, and `find_dependents`
+`GrpcTrace<'g>`, `ImpactFlow<'g>` and `ImpactMatrix<'g>` hold borrowed `&'g ContractNode`s
+(with an `EdgeConfidence` where relevant), and `find_dependents`
 and `search_symbols` return `Vec<&ContractNode>`. The snapshot guard the caller holds
 keeps them alive. Cloning a `ContractNode` per result per request is exactly what the
 formatter never needed. If a lifetime fights you, hold the guard longer — do not `clone()`.
@@ -161,8 +166,8 @@ The three indices live in one `MeshSnapshot` so a reader cannot observe a new
 
 Disk, tree-sitter and SQLite work runs either in `spawn_blocking` (`ToolRegistry::invoke`)
 or on the Rayon pools. `McpTool::run` is synchronous for that reason. Background rescans
-go through `BackgroundRescanEngine`, whose threads are `QOS_CLASS_BACKGROUND` on macOS and
-`nice 10` on Linux (Commandment 7); use `install` when the closure itself contains a
+go through `BackgroundRescanEngine`, whose threads are `QOS_CLASS_BACKGROUND` on macOS,
+`nice 10` on Linux and below-normal priority on Windows (Commandment 7); use `install` when the closure itself contains a
 `par_iter`, `spawn` when it does not.
 
 ### 2.10 Parallel extraction, sequential fold
@@ -175,7 +180,9 @@ must be pure and `Send`, and must not take `&mut ContractGraph`. See
 ### 2.11 Bound every output
 
 `MAX_OUTPUT_BYTES = 48 * 1024` is checked before appending each entry in
-`MarkdownFormatter::format_search_results`, and snippets are additionally capped per line.
+`MarkdownFormatter::format_search_page`, `smart_search` stops a page at
+`DEFAULT_PAGE_BUDGET_BYTES` (8 KiB) of rendered results, snippets are capped per line, and
+`ToolRegistry::invoke` truncates any remaining overflow at 48 KB with a narrowing note.
 An unbounded `format!` into a response body is a context-window regression even when it is
 fast.
 
@@ -206,9 +213,12 @@ The non-regression budgets that run in CI are in
 let budget_ms = if cfg!(debug_assertions) { 150 } else { 15 };
 ```
 
-decapitating one TypeScript controller, tied to the 15 ms C-FFI timeout budget
-(`AstGuard::PARSER_TIMEOUT_MICROS = 15_000`), plus an assertion that decapitation saves
-more than 50% of the raw character count (`len() / 4` as a token proxy). Tighten those
+decapitating one TypeScript controller in under 15 ms (release), plus an assertion that
+decapitation removes more than half of that one sample's characters (`len() / 4` as a token
+proxy). Both are regression guards on a single sample, not a measurement of token savings in
+general; do not quote them as one. The 15 ms figure is no longer tied to any parser timeout
+(indexing uses `INDEX_PARSE_TIMEOUT_MICROS` = 2 s, decapitation `QUERY_PARSE_TIMEOUT_MICROS`
+= 500 ms). Tighten those
 budgets only with a measurement; loosening one is an admission of a regression and needs
 saying out loud in the PR.
 

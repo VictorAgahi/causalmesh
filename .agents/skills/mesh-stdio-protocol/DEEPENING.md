@@ -98,20 +98,14 @@ returns, and the process exits while the final frame is still in the `BufWriter`
 symptom is a test or CI step that pipes one request in with `echo` and gets no response
 back — the exact race the comment records.
 
-`run_proxy_mode` has the same hazard in a different shape:
-
-```rust
-tokio::select! {
-    _ = stdin_to_daemon => {
-        let _ = (&mut daemon_to_stdout).await;
-    }
-    _ = daemon_to_stdout => {}
-}
-```
-
-If stdin closes first (a piped `echo`), the proxy must keep waiting for the daemon to
-finish writing. If the daemon disconnects first, there is nothing left to drain and the
-proxy exits immediately.
+The proxy's `bridge` (`crates/mesh-server/src/main.rs`) has the same hazard in a different
+shape. If stdin closes first (a piped `echo`), it records that the client ended the session,
+shuts down the daemon write half, and keeps copying until the daemon has finished writing. If
+the daemon disconnects first, there is nothing left to drain: `bridge` returns
+`ProxyEnd::DaemonClosed` and `finish_proxy_session` logs the cause and exits with status 1
+(returning normally would leave Tokio's blocking stdin reader keeping the process alive with
+stdout open). The tests `client_closing_stdin_drains_daemon_and_ends_cleanly` and
+`daemon_closing_first_is_reported_as_daemon_closed` pin both orders.
 
 ---
 

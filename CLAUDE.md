@@ -1,8 +1,8 @@
 # CLAUDE.md — Claude Code Developer Directives for MeshMCP
 
-> **Project**: MeshMCP (RFC-001 Rev. 2.9.0)  
-> **Repository**: `causalmesh/mesh-mcp`  
-> **Environment**: Rust 1.80+ (macOS, Linux, WSL2)
+> **Project**: MeshMCP (version: `[workspace.package]` in `Cargo.toml`)  
+> **Repository**: `VictorAgahi/causalmesh`  
+> **Environment**: stable Rust, no pinned MSRV (CI: macOS, Linux, Windows)
 
 ---
 
@@ -15,7 +15,7 @@ All CLI commands are optimized through the **RTK (Rust Token Killer)** proxy hoo
 # Build workspace in debug mode
 cargo build --workspace
 
-# Build optimized release binary with Thin LTO and mimalloc (6.8 MB)
+# Build optimized release binaries (thin LTO, mimalloc)
 cargo build --workspace --release
 
 # Run all unit and integration tests across workspace
@@ -49,7 +49,7 @@ Claude Code must strictly enforce these invariants on every edit:
    - `mimalloc` is the global allocator.
    - Use `compact_str::CompactString` for symbols, paths, and IDs (<= 24 bytes inline stack).
    - Use `RepoId = u16` for repository indexing (up to 65,535 repos).
-   - Use `ArcSwap<MeshSnapshot>` for lock-free state reads (0ns contention).
+   - Use `ArcSwap<MeshSnapshot>` for lock-free state reads (readers never wait on a lock).
 2. **Bounded Tree-Sitter & IOPS (`AstGuard`)**:
    - Files > 384 KB or lines > 1,024 bytes must be rejected.
    - Null-byte sniffing over first 4,096 bytes.
@@ -64,7 +64,8 @@ Claude Code must strictly enforce these invariants on every edit:
    - A parse failure during indexing is a counted `IndexHealth` event
      (`FileIndex::parse_failed`), retried once sequentially outside the contended
      pool — never silently folded as if the file were empty.
-   - Query cursor match limit: 10,000 steps.
+   - Query cursor: match limit 500 (`QUERY_MATCH_LIMIT`), iteration cap 10,000 steps
+     (`MAX_QUERY_STEPS`).
 3. **Stdio Isolation & Affordance Truncation**:
    - `stdout` is reserved exclusively for the `StdioFramingActor` via `BufWriter<Stdout>`.
    - **Never** write to `stdout` via `println!`, `print!`, or `dbg!`.
@@ -74,7 +75,8 @@ Claude Code must strictly enforce these invariants on every edit:
    - Never accept raw `PathBuf` or string paths in query engines.
    - Use `ValidatedScope::resolve()` which applies `path_clean::clean()`, `dunce::canonicalize()`, and case-folding.
    - Enforce `follow_links(false)` on all filesystem walks.
-   - Path traversal or symlink escape must return JSON-RPC error code `-32602`.
+   - Path traversal or symlink escape must return JSON-RPC error code `-32602` (classified
+     `-32602` and, per the MCP spec, delivered to the client as a tool result with `isError: true`).
 5. **Strict Schemas & Negative Prompting**:
    - Derive schemas using `schemars::JsonSchema` with `#[serde(deny_unknown_fields)]`.
    - Include negative constraints in tool descriptions.
@@ -93,7 +95,7 @@ Claude Code must strictly enforce these invariants on every edit:
 
 - **Pure Rust**: No mock code, no stubs (`todo!()`, `unimplemented!()`).
 - **Zero Unwrap in Production**: Use `?` operator and `thiserror` for error management. `unwrap()` is strictly forbidden outside `#[cfg(test)]`.
-- **AST Decapitation**: Strip function bodies into `{ /* stripped */ }` or `...` to minimize token consumption (measured 54-69% fewer tokens depending on language; run `cargo bench -p mesh-server`).
+- **AST Decapitation**: Strip function bodies into `{ /* stripped */ }` or `...` to minimize token consumption (the reduction depends on the file; no general figure is claimed until the pilot A/B in `docs/pilot-scorecard.md` measures agent token use).
 - **Markdown Payloads**: Format tool outputs in dense GitHub Flavored Markdown rather than raw JSON (avoids escaping overhead).
 
 ---
@@ -103,4 +105,4 @@ Claude Code must strictly enforce these invariants on every edit:
 - 6 MCP Tools & Schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md)
 - Developer & Tree-sitter guide: [`docs/development.md`](docs/development.md)
 - Governance & RSAH: [`docs/governance-rsah.md`](docs/governance-rsah.md)
-- Performance & Token benchmarks: [`docs/benchmarks.md`](docs/benchmarks.md)
+- Measurement harnesses: [`docs/benchmarks.md`](docs/benchmarks.md); dated results: [`docs/quality.md`](docs/quality.md)

@@ -114,18 +114,21 @@ parser.reset();
 Some(out)
 ```
 
-`set_timeout_micros(PARSER_TIMEOUT_MICROS)` makes `parser.parse()` return `None` when it
-runs out of budget, but the parser keeps its partial state and, without `reset()`, the
-*next* file parsed on that thread resumes from it. The timeout is set once at construction
-in `create_bounded_parser`, so every parser handed out by `with_parser` is bounded for its
-whole life; only the state needs clearing.
+`set_timeout_micros(..)` makes `parser.parse()` return `None` when it runs out of budget, but
+the parser keeps its partial state and, without `reset()`, the *next* file parsed on that
+thread resumes from it. `create_bounded_parser` sets `QUERY_PARSE_TIMEOUT_MICROS` at
+construction, so every parser handed out by `with_parser` is bounded for its whole life;
+`parse_with` additionally sets its caller's budget (`INDEX_PARSE_TIMEOUT_MICROS` for
+indexing) before each parse. Only the state needs clearing.
 
 The slot array is indexed by `tree_sitter_slot()` and sized by `TREE_SITTER_COUNT`:
 
 ```rust
 static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
-    const { RefCell::new([None, None, None, None, None, None]) };
+    const { RefCell::new([ None, None, /* ... one per slot, 13 today */ ]) };
 ```
+
+(`parse_with`'s `INDEX_PARSERS` is the same shape.)
 
 Adding a variant without extending both the slot mapping and this initialiser is a
 compile error at best and a wrong-grammar parse at worst. `Protobuf`, `Yaml` and `Unknown`

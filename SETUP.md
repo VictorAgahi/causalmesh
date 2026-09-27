@@ -37,7 +37,9 @@ exec $SHELL
 mesh-mcp --version
 ```
 
-Prebuilt targets: macOS (Apple Silicon and Intel), Linux x86-64 (gnu and musl), Windows x86-64.
+`install.sh` downloads the rolling `latest` release, rebuilt from `main` on every merge, for macOS
+(Apple Silicon and Intel), Linux x86-64 and Windows x86-64. On other platforms (Linux arm64, for
+example) it falls back to `cargo install` from the repository, which needs a Rust toolchain.
 
 ### From source
 
@@ -172,10 +174,17 @@ directory but leaves `build.rs` and `build_tools/` alone.
 
 ### Running in containers
 
-> **Not yet wired.** `[workspace.mount_aliases]` parses and the translation logic exists
-> (`ValidatedScope::resolve_with_aliases`), but nothing passes the table to it yet, so container
-> paths are not translated today. Until then, run the server with the same paths the agent uses,
-> or bind-mount at an identical path on both sides.
+If the agent sees the workspace under a different path than the server (a Docker bind mount, a
+devcontainer), map the container path to the host path:
+
+```toml
+[workspace.mount_aliases]
+"/workspace" = "${workspace_root}"
+```
+
+A path argument starting with `/workspace` is translated before the jail check instead of being
+rejected. The translation applies to the path arguments tools accept (`smart_search`'s `scope`,
+a `.proto` path given to `analyze_grpc`).
 
 ---
 
@@ -187,22 +196,28 @@ Two commands. Do not skip these — a misconfigured root fails quietly, by index
 mesh-mcp doctor
 ```
 
+Abridged output (the exact lines depend on the platform and configuration):
+
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (v2.9.1)...
+🔍 Running MeshMCP Diagnostic Healthcheck (v6.0.1, commit: ...)...
 
 ✔ Config syntax: Valid (.agents/mesh-mcp.toml)
 ✔ Jailed roots verified (6/6 allowed roots, 0 escapes detected)
 ℹ Project skills: none configured ([engines.policy.skills])
-✔ Symlink invariants: follow_links=false verified across all engines
+✔ Root overlap: 6 root(s), none overlapping
 ✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)
-✔ Host OS event subsystem: Native (APFS FSEvents/kqueue active)
-✔ Stdio loopback latency: 0.43ms
-✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++)
-✔ Memory baseline: < 20 MiB RSS (mimalloc + compact_str)
+✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
 ✔ Toolchain utilities: git & ripgrep detected
+⚠ Index health: ... files rejected (oversized, binary, guard, parse failure), first 10 listed
+    Searches cannot return these files; read them directly.
 
-✔ All systems operational. Ready for AI agents.
+✔ Socket permissions: socket 0600, directory 0700 (owner-only)
+✔ Audit trail: quick_check and hash chain: ok
 ```
+
+The last block (socket, daemon version, Linux sandbox, caches, audit chain) is what
+`mesh-mcp doctor --json` prints on stdout and what `mesh-mcp doctor --fix` repairs. Some lines are
+informational only; see [docs/development.md](docs/development.md#6-mesh-mcp-doctor) for which.
 
 `doctor` validates syntax and roots — it does not tell you whether the *content* was understood.
 For that:
@@ -229,22 +244,24 @@ Read the output against your mental model:
 claude mcp add mesh-mcp -- mesh-mcp run
 ```
 
-### Cursor, VS Code, Windsurf
+### Cursor, Windsurf
 
-`.cursor/mcp.json` or `.vscode/mcp.json` at the repo root:
+`.cursor/mcp.json` at the repo root:
 
 ```json
-{
-  "mcpServers": {
-    "mesh-mcp": {
-      "command": "mesh-mcp",
-      "args": ["run"]
-    }
-  }
-}
+{ "mcpServers": { "mesh-mcp": { "command": "mesh-mcp", "args": ["run"] } } }
 ```
 
-`mesh-mcp init --auto --write-ide-config` writes both files for you.
+### VS Code
+
+`.vscode/mcp.json` (VS Code keys servers under `servers`):
+
+```json
+{ "servers": { "mesh-mcp": { "type": "stdio", "command": "mesh-mcp", "args": ["run"] } } }
+```
+
+`mesh-mcp init --auto --write-ide-config` writes both files for you. It only adds or replaces the
+`mesh-mcp` entry: other servers are kept, and a file that is not valid JSON is left untouched.
 
 ### Verify by hand
 
@@ -408,14 +425,14 @@ Matching rules:
 
 - An exact **tool name** key (`smart_search`, `find_dependents`, `analyze_grpc`,
   `analyze_impact`, `search_docs`) fires on every call to that tool.
-- Otherwise the key is matched case-insensitively against the **scope or target** of the call —
-  the same way `stop_rules` are matched.
+- Otherwise the key is matched case-insensitively as a substring of the **scope, target or
+  query** of the call. (Stop rules, by contrast, match whole path segments.)
 - Among several matching path keys, the **longest** wins, so `services/billing` beats
   `services`.
 
 ### 3. See it work
 
-Any matching tool call now comes back with a footer:
+Any matching tool call now starts with this note:
 
 ```
 ---
@@ -449,31 +466,36 @@ Paths are resolved as given, or relative to the config file's directory.
 
 ## Step 8 — Guard critical paths (optional)
 
-Skills advise. Stop rules refuse.
+Skills advise. Stop rules can refuse, and a Git hook can reject mixed commits.
 
 ```toml
 [engines.policy]
 enabled = true
 enforce_git_hooks = true
 cryptographic_audit_trail = true
+read_governance_mode = "enforce_refusal"   # allow_all (default) | audit_warn | enforce_refusal
 
 [engines.policy.stop_rules]
-"proto-registry" = "STOP: proto-registry generates the TS/Go/Java stubs. Land the contract PR and let CI publish before touching consumers."
-"k8s-infrastructure" = "STOP: manifest changes require DevOps review."
+"proto-registry" = "proto-registry generates the TS/Go/Java stubs. Land the contract PR and let CI publish before touching consumers."
+"k8s" = "Manifest changes require DevOps review."
 ```
 
-Install the hook that enforces them:
+A stop rule key is matched as a whole path segment of the call's scope or target. With
+`read_governance_mode = "enforce_refusal"`, a tool call about a guarded path returns a structured
+refusal (RSAH) telling the agent to stop and report to you; `audit_warn` only logs a warning;
+the default `allow_all` never refuses a read. No shipped tool writes anything.
+
+The Git hook is separate from stop rules:
 
 ```bash
 mesh-mcp install-hooks
 ```
 
-A commit touching a guarded path is now rejected with a structured explanation of the required
-workflow. Read-only queries are never blocked — inspecting a guarded contract is allowed and
-expected; only mutations are.
+It rejects a commit that stages both a `.proto` under `[engines.contracts.grpc] proto_dirs` and
+service source files, so contract changes land first. Without `proto_dirs` it checks nothing.
 
 Every tool call is appended to a SHA-256 hash-chained SQLite log at
-`~/.cache/mesh-mcp/audit.db` (mode `0600`). Details in
+`~/.cache/mesh-mcp/audit.db` (mode `0600`); `mesh-mcp stats` summarises it. Details in
 [docs/governance-rsah.md](docs/governance-rsah.md).
 
 ---
@@ -483,9 +505,7 @@ Every tool call is appended to a SHA-256 hash-chained SQLite log at
 Only these sections exist. The parser rejects unknown keys, so a typo or an invented section
 fails loudly at startup rather than being ignored.
 
-Keys marked **wired** change behaviour. Keys marked *accepted* parse without error but are not
-read by anything yet — they are placeholders for planned engines, listed here so you know not to
-rely on them.
+Every key below changes behaviour.
 
 | Section / key | Status |
 | :--- | :--- |
@@ -498,20 +518,21 @@ rely on them.
 | `[engines.contracts.openapi]` `enabled`, `spec_files` | **wired** — scopes OpenAPI spec detection |
 | `[engines.contracts.asyncapi]` `enabled`, `spec_files`, `infer_string_topics` | **wired** — scopes AsyncAPI spec detection and topic string inference |
 | `[engines.contracts.cpp]` `include_paths` | **wired** — resolves C++ `<header.h>` angle-bracket include targets |
-| `[engines.policy.stop_rules]` | **wired** (evaluated in tool dispatch and git pre-commit hook) |
+| `[engines.policy.stop_rules]` | **wired** — evaluated in tool dispatch according to `read_governance_mode` (not used by the Git hook) |
 | `[engines.policy.skills]` | **wired** |
-| `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail` | **wired** — `enabled=false` turns off stop rules/skills; `enforce_git_hooks` gates hook installation; `cryptographic_audit_trail` gates audit logging |
+| `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail`, `read_governance_mode` | **wired** — `enabled=false` turns off stop rules/skills; `enforce_git_hooks` gates hook installation; `cryptographic_audit_trail` gates audit logging; `read_governance_mode` (`allow_all`, `audit_warn`, `enforce_refusal`) decides whether stop rules refuse read-only calls |
 | `[cache]` `max_size_mb` | **wired** — quota (MiB, default `2048`) of this workspace's parse cache `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`, database + WAL. Checked on open and after every scan writing more than 100 entries; over quota, least recently used entries are evicted down to 80 % of it |
 
-Practical consequence: **all configuration sections actively control their respective indexing and governance behavior**. Secret masking and prompt-injection sanitisation are enabled by default and can be configured per section.
+Secret masking and prompt-injection sanitisation are on by default.
 
 There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
 a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.
 
 The parse cache is a disposable performance cache, one SQLite file per workspace (same
 `workspace_id` as the daemon socket, so it also changes with the binary version). Deleting it is
-always safe: the next boot re-parses everything. Versions before 6.1.0 used a single
-machine-wide `~/.cache/mesh-mcp/index-cache.db`; it is no longer read and can be deleted.
+always safe: the next boot re-parses everything. Versions up to 6.0.1 used a single
+machine-wide `~/.cache/mesh-mcp/index-cache.db`; it is no longer read, and
+`mesh-mcp doctor --fix` removes it.
 
 A complete annotated example lives in [`mesh-mcp.toml`](mesh-mcp.toml) at the repo root.
 
@@ -539,8 +560,9 @@ supported, or your conventions need [custom patterns](#custom-contract-patterns)
 
 **A specific file is never indexed**
 It probably tripped a guard: over 384 KB (1.5 MB for `.proto` and generated schema stubs), a
-line longer than 1 KB (minified), a null byte, or nesting deeper than 64. Run with
-`RUST_LOG=debug` to see the rejection. If it's a generated file (a build-emitted OpenAPI spec,
+line longer than 1 KB (minified), a null byte, or nesting deeper than 64. `mesh-mcp doctor`
+lists rejected files with the reason, and `smart_search` / `find_dependents` name the rejected
+source files inside the scope of a query. If it's a generated file (a build-emitted OpenAPI spec,
 a compiled proto stub), also check whether it's gitignored — the crawler always respects
 `.gitignore`, with no config flag to disable it, so a file that never gets committed never gets
 scanned either.
@@ -566,7 +588,9 @@ echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo s
 ```
 
 **Stale index after switching branches**
-`pkill meshd` — the next `mesh-mcp run` respawns it with a fresh scan.
+The watcher holds reloads while a Git operation is in progress and reindexes once it settles;
+answers given meanwhile start with a "Git operation in progress" note. If the index still looks
+stale, `pkill meshd` — the next `mesh-mcp run` respawns it with a fresh scan.
 
 ---
 

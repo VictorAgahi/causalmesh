@@ -1,6 +1,6 @@
-# Polyglot Shop &mdash; CausalMesh Demonstration Monorepo
+# Polyglot Shop — MeshMCP example workspace
 
-This sample monorepo demonstrates real-world cross-service contract reconciliation, gRPC pipeline tracing, Kafka event streaming, and distributed saga coordination across **5 programming languages** (**Protobuf**, **TypeScript / NestJS**, **Go**, **Rust**, **Python / FastAPI**, and **Java / Spring Boot**).
+A small example workspace: three `.proto` contracts and five services in five languages (TypeScript / NestJS, Go, Rust, Python, Java / Spring Boot), wired together by gRPC calls and Kafka topics. The services are minimal stubs written to exercise MeshMCP's extraction, not runnable applications. It is also a test fixture: `crates/mesh-server/tests/impact_matrix.rs` and `scripts/determinism.sh` run against it.
 
 ```
                       ┌────────────────────────────────────────┐
@@ -43,14 +43,15 @@ This sample monorepo demonstrates real-world cross-service contract reconciliati
   - Calls `PaymentService.ProcessPayment` via gRPC client stub.
   - Emits events to Kafka topic `order-created-topic`.
 - **`services/payment-worker`** (*Go*):
-  - Implements `PaymentService.ProcessPayment`.
+  - Registers `PaymentService` (`pb.RegisterPaymentServiceServer`), implementing `ProcessPayment`.
+  - Opens an `InventoryService` client (`pb.NewInventoryServiceClient`).
   - Consumes `order-created-topic`.
   - Emits settlement events to `payment-settled-topic`.
 - **`services/inventory-manager`** (*Rust*):
-  - Implements `InventoryService.ReserveStock`.
+  - Implements the `InventoryService` trait (tonic style), including `ReserveStock`.
   - Consumes `payment-settled-topic`.
   - Emits stock reservation events to `stock-reserved-topic`.
-- **`services/notification-hub`** (*Python / FastAPI*):
+- **`services/notification-hub`** (*Python*):
   - Consumes `order-created-topic` (order confirmations).
   - Consumes `payment-settled-topic` (payment receipts).
   - Consumes `stock-reserved-topic` (dispatch notifications).
@@ -60,14 +61,14 @@ This sample monorepo demonstrates real-world cross-service contract reconciliati
 
 ---
 
-## 🚀 Instant Verification (10-Second Test)
+## Try it
 
 ### 1. View Interactive Graph Visualization
 From the repository root:
 ```bash
 mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
 ```
-*Opens an interactive, dark-mode SVG/Canvas topology map in your default browser.*
+*Writes a standalone HTML topology and opens it in the default browser.*
 
 ### 2. Export Mermaid Markdown
 ```bash
@@ -78,3 +79,16 @@ mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --format mermaid
 ```bash
 mesh-mcp doctor --config examples/polyglot-shop/mesh-mcp.toml
 ```
+
+### 4. Query it as an agent would
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_impact","arguments":{"target":"ProcessPayment"}}}' \
+  | mesh-mcp run --standalone --config examples/polyglot-shop/mesh-mcp.toml
+```
+
+The Kafka producers and consumers in this example are declared through
+`[[engines.contracts.patterns]]` regexes in `mesh-mcp.toml` (one set per language), to show how
+in-house conventions are described. The gRPC wiring is detected natively.

@@ -97,25 +97,20 @@ every row ordered by `entry_seq ASC` and enforces three things per row:
 
 1. `entry_seq == idx` — no gaps, no reordering.
 2. `prev_hash == expected_prev_hash`, starting from `GENESIS_HASH` (64 zeros).
-3. The recomputed hash matches the stored one:
-
-   ```rust
-   let hash_input = format!(
-       "{}{}{}{}{}",
-       entry.prev_hash, entry.timestamp, entry.session_id, entry.tool, entry.args_digest
-   );
-   let calculated_hash = Self::compute_sha256(hash_input.as_bytes());
-   ```
+3. The recomputed hash matches the stored one, using the formula of the row's own
+   `chain_version`: v1 rows hash `prev_hash`, `timestamp`, `session_id`, `tool`,
+   `args_digest`; v2 rows (every new write, `AuditLogger::CHAIN_VERSION`) also hash `status`,
+   `files_accessed` and `secrets_redacted_count`.
 
 Any failure returns `AuditError::BrokenChain(seq, expected, actual)`. A missing file
 verifies as `Ok(true)` — nothing recorded is not the same as something tampered with.
 
-Note what is **not** in the hash input: `status`, `files_accessed` and
-`secrets_redacted_count` are stored but not chained. An attacker with write access to the
-DB could alter those without breaking the chain. Treat the chained fields
-(`timestamp`, `session_id`, `tool`, `args_digest`) as the attested ones. If you add a field
-that must be attested, add it to both `record_entry` and `verify_db` in the same commit —
-changing one alone invalidates every existing database.
+Only v1 rows (written before chain v2) leave `status`, `files_accessed` and
+`secrets_redacted_count` unattested. Deleting the most recent rows is not detectable from the
+file alone, and the metrics tables (`tool_call_metrics`, `index_cache_metrics`,
+`process_starts`) are outside the chain by design. If you add a field that must be attested,
+bump `CHAIN_VERSION`, write it in `record_entry` and add a `verify_db` arm for the new version
+in the same commit — never change what an existing version number hashes.
 
 `record_entry` reads the tail inside the same `Immediate` transaction it writes in, which
 is what makes concurrent `mesh-mcp` processes and `meshd` sharing one DB safe: SQLite

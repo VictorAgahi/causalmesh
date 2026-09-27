@@ -1,400 +1,266 @@
 # MeshMCP
 
-**An MCP server that gives your AI coding agent a map of your polyglot codebase.**
-
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE-APACHE)
 
-Your agent reads code the way a newcomer does: one file at a time, guessing what calls what.
-On a monorepo with a proto registry, a TypeScript gateway, three Go workers and a Java saga,
-that means burnt context, missed callers, and confident answers that are wrong.
-
-MeshMCP indexes your workspace once, keeps it in memory, and answers four questions your agent
-can't answer alone:
-
-- **Who breaks if I change this?** — reverse dependency graph.
-- **Where does this RPC actually get implemented?** — `.proto` → generated stubs → handlers.
-- **Who produces and consumes this event?** — Kafka/stream topics across services.
-- **What do our own docs say about this?** — Markdown/ADR/RFC search.
-
-It's a single Rust binary, runs locally, reads only the directories you list, and never talks
-to the network.
-
-**Languages indexed**: Java · Go · Python · TypeScript/JavaScript · Rust · C++ · Kotlin · C# · Ruby · PHP · Swift · Scala · Protobuf · OpenAPI/AsyncAPI YAML · Markdown
+MeshMCP is a local [Model Context Protocol](https://modelcontextprotocol.io) server, written in
+Rust, that indexes a multi-language, multi-service codebase and answers structural questions for
+an AI coding agent: where a symbol is declared, who depends on a contract, which services
+implement and call a gRPC method, who produces and consumes an event, and what the team's own
+documentation says. It runs on the developer's machine, reads only the directories it is
+configured with, and its binaries contain no network client code.
 
 ---
 
-## Quick start
-
-### 1. Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
-```
-
-Installs a prebuilt binary to `~/.local/bin/`. No Rust toolchain needed.
-
-<details>
-<summary>Or build from source (needs Rust 1.80+)</summary>
-
-```bash
-git clone https://github.com/VictorAgahi/causalmesh.git
-cd causalmesh
-cargo build --workspace --release
-cp target/release/mesh-mcp target/release/meshd ~/.local/bin/
-```
-</details>
-
-### 2. Point it at your repo
-
-```bash
-cd /path/to/your/monorepo
-mesh-mcp init --auto      # writes .agents/mesh-mcp.toml by detecting your layout
-mesh-mcp doctor           # checks the config resolves and the parsers load
-```
-
-`init --auto` is a starting point, not a final answer — it guesses your roots from common
-directory names. Read [Configuration](#configuration) next; ten minutes there is what makes
-the difference between "it works" and "it understands our architecture".
-
-### 3. Connect your agent
-
-**Claude Code**
-```bash
-claude mcp add mesh-mcp -- mesh-mcp run
-```
-
-**Cursor / Windsurf** — `.cursor/mcp.json`:
-```json
-{ "mcpServers": { "mesh-mcp": { "command": "mesh-mcp", "args": ["run"] } } }
-```
-
-**VS Code** — `.vscode/mcp.json` (VS Code keys servers under `servers`):
-```json
-{ "servers": { "mesh-mcp": { "type": "stdio", "command": "mesh-mcp", "args": ["run"] } } }
-```
-
-(`mesh-mcp init --auto --write-ide-config` writes both files for you. It only adds or replaces the
-`mesh-mcp` entry: your other MCP servers are kept, and a file that isn't valid JSON is left
-untouched.)
-
-### 4. Ask it something
-
-> "Which services break if I change the `CreateOrder` RPC?"
-
-Your agent now calls `analyze_grpc` and `find_dependents` instead of grepping.
-
----
-
-## Try it in 30 seconds
-
-A small polyglot monorepo ships with the repo — one proto file and five services in
-TypeScript, Go, Rust, Python and Java, wired together by gRPC and Kafka topics:
-
-```bash
-mesh-mcp graph --config examples/polyglot-shop/mesh-mcp.toml --open
-```
-
-That opens an interactive topology in your browser. `--format mermaid` prints a diagram you
-can paste into a Markdown file instead.
-
----
-
-## What your agent gets
-
-Six tools. Each description tells the model when *not* to use it, which is most of what keeps
-an agent from flailing.
-
-| Tool | Answers | Notes |
-| :--- | :--- | :--- |
-| `smart_search` | "Where is `UserAuthRequest` declared?" | Returns signatures with bodies stripped, ranked by relevance (exact name match first, then prefix, then substring; ties broken by node kind). Searches the in-memory symbol index; pass `fuzzy: true` for a full-text scan of the scope. |
-| `find_dependents` | "Who imports this contract?" | Reverse dependency lookup. Import edges are extracted natively for Java, Go, Python, Rust, C++ and TypeScript/JavaScript; for anything else use a custom pattern. Edges carry a confidence (`Exact` for an FQCN/fully-qualified match, `Heuristic` for a bare-name match), surfaced in the output. |
-| `analyze_grpc` | "Where is this RPC implemented and called?" | Links `.proto` definitions to handlers and client stubs. |
-| `analyze_impact` | "Who produces/consumes this event?" | Kafka topics, streams, queues, sagas, post-processors. Detected natively for Java (`@KafkaListener`/`KafkaTemplate`), Go (kafka-go/sarama/confluent-kafka-go), Python (confluent_kafka/aiokafka/Celery), Rust (rdkafka), TypeScript (kafkajs/NestJS microservices/BullMQ) and AsyncAPI channels; for anything else declare a [custom pattern](#layer-5--custom-patterns-teach-it-your-conventions). |
-| `search_docs` | "What did we decide about idempotency?" | Keyword search over your Markdown docs, with alias, stop-word and optional fuzzy (edit-distance) fallback support. |
-| `visualize_mesh` | "Show me the topology." | Mermaid or standalone HTML. |
-
-Two things every tool does:
-
-- **Strips function bodies.** You get `fn charge(order: &Order) -> Result<Receipt> { /* stripped */ }`,
-  not 80 lines of retry logic. Measured on this repo's benchmark corpus, that removes 55–69% of
-  the tokens depending on language (`cargo bench -p mesh-server` prints the number for yours).
-- **Caps output at 48 KB**, with a note telling the agent how to narrow the query instead of
-  silently truncating.
-
----
-
-## Configuration
-
-Everything lives in one TOML file: `.agents/mesh-mcp.toml` (or `mesh-mcp.toml` at the root).
-Build it up in layers — each section below is independently useful.
-
-### Layer 1 — Roots: what may be read at all
-
-This is also the security boundary. Any path outside these roots is refused with a JSON-RPC
-`-32602`, symlinks pointing outside are dropped, and `..` traversal is resolved before the check.
-
-```toml
-[workspace]
-name = "my-mesh"
-version = "1.0.0"
-
-# Optional indirection so the same file works on every machine and in CI.
-workspace_root = "${WORKSPACE_ROOT:-..}"
-
-roots = [
-  "${workspace_root}/proto-registry",
-  "${workspace_root}/api-gateway",
-  "${workspace_root}/services/*",      # globs expand to one root per match
-  "${workspace_root}/docs",
-]
-```
-
-> **Paths are relative to the config file, not to your shell.** A config in `.agents/` needs
-> `..` to reach the repo root — that's why `init --auto` writes `${WORKSPACE_ROOT:-..}`.
-
-Exclusions are gitignore-style globs. The defaults already cover secrets and build output; add
-yours:
-
-```toml
-exclude_patterns = [
-  "**/node_modules/**", "**/target/**", "**/.venv/**",
-  "**/*.pem", "**/*.key", "**/.env*",
-  "**/generated/**",
-]
-```
-
-Excluded directories are pruned from the walk, so a large `node_modules/` costs nothing.
-
-Running inside a container where the agent sees a different path than the one on disk (a
-Docker bind mount, a devcontainer)? Map the container path to the real one:
-
-```toml
-[workspace.mount_aliases]
-"/workspace" = "${workspace_root}"
-```
-
-A scope argument starting with `/workspace` is translated before the jail check runs, instead
-of being rejected as a sandbox escape.
-
-### Layer 2 — Docs: make `search_docs` speak your vocabulary
-
-```toml
-[engines.docs]
-enabled = true
-paths = ["${workspace_root}/docs", "${workspace_root}/architecture"]
-
-# Your team's shorthand → the word actually written in the docs.
-aliases = { "k8s" = "kubernetes", "dlq" = "dead-letter-queue", "ws" = "websocket" }
-
-# Words that add noise to a query.
-stop_words = ["the", "how", "what", "which"]
-
-exact_phrase_boost = 60          # weight of a full-phrase hit in a section title
-sanitize_prompt_injections = true # neutralise "ignore previous instructions" in indexed docs
-```
-
-`enabled = false` skips markdown indexing entirely; `paths` scopes indexing to a glob allowlist
-instead of every `.md` file under `roots`. Add `fuzzy_fallback = true` (the default) to retry a
-query that found nothing with edit-distance-tolerant token matching, so a typo like "kubernets"
-still surfaces a section titled "Kubernetes".
-
-Aliases are the highest-leverage setting here: without them, an agent asking about "the DLQ"
-finds nothing in a doc that only ever says "dead-letter-queue".
-
-### Layer 3 — Skills: make the agent read your playbook first
-
-This is how you get *your* process in front of the agent before it edits anything.
-
-Write a Markdown file describing how work is done in some area of the codebase:
-
-```markdown
----
-name: proto-contract-evolution
-description: How to evolve a proto contract without breaking consumers.
----
-
-# Evolving a proto contract
-
-1. Never renumber or reuse a field tag. Mark removed fields `reserved`.
-2. Open the PR against `proto-registry` alone and wait for CI to publish stubs.
-3. Only then bump the dependency in the consuming services.
-```
-
-Then map it to the area it covers:
-
-```toml
-[engines.policy.skills]
-# Key = an MCP tool name, or any fragment of the scope/target being queried.
-"proto-registry" = ".agents/skills/proto-contract-evolution.md"
-"services/billing" = ".agents/skills/billing-invariants.md"
-"smart_search" = ".agents/skills/how-we-search.md"
-```
-
-Now any tool call whose target or scope contains `proto-registry` comes back with a footer:
-
-```
----
-**Project skill for this area**: `.agents/skills/proto-contract-evolution.md` — How to evolve a proto contract without breaking consumers.
-Read it before proposing changes here.
-```
-
-The agent reads the file and follows your rules instead of inventing its own. Matching is
-case-insensitive; an exact tool-name key wins over a path match, and the longest matching key
-wins among path matches. `mesh-mcp doctor` fails loudly if a configured skill file is missing —
-a typo here would otherwise just silently never fire.
-
-This repo's own skills live in [`.agents/skills/`](.agents/skills/) if you want examples.
-
-### Layer 4 — Stop rules: hard boundaries
-
-Where a skill is advice, a stop rule is a refusal. Used by the git pre-commit hook installed by
-`mesh-mcp install-hooks`:
-
-```toml
-[engines.policy]
-enabled = true                    # false disables stop rules and skill hints entirely
-enforce_git_hooks = true          # false makes `install-hooks` a no-op
-cryptographic_audit_trail = true  # false skips the audit write on every tool call
-
-[engines.policy.stop_rules]
-"proto-registry" = "STOP: proto-registry generates the TS/Go/Java stubs. Land the contract PR first."
-"k8s-infrastructure" = "STOP: manifest changes require DevOps review."
-```
-
-A commit touching a guarded path is rejected with a structured explanation of what to do
-instead. The same stop rules are also checked inside the MCP server itself, for any tool that
-declares it can mutate its target — read [docs/governance-rsah.md](docs/governance-rsah.md) for
-the honest scope of that (no shipped tool mutates anything today, so this is enforcement
-infrastructure the git hook alone doesn't need yet, not something you'll see fire in practice).
-
-### Layer 5 — Custom patterns: teach it your conventions
-
-MeshMCP recognises gRPC, Spring, OpenAPI and AsyncAPI shapes by file extension and content by
-default, and each of those is configurable:
-
-```toml
-[engines.contracts.grpc]
-proto_dirs = ["proto-registry"]              # scope .proto extraction; empty = unrestricted
-controller_annotations = ["@GrpcMethod"]     # TS decorators that mark a gRPC handler
-canonical_fqcn_projection = true             # false projects the bare method name
-
-[engines.contracts.spring]
-property_files = ["application*.properties"] # scope which files are Spring property sources
-resolve_placeholders = true                   # resolve ${key:default} in place
-auto_redact_secrets = true                    # false stops masking matched secret keys
-
-[engines.contracts.openapi]
-spec_files = ["**/openapi.yaml"]             # scope OpenAPI detection instead of sniffing
-
-[engines.contracts.asyncapi]
-spec_files = ["**/asyncapi.yaml"]
-infer_string_topics = true                   # also pick up a non-standard top-level `topics:` list
-```
-
-Your in-house event bus, outbox table or job queue it still cannot guess — describe it with a
-regex:
-
-```toml
-[[engines.contracts.patterns]]
-name = "transactional-outbox"
-kind = "topic_producer"        # topic_producer | topic_consumer | saga | rpc
-file_pattern = "*.ts"
-regex = 'createEvent<([^>]+)>'
-target_group = 1               # capture group holding the topic/event name
-
-[[engines.contracts.patterns]]
-name = "event-post-processor"
-kind = "topic_consumer"
-file_pattern = "*.ts"
-regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
-target_group = 2               # the event
-consumer_group = 1             # the class consuming it
-```
-
-Producers and consumers of the same name are then linked automatically, and `analyze_impact`
-can trace an event end to end. [`examples/polyglot-shop/mesh-mcp.toml`](examples/polyglot-shop/mesh-mcp.toml)
-has working patterns for five languages.
-
-After any config change:
-
-```bash
-mesh-mcp doctor                                    # config resolves, skills exist, parsers load
-mesh-mcp graph --format mermaid | head -40         # does the topology look like your architecture?
-```
+## The problem
+
+A coding agent explores a repository the way a newcomer does: it greps, opens files one at a
+time, and infers relationships from names. In a single-language repository this works. In a
+workspace where a `.proto` contract is implemented in Go, called from TypeScript and Java, and
+followed by Kafka events consumed in Python, the relationships the agent needs are spread across
+files it has no reason to open. The usual results are missed callers, changes that break a
+consumer in another service, and a context window filled with function bodies that were only
+read to find a signature.
+
+MeshMCP builds that cross-service map once, keeps it in memory, updates it as files change, and
+exposes it through six MCP tools.
 
 ---
 
 ## How it works
 
 ```
-crawl roots ──▶ size/binary guard ──▶ tree-sitter parse ──▶ per-file extract
-                                                                   │
-        agent query ◀── one atomic snapshot ◀── reconcile edges ◀── merge
-                                     ▲
-                          file watcher ──▶ differential rescan (changed files only)
+ roots in mesh-mcp.toml
+        │
+        ▼
+ crawl (gitignore-aware, no symlink following)
+        │
+        ▼
+ guard: size / binary / line-length / nesting limits ──▶ rejected files are listed, not dropped silently
+        │
+        ▼
+ tree-sitter parse + per-language extractors (parallel)
+        │
+        ▼
+ fold + reconcile edges (Imports, Implements, CallsRpc, Produces, Consumes)
+        │
+        ▼
+ one immutable snapshot, swapped atomically ◀── file watcher: changed files only,
+        │                                        held while a Git operation is in progress
+        ▼
+ MCP tools over stdio (JSON-RPC) ──▶ Markdown answers, capped at 48 KB
 ```
 
-- Parsing runs in parallel; the resulting graph is published as a single immutable snapshot, so
-  a query never sees a half-updated index.
-- A file watcher re-indexes only what changed, on background-priority threads, so it doesn't
-  compete with your editor.
-- Tree-sitter runs behind hard bounds: 15 ms parse timeout, 384 KB file budget (1.5 MB for
-  schemas), 1 KB max line length, depth limit. A file that trips a bound is skipped, never
-  dumped raw into your context.
-- Secrets in indexed YAML/properties are masked before they can reach a prompt.
-
-Details: [docs/architecture.md](docs/architecture.md).
-
-### Two ways to run
-
-**Daemon (default)** — `mesh-mcp run` is a thin proxy to a shared `meshd` process that holds the
-index: a Unix domain socket on macOS/Linux, a named pipe on Windows. Five IDE windows share one
-index instead of building five. `meshd` is auto-spawned and shuts down when idle.
-
-**Standalone** — `mesh-mcp run --standalone` keeps everything in one process. Use it in
-containers, in CI, or when the daemon transport isn't available.
+- **Daemon mode (default).** `mesh-mcp run` is a thin stdio proxy to a per-workspace `meshd`
+  process (Unix socket on macOS/Linux, named pipe on Windows), so several editor windows on the
+  same repository share one index. `meshd` is started on demand and exits after 30 idle minutes.
+  `mesh-mcp run --standalone` keeps everything in one process (containers, CI).
+- **Persistent parse cache.** One SQLite file per workspace under `~/.cache/mesh-mcp/workspaces/`,
+  with a size quota and LRU eviction, so a restart or a branch switch back to known content does
+  not re-parse it.
+- Details: [docs/architecture.md](docs/architecture.md).
 
 ---
 
-## Performance
+## The six tools
 
-Measured on this machine (Apple Silicon, 8 cores, macOS) with `cargo bench -p mesh-server`.
-Run it yourself — these are the numbers that come out, not a marketing claim:
-
-| Operation | Average | Notes |
-| :--- | ---: | :--- |
-| `find_dependents` on a 1,000-node graph | 3.95 µs | in-memory index lookup |
-| `analyze_grpc` pipeline trace | 9.12 µs | |
-| Audit log write (SQLite WAL + SHA-256 chain) | 12.22 µs | |
-| Markdown formatting with 48 KB bound | 34.40 µs | |
-| Lexical nesting guard | 1.20 µs | ~989 MB/s |
-| AST decapitation, TypeScript | 150 µs | −54.5% tokens |
-| AST decapitation, Rust | 107 µs | −57.4% tokens |
-| AST decapitation, Go | 110 µs | −68.9% tokens |
-
-Release binary: 12.3 MB (`mesh-mcp`) / 12.1 MB (`meshd`). Peak RSS indexing this repo (60
-files): 20.5 MiB. Index size scales with your workspace — measure on yours.
-
-`cargo test --workspace` includes a regression test asserting the benchmark budgets still hold.
-
----
-
-## CLI
-
-| Command | What it does |
+| Tool | Answers |
 | :--- | :--- |
-| `mesh-mcp run` | Start the MCP server on stdio (daemon-backed). |
-| `mesh-mcp run --standalone` | Same, single process, no daemon. |
-| `mesh-mcp init --auto` | Detect the layout and write `.agents/mesh-mcp.toml`. |
-| `mesh-mcp init --auto --write-ide-config` | Also write `.cursor/mcp.json` and `.vscode/mcp.json`. |
-| `mesh-mcp doctor` | Validate config, roots, skill files, parsers, secret masking. |
-| `mesh-mcp graph [--format html\|mermaid\|json] [--open]` | Render the topology. |
-| `mesh-mcp graph --format fingerprint` | Print a content hash of the full index; two runs over an unchanged workspace must print the same value (`scripts/determinism.sh`). |
-| `mesh-mcp install-hooks` | Install the git pre-commit hook enforcing stop rules. |
-| `mesh-mcp stats [--since 7d\|24h\|all]` | Local-only summary of the audit log: calls per tool, error rate, most-queried scopes/targets. Nothing leaves the machine. |
+| `smart_search` | Where is a symbol declared? Returns signatures with bodies stripped, ranked and paginated. |
+| `find_dependents` | Who imports or depends on this type, package or contract? |
+| `analyze_grpc` | Where is this RPC defined, implemented and called? Also checks the `.proto` for wire-format breaking changes against a Git base. |
+| `analyze_impact` | What is affected if this RPC, service, topic or event changes? One table row per impacted element, marked `INTERNAL`/`EXTERNAL` with edge confidence. |
+| `search_docs` | What do our Markdown docs, ADRs and RFCs say about this term? |
+| `visualize_mesh` | Per-service topology as Mermaid, JSON or HTML, bounded in size, with zoom. |
 
-All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RPC only.
+Arguments, output formats and error handling: [docs/mcp-tools.md](docs/mcp-tools.md).
+
+---
+
+## Languages and what is extracted
+
+Verified against `crates/mesh-parsers/src/languages/` at the time of writing. "Declarations" means
+classes, interfaces, functions/methods and similar symbols usable by `smart_search`.
+
+| Language | Declarations | Imports (`find_dependents`) | gRPC | Events / messaging | HTTP endpoints |
+| :--- | :---: | :---: | :--- | :--- | :--- |
+| Java | yes | yes | `*ImplBase` servers, `@GrpcService`, `newBlockingStub/newStub/newFutureStub` clients | `@KafkaListener`, `KafkaTemplate` | Spring MVC / JAX-RS annotations |
+| Go | yes | yes | `Register*Server`, `New*Client` | kafka-go, sarama, confluent-kafka-go | — |
+| Python | yes | yes | `*Servicer` servers, `*_pb2_grpc.*Stub(...)` clients | confluent_kafka, aiokafka, Celery | Flask / FastAPI routes (path and method) |
+| TypeScript / JavaScript (`.ts`, `.tsx`, `.js`) | yes | yes | NestJS `@GrpcMethod`, `getService<...>()`, imported `new XClient(...)` (ts-proto, `@grpc/grpc-js`) | kafkajs, NestJS `@EventPattern`/`@MessagePattern`, BullMQ | — |
+| Rust | yes | yes | tonic service implementations | rdkafka | — |
+| C++ | yes | yes (`#include`) | — | — | — |
+| Kotlin | yes | — | — | `@KafkaListener`, kafka-clients `subscribe`/`send` | Spring annotations |
+| C# | yes | — | — | Confluent.Kafka producers/consumers | — |
+| Ruby, PHP, Swift, Scala | yes | — | — | — | — |
+| Protobuf | services, methods, messages | `import` | contract source of truth | — | — |
+| OpenAPI / AsyncAPI YAML | paths, channels | — | — | AsyncAPI channels | OpenAPI paths |
+| Spring `application*.yml` / `.properties` | properties (secrets masked) | — | — | used to resolve topic names | — |
+| Markdown | sections for `search_docs` | — | — | — | — |
+
+Conventions MeshMCP does not recognise (an in-house event bus, an outbox table) can be declared
+as regular expressions in `[[engines.contracts.patterns]]`; see [SETUP.md](SETUP.md#custom-contract-patterns).
+
+---
+
+## Measured results
+
+Every figure below is copied from a dated section of [docs/quality.md](docs/quality.md) or from a
+file in the repository, with the platform it was measured on. Numbers from a developer
+workstation are single-machine measurements, not guarantees for your hardware.
+
+### Extraction correctness (gRPC service-to-service edges)
+
+Hand-written ground truth (`tests/golden/*.expected.yaml`, read from each project's source, never
+from MeshMCP output), scored by `scripts/golden/score.py` against pinned commits
+(`scripts/golden/repos.txt`).
+
+| Corpus | Golden edges | Precision | Recall |
+| :--- | ---: | ---: | ---: |
+| Google `online-boutique` | 14 | 100 % | 100 % |
+| OpenTelemetry `otel-demo` | 13 | 100 % | 100 % |
+| Google `bank-of-anthos` | 0 (no gRPC) | 100 % | 100 % (nothing fabricated) |
+
+Source: `docs/quality.md`, 2026-09-26, Plan 4 step 4.5 (release binary, before/after on the same
+corpus). Enforced on every pull request by `.github/workflows/golden.yml` on `ubuntu-latest`,
+which fails below 1.0/1.0 on all three corpora.
+
+**Scope of this claim:** only gRPC edges are scored, on three open-source demo applications (27
+edges in total). Kafka topic chains and HTTP routes have hand-written ground truth
+(`otel-demo`'s `orders` topic, `bank-of-anthos`'s 18 Flask routes) but no scorer yet.
+
+### Determinism
+
+Indexing the same content twice gives the same index: `scripts/determinism.sh` requires a single
+content fingerprint over 5 sequential and 8 concurrent runs per example workspace. It is a
+blocking CI job on `ubuntu-latest` and `macos-latest` (`.github/workflows/ci.yml`).
+
+### Performance budgets (synthetic 5,000-file workspace)
+
+The nightly job (`.github/workflows/nightly-bench.yml`, `ubuntu-latest`) generates a fixed-seed
+5,000-file workspace with 8 service roots (`scripts/bench/gen_synthetic.py`) and fails if
+`scripts/bench/scale_bench.py` exceeds `scripts/bench/budgets.json`:
+
+| Metric | Budget (`budgets.json`) | Measured, 6.0.0 |
+| :--- | ---: | ---: |
+| Boot to first `initialize` response | 3,000 ms | 0.30–0.31 s |
+| Peak RSS | 300 MB | 49 MB |
+| `smart_search` p50 / p95 | 300 / 800 ms | 2.2–2.4 / 3.7–7.8 ms |
+| Reload after a file edit, until searchable | 3,000 ms | 205–209 ms |
+
+Measured column: `docs/quality.md`, "Plan 3 closeout (2026-09-26, 6.0.0)", release build on the
+developer workstation, two runs outside the repository. The budgets carry 4–5x headroom for
+shared CI runners. Larger-repository budgets: see [docs/quality.md](docs/quality.md).
+
+### Resource use and payload size
+
+| What | Before | After | Source (`docs/quality.md`) and platform |
+| :--- | ---: | ---: | :--- |
+| Idle `meshd` CPU, macOS, 3,000 files in 503 directories, 10 min | 4.21 % (2 s polling) | 0.000 % (FSEvents) | 2026-09-27, step 4.2, macOS, shared loaded machine |
+| `git checkout` rewriting 3,000 files while searching | 3 partial index generations served mid-checkout | 1 generation after the checkout, identical to a cold index | 2026-09-27, step 4.2 (`scripts/test_git_storm.sh`) |
+| Parser memory for a 1.5 MB OpenAPI spec | 42.92 MB (28.7x file size) | 3.36 MB (2.2x) | 2026-09-27, step 4.9, Apple M2 |
+| 30 KB YAML file with alias fan-out (process peak delta) | 1,847.70 MB | 3.00 MB | 2026-09-27, step 4.9, Apple M2 |
+| Parse cache, 5,000-file corpus | 1,070 B/entry, one machine-wide file, no eviction | 1,171 B/entry, one file per workspace, quota + LRU; warm boot 127–136 ms | 2026-09-26, step 4.4, developer workstation |
+| `analyze_impact` on the `polyglot-shop` fixture, median of 51 calls | — | 24.5–26.7 µs (test asserts < 100 ms) | 2026-09-27, step 4.6a, Apple M2 |
+| Heaviest default `smart_search` page on the golden corpora | 15,418 bytes | 8,424 bytes | 2026-09-27, steps 4.13 and 4.1 note, macOS arm64 |
+| Empty `smart_search` page, `bank-of-anthos` | 2,133 bytes | 248 bytes | 2026-09-27, step 4.1 note, macOS arm64 |
+
+### What is not measured yet
+
+- **Token or cost savings.** MeshMCP makes no quantified claim here. Bodies are stripped from
+  search results and pages are capped, but whether an agent ends up using fewer tokens on real
+  tasks is what the pilot's A/B protocol in [docs/pilot-scorecard.md](docs/pilot-scorecard.md)
+  will measure. That grid is empty until the pilot has run.
+- Accuracy of event (Kafka) and HTTP route extraction, and of `analyze_impact` beyond one hop,
+  against ground truth.
+- Behaviour on large real repositories (the scale corpora are synthetic), and a long-lived
+  `meshd` over weeks. The full list is in `docs/quality.md`, "What's NOT measured yet".
+
+---
+
+## Security and governance
+
+| Control | What it does | Limits |
+| :--- | :--- | :--- |
+| **Path jail** (`ValidatedScope`) | Every path argument is Unicode-normalised, cleaned, canonicalised and must fall under a configured root; otherwise the call fails. The crawler never follows symlinks, so a link pointing outside the roots is never indexed. Case-folded comparison on macOS and Windows. | Limits what the tools read; it does not sandbox the process itself. |
+| **Network sandbox** (`meshd`, Linux) | After binding its socket, `meshd` installs a seccomp filter on every thread that makes creating IPv4/IPv6 sockets and `io_uring` fail with `EPERM`. `MESH_DAEMON_SANDBOX=required` makes a refused filter fatal. `mesh-mcp doctor` reports whether the running daemon is confined. | Linux only (x86_64, aarch64, riscv64). `mesh-mcp run --standalone` and macOS/Windows are not kernel-confined; there the guarantee is only that the code has no network client. Not a filesystem sandbox. |
+| **Secret masking** | Values of keys that look like secrets (`password`, `secret`, `token`, `credential`, `apikey`, …) in YAML and `.properties` files are replaced with `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`; the same key-based masking is applied to `key: value` / `key = value` lines in `smart_search` snippets. `.env*`, `*.pem`, `*.key` are excluded from indexing by default. | Keyed on names. A secret assigned to an innocuous name, or embedded in a string literal in code, is not detected. |
+| **Prompt-injection filtering** | Indexed Markdown is scanned for known injection phrases and chat-template markers, which are replaced before `search_docs` returns them. | A fixed phrase list, not a classifier. |
+| **Audit log** | Unless disabled (`cryptographic_audit_trail = false`), every tool call, including refused and invalid ones, is appended to a local SQLite database (`~/.cache/mesh-mcp/audit.db`, mode `0600`) with a SHA-256 hash chain covering timestamp, session, tool, argument digest, status, files accessed and redaction count. `mesh-mcp stats` summarises it locally. | Tamper-evident, not tamper-proof: a local user can delete the file. No compliance certification is claimed. |
+| **Stop rules (RSAH)** | `[engines.policy.stop_rules]` names guarded paths. With `read_governance_mode = "enforce_refusal"`, tool calls about a guarded path return a structured refusal telling the agent to stop and hand off to a human; `audit_warn` only logs. | The default (`allow_all`) never refuses reads, and no shipped tool writes anything, so refusals only occur if you opt in. |
+| **Pre-commit hook** | `mesh-mcp install-hooks` installs a Git hook that rejects a commit staging both `.proto` files under the configured `proto_dirs` and service source files (contract first, consumers after). | Only that one rule; does nothing when `proto_dirs` is not configured; bypassable with `git commit --no-verify` like any client-side hook. |
+
+Details: [docs/architecture.md](docs/architecture.md) (jail, sandbox, audit) and
+[docs/governance-rsah.md](docs/governance-rsah.md) (stop rules, skills, hook).
+
+---
+
+## Installation
+
+**Pilot install from a checkout** (macOS or Linux, x86-64 or arm64; builds locally, downloads
+nothing, idempotent):
+
+```bash
+git clone https://github.com/VictorAgahi/causalmesh.git
+cd /path/to/your/workspace
+/path/to/causalmesh/scripts/install_pilot.sh        # cargo build --release, then init after confirmation
+```
+
+It copies `mesh-mcp` and `meshd` into `~/.local/bin`, runs
+`mesh-mcp init --auto --write-ide-config` (keeps an existing config, merges `.cursor/mcp.json` and
+`.vscode/mcp.json` without removing other servers) and checks the result with
+`mesh-mcp doctor --json`. Building needs a stable Rust toolchain and a C compiler.
+
+**Prebuilt binaries.** `install.sh` downloads the rolling `latest` build of `main` for macOS
+(arm64, x86-64), Linux x86-64 and Windows x86-64, and falls back to `cargo install` elsewhere:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VictorAgahi/causalmesh/main/install.sh | bash
+```
+
+**Connect an agent:**
+
+```bash
+claude mcp add mesh-mcp -- mesh-mcp run          # Claude Code
+mesh-mcp doctor                                   # config, roots, parsers, daemon, cache, index health
+```
+
+The full walkthrough, including configuration of roots, docs vocabulary, custom patterns, skills
+and stop rules, is in [SETUP.md](SETUP.md). A five-language example workspace is in
+[`examples/polyglot-shop`](examples/polyglot-shop/README.md).
+
+### CLI
+
+| Command | Purpose |
+| :--- | :--- |
+| `mesh-mcp run [--standalone]` | MCP server on stdio (daemon-backed by default). |
+| `mesh-mcp init --auto [--write-ide-config]` | Generate `.agents/mesh-mcp.toml` from the directory layout; optionally write Cursor / VS Code MCP entries. |
+| `mesh-mcp doctor [--fix] [--json]` | Diagnose configuration, index health, socket, daemon version, cache and sandbox; `--fix` repairs what is safe to repair (never the audit log). |
+| `mesh-mcp graph [--format html\|mermaid\|json\|fingerprint] [--open]` | Render the full topology, or print a content fingerprint of the index. |
+| `mesh-mcp stats [--since 7d\|24h\|all]` | Local audit summary: calls, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. |
+| `mesh-mcp install-hooks` | Install the Git pre-commit hook. |
+
+Logs go to stderr. Under `mesh-mcp run`, stdout carries only JSON-RPC frames.
+
+---
+
+## Status and known limitations
+
+- **Version 6.0.1** on `main`. Single Rust workspace (`mesh-core`, `mesh-parsers`,
+  `mesh-server`, `mesh-daemon`); CI runs formatting, strict Clippy, and the test suite on Linux,
+  macOS and Windows, plus the determinism and golden-corpus gates.
+- **Ready for a pilot, not yet validated in production use.** The A/B pilot is the next
+  measurement.
+- Extraction is pattern-based per language and framework (table above). Code that reaches a
+  service through reflection, dependency-injection strings or generated code outside the
+  workspace is not linked. Edges carry a confidence (`exact`, `heuristic`, `ambiguous`) so the
+  agent can weigh them.
+- Files over 384 KB (1.5 MB for contracts and generated schemas), with a line over 1 KB, a null
+  byte in the first 4 KB, or nesting deeper than 64 are not parsed. They are listed by
+  `mesh-mcp doctor`, and rejected source files are named in the `smart_search` /
+  `find_dependents` results whose scope covers them.
+- File watching: one recursive FSEvents stream per root on macOS; per-directory watches on Linux
+  and Windows, where very large trees can exhaust `inotify` watches (`doctor` checks the limit).
+- The network sandbox exists on Linux only (see above).
 
 ---
 
@@ -402,49 +268,22 @@ All commands accept `--config <path>`. Logs go to stderr; stdout carries JSON-RP
 
 | Document | Contents |
 | :--- | :--- |
-| [SETUP.md](SETUP.md) | Full installation and configuration walkthrough. |
-| [docs/mcp-tools.md](docs/mcp-tools.md) | Tool schemas, arguments, output formats. |
-| [docs/architecture.md](docs/architecture.md) | Internals: snapshots, indexing, security jail. |
+| [SETUP.md](SETUP.md) | Installation and configuration walkthrough, config reference, troubleshooting. |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Tool schemas, output formats, error codes. |
+| [docs/architecture.md](docs/architecture.md) | Snapshot model, indexing, parser guards, jail, daemon, cache, sandbox, audit. |
+| [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, RSAH refusals, project skills, pre-commit hook. |
+| [docs/quality.md](docs/quality.md) | Every measurement, dated, with method and command. |
+| [docs/benchmarks.md](docs/benchmarks.md) | The measurement harnesses and how to run them. |
 | [docs/development.md](docs/development.md) | Building, testing, adding a language. |
-| [docs/governance-rsah.md](docs/governance-rsah.md) | Stop rules, skills, pre-commit enforcement. |
-| [docs/benchmarks.md](docs/benchmarks.md) | How to measure, and what the numbers mean. |
+| [docs/pilot-scorecard.md](docs/pilot-scorecard.md) | A/B protocol for the pilot. |
 
----
-
-## Development
-
-```bash
-cargo build --workspace                                  # debug build
-cargo test --workspace                                   # unit + integration tests
-cargo clippy --workspace --all-targets -- -D warnings    # must be clean
-cargo fmt --all                                          # before committing
-cargo bench -p mesh-server                               # benchmark suite
-```
-
-Once per clone, wire up the pre-commit hook (`.githooks/pre-commit`) so fmt/clippy/tests run
-automatically before every commit instead of being caught later in CI:
-```bash
-git config core.hooksPath .githooks
-```
-
-Workspace layout:
-
-| Crate | Responsibility |
-| :--- | :--- |
-| `mesh-core` | Graph, snapshot state, config, security jail, audit, watcher. |
-| `mesh-parsers` | Tree-sitter extractors, AST decapitation, Markdown output. |
-| `mesh-server` | MCP server, tools, indexing pipeline, CLI. |
-| `mesh-daemon` | Shared `meshd` daemon over a Unix socket. |
-
-`unwrap()` and `panic!()` are denied outside tests. See [docs/development.md](docs/development.md)
-and [CLAUDE.md](CLAUDE.md) for the architectural invariants a change must preserve.
+Contributors: the architectural invariants a change must preserve are in [CLAUDE.md](CLAUDE.md)
+and [AGENT.md](AGENT.md); task-specific guides for coding agents are in
+[`.agents/skills/`](.agents/skills/README.md).
 
 ---
 
 ## License
 
-Dual-licensed under either of:
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT license](LICENSE-MIT)
-
-at your option.
+Dual-licensed under the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.

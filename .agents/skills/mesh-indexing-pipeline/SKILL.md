@@ -22,15 +22,26 @@ the wrong place.
   - `WorkspaceIndexer::discover_config()`: explicit path, then `.agents/mesh-mcp.toml`, then `mesh-mcp.toml`, then a built-in single-root default
   - `WorkspaceIndexer::resolve_roots()`: `expand_roots` with a warn-and-fallback to the base dir
   - `WorkspaceIndexer::build_snapshot()`: full parallel scan → one `MeshSnapshot`. Optional
-    `Option<&PersistentIndexCache>` (P2 step 3.2,
-    [`crates/mesh-core/src/index_cache.rs`](../../../crates/mesh-core/src/index_cache.rs)):
+    `Option<&PersistentIndexCache>` (P2 step 3.2, one SQLite file per workspace since plan 4
+    step 4.4, [`crates/mesh-core/src/index_cache.rs`](../../../crates/mesh-core/src/index_cache.rs)):
     skips tree-sitter for a file whose (path, content hash, `RepoId`, extraction-config
-    fingerprint) all match a prior cached `FileIndex`. Passed at the two boot call sites only.
+    fingerprint) all match a prior cached `FileIndex`. Boot passes the cache opened by
+    `AppState::open_index_cache`; incremental reloads read and write it through
+    `state.index_cache`.
+  - `WorkspaceIndexer::build_snapshot_from_files()`: same over an explicit file list (the
+    determinism tests feed files in different orders)
   - `WorkspaceIndexer::build_graph()`: graph-only convenience for `mesh-mcp graph`
-  - `WorkspaceIndexer::reload()`: differential reload driven by the VFS, handles deletions
+  - `WorkspaceIndexer::reload()`: full differential reload (crawl, then only files whose stat
+    changed), handles deletions
+  - `WorkspaceIndexer::reload_paths(state, paths)`: targeted reload of the watcher's changed
+    paths, no crawl; falls back to `reload()` on a `.git` ref change, a directory event or a
+    vanished parent directory. This is the watcher's `ReloadFn`.
+  - private `apply_incremental`: shared tail of both reloads (stat filter, extraction on the QoS
+    pool, parse-failure retry, patch, fold, reconcile, install)
   - `WorkspaceIndexer::repo_names()`: display names indexed by `RepoId`
   - `SCAN_DEPTH`: crawl depth used by every full scan
-  - private: `crawl_all`, `process_file`, `fold`, `compiled_patterns`, `extract_config`,
+  - `crawl_all` (public), private: `run_scan_pass`, `process_file`, `extract_with_cache`,
+    `fold`, `compiled_patterns`, `extract_config`,
     `engine_toggles`, `FileFragment`, `ScanConfig` (bundles `patterns`/`doc_template`/
     `spring`/`extract_cfg`/`toggles` into one `&ScanConfig` param so `process_file` stays
     under `clippy::too_many_arguments` — resolved once per scan, not per file)
@@ -50,13 +61,14 @@ the wrong place.
   - `ExtractConfig::from_contracts(&ContractsConfig)` — `proto_dirs`, `controller_annotations`,
     `canonical_fqcn_projection`, `openapi_spec_files`, `asyncapi_spec_files`, `infer_string_topics`
 - **State**: [`crates/mesh-core/src/state.rs`](../../../crates/mesh-core/src/state.rs)
-  - `MeshSnapshot { contract_graph, doc_index, property_registry, generation }`
+  - `MeshSnapshot { contract_graph, doc_index, property_registry, generation, health, roots, .. }`
+    (`health: IndexHealth` counts and lists rejected / failed files, plan 4 step 4.1)
   - `AppState::snapshot()`, `AppState::snapshot_clone()`, `AppState::install_snapshot()`
 - **Differential VFS**: [`crates/mesh-core/src/vfs.rs`](../../../crates/mesh-core/src/vfs.rs)
   - `DifferentialVfs::is_unchanged_fast(path, metadata)`, `compute_signature`, `upsert`, `tracked_paths`, `remove`
 - **Background pool**: [`crates/mesh-core/src/rescan.rs`](../../../crates/mesh-core/src/rescan.rs)
   - `BackgroundRescanEngine::install(op)`, `::spawn(task)`, `::thread_count()`
-- **Watcher**: [`crates/mesh-core/src/watcher.rs`](../../../crates/mesh-core/src/watcher.rs) (debounce, coalescing) and [`crates/mesh-server/src/watcher.rs`](../../../crates/mesh-server/src/watcher.rs) (binds `WorkspaceIndexer::reload` as the `ReloadFn`)
+- **Watcher**: [`crates/mesh-core/src/watcher.rs`](../../../crates/mesh-core/src/watcher.rs) (debounce, coalescing, one recursive FSEvents stream per root on macOS, per-directory watches elsewhere, in-memory ignore filter), `crates/mesh-core/src/watcher/git.rs` (Git gate: holds reloads during checkout/rebase, plan 4 step 4.2) and [`crates/mesh-server/src/watcher.rs`](../../../crates/mesh-server/src/watcher.rs) (binds `WorkspaceIndexer::reload_paths` as the `ReloadFn`)
 
 ---
 
@@ -124,11 +136,10 @@ Both boot call sites pass `None`:
 WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, Some(&mut vfs), index_cache.as_ref())
 ```
 
-(`index_cache`: an `Option<PersistentIndexCache>` — P2 step 3.2's persistent, content-hash-keyed
-`FileIndex` cache, `None` if it failed to open. Only the two boot call sites above pass a real
-one; `reload` doesn't take this parameter at all, per the table above — it already only
-re-parses differential-VFS-flagged changed files, so a content-hash cache has nothing additional
-to skip there.)
+(`index_cache`: from `AppState::open_index_cache`, `None` if it failed to open, in which case
+every file is parsed. Reloads do not take the parameter: `apply_incremental` reads
+`state.index_cache`, so a branch switch back to already-seen content is a cache lookup instead of
+a re-parse.)
 
 `None` means the global Rayon pool. At boot a human is waiting on the first response and
 nothing else is running, so background-priority threads only make the wait longer — the
@@ -141,12 +152,20 @@ outer task.
 
 ### Reload, step by step
 
-1. Crawl all roots (the crawl itself is not incremental).
+The watcher calls `reload_paths` with the changed paths; it resolves each to its most specific
+root, applies that root's excludes and `.gitignore`, and treats a path that no longer exists as
+a deletion — no crawl. It falls back to the full `reload()` below for a `.git/HEAD` or
+`.git/refs` change, a directory event (rename, FSEvents `MustScanSubDirs`) or a path whose parent
+is gone. The full `reload()`:
+
+1. Crawl all roots.
 2. `deleted` = `vfs.tracked_paths()` minus what the crawl found.
 3. `candidates` = files where `!vfs.is_unchanged_fast(p, &m)`. For unchanged files the
    `fs::metadata` call is the only I/O — they are never read.
 4. Bail out early when both sets are empty; no new generation is installed.
-5. Extract candidates in parallel on the QoS pool.
+5. Extract candidates in parallel on the QoS pool (reading and writing the parse cache). A file
+   whose parse failed is retried once sequentially; if it still fails, its last known-good
+   facts are kept and it is retried on the next reload.
 6. `vfs.upsert` filters again by content hash: a bare `touch` changes mtime but hashes
    identical and is dropped here.
 7. `contract_graph.patch_files(changed ∪ deleted)` and `doc_index.remove_file(..)` purge
@@ -159,9 +178,15 @@ removed from the VFS, or the file resurrects on the next reload.
 ### Debounce and coalescing
 
 `FileWatcherService::DEBOUNCE_INTERVAL` is `Duration::from_millis(150)`.
-`schedule_reload` uses `state.reload_pending.swap(true, Ordering::AcqRel)` to coalesce a
-burst into a single queued job; events arriving during a run queue exactly one follow-up.
-Do not add your own queue on top of it.
+`schedule_reload(state, reload, paths)` appends the paths to `state.pending_reload_paths` and
+uses `state.reload_pending.swap(true, Ordering::AcqRel)` to coalesce a burst into a single
+queued job; events arriving during a run queue exactly one follow-up. Reloads are serialised by
+`state.reload_lock`. Do not add your own queue on top of it.
+
+While a Git operation is in progress (`index.lock`, `rebase-merge/`, `rebase-apply/`, or `HEAD`
+moving), the Git gate in `watcher/git.rs` holds changed paths and releases them as one reload
+when the operation settles (60 s cap). Tool answers meanwhile carry
+`FileWatcherService::git_operation_note`.
 
 ---
 
@@ -183,7 +208,9 @@ match ext {
     "yml" | "yaml" => { /* properties (same gate) + extract_with_config, gated by toggles.contracts_enabled */ }
     _ => {
         if toggles.contracts_enabled {
-            frag.code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+            // cache lookup by content hash, else PolyglotIndexer::extract_with_config
+            (frag.code, frag.cache_write) =
+                Self::extract_with_cache(path, content, repo_id, &frag.signature.content_hash, cfg);
         }
     }
 }
@@ -243,8 +270,10 @@ call and exists for callers that have no compiled set — do not use it in a sca
   guard; take it once per request and hold it for the whole request.
   `smart_search` takes a second guard for `redacted_count` after dropping the first —
   that is deliberate and narrow, not a pattern to copy.
-- **The VFS mutex is held across the deletion scan** in `reload`; it is dropped before
-  the snapshot is built. Do not widen that critical section.
+- **The VFS mutex is held across the stat filter** in `apply_incremental` (and the deletion
+  scan in `reload`); keep that critical section narrow.
+- **Rejected files are in `IndexHealth`, not the VFS.** A reload must also drop a rejected
+  file's entry when it disappears (`reload` does this from `snapshot.health.rejected`).
 - **Roots that fail `ValidatedScope::resolve` are skipped with a warning**, not an error.
   An empty graph is often a bad root, not a broken parser — check the `mesh::indexer`
   logs on stderr.
@@ -256,7 +285,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`indexer.rs` carries `full_scan_then_differential_reload_handles_edit_and_delete`, which
-covers full scan, no-op reload, edit and delete in one test; `crates/mesh-server/src/watcher.rs`
+`indexer.rs` carries `full_scan_then_differential_reload_handles_edit_and_delete` (full scan,
+no-op reload, edit, delete), the `reload_paths_*` tests (targeted reload, excludes, symlink
+escape, Git ref and directory fallbacks) and `warm_cache_produces_identical_snapshot_to_cold_parse`;
+`crates/mesh-server/tests/determinism.rs` checks fingerprints across file orders; `crates/mesh-server/src/watcher.rs`
 carries `test_file_watcher_live_reload` for the debounced path. Extend those rather than
 adding a parallel harness.

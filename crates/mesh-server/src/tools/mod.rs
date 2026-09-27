@@ -119,6 +119,31 @@ impl ToolRegistry {
         })
     }
 
+    /// Whether `name` is one of the tools `call_tool` actually dispatches —
+    /// checked before `respond`'s `still_indexing` gate (plan 4 step 4.12e), so
+    /// an unknown tool name gets the protocol-level `-32602` it would get once
+    /// indexed, not a retry-able "still indexing" that never stops being wrong.
+    pub fn is_known_tool(name: &str) -> bool {
+        matches!(
+            name,
+            SmartSearchTool::NAME
+                | FindDependentsTool::NAME
+                | AnalyzeGrpcTool::NAME
+                | AnalyzeImpactTool::NAME
+                | SearchDocsTool::NAME
+                | VisualizeMeshTool::NAME
+        ) || {
+            #[cfg(feature = "test-util")]
+            {
+                name == TestSlowOpTool::NAME
+            }
+            #[cfg(not(feature = "test-util"))]
+            {
+                false
+            }
+        }
+    }
+
     /// Dispatches an incoming MCP `tools/call` request.
     ///
     /// Per the MCP specification (2024-11-05), a failure *inside* a tool —
@@ -216,6 +241,46 @@ impl ToolRegistry {
         format!("{}…", &title[..cut])
     }
 
+    /// Audits a call refused before it ever reaches `T::run` — invalid arguments
+    /// or an RSAH governance refusal (plan 4 step 4.12b). Both used to leave
+    /// `invoke` through an early `return` ahead of the audit write at the end of
+    /// the `spawn_blocking` block below, so a refused call left no trace in the
+    /// audit log at all: exactly the failures an auditor most wants recorded.
+    /// Same `[engines.policy] cryptographic_audit_trail` gate and best-effort
+    /// semantics as the normal path, and off the executor for the same reason.
+    async fn record_refusal(
+        state: &Arc<AppState>,
+        tool: &'static str,
+        trace_id: Option<String>,
+        args_json: &str,
+    ) {
+        let audit_enabled = state
+            .config
+            .engines
+            .policy
+            .as_ref()
+            .is_none_or(|p| p.cryptographic_audit_trail);
+        if !audit_enabled {
+            return;
+        }
+        let state = Arc::clone(state);
+        let args_json = args_json.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = state.audit.record_entry(
+                "active-session",
+                trace_id.as_deref(),
+                tool,
+                &args_json,
+                "ERROR",
+                Vec::new(),
+                0,
+            ) {
+                tracing::warn!(target: "mesh::audit", "Audit write failed for {tool}: {e}");
+            }
+        })
+        .await;
+    }
+
     /// Parses arguments, runs the tool body and the audit write on the blocking
     /// pool, and returns the rendered text.
     /// Runs one tool. The outer `Result` is a protocol-level fault (the tool task
@@ -225,13 +290,14 @@ impl ToolRegistry {
         arguments: Value,
         state: Arc<AppState>,
     ) -> Result<Result<String, ToolError>, ToolError> {
-        let args: T::Args = match serde_json::from_value(arguments) {
+        let args: T::Args = match serde_json::from_value(arguments.clone()) {
             Ok(args) => args,
             Err(e) => {
+                Self::record_refusal(&state, T::NAME, None, &arguments.to_string()).await;
                 return Ok(Err((
                     -32602,
                     format!("Invalid arguments for {}: {e}", T::NAME),
-                )))
+                )));
             }
         };
 
@@ -251,6 +317,9 @@ impl ToolRegistry {
                         let payload = serde_json::to_string(&rsah).unwrap_or_else(|_| {
                             "RSAH governance refusal (payload serialization failed)".to_string()
                         });
+                        let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
+                        let args_json = serde_json::to_string(&args).unwrap_or_default();
+                        Self::record_refusal(&state, T::NAME, trace_id, &args_json).await;
                         return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
                     } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
                         tracing::warn!(
@@ -554,6 +623,53 @@ mod tests {
             run_with(false).await,
             0,
             "cryptographic_audit_trail = false must skip the audit write"
+        );
+    }
+
+    fn exported_statuses(audit: &AuditLogger) -> Vec<String> {
+        let dest = tempfile::NamedTempFile::new().expect("tmp file");
+        audit.export_to_jsonl(dest.path()).expect("export");
+        std::fs::read_to_string(dest.path())
+            .expect("read export")
+            .lines()
+            .map(|line| {
+                let v: Value = serde_json::from_str(line).expect("valid jsonl entry");
+                v["status"].as_str().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    /// Regression (step 4.12b review): invalid arguments and an RSAH governance
+    /// refusal both left `invoke` through an early `return`, before the audit
+    /// write at the end of the `spawn_blocking` block — so neither ever reached
+    /// the audit log, exactly the failures an auditor most wants recorded.
+    #[tokio::test]
+    async fn invalid_args_and_governance_refusals_are_both_audited() {
+        let state = governed_state();
+
+        // Invalid arguments: fails to deserialize before governance ever runs.
+        let result = ToolRegistry::invoke::<MutatingTestTool>(
+            json!({ "target": 12345 }), // `target` is a String
+            Arc::clone(&state),
+        )
+        .await
+        .expect("invalid args is a tool outcome, not a protocol fault");
+        result.expect_err("bad args must be refused");
+
+        // RSAH governance refusal: args parse fine, the guarded subject trips it.
+        let result = ToolRegistry::invoke::<MutatingTestTool>(
+            json!({ "target": "services/proto-registry/auth.proto" }),
+            Arc::clone(&state),
+        )
+        .await
+        .expect("a governance refusal is a tool outcome, not a protocol fault");
+        result.expect_err("guarded mutation must be refused");
+
+        let statuses = exported_statuses(&state.audit);
+        assert_eq!(
+            statuses,
+            vec!["ERROR".to_string(), "ERROR".to_string()],
+            "both the invalid-args call and the governance refusal must be audited: {statuses:?}"
         );
     }
 

@@ -60,14 +60,21 @@ impl MarkdownFormatter {
     /// One rendered result entry, exactly as [`Self::format_search_page`] emits it
     /// (`idx` is 0-based within the page).
     pub fn format_search_entry(idx: usize, r: &SearchResult) -> String {
+        let snippet = r.snippet.trim();
+        // Plan 4 step 4.12c: a snippet showing Markdown, a doc comment with an
+        // example, or a raw string containing its own ```` ``` ```` line closed
+        // this fence early, splitting the snippet across the entry boundary. The
+        // fence is now longer than the longest run of backticks the snippet
+        // itself contains, so no line inside it can ever close it.
+        let fence = "`".repeat((longest_backtick_run(snippet) + 1).max(3));
         format!(
-            "### [{}] `{}` (L{}-L{})\n```{}\n{}\n```\n\n",
+            "### [{}] `{}` (L{}-L{})\n{fence}{}\n{}\n{fence}\n\n",
             idx + 1,
             r.file_path,
             r.line_start,
             r.line_end,
             r.language,
-            r.snippet.trim()
+            snippet
         )
     }
 
@@ -434,6 +441,24 @@ impl MarkdownFormatter {
     }
 }
 
+/// Longest run of consecutive backticks anywhere in `s` (0 if none). Used to pick
+/// a code fence long enough that no line inside the wrapped content can close it
+/// early (CommonMark: a fence closes on a line of at least as many of the same
+/// character and nothing else).
+fn longest_backtick_run(s: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for c in s.chars() {
+        if c == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +477,48 @@ mod tests {
         assert!(formatted.contains("## Search Results for `Auth`"));
         assert!(formatted.contains("services/auth/src/Auth.ts"));
         assert!(formatted.contains("export class Auth {}"));
+    }
+
+    /// Regression (step 4.12c review): a snippet showing Markdown, a doc-comment
+    /// example, or a raw string that itself contains a ```` ``` ```` line closed
+    /// the entry's own fence early, splitting the snippet in two. The fence must
+    /// now always be longer than the longest run of backticks inside the snippet.
+    #[test]
+    fn format_search_entry_fence_is_never_closed_by_the_snippet() {
+        let r = SearchResult {
+            file_path: "docs/example.rs".to_string(),
+            line_start: 1,
+            line_end: 4,
+            language: "rust".to_string(),
+            snippet: "/// ```\n/// let x = 1;\n/// ```\nfn f() {}".to_string(),
+        };
+        let entry = MarkdownFormatter::format_search_entry(0, &r);
+        // Exactly two fences (open + close), never a third opened by the snippet.
+        assert_eq!(entry.matches("````").count(), 2, "{entry:?}");
+        assert!(
+            entry.contains("/// ```\n/// let x = 1;\n/// ```"),
+            "{entry:?}"
+        );
+
+        // A snippet with a longer run of backticks still round-trips: the fence
+        // grows to stay longer than it.
+        let r5 = SearchResult {
+            snippet: "`````already fenced`````".to_string(),
+            ..r
+        };
+        let entry5 = MarkdownFormatter::format_search_entry(0, &r5);
+        assert_eq!(entry5.matches("``````").count(), 2, "{entry5:?}");
+
+        // The common case (no backticks) still uses a plain 3-backtick fence.
+        let plain = SearchResult {
+            snippet: "fn f() {}".to_string(),
+            ..r5
+        };
+        let entry_plain = MarkdownFormatter::format_search_entry(0, &plain);
+        assert!(
+            entry_plain.contains("```rust\nfn f() {}\n```\n"),
+            "{entry_plain:?}"
+        );
     }
 
     #[test]

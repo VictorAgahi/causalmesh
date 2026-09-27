@@ -87,6 +87,19 @@ pub async fn respond(
                     None,
                 );
             };
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // Plan 4 step 4.12e: checked before `still_indexing` below, so an
+            // unknown tool name during the first scan gets the same protocol
+            // error it would once indexed, not a retry-able "still indexing"
+            // that would never stop being wrong for that name.
+            if !ToolRegistry::is_known_tool(tool_name) {
+                return JsonRpcResponse::error(
+                    req_id,
+                    -32602,
+                    format!("Unknown tool: {tool_name}"),
+                    None,
+                );
+            }
             if still_indexing {
                 return JsonRpcResponse::success(
                     req_id,
@@ -96,7 +109,6 @@ pub async fn respond(
                     ),
                 );
             }
-            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -109,5 +121,55 @@ pub async fn respond(
         unknown => {
             JsonRpcResponse::error(req_id, -32601, format!("Method not found: {unknown}"), None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_core::{AuditLogger, BackgroundRescanEngine, Config};
+
+    fn test_state() -> Arc<AppState> {
+        let cfg =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        Arc::new(AppState::new(cfg, vec![], audit, rescan))
+    }
+
+    fn tools_call(name: &str) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: Some("2.0".to_string()),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": name, "arguments": {} })),
+        }
+    }
+
+    /// Regression (step 4.12e review): an unknown tool name during the first
+    /// scan (`still_indexing: true`) got the generic, retry-able "still
+    /// indexing" answer instead of the `-32602` it would get once indexed —
+    /// a name that will never exist stayed silently wrong forever. The tool
+    /// name is now checked before the `still_indexing` gate.
+    #[tokio::test]
+    async fn unknown_tool_is_rejected_even_while_still_indexing() {
+        let resp = respond(tools_call("not_a_real_tool"), &test_state(), true).await;
+        let err = resp.error.expect("unknown tool must be a protocol error");
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("not_a_real_tool"), "{err:?}");
+    }
+
+    /// A known tool name during the first scan keeps the existing, retry-able
+    /// "still indexing" behavior (not a regression of the reordering above).
+    #[tokio::test]
+    async fn known_tool_still_gets_the_still_indexing_retry_while_indexing() {
+        let resp = respond(tools_call("smart_search"), &test_state(), true).await;
+        let result = resp
+            .result
+            .expect("known tool while indexing is a tool result, not an error");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("still indexing"), "{text}");
+        assert_eq!(result["isError"], json!(true));
     }
 }

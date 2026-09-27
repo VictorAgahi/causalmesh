@@ -1380,18 +1380,32 @@ impl ContractGraph {
             // Consumers of *any* newly-discovered topic, again in one pass
             // over `self.edges` rather than one pass per topic — keeps this
             // hop O(|edges|) too instead of O(new_topics × |edges|).
+            //
+            // `reconcile_edges` emits `Consumes` as topic -> consumer (the
+            // direction events flow, also what the graph renderers draw), while
+            // `add_edge` indexes it as consumer -> topic. The walk used to
+            // accept only the latter, so on an indexed workspace no hop past
+            // the first ever reached a consumer. The topic end is whichever end
+            // was just discovered; the consumer is the other one.
             let mut next_frontier: HashSet<NodeId> = HashSet::new();
             for edge in &self.edges {
-                if edge.kind != EdgeKind::Consumes
-                    || !new_topics_set.contains(&edge.to)
-                    || !visited_nodes.insert(edge.from)
-                {
+                if edge.kind != EdgeKind::Consumes {
                     continue;
                 }
-                let Some(consumer) = self.nodes.get(&edge.from) else {
+                let consumer_id = if new_topics_set.contains(&edge.from) {
+                    edge.to
+                } else if new_topics_set.contains(&edge.to) {
+                    edge.from
+                } else {
                     continue;
                 };
-                next_frontier.insert(edge.from);
+                if !visited_nodes.insert(consumer_id) {
+                    continue;
+                }
+                let Some(consumer) = self.nodes.get(&consumer_id) else {
+                    continue;
+                };
+                next_frontier.insert(consumer_id);
                 match consumer.kind {
                     NodeKind::Saga => flow.related_sagas.push(consumer),
                     _ => flow.downstream_consumers.push(consumer),
@@ -2896,6 +2910,45 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// `depth` must follow the edges `reconcile_edges` really builds:
+    /// `Produces` producer -> topic hub, `Consumes` topic hub -> consumer.
+    /// producer -> t1 -> relay (consumes t1, produces t2) -> t2 -> sink.
+    #[test]
+    fn analyze_impact_with_depth_follows_reconciled_edge_directions() {
+        let mut g = ContractGraph::new();
+        let producer = matrix_node(&mut g, "producer", NodeKind::ServiceClass, "a/p.go", "", 0);
+        let relay = matrix_node(&mut g, "relay", NodeKind::ServiceClass, "b/r.go", "", 1);
+        let sink = matrix_node(&mut g, "sink", NodeKind::ServiceClass, "c/s.go", "", 2);
+        g.add_producer(producer, "orders.t1");
+        g.add_consumer(relay, "orders.t1");
+        g.add_producer(relay, "billing.t2");
+        g.add_consumer(sink, "billing.t2");
+        g.reconcile_edges();
+        assert!(
+            g.all_edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Consumes && e.to == relay),
+            "reconcile_edges emits Consumes as topic -> consumer: {:?}",
+            g.all_edges()
+        );
+
+        let names = |f: &ImpactFlow<'_>| -> Vec<String> {
+            f.downstream_consumers
+                .iter()
+                .map(|n| n.name.to_string())
+                .collect()
+        };
+        let direct = g.analyze_impact_with_depth("orders.t1", 1);
+        assert_eq!(names(&direct), vec!["relay".to_string()]);
+        let deep = g.analyze_impact_with_depth("orders.t1", 3);
+        assert_eq!(
+            names(&deep),
+            vec!["relay".to_string(), "sink".to_string()],
+            "depth 3 must reach the second-hop consumer"
+        );
+        assert!(deep.topics.iter().any(|t| t.name == "billing.t2"));
     }
 
     /// Plan 4 step 4.6a: a client whose `CallsRpc` edges fan out to two

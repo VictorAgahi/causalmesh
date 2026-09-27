@@ -1038,12 +1038,16 @@ guarantees that the cost stays proportional to the file.
 - **Latency** (release, Apple M2, through `ToolRegistry::call_tool` with the in-memory audit,
   median of 51 calls after one warm-up, `ProcessPayment` on the fixture): 26.7 µs, 26.5 µs,
   24.5 µs over three runs (max 52.8 µs). Budget: < 100 ms; the test asserts it.
-- **Found, not fixed (out of scope)**: `analyze_impact_with_depth` expects `Consumes` edges as
-  consumer → topic, while `reconcile_edges` emits them topic → consumer, and pattern-declared
-  producers are distinct `produce:` nodes from the `consume:` nodes of the same service; so on an
-  indexed workspace a hop past the first can add the topics a frontier node produces onto but
-  never their consumers (`order-created-topic` on the fixture: 7 rows at depth 1, 8 at depth 3).
-  The existing depth tests build edges by hand in the direction the traversal expects.
+- **Fixed in the same PR**: `analyze_impact_with_depth` followed `Consumes` edges only as
+  consumer → topic, while `reconcile_edges` emits them topic → consumer, so no hop past the first
+  reached a consumer on an indexed workspace (the existing depth tests built edges by hand in the
+  direction the traversal expected). New test `analyze_impact_with_depth_follows_reconciled_edge_directions`
+  (producer → t1 → relay → t2 → sink, built with `add_producer`/`add_consumer` +
+  `reconcile_edges`) failed before (`["relay"]`), passes after (`["relay", "sink"]`). Still not
+  followed: a hop through a service whose pattern-declared `consume:` and `produce:` call sites
+  are distinct nodes (polyglot-shop `order-created-topic`: 7 rows at depth 1, 8 at depth 3 — the
+  extra row is the `invoice-generated-topic` hub, which has no consumer). Golden (3 corpora) stays
+  100 % / 100 %; `scripts/determinism.sh`: 1 fingerprint / 13 runs on both workspaces.
 
 ## What's NOT measured yet
 

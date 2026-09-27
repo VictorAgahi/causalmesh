@@ -866,6 +866,47 @@ each, 1 MB quota, size ≤ quota after every reload, eviction observed).
 
 **Not measured**: a real long-lived `meshd` over a real week, and the cache on a real 200k-file
 repository (entry size depends on the language mix; the 5k corpus is synthetic).
+## Update (2026-09-27, Plan 4 step 4.2: macOS watcher without polling, reloads held during Git operations)
+
+**Idle CPU of `meshd` on macOS.** Corpus: `scripts/bench/gen_synthetic.py /tmp/m42/cpu 3000 --services 250 --contracts`, a Git repository with 503 directories (outside `.git`), `roots = ["."]`. `meshd --idle-timeout-minutes 0 --startup-grace-secs 0` with an isolated `HOME` and socket. After 60 s of startup, `ps -o %cpu= -p <pid>` was sampled every 5 s for 10 min (120 samples), and `ps -o time=` was read at the start and end of the window.
+
+| binary | watcher backend (from the log) | mean `%cpu` | CPU time over the window | load averages (`uptime`, start / 5 min / end) |
+|---|---|---|---|---|
+| before, `97b7a3b` | `falling back to polling every 2s` (`PollWatcher`) | 4.211 % | 0:04.17 → 0:28.80 (24.6 s) | 18.78 / 14.91 / 6.26 |
+| after, this PR | `FileWatcher (FSEvents, recursive) watching root` | 0.000 % | 0:00.61 → 0:00.65 (0.04 s) | 19.61 / 24.93 / 7.19 |
+
+Both runs happened on a shared machine with other agents compiling in parallel. The system load was comparable across the two runs, and the `%cpu` of `meshd` counts only its own process. In the after run's log, `polling` appears 0 times (`grep -ci polling meshd.log`). The only watcher backend built was the recursive FSEvents stream.
+
+**Git storm** (`scripts/test_git_storm.sh`, 3,000 generated files rewritten by `git checkout main → feature`, `smart_search` in a loop against `mesh-mcp run --standalone`):
+
+| binary | generations installed after the checkout started | answers carrying the Git note | fingerprint of the installed index vs a cold `graph --format fingerprint` of the same directory |
+|---|---|---|---|
+| before, `97b7a3b` | 3: gen 2 (5 files, during the checkout), gen 3 (84 files, during), gen 4 (2,911 files) | n/a | not logged by this binary |
+| after, this PR | 1: gen 2, after the hold was released, none between hold and release | 5,446 of 149,132, all naming generation 1 | equal (`98219d59…9ef3e3`) |
+
+Before this step, two partial generations mixing both branches were installed and served mid-checkout. The script exits non-zero on the before binary and passes on the after binary.
+
+**Tests added.**
+- Pure unit tests for the Git gate state machine:
+  - checkout order: lock, files, lock removed, then `HEAD`;
+  - a fast checkout seen only through `HEAD`;
+  - `git commit`, where the ref moves and `HEAD` does not;
+  - an index refresh that flushes nothing;
+  - late worktree events;
+  - the 60 s cap;
+  - two repositories.
+- Orphan-lock rules: a young lock is live, an old lock with no `git` process is declared orphan once, and the process check is rate-limited.
+- Git directory resolution: plain repository, worktree and submodule with synthetic and real `git` layouts.
+- The in-memory event filter: excludes, root `.gitignore`, nested re-include kept, recompilation.
+- The per-state tool note.
+- An end-to-end test on the real OS watcher: nothing is installed while `.git/index.lock` exists, the tool text carries the note, and exactly one generation is installed after release.
+- Review fix: a directory renamed inside a root (`mv pkg pkg2`) is reported by FSEvents as one event per directory, never per contained file, and was discarded by the extension filter: `pkg2/a.proto` was never indexed and `pkg/a.proto` stayed in the index (`renamed_directory_is_reindexed_on_recursive_backend`, failing before the fix). On the recursive backends an existing, non-excluded directory event (which also covers an FSEvents `MustScanSubDirs` hint) is now kept, and `reload_paths` turns it into a full reload.
+
+**Limits.**
+- The in-memory filter only uses each root's own ignore files. An event under a nested `.gitignore` is kept, and `reload_paths` decides.
+- A hold covers every root: a busy repository delays reloads of the other roots too.
+- An orphan lock is declared only when the process check answers "no `git` process". On Windows there is no check, so only the 60 s cap applies.
+- A directory event is recognised only for an extension-less name (`v1.2/` is not), and a directory moved *out of* every root leaves its files indexed until the next full reload. Linux/Windows per-directory watches still drop directory events, as before this step.
 
 ## What's NOT measured yet
 

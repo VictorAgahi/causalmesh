@@ -31,6 +31,86 @@ pub struct ImpactFlow<'g> {
     pub related_sagas: Vec<&'g ContractNode>,
 }
 
+/// Whether an impacted element lives in the service that owns the changed
+/// contract (plan 4 step 4.6a). The graph has no "service" field, so the
+/// service is the root (`repo_id`): see [`ContractGraph::impact_matrix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactScope {
+    /// Another root than the owner's, or no root at all.
+    External,
+    /// The owner's root.
+    Internal,
+}
+
+impl ImpactScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImpactScope::External => "EXTERNAL",
+            ImpactScope::Internal => "INTERNAL",
+        }
+    }
+}
+
+/// How an impacted element relates to the changed contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactRole {
+    /// Implements the gRPC method/service.
+    Handler,
+    /// Calls the gRPC method, or binds a client to its service.
+    Client,
+    /// Produces onto a matched topic.
+    Producer,
+    /// A matched topic / stream / queue.
+    Topic,
+    /// Consumes a matched topic (directly or through `depth` hops).
+    Consumer,
+    /// A saga reached by the matched events.
+    Saga,
+}
+
+impl ImpactRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImpactRole::Handler => "handler",
+            ImpactRole::Client => "client",
+            ImpactRole::Producer => "producer",
+            ImpactRole::Topic => "topic",
+            ImpactRole::Consumer => "consumer",
+            ImpactRole::Saga => "saga",
+        }
+    }
+}
+
+/// One row of an [`ImpactMatrix`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactRow<'g> {
+    pub node: &'g ContractNode,
+    pub role: ImpactRole,
+    pub scope: ImpactScope,
+    /// Confidence of the edge that links `node` to `via` (gRPC rows) or of
+    /// the topic match (async rows).
+    pub confidence: EdgeConfidence,
+    /// Contract node the row is linked through: the proto method it
+    /// implements/calls, or its service for a service-level client. `None` for
+    /// a direct name match with no edge and for async rows.
+    pub via: Option<&'g ContractNode>,
+}
+
+/// Impact matrix of a change to a gRPC method/service or an async event
+/// (plan 4 step 4.6a). `rows` are deduplicated and totally ordered.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactMatrix<'g> {
+    pub target: CompactStr,
+    /// The `.proto` declarations the target resolved to.
+    pub contracts: Vec<&'g ContractNode>,
+    /// Roots that own the changed contract(s), sorted. Empty when no owner
+    /// could be determined, in which case every row is `External`.
+    pub owner_roots: Vec<RepoId>,
+    pub rows: Vec<ImpactRow<'g>>,
+}
+
 /// In-memory graph of polyglot architecture contracts and dependencies.
 #[derive(Debug, Clone, Default)]
 pub struct ContractGraph {
@@ -1082,30 +1162,13 @@ impl ContractGraph {
         let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
         for node in self.nodes.values() {
-            if !matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod) {
+            let Some((confidence, is_symbol_match)) = Self::grpc_target_match(node, norm_target)
+            else {
                 continue;
-            }
-            // Case-sensitive exact-name equality is unambiguous; case-folding
-            // or a substring FQCN hit is a name heuristic.
-            let exact_name = node.name.as_str() == norm_target;
-            let matches_name = exact_name
-                || node.name.eq_ignore_ascii_case(norm_target)
-                || Self::bare_names_match(&node.name, norm_target);
-            let matches_fqcn = node.package.contains(norm_target)
-                || Self::fqcn_contains(&node.package, &node.name, norm_target);
-            if !(matches_name || matches_fqcn) {
-                continue;
-            }
-            let confidence = if exact_name {
-                EdgeConfidence::Exact
-            } else {
-                EdgeConfidence::Heuristic
             };
 
-            let is_symbol_match = exact_name || Self::bare_names_match(&node.name, norm_target);
-
             if Self::is_proto_file(&node.file_path) {
-                if exact_name || proto_definition.is_none() {
+                if confidence == EdgeConfidence::Exact || proto_definition.is_none() {
                     proto_definition = Some(node);
                 }
                 anchors.push(node.id);
@@ -1152,6 +1215,34 @@ impl ContractGraph {
             client_stubs,
             server_handlers,
         }
+    }
+
+    /// How `node` matches an `analyze_grpc` / `impact_matrix` target: `None`
+    /// when it does not, else the confidence of the match and whether it is a
+    /// symbol-level match (the node *is* the target declaration or one of its
+    /// implementations) rather than a package/FQCN substring hit.
+    fn grpc_target_match(node: &ContractNode, norm_target: &str) -> Option<(EdgeConfidence, bool)> {
+        if !matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod) {
+            return None;
+        }
+        // Case-sensitive exact-name equality is unambiguous; case-folding
+        // or a substring FQCN hit is a name heuristic.
+        let exact_name = node.name.as_str() == norm_target;
+        let matches_name = exact_name
+            || node.name.eq_ignore_ascii_case(norm_target)
+            || Self::bare_names_match(&node.name, norm_target);
+        let matches_fqcn = node.package.contains(norm_target)
+            || Self::fqcn_contains(&node.package, &node.name, norm_target);
+        if !(matches_name || matches_fqcn) {
+            return None;
+        }
+        let confidence = if exact_name {
+            EdgeConfidence::Exact
+        } else {
+            EdgeConfidence::Heuristic
+        };
+        let is_symbol_match = exact_name || Self::bare_names_match(&node.name, norm_target);
+        Some((confidence, is_symbol_match))
     }
 
     /// `format!("{package}/{name}").contains(needle)` without the allocation.
@@ -1289,18 +1380,32 @@ impl ContractGraph {
             // Consumers of *any* newly-discovered topic, again in one pass
             // over `self.edges` rather than one pass per topic — keeps this
             // hop O(|edges|) too instead of O(new_topics × |edges|).
+            //
+            // `reconcile_edges` emits `Consumes` as topic -> consumer (the
+            // direction events flow, also what the graph renderers draw), while
+            // `add_edge` indexes it as consumer -> topic. The walk used to
+            // accept only the latter, so on an indexed workspace no hop past
+            // the first ever reached a consumer. The topic end is whichever end
+            // was just discovered; the consumer is the other one.
             let mut next_frontier: HashSet<NodeId> = HashSet::new();
             for edge in &self.edges {
-                if edge.kind != EdgeKind::Consumes
-                    || !new_topics_set.contains(&edge.to)
-                    || !visited_nodes.insert(edge.from)
-                {
+                if edge.kind != EdgeKind::Consumes {
                     continue;
                 }
-                let Some(consumer) = self.nodes.get(&edge.from) else {
+                let consumer_id = if new_topics_set.contains(&edge.from) {
+                    edge.to
+                } else if new_topics_set.contains(&edge.to) {
+                    edge.from
+                } else {
                     continue;
                 };
-                next_frontier.insert(edge.from);
+                if !visited_nodes.insert(consumer_id) {
+                    continue;
+                }
+                let Some(consumer) = self.nodes.get(&consumer_id) else {
+                    continue;
+                };
+                next_frontier.insert(consumer_id);
                 match consumer.kind {
                     NodeKind::Saga => flow.related_sagas.push(consumer),
                     _ => flow.downstream_consumers.push(consumer),
@@ -1310,6 +1415,359 @@ impl ContractGraph {
         }
 
         flow
+    }
+
+    /// Impact matrix of a change to `target` (plan 4 step 4.6a): the gRPC
+    /// handlers and clients of the proto method/service it names (resolved like
+    /// [`Self::analyze_grpc`]) plus the async producers, topics, consumers and
+    /// sagas of the events it names ([`Self::analyze_impact_with_depth`]), each
+    /// classified `Internal` or `External`.
+    ///
+    /// **Owner rule.** The graph has no service field, so a service is a root
+    /// (`repo_id`). The owner of a proto contract is the set of roots of the
+    /// handlers that implement it (`Implements` edges); with no handler, the
+    /// root of the `.proto` itself. A row linked through a contract (`via`) is
+    /// `Internal` when its root is in that contract's owner set, else
+    /// `External`. Rows with no `via` (direct name matches with no edge) are
+    /// classified against the union of every contract's owners. The owner of an
+    /// async event is the set of roots of its producers, else of its topics.
+    ///
+    /// **Edge cases.** A node with no root (`RepoId::MAX`: the synthetic
+    /// cross-repo topic hubs) is never `Internal` and never an owner. A client
+    /// whose `CallsRpc` edges fan out to several homonymous contracts
+    /// (`Ambiguous`) gets one row per candidate contract, each classified
+    /// against that candidate's owners. A service-level client (bound to the
+    /// method's service, not to the method) is capped at `Heuristic`: the edge
+    /// proves the binding, not that this method is called.
+    ///
+    /// **Dedup.** One row per `(node, role, via)`; when the same key is reached
+    /// by several paths the strongest confidence wins (exact > heuristic >
+    /// ambiguous). A via-less direct-match row is dropped when the same
+    /// `(node, role)` also has a row linked through a contract.
+    ///
+    /// **Order.** External first, then role, root-qualified path, line, name,
+    /// `via` (path, line, name), confidence — a total order over content, not
+    /// over `NodeId`s or hash iteration.
+    pub fn impact_matrix(&self, target: &str, depth: usize) -> ImpactMatrix<'_> {
+        let norm_target = target.trim();
+
+        // ── gRPC: anchors, then their handlers/clients through real edges ──
+        let mut anchors: Vec<&ContractNode> = Vec::new();
+        // (node, role, confidence, via); the owner anchor is kept alongside.
+        let mut grpc: Vec<(
+            &ContractNode,
+            ImpactRole,
+            EdgeConfidence,
+            Option<&ContractNode>,
+        )> = Vec::new();
+        for node in self.nodes.values() {
+            let Some((confidence, is_symbol_match)) = Self::grpc_target_match(node, norm_target)
+            else {
+                continue;
+            };
+            if Self::is_proto_file(&node.file_path) {
+                anchors.push(node);
+            } else if is_symbol_match {
+                anchors.push(node);
+                let role = if node.name.as_str().starts_with("rpc:") {
+                    ImpactRole::Client
+                } else {
+                    ImpactRole::Handler
+                };
+                grpc.push((node, role, confidence, None));
+            }
+        }
+
+        // Edge target -> (anchor the row is classified against, via node, is service-level).
+        let mut edge_targets: HashMap<NodeId, Vec<(NodeId, bool)>> = HashMap::new();
+        for anchor in &anchors {
+            edge_targets
+                .entry(anchor.id)
+                .or_default()
+                .push((anchor.id, false));
+            // A proto method's own service: clients bind to the service
+            // (`NewFooServiceClient`, `getService('FooService')`), not to a
+            // method, and `reconcile_edges` points that `CallsRpc` edge at the
+            // `.proto` service or, when one is indexed, at a server-side
+            // implementation of it (Go `RegisterFooServiceServer`, a tonic
+            // `impl FooService for …`). Both count: the `.proto` one only in
+            // the method's own file, a code one by its exact service name.
+            if anchor.kind == NodeKind::GrpcMethod && Self::is_proto_file(&anchor.file_path) {
+                if let Some((service_name, _)) = anchor.name.rsplit_once('.') {
+                    let same_name = self
+                        .name_to_nodes
+                        .get(service_name)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    for sid in same_name {
+                        let Some(service) = self.nodes.get(sid) else {
+                            continue;
+                        };
+                        let in_scope = !Self::is_proto_file(&service.file_path)
+                            || service.file_path == anchor.file_path;
+                        if service.kind == NodeKind::GrpcService && in_scope {
+                            edge_targets
+                                .entry(service.id)
+                                .or_default()
+                                .push((anchor.id, true));
+                        }
+                    }
+                }
+            }
+        }
+        // (row index in `grpc`) -> owner anchor id; via-less rows have none.
+        let mut owner_anchor: Vec<Option<NodeId>> = vec![None; grpc.len()];
+        for edge in &self.edges {
+            let role = match edge.kind {
+                EdgeKind::Implements => ImpactRole::Handler,
+                EdgeKind::CallsRpc => ImpactRole::Client,
+                _ => continue,
+            };
+            let Some(targets) = edge_targets.get(&edge.to) else {
+                continue;
+            };
+            let (Some(from), Some(via)) = (self.nodes.get(&edge.from), self.nodes.get(&edge.to))
+            else {
+                continue;
+            };
+            for &(anchor_id, service_level) in targets {
+                // Only a client can bind to the service; an `Implements` edge
+                // to the service is not an implementation of this method.
+                if service_level && role != ImpactRole::Client {
+                    continue;
+                }
+                let confidence = if service_level {
+                    Self::weakest(edge.confidence, EdgeConfidence::Heuristic)
+                } else {
+                    edge.confidence
+                };
+                grpc.push((from, role, confidence, Some(via)));
+                owner_anchor.push(Some(anchor_id));
+            }
+        }
+
+        // Owner roots per anchor: roots of its handlers, else its own root —
+        // except a client call site (`rpc:`), which never owns the contract.
+        let mut owners_of: HashMap<NodeId, Vec<RepoId>> = HashMap::new();
+        for ((node, role, _, _), anchor) in grpc.iter().zip(&owner_anchor) {
+            if let (ImpactRole::Handler, Some(anchor)) = (role, anchor) {
+                if node.repo_id != RepoId::MAX {
+                    owners_of.entry(*anchor).or_default().push(node.repo_id);
+                }
+            }
+        }
+        for anchor in &anchors {
+            let owners = owners_of.entry(anchor.id).or_default();
+            if owners.is_empty()
+                && anchor.repo_id != RepoId::MAX
+                && !anchor.name.starts_with("rpc:")
+            {
+                owners.push(anchor.repo_id);
+            }
+            owners.sort_unstable();
+            owners.dedup();
+        }
+        let mut grpc_owners: Vec<RepoId> = owners_of.values().flatten().copied().collect();
+        grpc_owners.extend(
+            grpc.iter()
+                .zip(&owner_anchor)
+                .filter(|((n, role, _, _), a)| {
+                    a.is_none() && *role == ImpactRole::Handler && n.repo_id != RepoId::MAX
+                })
+                .map(|((n, _, _, _), _)| n.repo_id),
+        );
+        grpc_owners.sort_unstable();
+        grpc_owners.dedup();
+
+        // Via-less rows are dropped when the same (node, role) is also linked
+        // through a contract.
+        let linked: HashSet<(NodeId, ImpactRole)> = grpc
+            .iter()
+            .filter(|(_, _, _, via)| via.is_some())
+            .map(|(n, role, _, _)| (n.id, *role))
+            .collect();
+
+        let mut rows: Vec<ImpactRow<'_>> = Vec::new();
+        for ((node, role, confidence, via), anchor) in grpc.into_iter().zip(owner_anchor) {
+            if via.is_none() && linked.contains(&(node.id, role)) {
+                continue;
+            }
+            let owners = match anchor {
+                Some(a) => owners_of.get(&a).map(Vec::as_slice).unwrap_or(&[]),
+                None => grpc_owners.as_slice(),
+            };
+            rows.push(ImpactRow {
+                node,
+                role,
+                scope: Self::scope_of(node, owners),
+                confidence,
+                via,
+            });
+        }
+
+        // ── Async: producers / topics / consumers / sagas ──
+        let flow = self.analyze_impact_with_depth(norm_target, depth);
+        let target_lc = norm_target.to_lowercase();
+        let mut async_owners: Vec<RepoId> = flow
+            .upstream_producers
+            .iter()
+            .map(|n| n.repo_id)
+            .filter(|r| *r != RepoId::MAX)
+            .collect();
+        if async_owners.is_empty() {
+            async_owners.extend(
+                flow.topics
+                    .iter()
+                    .map(|n| n.repo_id)
+                    .filter(|r| *r != RepoId::MAX),
+            );
+        }
+        async_owners.sort_unstable();
+        async_owners.dedup();
+        for (nodes, role) in [
+            (&flow.upstream_producers, ImpactRole::Producer),
+            (&flow.topics, ImpactRole::Topic),
+            (&flow.downstream_consumers, ImpactRole::Consumer),
+            (&flow.related_sagas, ImpactRole::Saga),
+        ] {
+            for node in nodes {
+                // `analyze_impact`'s node scan lists a pattern-declared
+                // `produce:`/`consume:` call site among the topics; in the
+                // matrix it is what its name says it is.
+                let role = if node.name.starts_with("produce:") {
+                    ImpactRole::Producer
+                } else if node.name.starts_with("consume:") {
+                    ImpactRole::Consumer
+                } else {
+                    role
+                };
+                rows.push(ImpactRow {
+                    node,
+                    role,
+                    scope: Self::scope_of(node, &async_owners),
+                    confidence: self.async_match_confidence(node, &target_lc),
+                    via: None,
+                });
+            }
+        }
+
+        // ── Dedup (strongest confidence per key), then a total content order ──
+        // The same key reached through several anchors keeps its strongest
+        // confidence, then `External` (the conservative answer) on a tie.
+        rows.sort_by_key(|r| {
+            (
+                r.node.id,
+                r.role,
+                r.via.map(|v| v.id),
+                Self::confidence_rank(r.confidence),
+                r.scope,
+            )
+        });
+        rows.dedup_by(|later, first| {
+            later.node.id == first.node.id
+                && later.role == first.role
+                && later.via.map(|v| v.id) == first.via.map(|v| v.id)
+        });
+        rows.sort_by(|a, b| Self::row_key(a).cmp(&Self::row_key(b)));
+
+        let mut owner_roots = grpc_owners;
+        owner_roots.extend(async_owners);
+        owner_roots.sort_unstable();
+        owner_roots.dedup();
+
+        let mut contracts: Vec<&ContractNode> = anchors
+            .into_iter()
+            .filter(|n| Self::is_proto_file(&n.file_path))
+            .collect();
+        contracts.sort_by(|a, b| {
+            (&a.file_path, a.line_start, &a.name).cmp(&(&b.file_path, b.line_start, &b.name))
+        });
+
+        ImpactMatrix {
+            target: CompactStr::new(norm_target),
+            contracts,
+            owner_roots,
+            rows,
+        }
+    }
+
+    /// `Internal` when `node` has a root and it is one of `owners`.
+    fn scope_of(node: &ContractNode, owners: &[RepoId]) -> ImpactScope {
+        if node.repo_id != RepoId::MAX && owners.contains(&node.repo_id) {
+            ImpactScope::Internal
+        } else {
+            ImpactScope::External
+        }
+    }
+
+    /// Exact (0) is the strongest, ambiguous (2) the weakest.
+    fn confidence_rank(c: EdgeConfidence) -> u8 {
+        match c {
+            EdgeConfidence::Exact => 0,
+            EdgeConfidence::Heuristic => 1,
+            EdgeConfidence::Ambiguous => 2,
+        }
+    }
+
+    fn weakest(a: EdgeConfidence, b: EdgeConfidence) -> EdgeConfidence {
+        if Self::confidence_rank(a) >= Self::confidence_rank(b) {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// Content sort key of an impact row (rows are already unique per
+    /// `(node, role, via)`). The `NodeId`s come last and only separate two
+    /// distinct nodes with identical content.
+    #[allow(clippy::type_complexity)]
+    fn row_key<'a>(
+        row: &'a ImpactRow<'_>,
+    ) -> (
+        ImpactScope,
+        ImpactRole,
+        &'a Path,
+        usize,
+        &'a str,
+        Option<(&'a Path, usize, &'a str)>,
+        NodeId,
+        Option<NodeId>,
+    ) {
+        (
+            row.scope,
+            row.role,
+            &row.node.file_path,
+            row.node.line_start,
+            row.node.name.as_str(),
+            row.via
+                .map(|v| (&*v.file_path, v.line_start, v.name.as_str())),
+            row.node.id,
+            row.via.map(|v| v.id),
+        )
+    }
+
+    /// Exact when `node` is registered on exactly the target topic, or its
+    /// name (minus a `produce:`/`consume:` prefix) is the target; otherwise the
+    /// row came from a substring match or a transitive hop: heuristic.
+    fn async_match_confidence(&self, node: &ContractNode, target_lc: &str) -> EdgeConfidence {
+        let registered = |index: &HashMap<CompactStr, Vec<NodeId>>| {
+            index
+                .get(target_lc)
+                .is_some_and(|ids| ids.contains(&node.id))
+        };
+        let name = node.name.as_str();
+        let bare = name
+            .strip_prefix("produce:")
+            .or_else(|| name.strip_prefix("consume:"))
+            .unwrap_or(name);
+        if registered(&self.topic_producers)
+            || registered(&self.topic_consumers)
+            || bare.eq_ignore_ascii_case(target_lc)
+        {
+            EdgeConfidence::Exact
+        } else {
+            EdgeConfidence::Heuristic
+        }
     }
 
     /// Case-insensitive substring search over symbol declarations, restricted to
@@ -2410,6 +2868,291 @@ mod tests {
     /// `topic_consumers` — both `HashMap`s — directly, so which producer/
     /// consumer topic matched first (and thus its node order in the result)
     /// depended on the process's random hash seed rather than content (I5).
+    fn matrix_node(
+        g: &mut ContractGraph,
+        name: &str,
+        kind: NodeKind,
+        path: &str,
+        package: &str,
+        repo_id: RepoId,
+    ) -> NodeId {
+        g.add_node(ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: Path::new(path).into(),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new(package),
+            repo_id,
+            signature: None,
+            docstring: None,
+        })
+    }
+
+    fn matrix_edge(
+        g: &mut ContractGraph,
+        from: NodeId,
+        to: NodeId,
+        kind: EdgeKind,
+        c: EdgeConfidence,
+    ) {
+        g.add_edge(ContractEdge {
+            from,
+            to,
+            kind,
+            metadata: None,
+            confidence: c,
+        });
+    }
+
+    /// (scope, role, name, via name, confidence) of every row, in order.
+    fn matrix_rows(
+        m: &ImpactMatrix<'_>,
+    ) -> Vec<(ImpactScope, ImpactRole, String, String, EdgeConfidence)> {
+        m.rows
+            .iter()
+            .map(|r| {
+                (
+                    r.scope,
+                    r.role,
+                    r.node.name.to_string(),
+                    r.via.map(|v| v.name.to_string()).unwrap_or_default(),
+                    r.confidence,
+                )
+            })
+            .collect()
+    }
+
+    /// `depth` must follow the edges `reconcile_edges` really builds:
+    /// `Produces` producer -> topic hub, `Consumes` topic hub -> consumer.
+    /// producer -> t1 -> relay (consumes t1, produces t2) -> t2 -> sink.
+    #[test]
+    fn analyze_impact_with_depth_follows_reconciled_edge_directions() {
+        let mut g = ContractGraph::new();
+        let producer = matrix_node(&mut g, "producer", NodeKind::ServiceClass, "a/p.go", "", 0);
+        let relay = matrix_node(&mut g, "relay", NodeKind::ServiceClass, "b/r.go", "", 1);
+        let sink = matrix_node(&mut g, "sink", NodeKind::ServiceClass, "c/s.go", "", 2);
+        g.add_producer(producer, "orders.t1");
+        g.add_consumer(relay, "orders.t1");
+        g.add_producer(relay, "billing.t2");
+        g.add_consumer(sink, "billing.t2");
+        g.reconcile_edges();
+        assert!(
+            g.all_edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Consumes && e.to == relay),
+            "reconcile_edges emits Consumes as topic -> consumer: {:?}",
+            g.all_edges()
+        );
+
+        let names = |f: &ImpactFlow<'_>| -> Vec<String> {
+            f.downstream_consumers
+                .iter()
+                .map(|n| n.name.to_string())
+                .collect()
+        };
+        let direct = g.analyze_impact_with_depth("orders.t1", 1);
+        assert_eq!(names(&direct), vec!["relay".to_string()]);
+        let deep = g.analyze_impact_with_depth("orders.t1", 3);
+        assert_eq!(
+            names(&deep),
+            vec!["relay".to_string(), "sink".to_string()],
+            "depth 3 must reach the second-hop consumer"
+        );
+        assert!(deep.topics.iter().any(|t| t.name == "billing.t2"));
+    }
+
+    /// Plan 4 step 4.6a: a client whose `CallsRpc` edges fan out to two
+    /// homonymous contracts (`Ambiguous`) gets one row per candidate, each
+    /// classified against that candidate's own owner root.
+    #[test]
+    fn impact_matrix_ambiguous_fan_out_is_one_row_per_candidate() {
+        use EdgeConfidence::*;
+        use ImpactRole::*;
+        use ImpactScope::*;
+        let mut g = ContractGraph::new();
+        let a = matrix_node(
+            &mut g,
+            "AdminService.Ping",
+            NodeKind::GrpcMethod,
+            "a/admin.proto",
+            "a.v1",
+            0,
+        );
+        let b = matrix_node(
+            &mut g,
+            "AdminService.Ping",
+            NodeKind::GrpcMethod,
+            "b/admin.proto",
+            "b.v1",
+            1,
+        );
+        let ha = matrix_node(
+            &mut g,
+            "pingA",
+            NodeKind::GrpcMethod,
+            "svc-a/server.go",
+            "",
+            2,
+        );
+        let hb = matrix_node(
+            &mut g,
+            "pingB",
+            NodeKind::GrpcMethod,
+            "svc-b/server.go",
+            "",
+            3,
+        );
+        let client = matrix_node(
+            &mut g,
+            "callPing",
+            NodeKind::ServiceClass,
+            "svc-a/client.go",
+            "",
+            2,
+        );
+        matrix_edge(&mut g, ha, a, EdgeKind::Implements, Exact);
+        matrix_edge(&mut g, hb, b, EdgeKind::Implements, Exact);
+        matrix_edge(&mut g, client, a, EdgeKind::CallsRpc, Ambiguous);
+        matrix_edge(&mut g, client, b, EdgeKind::CallsRpc, Ambiguous);
+
+        let m = g.impact_matrix("Ping", 1);
+        assert_eq!(m.owner_roots, vec![2, 3]);
+        assert_eq!(
+            matrix_rows(&m),
+            vec![
+                (
+                    External,
+                    Client,
+                    "callPing".into(),
+                    "AdminService.Ping".into(),
+                    Ambiguous
+                ),
+                (
+                    Internal,
+                    Handler,
+                    "pingA".into(),
+                    "AdminService.Ping".into(),
+                    Exact
+                ),
+                (
+                    Internal,
+                    Handler,
+                    "pingB".into(),
+                    "AdminService.Ping".into(),
+                    Exact
+                ),
+                (
+                    Internal,
+                    Client,
+                    "callPing".into(),
+                    "AdminService.Ping".into(),
+                    Ambiguous
+                ),
+            ]
+        );
+        // The EXTERNAL client row is the one linked through `b` (owned by root 3).
+        assert_eq!(m.rows[0].via.map(|v| v.id), Some(b));
+        assert_eq!(m.rows[3].via.map(|v| v.id), Some(a));
+        // Deterministic: the same graph gives the same rows.
+        assert_eq!(matrix_rows(&g.impact_matrix("Ping", 1)), matrix_rows(&m));
+    }
+
+    /// Owner = handlers' roots, else the `.proto` root; a rootless node is
+    /// never INTERNAL; a node reached by a direct name match and by an edge is
+    /// one row (the edge's).
+    #[test]
+    fn impact_matrix_owner_fallback_rootless_and_dedup() {
+        use EdgeConfidence::*;
+        use ImpactRole::*;
+        use ImpactScope::*;
+        let mut g = ContractGraph::new();
+        let m_id = matrix_node(
+            &mut g,
+            "PingService.Ping",
+            NodeKind::GrpcMethod,
+            "proto/ping.proto",
+            "p.v1",
+            0,
+        );
+        let local = matrix_node(
+            &mut g,
+            "localCaller",
+            NodeKind::ServiceClass,
+            "proto/tools/cli.go",
+            "",
+            0,
+        );
+        let rootless = matrix_node(
+            &mut g,
+            "busCaller",
+            NodeKind::ServiceClass,
+            "event-bus",
+            "",
+            RepoId::MAX,
+        );
+        matrix_edge(&mut g, local, m_id, EdgeKind::CallsRpc, Exact);
+        matrix_edge(&mut g, rootless, m_id, EdgeKind::CallsRpc, Exact);
+
+        // No handler: the `.proto` root owns the contract.
+        let m = g.impact_matrix("PingService.Ping", 1);
+        assert_eq!(m.owner_roots, vec![0]);
+        assert_eq!(
+            matrix_rows(&m),
+            vec![
+                (
+                    External,
+                    Client,
+                    "busCaller".into(),
+                    "PingService.Ping".into(),
+                    Exact
+                ),
+                (
+                    Internal,
+                    Client,
+                    "localCaller".into(),
+                    "PingService.Ping".into(),
+                    Exact
+                ),
+            ]
+        );
+
+        // A handler named like the method (a direct symbol match) that also
+        // implements it through an edge: one row, the edge's confidence, and
+        // its root becomes the owner.
+        let h = matrix_node(&mut g, "Ping", NodeKind::GrpcMethod, "svc/ping.go", "", 1);
+        matrix_edge(&mut g, h, m_id, EdgeKind::Implements, Heuristic);
+        let m = g.impact_matrix("Ping", 1);
+        assert_eq!(m.owner_roots, vec![1]);
+        assert_eq!(
+            matrix_rows(&m),
+            vec![
+                (
+                    External,
+                    Client,
+                    "busCaller".into(),
+                    "PingService.Ping".into(),
+                    Exact
+                ),
+                (
+                    External,
+                    Client,
+                    "localCaller".into(),
+                    "PingService.Ping".into(),
+                    Exact
+                ),
+                (
+                    Internal,
+                    Handler,
+                    "Ping".into(),
+                    "PingService.Ping".into(),
+                    Heuristic
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn analyze_impact_orders_producers_by_matched_topic_name() {
         let mut graph = ContractGraph::new();

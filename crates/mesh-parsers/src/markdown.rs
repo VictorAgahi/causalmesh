@@ -1,6 +1,8 @@
-use mesh_core::{ContractNode, DocSection, GrpcTrace, ImpactFlow};
+use mesh_core::{
+    ContractNode, DocSection, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactScope, RepoId,
+};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MAX_OUTPUT_BYTES: usize = 48 * 1024; // 48 KB hard limit
 
@@ -412,6 +414,201 @@ impl MarkdownFormatter {
         out
     }
 
+    /// Renders one page of an [`ImpactMatrix`] (plan 4 step 4.6a) as a compact
+    /// Markdown table, paged like [`Self::format_search_page`]: rows from
+    /// `offset`, at most `limit` of them and never more than fit the 48 KB
+    /// payload budget; the footer names the exact `offset` of the next page.
+    /// `roots` are the workspace roots indexed by `repo_id`: each row shows its
+    /// root (relative to the roots' common parent) and its root-relative path.
+    pub fn format_impact_matrix(
+        matrix: &ImpactMatrix,
+        roots: &[PathBuf],
+        offset: usize,
+        limit: usize,
+    ) -> String {
+        let labels = Self::root_labels(roots);
+        let label_of = |repo: RepoId| -> &str {
+            labels.get(repo as usize).map(String::as_str).unwrap_or("—")
+        };
+        let total = matrix.rows.len();
+        let external = matrix
+            .rows
+            .iter()
+            .filter(|r| r.scope == ImpactScope::External)
+            .count();
+
+        let mut header = format!("## Impact Matrix for `{}`\n", matrix.target);
+        if !matrix.contracts.is_empty() {
+            let shown: Vec<String> = matrix
+                .contracts
+                .iter()
+                .take(5)
+                .map(|c| {
+                    format!(
+                        "`{}/{}` (`{}`)",
+                        c.package,
+                        c.name,
+                        Self::location(c, roots)
+                    )
+                })
+                .collect();
+            let more = matrix.contracts.len().saturating_sub(5);
+            let more = if more > 0 {
+                format!(" … and {more} more")
+            } else {
+                String::new()
+            };
+            header.push_str(&format!("*Contract(s): {}{more}*\n", shown.join(", ")));
+        }
+        let owners: Vec<String> = matrix
+            .owner_roots
+            .iter()
+            .map(|r| format!("`{}`", label_of(*r)))
+            .collect();
+        header.push_str(&format!(
+            "*Owner root(s): {} — INTERNAL = same root as the handlers implementing the contract (else its `.proto`, or the event producers); EXTERNAL = any other root or none.*\n",
+            if owners.is_empty() {
+                "none (every row is EXTERNAL)".to_string()
+            } else {
+                owners.join(", ")
+            }
+        ));
+
+        if total == 0 {
+            header.push_str(
+                "\n*No gRPC handler/client or async producer/topic/consumer matched this target. Pass a proto method (`ProcessPayment`, `PaymentService.ProcessPayment`), a service, or an event/topic name.*\n",
+            );
+            return header;
+        }
+        if offset >= total {
+            header.push_str(&format!(
+                "\n*No rows at `offset: {offset}`: the matrix has {total} row(s); request an offset below {total}.*\n"
+            ));
+            return header;
+        }
+
+        const FOOTER_UPPER_BOUND: usize = 160;
+        const TABLE_HEAD: &str = "| # | Scope | Role | Element | Root | Location | Confidence | Via |\n|---|---|---|---|---|---|---|---|\n";
+        let budget = (MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES)
+            .saturating_sub(header.len() + 128 + TABLE_HEAD.len() + FOOTER_UPPER_BOUND);
+        let mut body = String::new();
+        let mut end = offset;
+        for (idx, row) in matrix
+            .rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(limit.max(1))
+        {
+            let via = row
+                .via
+                .map(|v| Self::code_cell(&v.name))
+                .unwrap_or_else(|| "—".to_string());
+            let line = format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                idx + 1,
+                row.scope.label(),
+                row.role.label(),
+                Self::code_cell(&row.node.name),
+                Self::code_cell(label_of(row.node.repo_id)),
+                Self::code_cell(&Self::location(row.node, roots)),
+                row.confidence.label(),
+                via
+            );
+            // Always emit at least one row so a page always makes progress.
+            if end > offset && body.len() + line.len() > budget {
+                break;
+            }
+            body.push_str(&line);
+            end = idx + 1;
+        }
+
+        let range = if offset == 0 && end == total {
+            String::new()
+        } else {
+            format!(" — showing {}-{end}", offset + 1)
+        };
+        header.push_str(&format!(
+            "*Rows: {total} ({external} EXTERNAL, {} INTERNAL){range}*\n\n",
+            total - external
+        ));
+        header.push_str(TABLE_HEAD);
+        header.push_str(&body);
+        if end < total {
+            header.push_str(&format!(
+                "\n*More rows: repeat the same call with `offset: {end}` for the next page.*\n"
+            ));
+        }
+        header
+    }
+
+    /// Display label of each root, indexed like `roots`: its path relative to
+    /// the roots' common parent (the root's own name when that is empty).
+    fn root_labels(roots: &[PathBuf]) -> Vec<String> {
+        let common: Option<PathBuf> = roots.iter().fold(None, |acc, r| {
+            let Some(acc) = acc else {
+                return Some(r.clone());
+            };
+            Some(
+                acc.components()
+                    .zip(r.components())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .collect(),
+            )
+        });
+        roots
+            .iter()
+            .map(|r| {
+                let rel = common
+                    .as_deref()
+                    .filter(|_| roots.len() > 1)
+                    .and_then(|c| r.strip_prefix(c).ok())
+                    .filter(|p| !p.as_os_str().is_empty());
+                match rel {
+                    Some(p) => Self::slash_path(p),
+                    None => r
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| r.to_string_lossy().into_owned()),
+                }
+            })
+            .collect()
+    }
+
+    /// `path:line`, the path relative to the node's root when it has one.
+    fn location(node: &ContractNode, roots: &[PathBuf]) -> String {
+        match roots
+            .get(node.repo_id as usize)
+            .and_then(|root| node.file_path.strip_prefix(root).ok())
+        {
+            Some(rel) => format!("{}:{}", Self::slash_path(rel), node.line_start),
+            None => format!("{}:{}", node.file_path.display(), node.line_start),
+        }
+    }
+
+    /// A relative path with `/` separators on every platform, so a matrix
+    /// reads (and compares) the same on Windows.
+    fn slash_path(rel: &Path) -> String {
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// An inline-code table cell: `|` escaped, line breaks flattened, and a
+    /// backtick fence longer than any run inside the text.
+    fn code_cell(text: &str) -> String {
+        let flat = text.replace(['\n', '\r'], " ").replace('|', "\\|");
+        let fence = "`".repeat(longest_backtick_run(&flat) + 1);
+        let pad = if flat.starts_with('`') || flat.ends_with('`') {
+            " "
+        } else {
+            ""
+        };
+        format!("{fence}{pad}{flat}{pad}{fence}")
+    }
+
     pub fn format_doc_sections(query: &str, sections: &[&DocSection]) -> String {
         let mut out = format!(
             "## Architecture Documentation Search for `{query}`\n*Matched {} conceptual section(s)*\n\n",
@@ -462,6 +659,105 @@ fn longest_backtick_run(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn impact_nodes(n: usize, name_len: usize) -> Vec<ContractNode> {
+        (0..n)
+            .map(|i| ContractNode {
+                id: i as u32,
+                name: format!("{i:04}{}", "x".repeat(name_len)).into(),
+                kind: mesh_core::NodeKind::ServiceClass,
+                file_path: Path::new(&format!("/ws/services/a/f{i}.go")).into(),
+                line_start: i + 1,
+                line_end: i + 1,
+                package: "".into(),
+                repo_id: (i % 2) as RepoId,
+                signature: None,
+                docstring: None,
+            })
+            .collect()
+    }
+
+    fn impact_matrix_of(nodes: &[ContractNode]) -> ImpactMatrix<'_> {
+        ImpactMatrix {
+            target: "Ping".into(),
+            contracts: Vec::new(),
+            owner_roots: vec![0],
+            rows: nodes
+                .iter()
+                .map(|n| mesh_core::ImpactRow {
+                    node: n,
+                    role: mesh_core::ImpactRole::Client,
+                    scope: if n.repo_id == 0 {
+                        ImpactScope::Internal
+                    } else {
+                        ImpactScope::External
+                    },
+                    confidence: mesh_core::EdgeConfidence::Heuristic,
+                    via: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Plan 4 step 4.6a: pages stop at `limit` or at the byte budget, whichever
+    /// comes first, and the footer's offset resumes exactly after the last row.
+    #[test]
+    fn impact_matrix_pages_by_limit_and_by_byte_budget() {
+        let roots = vec![
+            PathBuf::from("/ws/services/a"),
+            PathBuf::from("/ws/services/b"),
+        ];
+        let nodes = impact_nodes(5, 4);
+        let m = impact_matrix_of(&nodes);
+        let page = MarkdownFormatter::format_impact_matrix(&m, &roots, 1, 2);
+        assert!(
+            page.contains("*Rows: 5 (2 EXTERNAL, 3 INTERNAL) — showing 2-3*"),
+            "{page}"
+        );
+        // Root labels are relative to the roots' common parent; a path outside
+        // the node's root is shown whole.
+        assert!(
+            page.contains(
+                "| 2 | EXTERNAL | client | `0001xxxx` | `b` | `/ws/services/a/f1.go:2` |"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("| 3 | INTERNAL | client | `0002xxxx` | `a` | `f2.go:3` |"),
+            "{page}"
+        );
+        assert!(page.contains("`offset: 3`"), "{page}");
+        assert!(!page.contains("| 1 |"), "{page}");
+
+        // 2,000 rows of ~300 bytes cannot fit 48 KB: the page is cut by the
+        // budget, stays under it, and resumes where it stopped.
+        let nodes = impact_nodes(2000, 200);
+        let m = impact_matrix_of(&nodes);
+        let page = MarkdownFormatter::format_impact_matrix(&m, &roots, 0, usize::MAX);
+        assert!(
+            page.len() <= MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES,
+            "{}",
+            page.len()
+        );
+        let shown = page
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| # "))
+            .count();
+        assert!(shown > 0 && shown < 2000);
+        assert!(page.contains(&format!("`offset: {shown}`")), "{page}");
+    }
+
+    #[test]
+    fn impact_matrix_cells_escape_pipes_and_backticks() {
+        assert_eq!(MarkdownFormatter::code_cell("a|b"), "`a\\|b`");
+        assert_eq!(MarkdownFormatter::code_cell("x`y"), "``x`y``");
+        assert_eq!(MarkdownFormatter::code_cell("`q`"), "`` `q` ``");
+        assert_eq!(MarkdownFormatter::code_cell("a\nb"), "`a b`");
+        assert_eq!(
+            MarkdownFormatter::root_labels(&[PathBuf::from("/ws/solo")]),
+            vec!["solo".to_string()]
+        );
+    }
 
     #[test]
     fn test_format_search_results_basic() {

@@ -1,9 +1,16 @@
 // Inventory manager microservice listening to payment events and reserving stock
 
+pub mod proto {
+    tonic::include_proto!("shop.inventory.v1");
+}
+
+use proto::inventory_service_server::InventoryService;
+
 pub struct InventoryServiceServer;
 
-impl InventoryServiceServer {
-    pub fn reserve_stock(&self, order_id: &str, item_id: &str, qty: i32) -> bool {
+// Serves the InventoryService gRPC contract (proto/inventory.proto).
+impl InventoryService for InventoryServiceServer {
+    fn reserve_stock(&self, order_id: &str, item_id: &str, qty: i32) -> bool {
         println!("[InventoryService.ReserveStock] Order: {order_id}, item: {item_id}, qty: {qty}");
         true
     }

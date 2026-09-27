@@ -900,11 +900,13 @@ Before this step, two partial generations mixing both branches were installed an
 - The in-memory event filter: excludes, root `.gitignore`, nested re-include kept, recompilation.
 - The per-state tool note.
 - An end-to-end test on the real OS watcher: nothing is installed while `.git/index.lock` exists, the tool text carries the note, and exactly one generation is installed after release.
+- Review fix: a directory renamed inside a root (`mv pkg pkg2`) is reported by FSEvents as one event per directory, never per contained file, and was discarded by the extension filter: `pkg2/a.proto` was never indexed and `pkg/a.proto` stayed in the index (`renamed_directory_is_reindexed_on_recursive_backend`, failing before the fix). On the recursive backends an existing, non-excluded directory event (which also covers an FSEvents `MustScanSubDirs` hint) is now kept, and `reload_paths` turns it into a full reload.
 
 **Limits.**
 - The in-memory filter only uses each root's own ignore files. An event under a nested `.gitignore` is kept, and `reload_paths` decides.
 - A hold covers every root: a busy repository delays reloads of the other roots too.
 - An orphan lock is declared only when the process check answers "no `git` process". On Windows there is no check, so only the 60 s cap applies.
+- A directory event is recognised only for an extension-less name (`v1.2/` is not), and a directory moved *out of* every root leaves its files indexed until the next full reload. Linux/Windows per-directory watches still drop directory events, as before this step.
 
 ## What's NOT measured yet
 

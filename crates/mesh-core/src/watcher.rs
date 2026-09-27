@@ -166,7 +166,7 @@ impl EventFilter {
         }
     }
 
-    fn keeps(&self, path: &Path) -> bool {
+    fn keeps(&self, path: &Path, is_dir: bool) -> bool {
         let Some((root, ignore, _)) = self.roots.iter().find(|(r, _, _)| path.starts_with(r))
         else {
             return false;
@@ -183,7 +183,7 @@ impl EventFilter {
         let Some(ignore) = ignore else {
             return true;
         };
-        if !ignore.matched_path_or_any_parents(path, false).is_ignore() {
+        if !ignore.matched_path_or_any_parents(path, is_dir).is_ignore() {
             return true;
         }
         // A nested ignore file between `root` and `path` could re-include it (`!pattern`);
@@ -200,6 +200,17 @@ impl EventFilter {
         }
         false
     }
+}
+
+/// Whether a directory event may stand for a subtree worth reindexing: never one under
+/// `target/`, `node_modules/` or `.git/` (the same components `is_relevant_path` rejects).
+fn is_relevant_dir_path(path: &Path) -> bool {
+    !path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("target" | "node_modules" | ".git")
+        )
+    })
 }
 
 /// In-kernel filesystem watcher service providing debounced change notifications
@@ -735,10 +746,26 @@ impl LoopCtx {
                 filter.refresh_if_ignore_file(path);
             }
             if !FileWatcherService::is_relevant_path(path) {
+                // Recursive backends only: a directory event stands for its whole subtree. A
+                // renamed or moved-in directory is reported once, under its own name, never
+                // once per file it contains, and so is an FSEvents `MustScanSubDirs` hint
+                // (events dropped under load). Dropping it here, as the extension filter would,
+                // leaves every file under it unindexed (and those under the old name stale).
+                // It is kept, and `WorkspaceIndexer::reload_paths` turns an existing directory
+                // into a full reload. The stat only runs for extension-less paths.
+                let subtree = self.filter.as_ref().is_some_and(|filter| {
+                    path.extension().is_none()
+                        && is_relevant_dir_path(path)
+                        && path.is_dir()
+                        && filter.keeps(path, true)
+                });
+                if subtree {
+                    input.paths.push(path.clone());
+                }
                 continue;
             }
             if let Some(filter) = self.filter.as_ref() {
-                if !filter.keeps(path) {
+                if !filter.keeps(path, false) {
                     continue;
                 }
             }
@@ -991,27 +1018,44 @@ mod tests {
         let matcher = ExcludeMatcher::compile(&["vendor/**".to_string()]);
         let mut f = EventFilter::new(std::slice::from_ref(&root), &[None], matcher);
 
-        assert!(f.keeps(&root.join("src/a.ts")));
-        assert!(!f.keeps(&root.join("vendor/x/a.go")), "exclude_patterns");
+        assert!(f.keeps(&root.join("src/a.ts"), false));
         assert!(
-            !f.keeps(&root.join("dist/a.ts")),
+            !f.keeps(&root.join("vendor/x/a.go"), false),
+            "exclude_patterns"
+        );
+        assert!(
+            !f.keeps(&root.join("dist/a.ts"), false),
             "root .gitignore dir rule"
         );
         assert!(
-            !f.keeps(&root.join("src/b.gen.ts")),
+            !f.keeps(&root.join("src/b.gen.ts"), false),
             "root .gitignore file rule"
         );
         assert!(
-            f.keeps(&root.join("pkg/keep.gen.ts")),
+            f.keeps(&root.join("pkg/keep.gen.ts"), false),
             "nested ignore file: kept"
         );
-        assert!(!f.keeps(&root.join(".git/HEAD")), ".git is always excluded");
-        assert!(!f.keeps(Path::new("/elsewhere/a.ts")), "outside every root");
+        assert!(
+            !f.keeps(&root.join(".git/HEAD"), false),
+            ".git is always excluded"
+        );
+        assert!(
+            !f.keeps(Path::new("/elsewhere/a.ts"), false),
+            "outside every root"
+        );
+        assert!(
+            !f.keeps(&root.join("dist"), true),
+            "an ignored directory event is filtered like its files"
+        );
+        assert!(
+            f.keeps(&root.join("src"), true),
+            "a plain directory event is kept"
+        );
 
         std::fs::write(root.join(".gitignore"), "").expect("gitignore");
         f.refresh_if_ignore_file(&root.join(".gitignore"));
         assert!(
-            f.keeps(&root.join("dist/a.ts")),
+            f.keeps(&root.join("dist/a.ts"), false),
             "recompiled after the edit"
         );
     }

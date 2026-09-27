@@ -413,4 +413,54 @@ roots = ["."]
             state.snapshot().contract_graph.node_count()
         );
     }
+
+    /// Plan 4 step 4.2 review: a directory renamed inside a recursively watched root is reported
+    /// by FSEvents as one event per *directory* (the old and the new name), never one per file
+    /// it contains — the same shape as an FSEvents `MustScanSubDirs` (dropped events) hint.
+    /// Neither may be discarded by the extension filter: the files under the new name must be
+    /// indexed and the ones under the old name forgotten.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn renamed_directory_is_reindexed_on_recursive_backend() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root = dunce::canonicalize(temp_dir.path()).expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir pkg");
+        std::fs::write(
+            root.join("pkg/a.proto"),
+            "syntax = \"proto3\"; package a; service A { rpc X (R) returns (S); }",
+        )
+        .expect("write a");
+        let cfg = mesh_core::Config::load_from_str(
+            "[workspace]\nname = \"t-mv\"\nversion = \"0\"\nroots = [\".\"]\n",
+        )
+        .expect("config");
+        let audit = Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        FileWatcherService::execute_reload_sync(&state);
+        let tracked = |state: &AppState| -> Vec<std::path::PathBuf> {
+            let vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+            vfs.tracked_paths().map(Path::to_path_buf).collect()
+        };
+        assert!(tracked(&state).contains(&root.join("pkg/a.proto")));
+
+        let cancel_token = CancellationToken::new();
+        let handle =
+            FileWatcherService::spawn(state.clone(), cancel_token.clone()).expect("spawn watcher");
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::rename(root.join("pkg"), root.join("pkg2")).expect("rename dir");
+
+        let mut ok = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            let t = tracked(&state);
+            if t.contains(&root.join("pkg2/a.proto")) && !t.contains(&root.join("pkg/a.proto")) {
+                ok = true;
+                break;
+            }
+        }
+        cancel_token.cancel();
+        let _ = handle.join();
+        assert!(ok, "renamed directory not reindexed: {:?}", tracked(&state));
+    }
 }

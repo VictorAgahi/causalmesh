@@ -1066,7 +1066,7 @@ roots = ["."]
 
         let search_args = super::smart_search::SmartSearchArgs {
             query: mesh_core::CompactStr::new("signUp"),
-            scope: mesh_core::CompactStr::new("ms-user"),
+            scope: Some(mesh_core::CompactStr::new("ms-user")),
             include_body: false,
             fuzzy: None,
             limit: None,

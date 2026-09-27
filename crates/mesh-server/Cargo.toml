@@ -38,6 +38,7 @@ toml.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 dunce.workspace = true
+path-clean.workspace = true
 num_cpus.workspace = true
 rayon.workspace = true
 notify.workspace = true

@@ -681,6 +681,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "num_cpus",
+ "path-clean",
  "rayon",
  "schemars",
  "serde",

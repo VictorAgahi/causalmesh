@@ -929,6 +929,12 @@ The classic nested "billion laughs" (9x9 aliases, 1.3 KB) *was* stopped by that 
   visitors from them. Only anchored nodes are recorded, as scalars borrowed from the input, so
   aliases can be replayed. Recording and replay are charged to a per-file **alias budget** of
   1 event per input byte (minimum 64 Ki). Over budget, the document fails and ingests nothing.
+  Counting events alone let one anchored *long scalar* through: each alias replays it for one
+  unit, and a visitor that keeps strings (the AsyncAPI `topics:` list) copied it per alias, so
+  a 107 KB file (a 100 KB scalar, 1,000 `- *a`) produced 100 MB of topics within budget (found
+  in review). Replayed scalar bytes now go to a second **replay byte budget** (4 bytes per input
+  byte, minimum 64 KB). Scalars that libyaml had to unescape are held once behind an `Rc`, so
+  recording and replay never copy them. The golden sweeps below are unchanged.
   I first tried the pure-Rust `saphyr-parser` / `yaml-rust2`; both reject otel-demo's
   `compose.yaml` (a flow sequence closed at its key's indentation) that libyaml accepts.
 - `PropertyRegistry::ingest_yaml_str` gets a second per-file budget on **flattened output**

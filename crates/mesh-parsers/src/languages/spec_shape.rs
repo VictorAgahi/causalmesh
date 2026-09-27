@@ -474,4 +474,22 @@ components: {schemas: {User: {type: object}}}
         }
         eprintln!("compared {seen} YAML files");
     }
+
+    /// One long anchored scalar listed under `topics:` by many aliases: each
+    /// alias is one event, so only the replayed-bytes budget stops it from
+    /// copying the scalar once per alias (107 KB -> 100 MB before).
+    #[test]
+    fn long_scalar_alias_fan_out_in_topics_is_refused() {
+        let mut yaml = format!(
+            "asyncapi: 2.0.0\nbase: &a {}\ntopics:\n",
+            "x".repeat(100_000)
+        );
+        for _ in 0..1000 {
+            yaml.push_str("  - *a\n");
+        }
+        assert!(matches!(
+            from_yaml::<AsyncApiShape>(&yaml),
+            Err(mesh_core::yaml_stream::Error::ReplayBytesExceeded { .. })
+        ));
+    }
 }

@@ -4,8 +4,8 @@
 //! event per scalar/collection, plus its position) before any visitor runs. Measured
 //! with `scripts/bench/yaml_md_peak.py`, that is 24–34× the file size for an
 //! OpenAPI/AsyncAPI spec or a Spring property file (`docs/quality.md`, 4.9). This
-//! module drives the same serde visitors straight from the `saphyr-parser` event
-//! stream instead: events are pulled one at a time, so the parser holds only its
+//! module drives the same serde visitors straight from libyaml's event stream
+//! instead: events are pulled one at a time, so the parser holds only its
 //! scanner state, and a visitor's output is the only thing that grows with the file.
 //!
 //! The one thing a stream cannot do on its own is replay an alias (`*name`). The
@@ -21,6 +21,14 @@
 //! replayed by an alias. Exceeding it fails the document with
 //! [`Error::BudgetExceeded`] (callers already treat a failed document as
 //! contributing nothing). A file without aliases never spends any.
+//!
+//! Counting events alone would let one anchored *long scalar* through: each
+//! alias replays it for one unit, and a visitor that keeps strings (a spec's
+//! `topics:` list) copies it per alias (a 107 KB file flattened to 100 MB).
+//! Replayed scalar bytes are therefore charged to a second per-file budget,
+//! [`replay_byte_budget`] ([`Error::ReplayBytesExceeded`]), and a scalar the
+//! parser had to unescape is held once behind an `Rc` so recording and replay
+//! never copy it.
 //!
 //! Scalar resolution, tag handling (`!Tag` → enum), the recursion limit (128) and
 //! "skipping a value never follows its aliases" are ported from `serde_yaml` 0.9
@@ -38,6 +46,8 @@ use std::rc::Rc;
 pub const ALIAS_BUDGET_PER_BYTE: usize = 1;
 /// Floor of the alias budget, so small files keep room for ordinary anchors.
 pub const MIN_ALIAS_BUDGET: usize = 64 * 1024;
+/// Scalar bytes an alias may replay per input byte (see the module docs).
+pub const REPLAY_BYTES_PER_INPUT_BYTE: usize = 4;
 /// Same nesting limit as `serde_yaml` (`remaining_depth: 128`).
 const RECURSION_LIMIT: usize = 128;
 
@@ -47,12 +57,20 @@ pub fn alias_budget(len: usize) -> usize {
         .max(MIN_ALIAS_BUDGET)
 }
 
+/// The replayed-scalar-bytes budget of a `len`-byte document.
+pub fn replay_byte_budget(len: usize) -> usize {
+    len.saturating_mul(REPLAY_BYTES_PER_INPUT_BYTE)
+        .max(MIN_ALIAS_BUDGET)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// The YAML itself is malformed.
     Scan(String),
     /// Anchor recording + alias replay went over [`alias_budget`].
     BudgetExceeded { budget: usize },
+    /// Scalar bytes replayed by aliases went over [`replay_byte_budget`].
+    ReplayBytesExceeded { budget: usize },
     /// `from_str` on a stream holding more than one document.
     MoreThanOneDocument,
     /// Anything a visitor or the structure reported.
@@ -66,6 +84,10 @@ impl fmt::Display for Error {
             Error::BudgetExceeded { budget } => write!(
                 f,
                 "YAML anchor/alias expansion exceeds the per-file budget ({budget} events)"
+            ),
+            Error::ReplayBytesExceeded { budget } => write!(
+                f,
+                "YAML alias replay exceeds the per-file scalar budget ({budget} bytes)"
             ),
             Error::MoreThanOneDocument => f.write_str(
                 "deserializing from YAML containing more than one document is not supported",
@@ -119,11 +141,35 @@ pub fn first_document<'a, S: DeserializeSeed<'a>>(
     Ok(Some(v))
 }
 
+/// A scalar's text: borrowed from the input, or (unescaped by the parser)
+/// shared, so cloning an event into recordings and replays never copies it.
+#[derive(Debug, Clone)]
+enum Text<'a> {
+    Borrowed(&'a str),
+    Shared(Rc<str>),
+}
+
+impl<'a> Text<'a> {
+    fn new(value: Cow<'a, str>) -> Self {
+        match value {
+            Cow::Borrowed(s) => Text::Borrowed(s),
+            Cow::Owned(s) => Text::Shared(Rc::from(s)),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Text::Borrowed(s) => s,
+            Text::Shared(s) => s,
+        }
+    }
+}
+
 /// One node event, anchors stripped (they are resolved at record time).
 #[derive(Debug, Clone)]
 enum Ev<'a> {
     Scalar {
-        value: Cow<'a, str>,
+        value: Text<'a>,
         style: ScalarStyle,
         tag: Option<Rc<str>>,
     },
@@ -142,6 +188,28 @@ struct Recording<'a> {
     depth: usize,
 }
 
+/// A recorded anchored node and the scalar bytes one replay of it carries.
+struct Anchor<'a> {
+    events: Rc<[Ev<'a>]>,
+    bytes: usize,
+}
+
+impl<'a> Anchor<'a> {
+    fn new(events: Vec<Ev<'a>>) -> Self {
+        let bytes = events
+            .iter()
+            .map(|ev| match ev {
+                Ev::Scalar { value, .. } => value.as_str().len(),
+                _ => 0,
+            })
+            .fold(0usize, usize::saturating_add);
+        Self {
+            events: Rc::from(events),
+            bytes,
+        }
+    }
+}
+
 struct Replay<'a> {
     events: Rc<[Ev<'a>]>,
     pos: usize,
@@ -154,9 +222,11 @@ struct De<'a> {
     recording: Vec<Recording<'a>>,
     /// Anchor name -> id of its latest definition (a name may be redefined).
     anchor_ids: HashMap<Box<[u8]>, usize>,
-    anchors: HashMap<usize, Rc<[Ev<'a>]>>,
+    anchors: HashMap<usize, Anchor<'a>>,
     spent: usize,
     budget: usize,
+    replayed_bytes: usize,
+    byte_budget: usize,
     depth: usize,
     /// Set by `EnumAccess::variant_seed`: the next node is a tagged value being
     /// read through its tag (serde_yaml's `current_enum`).
@@ -174,6 +244,8 @@ impl<'a> De<'a> {
             anchors: HashMap::new(),
             spent: 0,
             budget: alias_budget(content.len()),
+            replayed_bytes: 0,
+            byte_budget: replay_byte_budget(content.len()),
             depth: 0,
             tagged: false,
         })
@@ -234,7 +306,14 @@ impl<'a> De<'a> {
                     tag,
                     value,
                     style,
-                } => (Ev::Scalar { value, style, tag }, self.define(anchor)),
+                } => (
+                    Ev::Scalar {
+                        value: Text::new(value),
+                        style,
+                        tag,
+                    },
+                    self.define(anchor),
+                ),
                 Raw::SequenceStart { anchor, tag } => (Ev::SeqStart(tag), self.define(anchor)),
                 Raw::MappingStart { anchor, tag } => (Ev::MapStart(tag), self.define(anchor)),
                 Raw::SequenceEnd => (Ev::SeqEnd, 0),
@@ -267,7 +346,7 @@ impl<'a> De<'a> {
             }
             while self.recording.last().is_some_and(|r| r.depth == 0) {
                 if let Some(done) = self.recording.pop() {
-                    self.anchors.insert(done.id, Rc::from(done.events));
+                    self.anchors.insert(done.id, Anchor::new(done.events));
                 }
             }
         }
@@ -280,7 +359,7 @@ impl<'a> De<'a> {
                     depth: 1,
                 }),
                 _ => {
-                    self.anchors.insert(anchor, Rc::from(vec![ev.clone()]));
+                    self.anchors.insert(anchor, Anchor::new(vec![ev.clone()]));
                 }
             }
         }
@@ -317,12 +396,18 @@ impl<'a> De<'a> {
     }
 
     fn follow(&mut self, id: usize) -> Result<()> {
-        let events = self
+        let (events, bytes) = self
             .anchors
             .get(&id)
-            .cloned()
+            .map(|a| (Rc::clone(&a.events), a.bytes))
             .ok_or_else(|| Error::Message(format!("unknown YAML anchor id {id}")))?;
         self.charge(events.len())?;
+        self.replayed_bytes = self.replayed_bytes.saturating_add(bytes);
+        if self.replayed_bytes > self.byte_budget {
+            return Err(Error::ReplayBytesExceeded {
+                budget: self.byte_budget,
+            });
+        }
         self.replay.push(Replay { events, pos: 0 });
         Ok(())
     }
@@ -387,7 +472,13 @@ impl<'de, 'a> Deserializer<'de> for &mut De<'a> {
                         self.peeked = Some(ev);
                         return visitor.visit_enum(EnumAccess { de: self, tag: t });
                     }
-                    return visit_scalar(visitor, value, style, tag.as_deref(), tagged_already);
+                    return visit_scalar(
+                        visitor,
+                        value.as_str(),
+                        style,
+                        tag.as_deref(),
+                        tagged_already,
+                    );
                 }
                 Ev::SeqStart(ref tag) | Ev::MapStart(ref tag) => {
                     if let Some(t) = enum_tag(tag, tagged_already) {
@@ -1091,5 +1182,73 @@ mod tests {
         }
         let (ours, theirs) = both(&yaml);
         assert_eq!(ours.expect("stream"), theirs.expect("serde_yaml"));
+    }
+
+    /// One long scalar replayed by many one-line aliases: one event per alias,
+    /// so only the replayed-bytes budget stops it.
+    #[test]
+    fn long_scalar_fan_out_is_cut_by_the_byte_budget() {
+        let mut yaml = format!("base: &a {}\ntopics:\n", "x".repeat(100_000));
+        for _ in 0..1000 {
+            yaml.push_str("  - *a\n");
+        }
+        assert!(serde_yaml::from_str::<serde_yaml::Value>(&yaml).is_ok());
+        assert_eq!(
+            from_str::<serde_yaml::Value>(&yaml),
+            Err(Error::ReplayBytesExceeded {
+                budget: replay_byte_budget(yaml.len())
+            })
+        );
+        // A few replays of the same anchor stay within budget.
+        let few = format!("base: &a {}\nc: [*a, *a, *a]\n", "x".repeat(100_000));
+        let (ours, theirs) = both(&few);
+        assert_eq!(ours.expect("stream"), theirs.expect("serde_yaml"));
+    }
+
+    #[test]
+    fn redefined_anchor_resolves_like_serde_yaml() {
+        let yaml = "x: &a 1\ny: &a 2\nz: &b 3\nw: *a\nv: *b\n";
+        let (ours, theirs) = both(yaml);
+        assert_eq!(ours.expect("ours"), theirs.expect("theirs"));
+    }
+
+    /// 1.5 MB of unclosed/nested flow sequences and 100k nested anchors: the
+    /// parser is iterative and the deserializer depth-limited, so nothing
+    /// overflows the stack.
+    #[test]
+    fn pathological_nesting_does_not_crash() {
+        let deep = "[".repeat(1_500_000);
+        let _ = skip(&deep);
+        let _ = from_str::<serde_yaml::Value>(&deep);
+        let deep2 = format!("{}{}", "[".repeat(750_000), "]".repeat(750_000));
+        assert!(skip(&deep2).is_ok());
+        assert!(from_str::<serde_yaml::Value>(&deep2).is_err());
+        let mut nested = String::new();
+        for i in 0..100_000 {
+            nested.push_str(&format!("&a{i} ["));
+        }
+        let _ = from_str::<serde_yaml::Value>(&nested);
+        let _ = skip(&nested);
+    }
+
+    #[test]
+    fn matches_serde_yaml_on_bom_crlf_and_edge_scalars() {
+        for yaml in [
+            "\u{feff}a: 1\r\nb: yes\r\nc: on\r\nd: off\r\ne: no\r\n",
+            "a: 0o17\nb: 017\nc: 0x_1\nd: +.inf\ne: .NaN\nf: -0\ng: 1_000\nh: 1.\n",
+            "a: !!str 1\nb: !!binary aGk=\nc: !!map {x: 1}\nd: !!seq [1]\n",
+            "a: |+\n  x\n\nb: >-\n  y\n  z\n",
+            "a: \"\\u00e9t\u{e9}\"\nb: 'it''s'\nc: \u{e9}\u{e9} &x v\n",
+            "\u{e9}\u{e9}: &k 'caf\u{e9}'\nz: *k\n",
+            "<<: {a: 1}\nb: 2\n",
+            "a: &x !Tag 1\nb: *x\n",
+            "? &k {a: 1}\n: v\n? *k\n: w\n",
+        ] {
+            let (ours, theirs) = both(yaml);
+            match (ours, theirs) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "yaml: {yaml:?}"),
+                (a, b) => assert_eq!(a.is_ok(), b.is_ok(), "yaml {yaml:?}: ours {a:?} vs {b:?}"),
+            }
+        }
     }
 }

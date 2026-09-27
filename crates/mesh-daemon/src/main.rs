@@ -79,10 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // workspaces can never end up sharing (or racing to bind) the same
     // socket and silently serving each other's data (idempotence invariant
     // I7).
+    let workspace_id = socket::workspace_id(&base_dir);
+
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
         Some(p) => p,
-        None => socket::socket_path_for(&socket::workspace_id(&base_dir)),
+        None => socket::socket_path_for(&workspace_id),
     };
 
     // Clean up any stale socket from a previous crashed daemon
@@ -92,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     let pipe_name = match args.socket.clone() {
         Some(p) => p.to_string_lossy().into_owned(),
-        None => socket::pipe_name_for(&socket::workspace_id(&base_dir)),
+        None => socket::pipe_name_for(&workspace_id),
     };
 
     // ── AppState (shared, single instance) ───────────────────────────────────
@@ -239,6 +241,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IPC server (blocking until cancelled) ─────────────────────────────────
+    // Recorded so `doctor` can compare this daemon's version to its own and,
+    // on `--fix`, stop exactly this PID (plan 4 step 4.7). Written just before
+    // the accept loop rather than strictly after bind succeeds (`run_uds_server`/
+    // `run_named_pipe_server` block until shutdown, so there is no earlier
+    // return to hook): a reader sees this PID moments before its socket, never
+    // after, and `process_is_alive` is the actual liveness check either way.
+    socket::write_daemon_meta(&workspace_id, env!("CARGO_PKG_VERSION"));
+
     #[cfg(unix)]
     server::run_uds_server(&sock_path, state, cancel_token, counter)
         .await
@@ -248,6 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::run_named_pipe_server(&pipe_name, state, cancel_token, counter)
         .await
         .map_err(|e| e.to_string())?;
+
+    socket::remove_daemon_meta(&workspace_id);
 
     // Clean up socket on exit (Unix only — named pipes are released by the OS
     // once the last handle closes, there is no file to remove on Windows).

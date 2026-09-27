@@ -1,10 +1,74 @@
 use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
-use mesh_core::{expand_roots, Config, PropertyRegistry};
+use mesh_core::{expand_roots, AuditLogger, Config, PersistentIndexCache, PropertyRegistry};
 use mesh_parsers::AstGuard;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub struct DoctorCommand;
+
+/// One repairable-health finding (plan 4 step 4.7): socket permissions, a
+/// stale daemon version, a corrupt or legacy cache, an orphaned per-version
+/// workspace directory. Separate from sections 1-9's plain prose above, which
+/// stay exactly as they were — these are the checks `--fix` can act on and
+/// `--json` renders as structured output for install scripts.
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    /// "ok" | "warn" | "error" | "info"
+    status: &'static str,
+    message: String,
+    /// `None` when `--fix` was not requested or this finding has no fix;
+    /// `Some(true/false)` for whether the attempted fix succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed: Option<bool>,
+}
+
+impl DoctorCheck {
+    fn ok(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "ok",
+            message: message.into(),
+            fixed: None,
+        }
+    }
+    fn warn(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "warn",
+            message: message.into(),
+            fixed: None,
+        }
+    }
+    fn error(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "error",
+            message: message.into(),
+            fixed: None,
+        }
+    }
+    fn info(name: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "info",
+            message: message.into(),
+            fixed: None,
+        }
+    }
+    fn with_fixed(mut self, fixed: bool) -> Self {
+        self.fixed = Some(fixed);
+        self
+    }
+    fn icon(&self) -> &'static str {
+        match self.status {
+            "ok" => "✔",
+            "warn" => "⚠",
+            "error" => "✖",
+            _ => "ℹ",
+        }
+    }
+}
 
 impl DoctorCommand {
     /// Scans the workspace once (no persistent cache, nothing written) and
@@ -27,7 +91,11 @@ impl DoctorCommand {
         }
     }
 
-    pub fn run(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(
+        config_path: Option<&Path>,
+        fix: bool,
+        json: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "🔍 Running MeshMCP Diagnostic Healthcheck (v{}, commit: {})...\n",
             env!("CARGO_PKG_VERSION"),
@@ -384,6 +452,338 @@ impl DoctorCommand {
 
         eprintln!("\n✔ All systems operational. Ready for AI agents.");
 
+        // 10. Repairable health (plan 4 step 4.7): socket permissions, daemon
+        // version drift, corrupt or legacy caches, orphaned per-version
+        // workspace directories. Structured separately from sections 1-9
+        // above so `--json` has something to render and `--fix` something
+        // to act on.
+        let checks = Self::run_repairable_checks(config_path, fix);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&checks)?);
+        } else {
+            eprintln!();
+            for check in &checks {
+                let suffix = match check.fixed {
+                    Some(true) => " (fixed)",
+                    Some(false) => " (fix attempted, still failing)",
+                    None => "",
+                };
+                eprintln!("{} {}: {}{suffix}", check.icon(), check.name, check.message);
+            }
+        }
+
         Ok(())
+    }
+
+    /// The workspace's own daemon socket, if this run has a resolvable config
+    /// (skipped entirely otherwise — there is no workspace to look one up
+    /// for). Shared by the socket-permission and version checks below.
+    fn resolved_workspace(config_path: Option<&Path>) -> Option<(PathBuf, String)> {
+        let (_, base_dir) = WorkspaceIndexer::discover_config(config_path).ok()?;
+        let canonical = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
+        let id = mesh_core::workspace_id(&canonical);
+        Some((canonical, id))
+    }
+
+    fn run_repairable_checks(config_path: Option<&Path>, fix: bool) -> Vec<DoctorCheck> {
+        let mut checks = Vec::new();
+        let workspace = Self::resolved_workspace(config_path);
+
+        Self::check_socket(&workspace, fix, &mut checks);
+        Self::check_daemon_version(&workspace, fix, &mut checks);
+        Self::check_legacy_global_cache(fix, &mut checks);
+        Self::check_workspace_cache(&workspace, fix, &mut checks);
+        Self::check_audit_db(&mut checks);
+        Self::check_orphaned_workspace_dirs(&workspace, fix, &mut checks);
+
+        checks
+    }
+
+    fn check_socket(
+        workspace: &Option<(PathBuf, String)>,
+        fix: bool,
+        checks: &mut Vec<DoctorCheck>,
+    ) {
+        let Some((_, workspace_id)) = workspace else {
+            checks.push(DoctorCheck::info(
+                "Socket permissions",
+                "skipped (no config to resolve a workspace)",
+            ));
+            return;
+        };
+        let sock_path = mesh_core::socket_path_for(workspace_id);
+        if !sock_path.exists() {
+            checks.push(DoctorCheck::info(
+                "Socket permissions",
+                format!(
+                    "no daemon running for this workspace ({})",
+                    sock_path.display()
+                ),
+            ));
+            return;
+        }
+
+        #[cfg(unix)]
+        if std::os::unix::net::UnixStream::connect(&sock_path).is_err() {
+            let mut check = DoctorCheck::warn(
+                "Orphaned socket",
+                format!(
+                    "{} exists but nothing is listening (a crashed daemon left it behind)",
+                    sock_path.display()
+                ),
+            );
+            if fix {
+                mesh_core::cleanup_stale_socket(&sock_path);
+                check = check.with_fixed(!sock_path.exists());
+            }
+            checks.push(check);
+            // Nothing to say about permissions on a socket that is about to be
+            // (or already was) removed.
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sock_mode = std::fs::metadata(&sock_path)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            let dir_mode = sock_path
+                .parent()
+                .and_then(|d| std::fs::metadata(d).ok())
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            if sock_mode == 0o600 && dir_mode == 0o700 {
+                checks.push(DoctorCheck::ok(
+                    "Socket permissions",
+                    format!("socket 0{sock_mode:o}, directory 0{dir_mode:o} (owner-only)"),
+                ));
+            } else {
+                let mut check = DoctorCheck::warn(
+                    "Socket permissions",
+                    format!(
+                        "socket 0{sock_mode:o} (want 0600), directory 0{dir_mode:o} (want 0700)"
+                    ),
+                );
+                if fix {
+                    let sock_fixed = std::fs::set_permissions(
+                        &sock_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .is_ok();
+                    let dir_fixed = sock_path.parent().is_some_and(|d| {
+                        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).is_ok()
+                    });
+                    check = check.with_fixed(sock_fixed && dir_fixed);
+                }
+                checks.push(check);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            checks.push(DoctorCheck::info(
+                "Socket permissions",
+                "not applicable on this OS (named pipe, not a filesystem socket)",
+            ));
+        }
+    }
+
+    fn check_daemon_version(
+        workspace: &Option<(PathBuf, String)>,
+        fix: bool,
+        checks: &mut Vec<DoctorCheck>,
+    ) {
+        let Some((_, workspace_id)) = workspace else {
+            return;
+        };
+        let Some(meta) = mesh_core::socket::read_daemon_meta(workspace_id) else {
+            return;
+        };
+        if meta.version == env!("CARGO_PKG_VERSION") {
+            checks.push(DoctorCheck::ok(
+                "Daemon version",
+                format!("running meshd (pid {}) matches this version", meta.pid),
+            ));
+            return;
+        }
+
+        let mut check = DoctorCheck::warn(
+            "Daemon version",
+            format!(
+                "running meshd (pid {}) is version {}, this mesh-mcp is {}",
+                meta.pid,
+                meta.version,
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        if fix {
+            // Same-user enforcement is the OS's, not ours: `kill`/`OpenProcess`
+            // fail on a PID this user does not own, never terminates a
+            // stranger's process (see `terminate_process`'s own doc).
+            let alive = mesh_core::socket::process_is_alive(meta.pid);
+            // A dead PID (a crashed daemon, or one that already stopped) has
+            // nothing left to terminate; the stale record itself is the whole
+            // fix, and removing it is unconditionally safe.
+            let fixed = !alive || mesh_core::socket::terminate_process(meta.pid);
+            if fixed {
+                // `terminate_process` sends SIGTERM/`TerminateProcess`, neither
+                // of which the daemon can catch to clean up after itself (only
+                // SIGINT is handled for a graceful shutdown) — so the record of
+                // it stays behind unless removed here, and a later `doctor`
+                // would otherwise keep reporting a PID that no longer exists.
+                mesh_core::socket::remove_daemon_meta(workspace_id);
+            }
+            check = check.with_fixed(fixed);
+        }
+        checks.push(check);
+    }
+
+    fn check_legacy_global_cache(fix: bool, checks: &mut Vec<DoctorCheck>) {
+        let path = PersistentIndexCache::legacy_global_db_path();
+        if !path.exists() {
+            return;
+        }
+        let mut check = DoctorCheck::warn(
+            "Legacy cache",
+            format!(
+                "pre-4.4 machine-wide cache still present at {} (never opened any more)",
+                path.display()
+            ),
+        );
+        if fix {
+            check = check.with_fixed(Self::remove_db_files(&path));
+        }
+        checks.push(check);
+    }
+
+    fn check_workspace_cache(
+        workspace: &Option<(PathBuf, String)>,
+        fix: bool,
+        checks: &mut Vec<DoctorCheck>,
+    ) {
+        let Some((_, workspace_id)) = workspace else {
+            return;
+        };
+        let path = PersistentIndexCache::workspace_db_path(workspace_id);
+        if !path.exists() {
+            return;
+        }
+        match PersistentIndexCache::quick_check(&path) {
+            Ok(true) => checks.push(DoctorCheck::ok("Index cache", "PRAGMA quick_check: ok")),
+            Ok(false) => {
+                let mut check =
+                    DoctorCheck::error("Index cache", "PRAGMA quick_check reported corruption");
+                if fix {
+                    check = check.with_fixed(Self::remove_db_files(&path));
+                }
+                checks.push(check);
+            }
+            Err(e) => {
+                let mut check =
+                    DoctorCheck::error("Index cache", format!("could not open for check: {e}"));
+                if fix {
+                    check = check.with_fixed(Self::remove_db_files(&path));
+                }
+                checks.push(check);
+            }
+        }
+    }
+
+    /// Never offers a fix: a corrupt audit trail is evidence, not a disposable
+    /// cache — `doctor --fix` reports it and stops there (plan 4 step 4.7).
+    fn check_audit_db(checks: &mut Vec<DoctorCheck>) {
+        let path = AuditLogger::default_db_path();
+        if !path.exists() {
+            return;
+        }
+        let quick = PersistentIndexCache::quick_check(&path);
+        let chain = AuditLogger::verify_db(&path);
+        match (quick, chain) {
+            (Ok(true), Ok(true)) => {
+                checks.push(DoctorCheck::ok(
+                    "Audit trail",
+                    "quick_check and hash chain: ok",
+                ));
+            }
+            (Ok(true), Ok(false)) => {
+                checks.push(DoctorCheck::error(
+                    "Audit trail",
+                    "hash chain broken — entries may have been tampered with or edited",
+                ));
+            }
+            (Ok(false), _) => {
+                checks.push(DoctorCheck::error(
+                    "Audit trail",
+                    "PRAGMA quick_check reported corruption",
+                ));
+            }
+            (Ok(true), Err(e)) => {
+                checks.push(DoctorCheck::error(
+                    "Audit trail",
+                    format!("hash chain verification failed: {e}"),
+                ));
+            }
+            (Err(e), _) => {
+                checks.push(DoctorCheck::error(
+                    "Audit trail",
+                    format!("could not open for check: {e}"),
+                ));
+            }
+        }
+    }
+
+    fn check_orphaned_workspace_dirs(
+        workspace: &Option<(PathBuf, String)>,
+        fix: bool,
+        checks: &mut Vec<DoctorCheck>,
+    ) {
+        let Some((base_dir, current_id)) = workspace else {
+            return;
+        };
+        let workspaces_dir = mesh_core::mesh_cache_dir().join("workspaces");
+        let Ok(entries) = std::fs::read_dir(&workspaces_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if id == *current_id {
+                continue;
+            }
+            let Some(marker_path) = PersistentIndexCache::read_workspace_path_marker(&id) else {
+                continue;
+            };
+            if marker_path != *base_dir {
+                continue;
+            }
+            let mut check = DoctorCheck::warn(
+                "Orphaned workspace cache",
+                format!(
+                    "{} is a leftover from a previous mesh-mcp version of this project",
+                    entry.path().display()
+                ),
+            );
+            if fix {
+                check = check.with_fixed(std::fs::remove_dir_all(entry.path()).is_ok());
+            }
+            checks.push(check);
+        }
+    }
+
+    /// Removes a SQLite database and its WAL/SHM siblings, if present.
+    fn remove_db_files(path: &Path) -> bool {
+        let mut ok = std::fs::remove_file(path).is_ok();
+        for suffix in ["-wal", "-shm"] {
+            let side = PathBuf::from(format!("{}{suffix}", path.display()));
+            if side.exists() {
+                ok &= std::fs::remove_file(&side).is_ok();
+            }
+        }
+        ok
     }
 }

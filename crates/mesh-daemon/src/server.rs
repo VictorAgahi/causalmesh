@@ -107,7 +107,18 @@ mod unix_impl {
         cancel_token: CancellationToken,
         counter: ClientCounter,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(parent) = socket_path.parent() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
         let listener = UnixListener::bind(socket_path)?;
+        // `bind` creates the socket file with a mode shaped by the process umask, not a
+        // fixed one (plan 4 step 4.7): explicit 0600 so a permissive umask never leaves
+        // it group/world-accessible.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+        }
         tracing::info!(
             target: "meshd::server",
             "meshd listening on {}",
@@ -285,6 +296,38 @@ mod unix_tests {
             sock_path.exists(),
             "Socket file must exist after daemon binds"
         );
+
+        token.cancel();
+    }
+
+    /// Plan 4 step 4.7: the socket file and its parent directory must be
+    /// owner-only, whatever the process umask (`bind` alone shapes the file's
+    /// mode from it, not a fixed value).
+    #[tokio::test]
+    async fn test_daemon_socket_and_parent_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("perm-meshd.sock");
+
+        let state = make_state();
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+
+        let sock_path_clone = sock_path.clone();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            run_uds_server(&sock_path_clone, state, token_clone, counter)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock_mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "socket file mode: {sock_mode:o}");
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "socket dir mode: {dir_mode:o}");
 
         token.cancel();
     }

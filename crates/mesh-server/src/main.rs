@@ -156,25 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !standalone {
                 // ── UDS Proxy Mode ────────────────────────────────────────────
                 let sock_path = mesh_core::socket_path_for(&workspace_id);
-                match ensure_daemon_running(&sock_path, &canonical_base, cli.config.as_deref())
-                    .await
+                let ensured =
+                    ensure_daemon_running(&sock_path, &canonical_base, cli.config.as_deref()).await;
+                if try_proxy_unix(ensured, &sock_path, &workspace_id).await? == ProxyAttempt::Served
                 {
-                    Ok(()) => {
-                        tracing::info!(
-                            target: "mesh::proxy",
-                            "Connecting to meshd at {} (workspace {})",
-                            sock_path.display(),
-                            workspace_id
-                        );
-                        return run_proxy_mode(&sock_path).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "mesh::proxy",
-                            "Could not connect to meshd ({}). Falling back to standalone mode.",
-                            e
-                        );
-                    }
+                    return Ok(());
                 }
             }
 
@@ -182,29 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !standalone {
                 // ── Named Pipe Proxy Mode ──────────────────────────────────────
                 let pipe_name = mesh_core::pipe_name_for(&workspace_id);
-                match ensure_daemon_running_windows(
+                let ensured = ensure_daemon_running_windows(
                     &pipe_name,
                     &canonical_base,
                     cli.config.as_deref(),
                 )
-                .await
+                .await;
+                if try_proxy_windows(ensured, &pipe_name, &workspace_id).await?
+                    == ProxyAttempt::Served
                 {
-                    Ok(()) => {
-                        tracing::info!(
-                            target: "mesh::proxy",
-                            "Connecting to meshd at {} (workspace {})",
-                            pipe_name,
-                            workspace_id
-                        );
-                        return run_proxy_mode_windows(&pipe_name).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "mesh::proxy",
-                            "Could not connect to meshd ({}). Falling back to standalone mode.",
-                            e
-                        );
-                    }
+                    return Ok(());
                 }
             }
 
@@ -403,40 +376,159 @@ async fn ensure_daemon_running(
     Err("meshd did not bind socket within 500ms".into())
 }
 
-/// Ultra-lightweight proxy: bridges stdin/stdout ↔ UDS (zero-copy, < 2 MiB footprint).
+/// Whether this session was served through `meshd` or must fall back to the
+/// in-process standalone server.
+#[cfg(any(unix, windows))]
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyAttempt {
+    Served,
+    Fallback,
+}
+
+/// How a proxy session ended.
+#[cfg(any(unix, windows))]
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyEnd {
+    /// The MCP client closed stdin; the daemon's last responses were drained.
+    ClientClosed,
+    /// The daemon side closed or broke first: `meshd` exited or crashed.
+    DaemonClosed,
+}
+
+/// Logged on stderr when the daemon dies mid-session (plan 4 step 4.13 (b),
+/// option (i)): the zero-copy proxy has no framing, so it cannot answer the
+/// requests in flight — it closes stdout, and this says why.
+#[cfg(any(unix, windows))]
+const DAEMON_LOST_MESSAGE: &str = "meshd closed the connection mid-session";
+
+/// Logged on stderr when the proxy's own connection fails right after
+/// `ensure_daemon_running` succeeded (plan 4 step 4.13 (a)).
+#[cfg(any(unix, windows))]
+const POST_ENSURE_FALLBACK_MESSAGE: &str =
+    "meshd answered its liveness check but the proxy connection failed";
+
+/// Ends a proxy session. A daemon that went away first is logged as an error
+/// with a readable cause, then the process exits with status 1: tokio reads
+/// stdin on a blocking thread that the runtime waits for on shutdown, so merely
+/// returning left the process alive with stdout open while the client still
+/// held stdin — a hang instead of an EOF (plan 4 step 4.13 (b), option (i)).
+#[cfg(any(unix, windows))]
+fn finish_proxy_session(end: &ProxyEnd, endpoint: &str, workspace_id: &str) {
+    if *end == ProxyEnd::DaemonClosed {
+        let log = mesh_core::mesh_cache_dir()
+            .join("logs")
+            .join(format!("meshd-{workspace_id}.log"));
+        tracing::error!(
+            target: "mesh::proxy",
+            "{DAEMON_LOST_MESSAGE} ({endpoint}): the daemon exited or crashed. \
+             Requests in flight get no response and this MCP session ends (EOF on stdout); \
+             restart the MCP server. Daemon log: {}",
+            log.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Serves this session through `meshd` at `sock_path` once `ensure_daemon_running`
+/// returned `ensured`. Either failure — the daemon could not be reached or
+/// spawned, or it answered the liveness check but the proxy's own connection
+/// then failed (a daemon exiting in between) — falls back to standalone
+/// instead of closing stdout on the client.
 #[cfg(unix)]
-async fn run_proxy_mode(sock_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn try_proxy_unix(
+    ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    sock_path: &Path,
+    workspace_id: &str,
+) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
+    if let Err(e) = ensured {
+        tracing::warn!(
+            target: "mesh::proxy",
+            "Could not connect to meshd ({}). Falling back to standalone mode.",
+            e
+        );
+        return Ok(ProxyAttempt::Fallback);
+    }
+    let stream = match tokio::net::UnixStream::connect(sock_path).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "{POST_ENSURE_FALLBACK_MESSAGE} ({}: {e}). Falling back to standalone mode.",
+                sock_path.display()
+            );
+            return Ok(ProxyAttempt::Fallback);
+        }
+    };
+    tracing::info!(
+        target: "mesh::proxy",
+        "Connecting to meshd at {} (workspace {})",
+        sock_path.display(),
+        workspace_id
+    );
+    let (daemon_reader, daemon_writer) = stream.into_split();
+    let end = bridge(
+        daemon_reader,
+        daemon_writer,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await;
+    finish_proxy_session(&end, &sock_path.display().to_string(), workspace_id);
+    Ok(ProxyAttempt::Served)
+}
+
+/// Ultra-lightweight proxy: bridges the client's stdin/stdout and the daemon's
+/// stream (zero-copy, < 2 MiB footprint). If the daemon disconnects, it ends
+/// at once; if stdin closes (e.g. an `echo` pipe in CI), it waits for the
+/// daemon to drain its responses.
+#[cfg(any(unix, windows))]
+async fn bridge<DR, DW, I, O>(
+    mut daemon_reader: DR,
+    mut daemon_writer: DW,
+    mut stdin: I,
+    mut stdout: O,
+) -> ProxyEnd
+where
+    DR: tokio::io::AsyncRead + Unpin + Send + 'static,
+    DW: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    I: tokio::io::AsyncRead + Unpin + Send + 'static,
+    O: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::AsyncWriteExt;
 
-    let stream = tokio::net::UnixStream::connect(sock_path).await?;
-    let (daemon_reader, mut daemon_writer) = stream.into_split();
-
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-
+    // Set when stdin reached EOF, *before* the daemon is told (shutdown): once
+    // the daemon closes in answer to that, the end is the client's, not a
+    // daemon failure — whichever task the select below happens to see first.
+    let client_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client_done_writer = Arc::clone(&client_done);
     let stdin_to_daemon = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stdin, &mut daemon_writer).await;
+        if tokio::io::copy(&mut stdin, &mut daemon_writer)
+            .await
+            .is_ok()
+        {
+            client_done_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let _ = daemon_writer.shutdown().await;
     });
 
     let daemon_to_stdout = tokio::spawn(async move {
-        let mut daemon_reader = daemon_reader;
         let _ = tokio::io::copy(&mut daemon_reader, &mut stdout).await;
         let _ = stdout.flush().await;
     });
 
     tokio::pin!(daemon_to_stdout);
 
-    // If daemon disconnects, terminate immediately.
-    // If stdin closes (e.g. echo pipe in CI), wait for daemon to drain response.
     tokio::select! {
         _ = stdin_to_daemon => {
             let _ = (&mut daemon_to_stdout).await;
         }
         _ = &mut daemon_to_stdout => {}
     }
-
-    Ok(())
+    if client_done.load(std::sync::atomic::Ordering::SeqCst) {
+        ProxyEnd::ClientClosed
+    } else {
+        ProxyEnd::DaemonClosed
+    }
 }
 
 // ── Windows named pipe proxy helpers ─────────────────────────────────────────
@@ -499,41 +591,49 @@ async fn ensure_daemon_running_windows(
     Err("meshd did not bind its named pipe within 500ms".into())
 }
 
-/// Ultra-lightweight proxy: bridges stdin/stdout ↔ named pipe.
+/// Windows mirror of [`try_proxy_unix`] over this workspace's named pipe.
 #[cfg(windows)]
-async fn run_proxy_mode_windows(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::AsyncWriteExt;
+async fn try_proxy_windows(
+    ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    pipe_name: &str,
+    workspace_id: &str,
+) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    let client = ClientOptions::new().open(pipe_name)?;
-    let (daemon_reader, mut daemon_writer) = tokio::io::split(client);
-
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-
-    let stdin_to_daemon = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stdin, &mut daemon_writer).await;
-        let _ = daemon_writer.shutdown().await;
-    });
-
-    let daemon_to_stdout = tokio::spawn(async move {
-        let mut daemon_reader = daemon_reader;
-        let _ = tokio::io::copy(&mut daemon_reader, &mut stdout).await;
-        let _ = stdout.flush().await;
-    });
-
-    tokio::pin!(daemon_to_stdout);
-
-    // If daemon disconnects, terminate immediately.
-    // If stdin closes (e.g. echo pipe in CI), wait for daemon to drain response.
-    tokio::select! {
-        _ = stdin_to_daemon => {
-            let _ = (&mut daemon_to_stdout).await;
-        }
-        _ = &mut daemon_to_stdout => {}
+    if let Err(e) = ensured {
+        tracing::warn!(
+            target: "mesh::proxy",
+            "Could not connect to meshd ({}). Falling back to standalone mode.",
+            e
+        );
+        return Ok(ProxyAttempt::Fallback);
     }
-
-    Ok(())
+    let client = match ClientOptions::new().open(pipe_name) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "{POST_ENSURE_FALLBACK_MESSAGE} ({pipe_name}: {e}). Falling back to standalone mode."
+            );
+            return Ok(ProxyAttempt::Fallback);
+        }
+    };
+    tracing::info!(
+        target: "mesh::proxy",
+        "Connecting to meshd at {} (workspace {})",
+        pipe_name,
+        workspace_id
+    );
+    let (daemon_reader, daemon_writer) = tokio::io::split(client);
+    let end = bridge(
+        daemon_reader,
+        daemon_writer,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await;
+    finish_proxy_session(&end, pipe_name, workspace_id);
+    Ok(ProxyAttempt::Served)
 }
 
 // ── Standalone mode (full in-process server, original V2 behaviour) ───────────
@@ -679,5 +779,71 @@ mod daemon_log_tests {
             std::fs::read_to_string(dir.path().join("meshd-workspace-b.log")).expect("read b"),
             "from b"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod proxy_tests {
+    use super::{bridge, try_proxy_unix, ProxyAttempt, ProxyEnd};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Plan 4 step 4.13 (a): the daemon answered `ensure_daemon_running`, then
+    /// went away before the proxy connected. The session falls back to
+    /// standalone instead of ending on an EOF.
+    #[tokio::test]
+    async fn connect_failure_after_successful_ensure_falls_back_to_standalone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        // What `ensure_daemon_running` saw: a live daemon.
+        assert!(tokio::net::UnixStream::connect(&sock).await.is_ok());
+        drop(listener);
+        std::fs::remove_file(&sock).expect("rm socket");
+
+        let attempt = try_proxy_unix(Ok(()), &sock, "ws").await.expect("no error");
+        assert_eq!(attempt, ProxyAttempt::Fallback);
+    }
+
+    /// A daemon closing its end first is reported as such (the caller logs it).
+    #[tokio::test]
+    async fn daemon_closing_first_is_reported_as_daemon_closed() {
+        let (daemon_side, proxy_side) = tokio::io::duplex(64);
+        let (client_stdin, _client_keeps_stdin_open) = tokio::io::duplex(64);
+        let (mut client_stdout_reader, client_stdout) = tokio::io::duplex(64);
+        drop(daemon_side);
+        let (r, w) = tokio::io::split(proxy_side);
+        let end = bridge(r, w, client_stdin, client_stdout).await;
+        assert_eq!(end, ProxyEnd::DaemonClosed);
+        let mut out = Vec::new();
+        client_stdout_reader
+            .read_to_end(&mut out)
+            .await
+            .expect("read");
+        assert!(out.is_empty());
+    }
+
+    /// The client closing stdin first drains the daemon's response and is a
+    /// normal end, not a daemon failure.
+    #[tokio::test]
+    async fn client_closing_stdin_drains_daemon_and_ends_cleanly() {
+        let (mut daemon_side, proxy_side) = tokio::io::duplex(64);
+        let (client_stdin, client_stdin_writer) = tokio::io::duplex(64);
+        let (mut client_stdout_reader, client_stdout) = tokio::io::duplex(64);
+        drop(client_stdin_writer);
+        let daemon = tokio::spawn(async move {
+            let mut req = Vec::new();
+            daemon_side.read_to_end(&mut req).await.expect("read");
+            daemon_side.write_all(b"{\"id\":1}\n").await.expect("write");
+        });
+        let (r, w) = tokio::io::split(proxy_side);
+        let end = bridge(r, w, client_stdin, client_stdout).await;
+        daemon.await.expect("daemon");
+        assert_eq!(end, ProxyEnd::ClientClosed);
+        let mut out = Vec::new();
+        client_stdout_reader
+            .read_to_end(&mut out)
+            .await
+            .expect("read");
+        assert_eq!(out, b"{\"id\":1}\n");
     }
 }

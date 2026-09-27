@@ -58,9 +58,22 @@ Resolution order:
    deliberate: it means "no symbol by that name is declared here", not "the file doesn't
    mention it".
 
+**Global scope.** `scope` is optional. Omitting it, or passing `"."`, `"*"` or the exact
+configured workspace root, searches **every configured root** (header: `Scope: * (all configured
+roots)`). This is decided before the sandbox jail, which is unchanged: in a multi-root workspace
+(`roots = ["ms-event", "ms-post", …]`) the workspace root is only the roots' parent and the jail
+still rejects it when spelled any other way, and any other enclosing ancestor (`/`, `$HOME`, a
+parent of the workspace) is rejected with `-32602` as before. A global indexed search reads the
+whole index; a global `fuzzy` scan crawls each configured root in turn (each re-validated by the
+jail), merged by root path then file path, and never returns a file outside the roots. An
+explicit `scope` naming one root or a directory inside it behaves exactly as before.
+
 Results are **ranked and paginated**: exact-name matches first, then prefix, then substring
 (ties: protocol declarations before plain classes, then path). A page holds at most `limit`
-files (default 20, max 100) starting at `offset`, and only that page's files are read and
+files (default 20, max 100) starting at `offset`, **and stops at about 8 KB of rendered results**
+(`DEFAULT_PAGE_BUDGET_BYTES`, calibrated on measured golden-corpus pages — see
+`docs/quality.md`, 2026-09-27), whichever comes first; the not-indexed note of step 4.1 comes on
+top. Only that page's files are read and
 decapitated — a broad query over 30,000 files no longer parses every hit. Each result's rendered
 size is measured before it is accepted, so a page stops early rather than ever hitting the 48 KB
 truncation; when more results exist, the footer gives the exact `offset` to request next. The
@@ -94,15 +107,15 @@ specific implementation.
 ```json
 {
   "type": "object",
-  "required": ["query", "scope"],
+  "required": ["query"],
   "properties": {
     "query": {
       "type": "string",
       "description": "Symbol, class, or method name to search for (case-insensitive substring, not a regex). Example: 'UserAuthRequest', 'createEvent'"
     },
     "scope": {
-      "type": "string",
-      "description": "Relative directory or repository scope to constrain search (e.g. 'services/auth-service', 'proto-registry')"
+      "type": ["string", "null"],
+      "description": "Repository or directory to search, resolved within the configured roots. Omit it (or pass \".\" or \"*\") to search every configured root at once. DO NOT guess a parent directory of the roots: only the exact workspace root counts as global, any other path outside the roots is rejected."
     },
     "include_body": {
       "type": "boolean",
@@ -114,7 +127,7 @@ specific implementation.
     },
     "limit": {
       "type": "integer",
-      "description": "Maximum number of files returned in this page (1-100, default 20). DO NOT raise it to see everything; page with `offset` or narrow `scope` instead."
+      "description": "Upper bound on files returned in this page (1-100, default 20). A page also stops at about 8 KB of results, whichever comes first, so a page may hold fewer entries than `limit`. Results are ranked: exact symbol matches first. DO NOT raise it to see everything; page with the `offset` given in the 'More results' footer or narrow `scope` instead."
     },
     "offset": {
       "type": "integer",

@@ -4,8 +4,9 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `98e9414` ; texte du §4.13 (plan4-enterprise-readiness.md)
-> et §3.5 ci-dessous réécrits après relecture adversariale (sous-agent, avant tout code) — voir §3.5.
+> **Dernière mise à jour** : 2026-09-27 — `main` = `09daf0d` (après merge de #49 et #52). #51 (mise à
+> jour de statut concurrente, basée sur un `main` périmé) a été fermée comme obsolète : ce fichier la
+> remplace.
 
 ---
 
@@ -16,18 +17,20 @@
 | 4.0 filtre CI PR empilées | ✅ mergé | #36 | — | — |
 | 4.12a déterminisme CI macOS | ✅ mergé | #38 | — | — |
 | 4.5 recall gRPC TS + golden CI | ✅ mergé | #39 | — | — |
-| 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
+| 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | — |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
-| 4.4-fix éviction intermittente | ✅ PR ready, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1) ; N/N sous charge Linux (12/12) et N/N macOS/Windows (5/5 chacun, sur reruns successifs du même run CI) faits ; repro sur l'ancien code (8/8) faite ; passée en ready. Reste : accord de l'utilisateur pour merger |
+| 4.4-fix éviction intermittente | ✅ mergé | #47 | — | — |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
 | 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
-| 4.1 diagnostics d'indexation | ✅ review faite, correctifs poussés | #46 `p3/4.1-index-diagnostics` | `8f0709d` | review adversariale complète faite (§2.3) : 2 MAJOR + 2 MINOR corrigés, tests de régression ajoutés ; clippy/fmt/déterminisme/tests verts ; reste la CI puis passer en ready |
+| 4.1 diagnostics d'indexation | ✅ mergé | #46 | — | — |
+| doc de statut (celui-ci) | ✅ mergé | #48 | — | — |
+| 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ✅ mergé | #49 | — | — |
+| 4.13 texte du plan corrigé après relecture adversariale | ✅ mergé | #52 | — | — |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
-| 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
-| 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ⏳ à faire | — | — | tout |
+| 4.7 `doctor --fix`, socket, version | 🔧 2 correctifs CI Windows poussés, run en cours | #50 `p3/4.7-doctor-fix` | `f95ed46` | CI du second correctif en cours (§2.6) ; si verte, passer en ready |
 | 4.12f empreinte sans chemins absolus | ⏳ à faire (après 4.9) | — | — | tout (§3.3) |
-| 4.13 retours terrain (scope multi-racines `smart_search.rs`, budget payload mesuré, stdio — texte corrigé après relecture) | ⏳ à faire (après #49, #46, 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
+| 4.13 implémentation (scope multi-racines `smart_search.rs`, budget payload mesuré, stdio — spec corrigée par #52) | ⏳ à faire (après 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
 | 4.10 sandbox réseau Linux | ⏳ à faire (après 4.7) | — | — | tout |
 | 4.8 install pilote + `stats` | ⏳ à faire (après 4.7) | — | — | partie agent seulement (§5) |
 | 4.11 masquage des secrets | 🧑 humain | — | — | aucun code (§5) |
@@ -101,7 +104,51 @@ budget 48 Ko. Findings, tous corrigés (commit `8f0709d`) :
 Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+171 tests ciblés
 (`mesh-server`/`mesh-core`) verts après correctif.
 
-### 2.4 Limites connues, documentées, non bloquantes
+### 2.4 Review groupée de 4.12b–e (#49) — aucun finding, mergé
+Auto-review par l'orchestrateur (barème §4 : review groupée, pas de sous-agent) sur les quatre
+correctifs indépendants (`tools/mod.rs`, `lib.rs`, `markdown.rs`, `indexer.rs`). Chaque correctif
+vérifié isolément et par test dédié : `record_refusal` couvre les deux sorties anticipées sans
+dupliquer le chemin normal ; la fence de `format_search_entry` se dimensionne sur le plus long run
+de backticks du extrait ; `repo_names` désambiguïse les racines homonymes symétriquement et
+déterministiquement ; le nom d'outil inconnu est rejeté avant la porte `still_indexing`. Aucun
+finding. CI verte sur les trois OS (10/10). Mergé.
+
+### 2.5 Relecture adversariale du texte de 4.13 (#52) — 2 correctifs de calibrage, mergé
+Sous-agent dédié à la relecture du plan (pas du code — 4.13 n'a encore aucune implémentation),
+lancé sur `docs/plan4-enterprise-readiness.md` §4.13 ajouté directement sur `main` par l'utilisateur
+depuis un retour terrain. Les trois frictions relevées sont réelles, mais deux des trois correctifs
+proposés étaient mal calibrés : (1) le correctif de scope aurait affaibli `ValidatedScope` lui-même
+et cassé un test existant (`test_parent_directory_access_strictly_rejected`) — corrigé pour ne
+jamais toucher le jail, uniquement `smart_search.rs` ; (2) le nouveau `DEFAULT_LIMIT` proposé (20→8)
+était un chiffre inventé, contraire à la règle §5 « aucun chiffre inventé » — corrigé pour exiger une
+mesure d'abord. Détail complet en §3.5. Texte du plan et de ce fichier réécrits en conséquence,
+mergé.
+
+### 2.6 Review adversariale complète de 4.7 (#50) — en cours, deux correctifs de CI Windows poussés
+Sous-agent unique (budget §4) lancé sur `crates/mesh-core/src/socket.rs` (`DaemonMeta`,
+`process_is_alive`, `terminate_process`, permissions du socket), `crates/mesh-daemon/src/{server,main}.rs`,
+`crates/mesh-server/src/main.rs` (avertissement de version) et `crates/mesh-server/src/cli/doctor.rs`
+(les six vérifications réparables). Finding traité : fenêtre de réutilisation de PID entre
+`process_is_alive` et `terminate_process` après un crash/redémarrage (pas seulement une fenêtre
+TOCTOU microseconde) — corrigé par un garde-fou `daemon_is_reachable` qui exige un socket
+connectable réel avant toute terminaison de processus (commit `52d8905`).
+
+Séparément de la review, deux erreurs de compilation Windows-only (jamais vues dans cette session
+cloud, Linux uniquement — seul le job CI `windows-latest` les fait apparaître) sont apparues coup sur
+coup en poussant ce correctif :
+1. `check_socket`'s paramètre `fix` n'est lu que dans les branches `#[cfg(unix)]` ; sous `-D warnings`,
+   cela devient une erreur de compilation dure (`error: unused variable: fix`, `doctor.rs:504`).
+   Corrigé (`#[cfg_attr(not(unix), allow(unused_variables))]`, portée limitée au cfg non-unix pour ne
+   pas masquer un vrai `fix` mort côté unix), commit `4a4b9d0`.
+2. Le module `#[cfg(all(test, windows))] mod windows_tests` de `crates/mesh-daemon/src/server.rs`
+   appelle directement `run_named_pipe_server` et avait été manqué par le script de mise à jour des
+   ~10 sites d'appel vers la nouvelle signature (`workspace_id`, `version`) — il ne type-check que sur
+   un runner Windows, jamais en local ici. Corrigé, commit `f95ed46`.
+
+Build release, clippy et les 11 tests d'intégration de `doctor_repairable_health.rs` revérifiés en
+local avant chaque push. Nouveau run CI en cours ; si vert, passer en ready.
+
+### 2.7 Limites connues, documentées, non bloquantes
 - 4.5 : un client TS construit au niveau module et utilisé seulement depuis une `function` de premier
   niveau ou une arrow `const` n'a pas d'arête. Les imports CommonJS `require()` ne sont pas gérés.
 - 4.6b : sans `base` explicite, un dossier hors dépôt Git ou un `git` absent donne une note
@@ -115,11 +162,6 @@ Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+1
 ---
 
 ## 3. Notes de conception pour les jalons à faire
-
-### 3.1 4.1 — diagnostics d'indexation
-4.4 a modifié `crates/mesh-core/src/state.rs` (ajout de `AppState::index_cache`, `open_index_cache`) :
-repartir de `main`. 4.2 a ajouté 7 lignes dans `ToolRegistry::invoke` (`tools/mod.rs`) pour la note
-« opération Git en cours » ; la note de rejet de 4.1 doit coexister avec elle.
 
 ### 3.2 4.6a — matrice d'impact (exploration déjà faite)
 - `examples/polyglot-shop` couvre Go, Rust et proto : pas besoin de nouvelle fixture.
@@ -231,20 +273,22 @@ réelles, mais deux des trois correctifs proposés étaient mal calibrés. Le pl
 ## 6. Ordre de reprise recommandé
 
 1. ✅ #42 (4.9) mergé.
-2. ✅ Correctif de l'éviction intermittente (§2.1) fait, PR #47 ready, verte (5/5 macOS, 5/5
-   Windows) ; reste l'accord de l'utilisateur pour merger.
-3. ✅ 4.1 (#46) : code, hygiène et review adversariale complète faits (§2.3, 2 MAJOR + 2 MINOR
-   corrigés) ; reste la CI, puis passer en ready, puis merge.
-4. 4.12b–e, avec une review groupée (PR #49 ouverte).
-5. 4.7, puis sa review complète.
-6. 4.10, puis sa review complète.
-7. 4.13 (retours terrain — texte du plan corrigé après relecture adversariale, §3.5 ; nécessite aussi
-   #49 et #46 mergées, en plus de 4.7 ci-dessus).
-8. 4.6a.
-9. 4.8 (partie agent).
-10. 4.12f.
-11. 4.3, sur une machine calme.
-12. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
+2. ✅ #47 (correctif de l'éviction, §2.1) mergé.
+3. ✅ #46 (4.1) mergé.
+4. ✅ #48 (statut) mergé.
+5. ✅ #49 (4.12b–e) : review groupée faite (§2.4, aucun finding), CI verte, mergé.
+6. ✅ #52 (relecture du texte de 4.13) : review adversariale du plan faite (§2.5, 2 correctifs de
+   calibrage), mergé.
+7. 🔧 4.7 (#50) : code et tests faits ; review adversariale complète faite (§2.6, 1 finding PID-reuse
+   corrigé) ; deux correctifs de CI Windows séparés poussés (§2.6) ; reste ce run CI, puis passer en ready,
+   puis l'accord de l'utilisateur pour merger.
+8. 4.10, puis sa review complète.
+9. 4.13 implémentation (spec corrigée par #52, §3.5 ; après 4.7 ci-dessus).
+10. 4.6a.
+11. 4.8 (partie agent).
+12. 4.12f.
+13. 4.3, sur une machine calme.
+14. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
     (les puces otel-demo de « What's NOT measured yet », la phrase « not yet wired in » de « Ratchet
     policy ») ; consolider `changelog.d/` ; lister ce qui reste humain (4.8 pilote, 4.11, 4.3 réel).
 

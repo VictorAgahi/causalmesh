@@ -1,0 +1,69 @@
+name: Golden Corpus Ratchet
+
+# gRPC edge precision/recall of `mesh-mcp graph` against the hand-written
+# ground truth in tests/golden/<repo>.expected.yaml (scripts/golden/score.py),
+# on the pinned repos of scripts/golden/repos.txt. A threshold is the best
+# score reached so far: a PR may raise it, never lower it (Plan 4 step 4.5).
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    # Stacked PRs target a previous milestone branch (p3/…), not main.
+    branches: [ "main", "p*/**" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  golden:
+    name: "Golden gRPC precision/recall"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Rust stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Rust Cache"
+        uses: Swatinem/rust-cache@v2
+
+      - name: "Golden corpus cache"
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mesh-golden
+          key: mesh-golden-${{ hashFiles('scripts/golden/repos.txt') }}
+
+      - name: "Fetch pinned golden corpus"
+        run: scripts/golden/fetch.sh
+
+      - name: "Compile Release Binary"
+        run: cargo build --release -p mesh-server
+
+      - name: "Score (binary under test first on PATH)"
+        shell: bash
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          command -v mesh-mcp
+          status=0
+          scored=0
+          # repo  min-precision  min-recall
+          while read -r repo precision recall; do
+            # stdin from /dev/null: score.py's `mesh-mcp` child inherits
+            # stdin, and anything reading it would swallow the remaining
+            # rows below — silently skipping corpora with a green exit.
+            python3 scripts/golden/score.py "$repo" \
+              --fail-under-precision "$precision" \
+              --fail-under-recall "$recall" </dev/null || status=1
+            scored=$((scored + 1))
+          done <<'EOF'
+          online-boutique 1.0 1.0
+          bank-of-anthos  1.0 1.0
+          otel-demo       1.0 1.0
+          EOF
+          if [ "$scored" -ne 3 ]; then
+            echo "FAIL: scored $scored corpora, expected 3"
+            status=1
+          fi
+          exit $status

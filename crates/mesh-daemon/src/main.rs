@@ -79,10 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // workspaces can never end up sharing (or racing to bind) the same
     // socket and silently serving each other's data (idempotence invariant
     // I7).
+    let workspace_id = socket::workspace_id(&base_dir);
+
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
         Some(p) => p,
-        None => socket::socket_path_for(&socket::workspace_id(&base_dir)),
+        None => socket::socket_path_for(&workspace_id),
     };
 
     // Clean up any stale socket from a previous crashed daemon
@@ -92,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     let pipe_name = match args.socket.clone() {
         Some(p) => p.to_string_lossy().into_owned(),
-        None => socket::pipe_name_for(&socket::workspace_id(&base_dir)),
+        None => socket::pipe_name_for(&workspace_id),
     };
 
     // ── AppState (shared, single instance) ───────────────────────────────────
@@ -239,15 +241,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IPC server (blocking until cancelled) ─────────────────────────────────
+    // `write_daemon_meta`/`remove_daemon_meta` (plan 4 step 4.7) run inside
+    // `run_uds_server`/`run_named_pipe_server` themselves, only once bind/pipe
+    // creation actually succeeds — never here, before it's known this process
+    // is the one that will actually serve this workspace's socket (a losing
+    // side of a bind race must never overwrite the winner's record with its
+    // own, already-exiting PID).
     #[cfg(unix)]
-    server::run_uds_server(&sock_path, state, cancel_token, counter)
-        .await
-        .map_err(|e| e.to_string())?;
+    server::run_uds_server(
+        &sock_path,
+        state,
+        cancel_token,
+        counter,
+        &workspace_id,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     #[cfg(windows)]
-    server::run_named_pipe_server(&pipe_name, state, cancel_token, counter)
-        .await
-        .map_err(|e| e.to_string())?;
+    server::run_named_pipe_server(
+        &pipe_name,
+        state,
+        cancel_token,
+        counter,
+        &workspace_id,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     // Clean up socket on exit (Unix only — named pipes are released by the OS
     // once the last handle closes, there is no file to remove on Windows).

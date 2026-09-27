@@ -13,10 +13,11 @@
 #   SEQUENTIAL_RUNS  sequential runs per workspace (default: 5)
 #   CONCURRENT_RUNS  concurrent runs per workspace (default: 8)
 #
-# The fingerprint covers absolute file paths (node, doc section and property
-# source paths), so it is only comparable between runs over the same checkout
-# path: the same content checked out elsewhere, or on another machine or OS,
-# gives a different value. This gate compares runs within one checkout only.
+# The fingerprint writes every file path (node, doc section and property
+# source) as "<root index>:<path relative to that root>" with `/` separators
+# (4.12f), so the same content under the same mesh-mcp.toml fingerprints the
+# same in any checkout directory, on any machine or OS. It still depends on
+# the config: reordering or adding `workspace.roots` changes the root indices.
 #
 # Every failure is reported, never silent: a failing mesh-mcp run prints its
 # command, exit code and captured stderr, and any other failing command is

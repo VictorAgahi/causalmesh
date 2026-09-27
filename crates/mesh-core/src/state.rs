@@ -8,6 +8,7 @@ use crate::index_cache::PersistentIndexCache;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::search_cache::SearchCache;
+use crate::types::RepoId;
 use crate::vfs::DifferentialVfs;
 use arc_swap::{ArcSwap, Guard};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,48 @@ pub struct MeshSnapshot {
     /// whenever `!health.is_healthy()`, so a file that didn't make it into the
     /// graph is never silently indistinguishable from a legitimately empty one.
     pub health: IndexHealth,
+    /// The workspace roots this snapshot was indexed from, indexed by
+    /// `RepoId`. Not content: `fingerprint()` uses them only to write every
+    /// file path relative to its root, so the same tree checked out in two
+    /// directories (or on two machines) fingerprints the same (plan 4.12f).
+    /// Set by the indexer and re-stamped by `AppState::install_snapshot`.
+    pub roots: Arc<[PathBuf]>,
+}
+
+/// Checkout-independent identity of `path` for the canonical forms behind
+/// [`MeshSnapshot::fingerprint`]: `"<root index>:<path relative to that root>"`,
+/// components joined with `/` whatever the platform separator.
+///
+/// The root is `roots[hint]` when given and it contains `path` (a contract
+/// node's own `repo_id`), otherwise the most specific root containing it — the
+/// same rule the indexer uses to assign a `RepoId`. The root is named by its
+/// index, not its directory: that index is its position in the configured
+/// `workspace.roots` after expansion (declared order, globs expanded in sorted
+/// order, duplicates dropped), so it depends on the config, not on where the
+/// checkout lives, while a root's directory name does. A path under no root
+/// (or with no roots at all) is written as-is.
+pub fn root_relative_path(path: &Path, roots: &[PathBuf], hint: Option<RepoId>) -> String {
+    let hinted = hint
+        .map(usize::from)
+        .and_then(|i| roots.get(i).map(|r| (i, r)))
+        .filter(|(_, r)| path.starts_with(r));
+    let root = hinted.or_else(|| {
+        roots
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| path.starts_with(r))
+            .max_by_key(|(_, r)| r.components().count())
+    });
+    let Some((idx, root)) = root else {
+        return path.to_string_lossy().into_owned();
+    };
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let joined = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{idx}:{joined}")
 }
 
 /// Content fingerprint of a [`MeshSnapshot`]: one SHA-256 per index plus a
@@ -76,9 +119,10 @@ impl MeshSnapshot {
     /// Fingerprints the three indices from their canonical forms.
     pub fn fingerprint(&self) -> SnapshotFingerprint {
         let sha = |lines: &[String]| AuditLogger::compute_sha256(lines.join("\n").as_bytes());
-        let graph = sha(&self.contract_graph.canonical_lines());
-        let docs = sha(&self.doc_index.canonical_lines());
-        let properties = sha(&self.property_registry.canonical_lines());
+        let roots = &self.roots;
+        let graph = sha(&self.contract_graph.canonical_lines_rooted(roots));
+        let docs = sha(&self.doc_index.canonical_lines_rooted(roots));
+        let properties = sha(&self.property_registry.canonical_lines_rooted(roots));
         let combined =
             AuditLogger::compute_sha256(format!("{graph}\n{docs}\n{properties}").as_bytes());
         SnapshotFingerprint {
@@ -213,6 +257,7 @@ impl AppState {
     pub fn install_snapshot(&self, mut snapshot: MeshSnapshot) -> u64 {
         let generation = self.snapshot.load().generation + 1;
         snapshot.generation = generation;
+        snapshot.roots = Arc::clone(&self.allowed_roots);
         self.snapshot.store(Arc::new(snapshot));
         generation
     }
@@ -328,6 +373,36 @@ roots = ["."]
         assert_eq!(view.generation, 1);
         assert_eq!(view.contract_graph.node_count(), 1);
         assert_eq!(view.doc_index.section_count(), 1);
+    }
+
+    #[test]
+    fn root_relative_path_is_checkout_independent() {
+        let roots = [PathBuf::from("/x/ws"), PathBuf::from("/x/ws/nested")];
+        let file = Path::new("/x/ws/nested/src/a.rs");
+        // Most specific root without a hint, the hinted root when it contains the file.
+        assert_eq!(root_relative_path(file, &roots, None), "1:src/a.rs");
+        assert_eq!(
+            root_relative_path(file, &roots, Some(0)),
+            "0:nested/src/a.rs"
+        );
+        // A hint that does not contain the file falls back to the most specific root.
+        let other = Path::new("/x/ws/b.md");
+        assert_eq!(root_relative_path(other, &roots, Some(1)), "0:b.md");
+        // Same tree elsewhere: same key.
+        let moved = [PathBuf::from("/y/z/co"), PathBuf::from("/y/z/co/nested")];
+        assert_eq!(
+            root_relative_path(Path::new("/y/z/co/nested/src/a.rs"), &moved, None),
+            "1:src/a.rs"
+        );
+        // Outside every root, or no roots: written as-is.
+        assert_eq!(
+            root_relative_path(Path::new("/elsewhere/c.rs"), &roots, None),
+            "/elsewhere/c.rs"
+        );
+        assert_eq!(
+            root_relative_path(file, &[], Some(0)),
+            "/x/ws/nested/src/a.rs"
+        );
     }
 
     #[test]

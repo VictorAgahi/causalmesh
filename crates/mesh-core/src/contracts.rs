@@ -2072,11 +2072,23 @@ impl ContractGraph {
     /// whole list sorted. The same facts give the same lines whatever the
     /// insertion order, thread count or id numbering; duplicates are kept so a
     /// file indexed twice stays visible.
+    ///
+    /// File paths are written as-is (absolute); see
+    /// [`Self::canonical_lines_rooted`] for the checkout-independent form.
     pub fn canonical_lines(&self) -> Vec<String> {
+        self.canonical_lines_rooted(&[])
+    }
+
+    /// [`Self::canonical_lines`] with every file path written relative to its
+    /// workspace root (`roots[node.repo_id]`, see
+    /// [`crate::state::root_relative_path`]), so the same content checked out
+    /// in two directories gives the same lines (plan 4.12f).
+    pub fn canonical_lines_rooted(&self, roots: &[std::path::PathBuf]) -> Vec<String> {
         let key_of = |id: NodeId| -> String {
-            self.nodes
-                .get(&id)
-                .map_or_else(|| String::from("<missing>"), Self::canonical_node_key)
+            self.nodes.get(&id).map_or_else(
+                || String::from("<missing>"),
+                |n| Self::canonical_node_key(n, roots),
+            )
         };
 
         let mut lines = Vec::with_capacity(
@@ -2085,7 +2097,7 @@ impl ContractGraph {
         lines.extend(
             self.nodes
                 .values()
-                .map(|n| format!("node {}", Self::canonical_node_key(n))),
+                .map(|n| format!("node {}", Self::canonical_node_key(n, roots))),
         );
         for edge in &self.edges {
             let line = serde_json::json!([
@@ -2128,9 +2140,9 @@ impl ContractGraph {
     }
 
     /// Every observable field of a node except its `NodeId`.
-    fn canonical_node_key(node: &ContractNode) -> String {
+    fn canonical_node_key(node: &ContractNode, roots: &[std::path::PathBuf]) -> String {
         serde_json::json!([
-            node.file_path.to_string_lossy(),
+            crate::state::root_relative_path(&node.file_path, roots, Some(node.repo_id)),
             node.line_start,
             node.line_end,
             node.kind,

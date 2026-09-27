@@ -178,6 +178,19 @@ impl PersistentIndexCache {
         crate::paths::mesh_cache_dir().join("index-cache.db")
     }
 
+    /// Runs `PRAGMA quick_check` on the SQLite database at `path`, which must already
+    /// exist (never creates one — a fresh, empty database would trivially pass, and
+    /// this must never be the reason one gets created). Used for both this cache and
+    /// `AuditLogger`'s database (plan 4 step 4.7), so it lives here rather than as a
+    /// method tied to one or the other. `Ok(true)` is "ok", `Ok(false)` a reported
+    /// corruption, `Err` a failure to even open the file (itself a strong corruption
+    /// signal).
+    pub fn quick_check(path: &Path) -> Result<bool, IndexCacheError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result: String = conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))?;
+        Ok(result.eq_ignore_ascii_case("ok"))
+    }
+
     /// `[cache] max_size_mb` in bytes. `0` is treated as 1 MB: a zero quota would evict every
     /// entry right after writing it.
     pub fn quota_bytes_from_mb(max_size_mb: u64) -> u64 {
@@ -200,7 +213,40 @@ impl PersistentIndexCache {
                     std::fs::set_permissions(workspaces, std::fs::Permissions::from_mode(0o700));
             }
         }
+        Self::write_workspace_path_marker(&id, base_dir);
         Self::open(db_path, Self::quota_bytes_from_mb(max_size_mb))
+    }
+
+    /// Marker file naming the canonical `base_dir` a workspace id's cache
+    /// belongs to (plan 4 step 4.7). `workspace_id` folds in this binary's
+    /// version, so upgrading leaves the previous version's directory under
+    /// `workspaces/` behind with nothing pointing back to it; `doctor --fix`
+    /// reads this marker to recognize "an old-version leftover for the
+    /// project I was just asked about" without touching any other project's
+    /// cache on the same machine. Best-effort: a write failure only costs
+    /// `doctor --fix` this one cleanup, never the cache itself.
+    fn write_workspace_path_marker(workspace_id: &str, base_dir: &Path) {
+        let Some(dir) = Self::workspace_db_path(workspace_id)
+            .parent()
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let canonical = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+        let _ = std::fs::write(
+            dir.join("workspace_path"),
+            canonical.to_string_lossy().as_bytes(),
+        );
+    }
+
+    /// Reads back a workspace cache directory's [`Self::write_workspace_path_marker`],
+    /// if present — the canonical base directory it was opened for.
+    pub fn read_workspace_path_marker(workspace_id: &str) -> Option<PathBuf> {
+        let dir = Self::workspace_db_path(workspace_id)
+            .parent()?
+            .to_path_buf();
+        let text = std::fs::read_to_string(dir.join("workspace_path")).ok()?;
+        Some(PathBuf::from(text))
     }
 
     /// Opens (creating if absent) the cache database at `db_path` with a quota of

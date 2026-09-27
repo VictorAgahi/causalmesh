@@ -294,6 +294,48 @@ branch switch back to already-seen content is a lookup instead of a re-parse.
 
 The pre-4.4 machine-wide `~/.cache/mesh-mcp/index-cache.db` is no longer read.
 
+### 8.3 Kernel network sandbox of `meshd` (Linux, plan 4 step 4.10)
+
+MeshMCP has no network code. On Linux, `meshd` also has the kernel guarantee it: right after
+binding its Unix socket (`server::run_uds_server_then`), it installs a seccomp-bpf filter
+(`crates/mesh-daemon/src/sandbox.rs`, built with `seccompiler`) that returns `EPERM` for:
+
+- `socket(AF_INET, …)` and `socket(AF_INET6, …)`: no TCP, UDP or raw IP socket, hence no outbound
+  connection and no DNS lookup;
+- `io_uring_setup`: `IORING_OP_SOCKET` would create sockets without the `socket` syscall. `meshd`
+  does not use io_uring (Tokio uses epoll);
+- on x86_64, the x32-ABI spellings of both syscalls (same audit architecture, bit 30 set). Any
+  other architecture (e.g. i386 `int 0x80`) fails seccompiler's architecture check and kills the
+  process.
+
+Everything else is allowed. `AF_UNIX` is the daemon's transport; other families (`AF_NETLINK`, …)
+are local kernel interfaces that glibc may use internally, not a route off the machine. The filter
+is a deny-list on purpose: an allow-list of every syscall Tokio, rayon, `notify`, SQLite and
+tree-sitter may issue would turn a libc or kernel upgrade into a daemon crash.
+
+The filter is installed with `SECCOMP_FILTER_FLAG_TSYNC` (`seccompiler::apply_filter_all_threads`,
+which also sets `PR_SET_NO_NEW_PRIVS`). `meshd` runs under `#[tokio::main]`, so by the time the
+socket is bound the Tokio workers and blocking pool, rayon and the file watcher already exist;
+TSYNC applies the filter to all of them. Later threads and child processes (`git`, `ps`, `pgrep`)
+inherit it. `/proc/<pid>/task/*/status` shows `Seccomp: 2` for every thread.
+
+**Failure policy.** If the kernel refuses the filter (seccomp disabled, a container that forbids
+`seccomp(2)`, gVisor without TSYNC), `meshd` logs a `warn` and keeps serving: the filter is
+defence in depth, and a daemon that refuses to start pushes every IDE client into standalone mode,
+which is not confined either. `MESH_DAEMON_SANDBOX=required` makes `meshd` remove its socket and
+exit instead (on every OS, since the sandbox never exists outside Linux).
+
+**Limits.**
+- Only `meshd` is confined. `mesh-mcp run` (the stdio proxy, or `--standalone`, which indexes
+  in-process) and `mesh-mcp graph --open` (which launches a browser) are not.
+- Linux only, on x86_64, aarch64 and riscv64. macOS (`sandbox_init` is deprecated) and Windows
+  are out of scope.
+- `git` subprocesses inherit the filter: any git operation that would need the network (a remote
+  helper, a lazy-fetch of a partial clone) fails with `EPERM` inside `meshd`. MeshMCP only runs
+  local git commands.
+- This is a network sandbox, not a filesystem one: `meshd` can still read and write every file its
+  user can.
+
 ---
 
 ## 9. Cryptographic Audit Trail (SOC2 & EU AI Act)

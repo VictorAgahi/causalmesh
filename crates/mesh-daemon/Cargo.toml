@@ -31,6 +31,10 @@ mimalloc.workspace = true
 libc.workspace = true
 tempfile.workspace = true
 
+# Plan 4 step 4.10: kernel-level network sandbox (seccomp-bpf), Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
 [dev-dependencies]
 tempfile.workspace = true
 # Enables mesh-server's test-only "test_slow_op" tool for daemon concurrency

@@ -11,6 +11,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod idle;
+#[cfg(unix)]
+mod sandbox;
 mod server;
 mod socket;
 
@@ -247,14 +249,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the one that will actually serve this workspace's socket (a losing
     // side of a bind race must never overwrite the winner's record with its
     // own, already-exiting PID).
+    //
+    // Plan 4 step 4.10: once the socket is bound, confine the whole process
+    // (every thread, via TSYNC) so the kernel refuses any AF_INET/AF_INET6
+    // socket — see `sandbox`'s module docs for scope, limits and failure policy.
     #[cfg(unix)]
-    server::run_uds_server(
+    server::run_uds_server_then(
         &sock_path,
         state,
         cancel_token,
         counter,
         &workspace_id,
         env!("CARGO_PKG_VERSION"),
+        sandbox::apply_after_bind,
     )
     .await
     .map_err(|e| e.to_string())?;

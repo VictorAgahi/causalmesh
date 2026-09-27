@@ -4,7 +4,7 @@ use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
 use crate::health::IndexHealth;
-use crate::index_cache::PersistentIndexCache;
+use crate::index_cache::{CacheStats, PersistentIndexCache};
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::search_cache::SearchCache;
@@ -179,6 +179,9 @@ pub struct AppState {
     /// reloads both hit it (a branch switch back to already-seen content) and keep it under
     /// its quota. Empty when opening failed or in tests: indexing then parses everything.
     pub index_cache: OnceLock<PersistentIndexCache>,
+    /// `index_cache` counters as of the last recorded indexing pass, so each
+    /// `install_snapshot` persists only its own pass's lookups (plan 4 step 4.8).
+    recorded_cache_stats: Mutex<CacheStats>,
 }
 
 impl AppState {
@@ -204,7 +207,7 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        Self {
+        let state = Self {
             config: Arc::new(config),
             allowed_roots: allowed_roots.into(),
             governance: Arc::new(GovernanceEngine::new(
@@ -221,6 +224,65 @@ impl AppState {
             reload_lock: Mutex::new(()),
             search_cache: SearchCache::default(),
             index_cache: OnceLock::new(),
+            recorded_cache_stats: Mutex::new(CacheStats::default()),
+        };
+        state.record_process_start();
+        state
+    }
+
+    /// Whether `[engines.policy] cryptographic_audit_trail` leaves the audit trail on
+    /// (absent config defaults to on). Operational metrics follow the same switch.
+    pub fn audit_enabled(&self) -> bool {
+        self.config
+            .engines
+            .policy
+            .as_ref()
+            .is_none_or(|p| p.cryptographic_audit_trail)
+    }
+
+    /// Persists one start of this process (plan 4 step 4.8: `stats` counts `meshd`
+    /// restarts from these rows). Best-effort, like every audit write.
+    fn record_process_start(&self) {
+        if !self.audit_enabled() {
+            return;
+        }
+        let process = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let workspace = self
+            .allowed_roots
+            .iter()
+            .map(|r| r.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(";");
+        if let Err(e) = self.audit.record_process_start(&process, &workspace) {
+            tracing::warn!(target: "mesh::audit", "Failed to record process start: {e}");
+        }
+    }
+
+    /// Persists the index cache lookups made since the previous call (plan 4 step 4.8):
+    /// `PersistentIndexCache::stats()` is in-memory only, so without this the hit rate
+    /// would die with the process. A pass with no lookup writes nothing.
+    fn record_index_cache_pass(&self) {
+        let Some(cache) = self.index_cache.get() else {
+            return;
+        };
+        let now = cache.stats();
+        let mut last = self
+            .recorded_cache_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let hits = now.hits.saturating_sub(last.hits);
+        let misses = now.misses.saturating_sub(last.misses);
+        let errors = now.errors.saturating_sub(last.errors);
+        *last = now;
+        drop(last);
+        if hits + misses + errors == 0 || !self.audit_enabled() {
+            return;
+        }
+        if let Err(e) = self.audit.record_index_cache_pass(hits, misses, errors) {
+            tracing::warn!(target: "mesh::audit", "Failed to record index cache pass: {e}");
         }
     }
 
@@ -259,6 +321,7 @@ impl AppState {
         snapshot.generation = generation;
         snapshot.roots = Arc::clone(&self.allowed_roots);
         self.snapshot.store(Arc::new(snapshot));
+        self.record_index_cache_pass();
         generation
     }
 

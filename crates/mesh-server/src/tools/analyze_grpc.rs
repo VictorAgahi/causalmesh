@@ -157,15 +157,26 @@ const DEFAULT_BASE_CHAIN: [&str; 3] = ["origin/HEAD", "origin/main", "main"];
 /// Longest `base` accepted: a ref name or an expression like `main~3`, never a blob.
 const MAX_BASE_LEN: usize = 256;
 
-/// Git variables that would redirect every command to another repository
-/// (they are set, for instance, when the server is spawned from a Git hook).
-const REPO_REDIRECT_VARS: [&str; 6] = [
+/// Git variables that would redirect every command to another repository or
+/// object store, inject configuration, or change which objects are read (they
+/// are set, for instance, when the server is spawned from a Git hook, where
+/// `GIT_QUARANTINE_PATH`/`GIT_ALTERNATE_OBJECT_DIRECTORIES` point at a
+/// push's quarantine). The user's own discovery settings
+/// (`GIT_CEILING_DIRECTORIES`) are kept.
+const REPO_REDIRECT_VARS: [&str; 13] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -176,8 +187,8 @@ pub(crate) enum WireCheckError {
         "`git` was not found on the PATH; install Git or add it to the PATH of the MeshMCP process"
     )]
     GitNotFound,
-    #[error("`{0}` is not inside a Git repository")]
-    NotARepository(PathBuf),
+    #[error("`{0}` is not inside a usable Git repository{1}")]
+    NotARepository(PathBuf, String),
     #[error("Git base `{0}` was not found in the repository of this file")]
     BaseNotFound(String),
     #[error("`git {0}` did not finish within {1:?}")]
@@ -403,10 +414,10 @@ pub(crate) fn check_wire_format(
     let program = git.locate()?;
     let dir = file
         .parent()
-        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf()))?;
+        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf(), String::new()))?;
     let file_name = file
         .file_name()
-        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf()))?;
+        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf(), String::new()))?;
     let run = |args: &[&OsStr], limit: u64| git.run(&program, dir, args, limit);
     let os = |s: &'static str| OsStr::new(s);
 
@@ -415,7 +426,17 @@ pub(crate) fn check_wire_format(
     // the repository top level, so no canonical-path comparison is needed.
     let prefix = run(&[os("rev-parse"), os("--show-prefix")], SMALL_OUTPUT)?;
     if !prefix.success {
-        return Err(WireCheckError::NotARepository(dir.to_path_buf()));
+        // Keep git's own reason: "not a git repository" and a `safe.directory`
+        // ownership refusal need different fixes.
+        let reason = if prefix.stderr.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (git: {})",
+                prefix.stderr.lines().next().unwrap_or_default()
+            )
+        };
+        return Err(WireCheckError::NotARepository(dir.to_path_buf(), reason));
     }
     let rel_path = format!(
         "{}{}",
@@ -591,6 +612,24 @@ fn render_report(report: &WireReport) -> String {
                     ));
                 }
             }
+            if !diff.warnings.is_empty() {
+                out.push_str(&format!(
+                    "- **Warnings** ({}, not wire-breaking):\n",
+                    diff.warnings.len()
+                ));
+                for w in diff.warnings.iter().take(MAX_LISTED_FINDINGS) {
+                    out.push_str(&format!(
+                        "  - `{}` #{} (L{}): {}\n",
+                        w.message, w.number, w.line, w.detail
+                    ));
+                }
+                if diff.warnings.len() > MAX_LISTED_FINDINGS {
+                    out.push_str(&format!(
+                        "  - … and {} more\n",
+                        diff.warnings.len() - MAX_LISTED_FINDINGS
+                    ));
+                }
+            }
             if !diff.removed_messages.is_empty() {
                 let listed: Vec<String> = diff
                     .removed_messages
@@ -749,7 +788,7 @@ message User {
         let (repo, file) = committed_repo();
         repo.write(
             "protos/user.proto",
-            &BASE_PROTO.replace("string email = 2;", "string display_name = 2;"),
+            &BASE_PROTO.replace("string email = 2;", "int64 display_name = 2;"),
         );
         let report = check_wire_format(&file, Some("main"), &repo.runner()).expect("check");
         let diff = compared(&report);
@@ -760,6 +799,25 @@ message User {
         let text = render_report(&report);
         assert!(text.contains("WIRE_FORMAT_BREAKING_CHANGE"), "{text}");
         assert!(text.contains("`main`"), "{text}");
+    }
+
+    /// Names never go on the wire: an in-place rename with the same type is a
+    /// non-blocking JSON warning, not a `WIRE_FORMAT_BREAKING_CHANGE`.
+    #[test]
+    fn pure_rename_is_a_json_warning_not_a_wire_break() {
+        let (repo, file) = committed_repo();
+        repo.write(
+            "protos/user.proto",
+            &BASE_PROTO.replace("string email = 2;", "string contact_email = 2;"),
+        );
+        let report = check_wire_format(&file, Some("main"), &repo.runner()).expect("check");
+        let diff = compared(&report);
+        assert!(rules(diff).is_empty(), "{diff:?}");
+        assert_eq!(diff.warnings.len(), 1, "{diff:?}");
+        let text = render_report(&report);
+        assert!(text.contains("no wire-format breaking change"), "{text}");
+        assert!(text.contains("**Warnings**"), "{text}");
+        assert!(text.contains("JSON"), "{text}");
     }
 
     #[test]
@@ -818,7 +876,7 @@ message User {
         // one. `HEAD~1` would miss the break; the merge-base with main keeps it.
         repo.write(
             "protos/user.proto",
-            &BASE_PROTO.replace("string email = 2;", "string display_name = 2;"),
+            &BASE_PROTO.replace("string email = 2;", "int64 display_name = 2;"),
         );
         repo.commit("break");
         repo.write("README.md", "hi\n");
@@ -880,7 +938,9 @@ message User {
             timeout: GIT_COMMAND_TIMEOUT,
         };
         let err = check_wire_format(&file, Some("main"), &runner).expect_err("not a repo");
-        assert!(matches!(err, WireCheckError::NotARepository(_)), "{err}");
+        assert!(matches!(err, WireCheckError::NotARepository(..)), "{err}");
+        // git's own reason is kept (vs. a `safe.directory` ownership refusal).
+        assert!(err.to_string().contains("not a git repository"), "{err}");
     }
 
     #[test]

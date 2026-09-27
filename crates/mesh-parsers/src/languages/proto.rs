@@ -489,14 +489,59 @@ pub struct WireBreakingChange {
     pub line: usize,
 }
 
+/// A change that does not break the binary wire format but still deserves a
+/// look: a field renamed in place (JSON and text-format payloads carry field
+/// names), or a type change that depends on a type declared in another file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireWarning {
+    /// Message path (`Outer.Inner`).
+    pub message: String,
+    pub number: u32,
+    pub detail: String,
+    /// Line in the new version.
+    pub line: usize,
+}
+
 /// Result of comparing a base schema to the working-tree schema.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WireDiff {
     pub breaking: Vec<WireBreakingChange>,
+    /// Non-blocking findings (see [`WireWarning`]).
+    pub warnings: Vec<WireWarning>,
     /// Messages present in the base but not in the new version (removed or
     /// renamed). Not a wire break by itself — a field still typed with it is
     /// caught as an incompatible type — but listed so the agent can check.
     pub removed_messages: Vec<String>,
+}
+
+/// Verdict on whether two declarations decode each other's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireCompat {
+    Compatible,
+    Incompatible,
+    /// Depends on a type the file does not declare (an imported enum is a
+    /// varint, an imported message is length-delimited): not decidable from
+    /// this file alone, so never reported as a break.
+    Unknown,
+}
+
+impl WireCompat {
+    fn from_bool(ok: bool) -> Self {
+        if ok {
+            Self::Compatible
+        } else {
+            Self::Incompatible
+        }
+    }
+
+    /// Both must hold: `Incompatible` wins over `Unknown`, which wins over `Compatible`.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Incompatible, _) | (_, Self::Incompatible) => Self::Incompatible,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            _ => Self::Compatible,
+        }
+    }
 }
 
 /// Wire class of a field's value type. Two value types are compatible when a
@@ -519,11 +564,31 @@ enum WireClass {
     Double,
     String,
     Bytes,
-    /// A message type, by the name the field uses.
+    /// A message declared in the file, by the name the field uses.
     Message(String),
+    /// A named type the file does not declare (imported enum or message).
+    Unresolved(String),
 }
 
-fn classify_wire_type(ty: &str, enum_names: &[CompactStr]) -> WireClass {
+impl WireClass {
+    fn is_length_delimited(&self) -> bool {
+        matches!(self, Self::String | Self::Bytes | Self::Message(_))
+    }
+}
+
+impl ProtoWireSchema {
+    /// The message a field type names: exact path first, then a dotted-suffix
+    /// match (`pkg.v1.Outer.Inner` or `Inner` used inside `Outer`).
+    fn resolve_message(&self, name: &str) -> Option<&ProtoWireMessage> {
+        let name = name.trim_start_matches('.');
+        self.messages
+            .iter()
+            .find(|m| m.path == name)
+            .or_else(|| self.messages.iter().find(|m| same_type_name(&m.path, name)))
+    }
+}
+
+fn classify_wire_type(ty: &str, schema: &ProtoWireSchema) -> WireClass {
     match ty {
         "int32" | "uint32" | "int64" | "uint64" | "bool" => WireClass::Varint,
         "sint32" | "sint64" => WireClass::ZigZag,
@@ -534,11 +599,14 @@ fn classify_wire_type(ty: &str, enum_names: &[CompactStr]) -> WireClass {
         "string" => WireClass::String,
         "bytes" => WireClass::Bytes,
         named => {
-            let bare = named.rsplit('.').next().unwrap_or(named);
-            if enum_names.iter().any(|e| e.as_str() == bare) {
+            let name = named.trim_start_matches('.');
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            if schema.enum_names.iter().any(|e| e.as_str() == bare) {
                 WireClass::Varint
+            } else if schema.resolve_message(name).is_some() {
+                WireClass::Message(name.to_string())
             } else {
-                WireClass::Message(named.trim_start_matches('.').to_string())
+                WireClass::Unresolved(name.to_string())
             }
         }
     }
@@ -562,48 +630,129 @@ fn same_type_name(a: &str, b: &str) -> bool {
 ///
 /// Everything else is incompatible, including `float`/`double` against the
 /// fixed types they share a wire type with, `sint*` against the plain varints,
-/// `string` against a message, and two different message types.
+/// `string` against a message, and two different message types. A type the
+/// file does not declare is [`WireCompat::Unknown`] against a varint, `bytes`
+/// or another undeclared type (it may be an imported enum or message), and
+/// incompatible against everything else (neither an enum nor a message fits).
 pub fn wire_types_compatible(
     old_ty: &str,
-    old_enums: &[CompactStr],
+    old_schema: &ProtoWireSchema,
     new_ty: &str,
-    new_enums: &[CompactStr],
-) -> bool {
+    new_schema: &ProtoWireSchema,
+) -> WireCompat {
     use WireClass as C;
     match (
-        classify_wire_type(old_ty, old_enums),
-        classify_wire_type(new_ty, new_enums),
+        classify_wire_type(old_ty, old_schema),
+        classify_wire_type(new_ty, new_schema),
     ) {
-        (C::Message(a), C::Message(b)) => same_type_name(&a, &b),
-        (C::String, C::Bytes) | (C::Bytes, C::String) => true,
-        (C::Bytes, C::Message(_)) | (C::Message(_), C::Bytes) => true,
-        (a, b) => a == b,
+        (C::Message(a) | C::Unresolved(a), C::Message(b) | C::Unresolved(b))
+            if same_type_name(&a, &b) =>
+        {
+            WireCompat::Compatible
+        }
+        (C::Message(_), C::Message(_)) => WireCompat::Incompatible,
+        (C::Unresolved(_), C::Unresolved(_) | C::Varint | C::Bytes)
+        | (C::Varint | C::Bytes, C::Unresolved(_)) => WireCompat::Unknown,
+        (C::Unresolved(_), _) | (_, C::Unresolved(_)) => WireCompat::Incompatible,
+        (C::String, C::Bytes) | (C::Bytes, C::String) => WireCompat::Compatible,
+        (C::Bytes, C::Message(_)) | (C::Message(_), C::Bytes) => WireCompat::Compatible,
+        (a, b) => WireCompat::from_bool(a == b),
     }
 }
 
-/// Whether `old` and `new` (same number, same name) can decode each other's
-/// bytes: same cardinality (a `repeated` ↔ singular or map ↔ non-map change is
-/// always reported), then [`wire_types_compatible`] on the value (and map key).
+/// Whether `old` and `new` (same number) can decode each other's bytes:
+///
+/// - same cardinality: [`wire_types_compatible`] on the value (and map key);
+/// - singular ↔ `repeated`: only for `string`, `bytes` and messages (numeric
+///   repeated fields are packed, which a singular reader cannot parse);
+/// - `map<K, V>` ↔ `repeated Entry`: when `Entry` is exactly
+///   `{K key = 1; V value = 2;}` (the map's wire form);
+/// - map ↔ singular: never.
 pub fn wire_fields_compatible(
     old: &ProtoWireField,
-    old_enums: &[CompactStr],
+    old_schema: &ProtoWireSchema,
     new: &ProtoWireField,
-    new_enums: &[CompactStr],
-) -> bool {
-    if old.cardinality != new.cardinality {
-        return false;
+    new_schema: &ProtoWireSchema,
+) -> WireCompat {
+    use ProtoCardinality as K;
+    let values = wire_types_compatible(&old.value_type, old_schema, &new.value_type, new_schema);
+    match (old.cardinality, new.cardinality) {
+        (a, b) if a == b => {
+            let keys = match (&old.map_key, &new.map_key) {
+                (Some(a), Some(b)) => wire_types_compatible(a, old_schema, b, new_schema),
+                (None, None) => WireCompat::Compatible,
+                _ => WireCompat::Incompatible,
+            };
+            keys.and(values)
+        }
+        (K::Singular, K::Repeated) | (K::Repeated, K::Singular) => {
+            if values == WireCompat::Incompatible {
+                return WireCompat::Incompatible;
+            }
+            let a = classify_wire_type(&old.value_type, old_schema);
+            let b = classify_wire_type(&new.value_type, new_schema);
+            let maybe_ld =
+                |c: &WireClass| c.is_length_delimited() || matches!(c, WireClass::Unresolved(_));
+            if a.is_length_delimited() && b.is_length_delimited() {
+                values
+            } else if maybe_ld(&a) && maybe_ld(&b) {
+                WireCompat::Unknown
+            } else {
+                WireCompat::Incompatible
+            }
+        }
+        (K::Map, K::Repeated) => map_entry_compatible(old, old_schema, new, new_schema),
+        (K::Repeated, K::Map) => map_entry_compatible(new, new_schema, old, old_schema),
+        _ => WireCompat::Incompatible,
     }
-    let keys_ok = match (&old.map_key, &new.map_key) {
-        (Some(a), Some(b)) => wire_types_compatible(a, old_enums, b, new_enums),
-        (None, None) => true,
-        _ => false,
+}
+
+/// `map<K, V>` against `repeated Entry`: compatible when `Entry` is
+/// `{K' key = 1; V' value = 2;}` with `K'`/`V'` compatible with `K`/`V`.
+fn map_entry_compatible(
+    map: &ProtoWireField,
+    map_schema: &ProtoWireSchema,
+    repeated: &ProtoWireField,
+    repeated_schema: &ProtoWireSchema,
+) -> WireCompat {
+    let Some(key) = map.map_key.as_deref() else {
+        return WireCompat::Incompatible;
     };
-    keys_ok && wire_types_compatible(&old.value_type, old_enums, &new.value_type, new_enums)
+    match classify_wire_type(&repeated.value_type, repeated_schema) {
+        WireClass::Unresolved(_) => WireCompat::Unknown,
+        WireClass::Message(name) => {
+            let Some(entry) = repeated_schema.resolve_message(&name) else {
+                return WireCompat::Unknown;
+            };
+            let [a, b] = entry.fields.as_slice() else {
+                return WireCompat::Incompatible;
+            };
+            let (k, v) = if a.number == 1 { (a, b) } else { (b, a) };
+            if k.number != 1
+                || v.number != 2
+                || k.cardinality != ProtoCardinality::Singular
+                || v.cardinality != ProtoCardinality::Singular
+            {
+                return WireCompat::Incompatible;
+            }
+            wire_types_compatible(key, map_schema, &k.value_type, repeated_schema).and(
+                wire_types_compatible(&map.value_type, map_schema, &v.value_type, repeated_schema),
+            )
+        }
+        _ => WireCompat::Incompatible,
+    }
 }
 
 /// Applies the three 4.6b rules to every message present in both versions.
 /// Findings come out in base document order, then field-number order, so the
 /// report is deterministic.
+///
+/// A field whose name changed at the same number is a break only when the
+/// numbers were really reassigned — the old name still exists at another
+/// number, the new name existed at another number in the base, or the types
+/// do not decode each other. A plain in-place rename with a compatible type is
+/// binary-safe (names never go on the wire) and is reported as a warning,
+/// since JSON and text-format payloads carry field names.
 pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDiff {
     use std::collections::BTreeMap;
 
@@ -621,6 +770,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
             continue;
         };
         let start = diff.breaking.len();
+        let warn_start = diff.warnings.len();
         let old_by_num: BTreeMap<u32, &ProtoWireField> =
             old_msg.fields.iter().rev().map(|f| (f.number, f)).collect();
         let new_by_num: BTreeMap<u32, &ProtoWireField> =
@@ -628,44 +778,88 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
 
         for (&number, &of) in &old_by_num {
             match new_by_num.get(&number) {
-                Some(&nf) if nf.name != of.name => {
-                    diff.breaking.push(WireBreakingChange {
-                        rule: WireRule::FieldNumberReused,
-                        message: old_msg.path.clone(),
-                        number,
-                        detail: format!(
-                            "was `{}` (`{}`), now `{}` (`{}`): data written by either side is read as the other field",
-                            of.name,
-                            of.type_label(),
-                            nf.name,
-                            nf.type_label()
-                        ),
-                        line: nf.line,
-                    });
-                }
                 Some(&nf) => {
-                    if !wire_fields_compatible(of, &old.enum_names, nf, &new.enum_names) {
-                        let why = if of.cardinality != nf.cardinality {
-                            format!(
-                                "cardinality {} -> {}",
-                                of.cardinality.label(),
-                                nf.cardinality.label()
-                            )
+                    let compat = wire_fields_compatible(of, old, nf, new);
+                    if nf.name != of.name {
+                        let old_name_moved = new_msg
+                            .fields
+                            .iter()
+                            .any(|f| f.name == of.name && f.number != number);
+                        let new_name_moved = old_msg
+                            .fields
+                            .iter()
+                            .any(|f| f.name == nf.name && f.number != number);
+                        if old_name_moved || new_name_moved || compat == WireCompat::Incompatible {
+                            diff.breaking.push(WireBreakingChange {
+                                rule: WireRule::FieldNumberReused,
+                                message: old_msg.path.clone(),
+                                number,
+                                detail: format!(
+                                    "was `{}` (`{}`), now `{}` (`{}`): data written by either side is read as the other field",
+                                    of.name,
+                                    of.type_label(),
+                                    nf.name,
+                                    nf.type_label()
+                                ),
+                                line: nf.line,
+                            });
                         } else {
-                            "encodings are not interchangeable".to_string()
-                        };
-                        diff.breaking.push(WireBreakingChange {
-                            rule: WireRule::IncompatibleType,
+                            let caveat = if compat == WireCompat::Unknown {
+                                "; the type change involves a type declared in another file and was not checked"
+                            } else {
+                                ""
+                            };
+                            diff.warnings.push(WireWarning {
+                                message: old_msg.path.clone(),
+                                number,
+                                detail: format!(
+                                    "renamed `{}` -> `{}` (`{}` -> `{}`): binary-compatible, but JSON and text-format payloads use the old name{caveat}",
+                                    of.name,
+                                    nf.name,
+                                    of.type_label(),
+                                    nf.type_label()
+                                ),
+                                line: nf.line,
+                            });
+                        }
+                        continue;
+                    }
+                    match compat {
+                        WireCompat::Compatible => {}
+                        WireCompat::Unknown => diff.warnings.push(WireWarning {
                             message: old_msg.path.clone(),
                             number,
                             detail: format!(
-                                "`{}`: `{}` -> `{}` ({why})",
+                                "`{}`: `{}` -> `{}` involves a type declared in another file (imported enum or message); compatibility not checked",
                                 of.name,
                                 of.type_label(),
                                 nf.type_label()
                             ),
                             line: nf.line,
-                        });
+                        }),
+                        WireCompat::Incompatible => {
+                            let why = if of.cardinality != nf.cardinality {
+                                format!(
+                                    "cardinality {} -> {}",
+                                    of.cardinality.label(),
+                                    nf.cardinality.label()
+                                )
+                            } else {
+                                "encodings are not interchangeable".to_string()
+                            };
+                            diff.breaking.push(WireBreakingChange {
+                                rule: WireRule::IncompatibleType,
+                                message: old_msg.path.clone(),
+                                number,
+                                detail: format!(
+                                    "`{}`: `{}` -> `{}` ({why})",
+                                    of.name,
+                                    of.type_label(),
+                                    nf.type_label()
+                                ),
+                                line: nf.line,
+                            });
+                        }
                     }
                 }
                 None => {
@@ -703,6 +897,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
             }
         }
         diff.breaking[start..].sort_by_key(|c| (c.number, c.rule));
+        diff.warnings[warn_start..].sort_by_key(|w| w.number);
     }
 
     diff
@@ -1219,8 +1414,9 @@ message Outer {
     /// incompatible pair from each wire type is refused.
     #[test]
     fn wire_type_compatibility_table() {
-        let enums = [CompactStr::new("Color")];
-        let ok = |a: &str, b: &str| wire_types_compatible(a, &enums, b, &enums);
+        let s =
+            schema("syntax = \"proto3\";\nenum Color { C = 0; }\nmessage Bar {}\nmessage Baz {}\n");
+        let compat = |a: &str, b: &str| wire_types_compatible(a, &s, b, &s);
         for (a, b) in [
             ("int32", "int64"),
             ("int32", "uint32"),
@@ -1230,11 +1426,12 @@ message Outer {
             ("fixed32", "sfixed32"),
             ("fixed64", "sfixed64"),
             ("string", "bytes"),
-            ("bytes", "foo.Bar"),
+            ("bytes", "Bar"),
             (".demo.v1.Bar", "Bar"),
+            ("other.v1.Imported", "Imported"),
         ] {
-            assert!(ok(a, b), "{a} -> {b} must be compatible");
-            assert!(ok(b, a), "{b} -> {a} must be compatible");
+            assert_eq!(compat(a, b), WireCompat::Compatible, "{a} -> {b}");
+            assert_eq!(compat(b, a), WireCompat::Compatible, "{b} -> {a}");
         }
         for (a, b) in [
             ("int32", "sint32"),
@@ -1246,18 +1443,113 @@ message Outer {
             ("string", "Bar"),
             ("Bar", "Baz"),
             ("Color", "Bar"),
+            // Neither an imported enum nor an imported message fits these.
+            ("string", "other.v1.Imported"),
+            ("sint32", "Imported"),
+            ("Bar", "Imported"),
         ] {
-            assert!(!ok(a, b), "{a} -> {b} must be incompatible");
+            assert_eq!(compat(a, b), WireCompat::Incompatible, "{a} -> {b}");
         }
+        // Imported enum (varint) or imported message (length-delimited):
+        // undecidable from this file, never a break.
+        for (a, b) in [
+            ("int32", "other.v1.Imported"),
+            ("bytes", "Imported"),
+            ("Imported", "OtherImported"),
+        ] {
+            assert_eq!(compat(a, b), WireCompat::Unknown, "{a} -> {b}");
+            assert_eq!(compat(b, a), WireCompat::Unknown, "{b} -> {a}");
+        }
+    }
+
+    /// Protobuf "Updating A Message Type": singular ↔ `repeated` is compatible
+    /// for `string`, `bytes` and message fields only (numeric repeated fields
+    /// are packed); `map<K, V>` ↔ the equivalent `repeated` entry message is
+    /// compatible; map ↔ singular never is.
+    #[test]
+    fn wire_diff_cardinality_changes_follow_the_protobuf_rules() {
+        let old = schema(
+            "syntax = \"proto3\";\nmessage Tag { string v = 1; }\nmessage Entry { string key = 1; int64 value = 2; }\nmessage M {\n  string s = 1;\n  bytes b = 2;\n  Tag t = 3;\n  int32 n = 4;\n  map<string, int64> counts = 5;\n  map<string, int32> m2 = 6;\n  imp.Thing u = 7;\n}\n",
+        );
+        let new = schema(
+            "syntax = \"proto3\";\nmessage Tag { string v = 1; }\nmessage Entry { string key = 1; int64 value = 2; }\nmessage M {\n  repeated string s = 1;\n  repeated bytes b = 2;\n  repeated Tag t = 3;\n  repeated int32 n = 4;\n  repeated Entry counts = 5;\n  int32 m2 = 6;\n  repeated imp.Thing u = 7;\n}\n",
+        );
+        let diff = diff_wire_schemas(&old, &new);
+        let found: Vec<(WireRule, u32)> =
+            diff.breaking.iter().map(|c| (c.rule, c.number)).collect();
+        assert_eq!(
+            found,
+            vec![
+                (WireRule::IncompatibleType, 4),
+                (WireRule::IncompatibleType, 6)
+            ],
+            "{diff:#?}"
+        );
+        // `imp.Thing` may be an imported enum (packed) or message: a warning.
+        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        assert_eq!(warned, vec![7], "{diff:#?}");
+        // And back: repeated -> singular for the same types.
+        let back = diff_wire_schemas(&new, &old);
+        let found: Vec<u32> = back.breaking.iter().map(|c| c.number).collect();
+        assert_eq!(found, vec![4, 6], "{back:#?}");
+    }
+
+    /// Field names never go on the wire: an in-place rename with a compatible
+    /// type is a warning (JSON / text format), not a break. Numbers that were
+    /// really reassigned (names swapped or moved) or a rename with an
+    /// incompatible type still are.
+    #[test]
+    fn wire_diff_rename_is_a_warning_but_a_swap_is_a_break() {
+        let old = schema(
+            "syntax = \"proto3\";\nmessage M {\n  string email = 1;\n  int32 a = 2;\n  int32 b = 3;\n  string c = 4;\n  int32 d = 5;\n}\n",
+        );
+        let new = schema(
+            "syntax = \"proto3\";\nmessage M {\n  string contact_email = 1;\n  int32 b = 2;\n  int32 a = 3;\n  int64 cc = 4;\n  int64 d_renamed = 5;\n}\n",
+        );
+        let diff = diff_wire_schemas(&old, &new);
+        let found: Vec<(WireRule, u32)> =
+            diff.breaking.iter().map(|c| (c.rule, c.number)).collect();
+        assert_eq!(
+            found,
+            vec![
+                (WireRule::FieldNumberReused, 2),
+                (WireRule::FieldNumberReused, 3),
+                (WireRule::FieldNumberReused, 4),
+            ],
+            "{diff:#?}"
+        );
+        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        assert_eq!(warned, vec![1, 5], "{diff:#?}");
+        assert!(diff.warnings[0].detail.contains("JSON"), "{diff:#?}");
+    }
+
+    /// An enum imported from another file used to be presumed a message, so
+    /// `int32 -> ImportedEnum` was a false break. It is now a warning, and an
+    /// unchanged imported type is not reported at all.
+    #[test]
+    fn wire_diff_imported_types_are_never_presumed_messages() {
+        let old = schema(
+            "syntax = \"proto3\";\nimport \"other.proto\";\nmessage M {\n  int32 status = 1;\n  other.v1.Money price = 2;\n  other.v1.Kind kind = 3;\n}\n",
+        );
+        let new = schema(
+            "syntax = \"proto3\";\nimport \"other.proto\";\nmessage M {\n  other.v1.Status status = 1;\n  other.v1.Money price = 2;\n  other.v1.Kind kind = 3;\n}\n",
+        );
+        let diff = diff_wire_schemas(&old, &new);
+        assert!(diff.breaking.is_empty(), "{diff:#?}");
+        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        assert_eq!(warned, vec![1], "{diff:#?}");
+        // Identical versions: nothing at all.
+        let same = diff_wire_schemas(&old, &old);
+        assert_eq!(same, WireDiff::default());
     }
 
     #[test]
     fn wire_diff_applies_the_three_rules() {
         let old = schema(
-            "syntax = \"proto3\";\nmessage M {\n  reserved 7;\n  int32 a = 1;\n  string b = 2;\n  int32 c = 3;\n  int32 d = 4;\n  repeated string e = 5;\n  int32 f = 6;\n}\n",
+            "syntax = \"proto3\";\nmessage M {\n  reserved 7;\n  int32 a = 1;\n  string b = 2;\n  int32 c = 3;\n  int32 d = 4;\n  repeated int32 e = 5;\n  int32 f = 6;\n}\n",
         );
         let new = schema(
-            "syntax = \"proto3\";\nmessage M {\n  reserved 4;\n  reserved \"f\";\n  int64 a = 1;\n  string renamed = 2;\n  sint32 c = 3;\n  string e = 5;\n  int32 g = 7;\n}\n",
+            "syntax = \"proto3\";\nmessage M {\n  reserved 4;\n  reserved \"f\";\n  int64 a = 1;\n  int32 renamed = 2;\n  sint32 c = 3;\n  int32 e = 5;\n  int32 g = 7;\n}\n",
         );
         let diff = diff_wire_schemas(&old, &new);
         let found: Vec<(WireRule, u32)> =
@@ -1275,8 +1567,8 @@ message Outer {
         // a: int32 -> int64 is compatible; d: deleted but number reserved;
         // f: deleted but name reserved.
         assert!(diff.removed_messages.is_empty());
+        assert!(diff.warnings.is_empty());
     }
-
     #[test]
     fn wire_diff_reports_a_deletion_without_reserved_and_removed_messages() {
         let old = schema(

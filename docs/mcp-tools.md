@@ -263,8 +263,8 @@ path in the file (`Outer.Inner`); `oneof` members belong to the enclosing messag
 
 | Rule | Reported when |
 |---|---|
-| Field number reused | Number N names a different field than in the base, or a number `reserved` in the base is used again |
-| Incompatible type | Same number and name, but the cardinality changed (singular ↔ `repeated`, map ↔ non-map) or the value types are not in the same group below |
+| Field number reused | Number N now names a different field: the old name still exists at another number, the new name existed at another number in the base (swap/move), or the name changed together with an incompatible type; or a number `reserved` in the base is used again |
+| Incompatible type | Same number and name, but the value types are not in the same group below, or the cardinality changed in a way the other side cannot parse (see below) |
 | Deleted without `reserved` | A field of the base is gone and neither its number (single, `N to M`, `N to max`) nor its name is `reserved` |
 
 **Compatibility table** (value types, and map keys/values):
@@ -279,8 +279,23 @@ path in the file (`Outer.Inner`); `oneof` members belong to the enclosing messag
 
 Everything else is reported, including `float`/`double` against `fixed32`/`fixed64`, `sint*` against
 plain varints, `string` against a message and two different message types. `optional` ↔ plain
-singular is not a change. An enum imported from another file is not resolved and is treated as a
-message type.
+singular is not a change.
+
+**Cardinality** (protobuf "Updating A Message Type"): singular ↔ `repeated` is compatible for
+`string`, `bytes` and message fields only — numeric `repeated` fields are packed, which a singular
+reader cannot parse, so `int32` ↔ `repeated int32` (and enums, `bool`) is reported. `map<K, V>` ↔
+`repeated Entry` is compatible when `Entry` is exactly `{K key = 1; V value = 2;}`; map ↔ singular
+is always reported.
+
+**Warnings** (listed under `**Warnings**`, never counted as `WIRE_FORMAT_BREAKING_CHANGE`):
+
+- *In-place rename* — same number, compatible type, and neither name used elsewhere in the message:
+  names never go on the wire, but JSON and text-format payloads carry them.
+- *Type declared in another file* — a type the `.proto` does not declare may be an imported enum
+  (varint) or message (length-delimited). Against a varint, `bytes` or another undeclared type the
+  change cannot be decided from this file and is a warning; against `string`, `sint*`, fixed or
+  floating types it is incompatible either way and reported. The same undeclared name on both sides
+  is not a change.
 
 **Edge cases.**
 
@@ -299,8 +314,10 @@ the trace is still valid there, only the comparison is impossible.
 ### Wire-format check: `protos/user.proto`
 - **Base**: merge-base of `HEAD` and `origin/main` (`3f2c1a9b7d4e`), compared with the working tree
 - **Result**: 2 `WIRE_FORMAT_BREAKING_CHANGE`
-  - `WIRE_FORMAT_BREAKING_CHANGE` field number reused — `User` #2 (L6): was `email` (`string`), now `display_name` (`string`): data written by either side is read as the other field
+  - `WIRE_FORMAT_BREAKING_CHANGE` field number reused — `User` #2 (L6): was `email` (`string`), now `signup_ts` (`int64`): data written by either side is read as the other field
   - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #5 (L10): `fax` (`string`) was removed; add `reserved 5;` and `reserved "fax";` so the number is never reused
+- **Warnings** (1, not wire-breaking):
+  - `User` #1 (L5): renamed `id` -> `user_id` (`string` -> `string`): binary-compatible, but JSON and text-format payloads use the old name
 ```
 
 ---

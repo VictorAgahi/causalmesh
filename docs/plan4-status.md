@@ -26,6 +26,7 @@
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
 | 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ⏳ à faire | — | — | tout |
 | 4.12f empreinte sans chemins absolus | ⏳ à faire (après 4.9) | — | — | tout (§3.3) |
+| 4.13 retours terrain (scope multi-racines, calibrage IDE, résilience stdio) | ⏳ à faire (après 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
 | 4.10 sandbox réseau Linux | ⏳ à faire (après 4.7) | — | — | tout |
 | 4.8 install pilote + `stats` | ⏳ à faire (après 4.7) | — | — | partie agent seulement (§5) |
 | 4.11 masquage des secrets | 🧑 humain | — | — | aucun code (§5) |
@@ -145,6 +146,22 @@ les p50/p95 réels, le taux d'`isError`, le taux de hit du cache d'index (compte
 `PersistentIndexCache::stats()` déjà exposés par 4.4) et les redémarrages du démon, sur un audit de
 fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 
+### 3.5 4.13 — retours terrain (REX pilote réel `meta`)
+Frictions identifiées lors de l'audit réel sur architecture NestJS multi-roots :
+1. **Scope multi-racines (`security.rs`, `smart_search.rs`)** : dans un workspace avec plusieurs racines
+   (`roots = ["ms-event", "ms-post", …]`), `anchor` vaut `meta`. Un appel avec `scope: "."` résout sur
+   ce dossier parent, qui ne commence par aucune racine -> `SandboxEscapeAttempt` (`-32602`) injustifié.
+   Correctif : `ValidatedScope` valide un scope englobant égal à `resolved_workspace_root` comme
+   `WorkspaceWide`. `SmartSearchArgs.scope` devient `Option<CompactStr>` (par défaut `None`), autorisant
+   l'agent à chercher globalement sans connaître la topologie exacte des sous-dossiers.
+2. **Calibrage du payload sous 4 Ko (`smart_search.rs`)** : `DEFAULT_LIMIT` passe de 20 à **8**.
+   À 8 signatures décapitées, le Markdown pèse 2,2 à 3,6 Ko, restant systématiquement sous la limite
+   d'interception de l'IDE (~4 Ko), évitant le débordement dans `.system_generated/.../output.txt` et
+   préservant le gain d'1 roundtrip direct pour l'agent.
+3. **Résilience du proxy stdio (`main.rs`)** : éliminer toute rupture abrupte ou crash produisant
+   l'erreur `EOF`. Émettre une réponse JSON-RPC d'erreur explicite et tolérer un délai de readiness plus
+   long, avec repli automatique en mode `standalone` in-process si le démon tarde.
+
 ---
 
 ## 4. Décisions de l'utilisateur (à respecter)
@@ -202,14 +219,15 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
    Windows) ; reste l'accord de l'utilisateur pour merger.
 3. ✅ 4.1 (#46) : code, hygiène et review adversariale complète faits (§2.3, 2 MAJOR + 2 MINOR
    corrigés) ; reste la CI, puis passer en ready, puis merge.
-4. 4.12b–e, avec une review groupée.
+4. 4.12b–e, avec une review groupée (PR #49 ouverte).
 5. 4.7, puis sa review complète.
 6. 4.10, puis sa review complète.
-7. 4.6a.
-8. 4.8 (partie agent).
-9. 4.12f.
-10. 4.3, sur une machine calme.
-11. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
+7. 4.13 (retours terrain scope multi-racines, calibrage IDE, résilience stdio).
+8. 4.6a.
+9. 4.8 (partie agent).
+10. 4.12f.
+11. 4.3, sur une machine calme.
+12. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
     (les puces otel-demo de « What's NOT measured yet », la phrase « not yet wired in » de « Ratchet
     policy ») ; consolider `changelog.d/` ; lister ce qui reste humain (4.8 pilote, 4.11, 4.3 réel).
 

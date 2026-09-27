@@ -66,6 +66,7 @@ l'utilisateur.
 | **4.10** | Sandbox réseau du démon (Linux) | Agent | `EPERM` sur connexion sortante |
 | **4.11** | Masquage des secrets dans les fixtures | **Humain** (données du pilote) | Décision fondée sur les données |
 | **4.12** | Dette : déterminisme CI, audit, fences, homonymes | Agent | Un test de non-régression par point |
+| **4.13** | Retours terrain : scope multi-racines, calibrage payload IDE, résilience stdio | Agent | Scope '.' et '*' acceptés ; payload par défaut ≤ 4 KB ; 0 EOF sur timeout démon |
 
 ---
 
@@ -88,9 +89,11 @@ Fichiers de code touchés par jalon (en plus des fragments `changelog.d/`) :
 | 4.9 | `crates/mesh-core/src/properties.rs`, `docs.rs`, `crates/mesh-parsers/src/languages/spec_shape.rs` |
 | 4.10 | `crates/mesh-daemon/src/sandbox.rs` (nouveau), `crates/mesh-daemon/src/main.rs`, `Cargo.toml` (dépendance) |
 | 4.12 | `scripts/determinism.sh`, `crates/mesh-server/src/tools/mod.rs`, `crates/mesh-parsers/src/markdown.rs`, `crates/mesh-server/src/indexer.rs` (`repo_names`), `crates/mesh-server/src/lib.rs` |
+| 4.13 | `crates/mesh-core/src/security.rs`, `crates/mesh-server/src/tools/smart_search.rs`, `crates/mesh-server/src/main.rs` |
 
 Recouvrements : `indexer.rs` (4.1, 4.4, 4.12) ; `mesh-daemon/src/main.rs` (4.4, 4.7, 4.10) ;
-`mesh-server/src/main.rs` (4.4, 4.7) ; `cli/doctor.rs` (4.1, 4.7) ; `markdown.rs` (4.6a, 4.12).
+`mesh-server/src/main.rs` (4.4, 4.7, 4.13) ; `cli/doctor.rs` (4.1, 4.7) ; `markdown.rs` (4.6a, 4.12) ;
+`smart_search.rs` (4.1, 4.13).
 Deux jalons qui se recouvrent ne tournent jamais en même temps.
 
 **Vagues** (au plus 3 jalons simultanés) :
@@ -102,7 +105,7 @@ Deux jalons qui se recouvrent ne tournent jamais en même temps.
 | 2 | 4.1 ∥ 4.6b ∥ 4.9 | 4.4 mergé (pour 4.1) |
 | 3 | 4.2 ∥ 4.6a ∥ 4.3 | 4.5 mergé (pour 4.6a) |
 | 4 | 4.7 ∥ 4.12b–e | 4.1 et 4.4 mergés |
-| 5 | 4.10 ∥ 4.8 (partie agent) | 4.7 mergé |
+| 5 | 4.10 ∥ 4.8 (partie agent) ∥ 4.13 | 4.7 mergé (pour main.rs) et 4.1 mergé (pour smart_search.rs) |
 | Clôture | consolidation, version 6.1.0, suites de régression | tout mergé |
 
 Après chaque merge, les branches encore ouvertes intègrent `main` (rebase si la branche n'a pas
@@ -431,6 +434,72 @@ déterministe. Sortie : test.
 inconnu reçoit l'erreur d'outil « still indexing » au lieu de `-32602`
 (`crates/mesh-server/src/lib.rs`, fonction `respond`). Vérifier le nom avant l'état d'indexation.
 Sortie : test.
+
+---
+
+### 4.13 — Retours terrain : ergonomie du scope multi-racines, calibrage payload IDE et résilience stdio
+
+**Constat vérifié dans le code & REX terrain.**
+Le retour d'expérience d'un pilote réel sur une architecture NestJS multi-services (dépôt `meta`)
+a mis en lumière 3 frictions opérationnelles qui freinent l'usage de MeshMCP en conditions réelles :
+
+1. **Faux positif d'évasion de bac à sable sur `scope: "."`** :
+   Dans un workspace multi-racines (`roots = ["ms-event", "ms-post", …]`), le chemin canonique de `.`
+   est la racine globale du projet (`resolved_workspace_root`), parent direct des racines déclarées.
+   Or, `ValidatedScope::resolve_with_aliases` (`crates/mesh-core/src/security.rs:107-118`) vérifie
+   `canonical_check.starts_with(&root_check)`. Le dossier parent ne commençant par aucun de ses
+   enfants, l'appel lève `SecurityError::SandboxEscapeAttempt` (`-32602`) ! De plus, `SmartSearchArgs.scope`
+   (`crates/mesh-server/src/tools/smart_search.rs:29`) est un champ obligatoire : l'agent est obligé
+   de deviner la topologie exacte des sous-dossiers racines pour pouvoir chercher.
+2. **Débordement du payload par défaut et rupture du roundtrip unique** :
+   Dans `smart_search.rs:68`, `DEFAULT_LIMIT = 20`. Sur des symboles fréquents (`Worker`,
+   `PostProcessor`), 20 signatures décapitées avec décorateurs pèsent entre 5 Ko et 9 Ko. Bien que
+   largement sous le plafond MCP de 48 Ko, les environnements d'agents (Antigravity, Claude Code,
+   Cursor) interceptent toute réponse d'outil dépassant ~4 à 5 Ko pour l'écrire dans un fichier
+   temporaire (`output.txt`). L'agent est alors contraint d'émettre un appel `view_file` supplémentaire,
+   ce qui détruit l'avantage concurrentiel d'1 tour de MeshMCP (face aux 3 tours de `ripgrep`),
+   double la latence et invalide le cache de prompt (KV cache).
+3. **Erreur `EOF` sur le cycle de vie stdio** :
+   Lorsque l'IDE démarre `mesh-mcp` en mode proxy stdio (`crates/mesh-server/src/main.rs:146-165`),
+   si le démon `meshd` met du temps à initialiser son ingestion ou si le handshake UDS échoue,
+   le proxy se termine brutalement ou ferme `stdout`. Le client MCP reçoit alors une erreur `EOF`
+   opaque (`calling "tools/call": EOF`) au lieu d'une erreur JSON-RPC gérée, poussant l'agent à
+   abandonner le serveur.
+
+**Travail.**
+1. **Scope multi-racines et global (`ValidatedScope` & `smart_search`)** :
+   - Dans `crates/mesh-core/src/security.rs` : si le chemin canonique correspond au `resolved_workspace_root`
+     (ou à un ancêtre direct englobant l'intégralité des `allowed_roots`), valider le scope sans lever
+     d'évasion sandbox. Introduire `ValidatedScope::is_workspace_wide(&self, allowed_roots: &[PathBuf]) -> bool`.
+   - Dans `crates/mesh-server/src/tools/smart_search.rs` :
+     - Passer `SmartSearchArgs.scope` en `Option<CompactStr>` (par défaut `None`), avec description mise à jour :
+       *"Target repository or directory path (OPTIONAL). Defaults to all configured workspace roots if omitted, '.' or '*'."*
+     - Dans `run` : si `scope` est `None`, `"."` ou `"*"`, la recherche ne restreint pas les résultats
+       à une racine unique mais filtre sur l'ensemble des fichiers indexés dans `state.allowed_roots`.
+2. **Calibrage du budget payload par défaut sous 4 Ko** :
+   - Dans `smart_search.rs:68` : passer `DEFAULT_LIMIT` de 20 à **8** (le plafond `MAX_LIMIT = 100`
+     reste disponible pour l'agent via `limit: N` explicite).
+   - À 8 signatures décapitées, le payload Markdown moyen se situe entre **2,2 Ko et 3,6 Ko** (toujours
+     inférieur au seuil d'interception de 4 Ko de l'IDE), garantissant l'affichage 100 % in-line.
+   - Message de pagination clair en fin de résultat : *"More results: N remaining (use `offset: 8`)"*.
+3. **Résilience stdio et repli transparent (zéro EOF)** :
+   - Dans `crates/mesh-server/src/main.rs` :
+     - Éliminer toute fermeture abrupte de `stdout`. Si la communication avec le socket `meshd` est
+       rompue ou introuvable en mode proxy, émettre immédiatement une réponse JSON-RPC valide d'erreur
+       interne (`-32603` ou `isError: true` formaté) sur `stdout` avant toute sortie.
+     - Augmenter le délai de garde et le backoff dans `ensure_daemon_running` pour tolérer un boot
+       légèrement plus long sur les dépôts multi-racines volumineux.
+     - Si le démon ne répond pas après le délai de grâce, basculer automatiquement de manière
+       transparente en mode `run_standalone` in-process pour honorer la requête plutôt que d'échouer.
+
+**Sortie.**
+- Test d'intégration multi-racines : sur un workspace configuré avec 3 racines distinctes,
+  `smart_search` avec `scope: "."`, `scope: "*"` ou `scope: None` renvoie les résultats répartis sur
+  les 3 racines sans erreur de sandbox.
+- Test d'empreinte payload : une requête `smart_search` sur un terme générique avec la limite par défaut
+  (8) produit une sortie Markdown strictement $\le$ 4 096 octets.
+- Test de résilience stdio : un process proxy dont le socket démon est tué en cours de route renvoie
+  une réponse JSON-RPC propre ou bascule en standalone sans provoquer de fermeture `EOF` sur son `stdout`.
 
 ---
 

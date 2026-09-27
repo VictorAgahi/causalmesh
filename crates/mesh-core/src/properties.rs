@@ -224,7 +224,14 @@ impl PropertyRegistry {
 
     /// Canonical, order-independent form of the registry (one sorted JSON line
     /// per key: key, value, owning file), used to compare two builds.
+    /// Paths are written as-is; see [`Self::canonical_lines_rooted`].
     pub fn canonical_lines(&self) -> Vec<String> {
+        self.canonical_lines_rooted(&[])
+    }
+
+    /// [`Self::canonical_lines`] with each owning file written relative to its
+    /// most specific workspace root (plan 4.12f).
+    pub fn canonical_lines_rooted(&self, roots: &[PathBuf]) -> Vec<String> {
         let mut lines: Vec<String> = self
             .flat_properties
             .iter()
@@ -232,7 +239,7 @@ impl PropertyRegistry {
                 let source = self
                     .sources
                     .get(key)
-                    .map(|p| p.to_string_lossy().into_owned());
+                    .map(|p| crate::state::root_relative_path(p, roots, None));
                 serde_json::json!([key, value, source]).to_string()
             })
             .collect();

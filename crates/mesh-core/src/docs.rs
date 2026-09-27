@@ -156,13 +156,20 @@ impl DocIndex {
 
     /// Canonical, order-independent form of the indexed sections (one sorted
     /// JSON line per section), used to compare two builds of the same workspace.
+    /// Paths are written as-is; see [`Self::canonical_lines_rooted`].
     pub fn canonical_lines(&self) -> Vec<String> {
+        self.canonical_lines_rooted(&[])
+    }
+
+    /// [`Self::canonical_lines`] with each path written relative to its most
+    /// specific workspace root (plan 4.12f).
+    pub fn canonical_lines_rooted(&self, roots: &[std::path::PathBuf]) -> Vec<String> {
         let mut lines: Vec<String> = self
             .sections
             .iter()
             .map(|s| {
                 serde_json::json!([
-                    s.file_path.to_string_lossy(),
+                    crate::state::root_relative_path(&s.file_path, roots, None),
                     s.start_line,
                     s.end_line,
                     s.level,

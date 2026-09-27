@@ -27,7 +27,9 @@ pub use config::{
     ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternKind,
     ReadGovernanceMode, WorkspaceConfig,
 };
-pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
+pub use contracts::{
+    ContractGraph, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow, ImpactScope,
+};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};

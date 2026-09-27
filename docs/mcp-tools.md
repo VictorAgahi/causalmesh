@@ -325,9 +325,22 @@ the trace is still valid there, only the comparison is impossible.
 ### Tool 4: `analyze_impact`
 
 #### Description
-Maps asynchronous events, Kafka topics, queues, post-processors, and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges.
+Impact matrix of a change. For a proto/gRPC method or service: its server handlers and clients, resolved like `analyze_grpc` (`Implements` / `CallsRpc` edges). For an event, topic, queue or saga: its producers, topics, consumers and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. Each row is classified `EXTERNAL` or `INTERNAL` and carries the confidence of its edge (`exact` / `heuristic` / `ambiguous`).
 
-**Negative Constraints**: DO NOT USE for synchronous direct HTTP/gRPC RPC calls (use analyze_grpc).
+**Negative Constraints**: DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
+
+#### Classification rule
+The graph has no "service" field, so a service is a workspace **root** (`repo_id`).
+- **Owner of a proto contract**: the roots of the handlers that implement it; with no handler, the root of the `.proto` itself. **Owner of an event**: the roots of its producers, else of its topic nodes.
+- A row linked through a contract (the `Via` column) is `INTERNAL` when its root is one of that contract's owner roots, else `EXTERNAL`. A direct name match with no edge (empty `Via`) is classified against the union of every contract's owners.
+- A node with no root (the synthetic cross-repo `event-bus` topic hubs) is always `EXTERNAL`, and never an owner. No owner at all ⇒ every row is `EXTERNAL`.
+- `Ambiguous` fan-out: a client whose `CallsRpc` edges point at several homonymous contracts gets **one row per candidate**, each classified against that candidate's owners.
+- A service-level client (bound to the method's service — `NewFooServiceClient`, `getService('FooService')` — not to the method) is capped at `heuristic`: the edge proves the binding, not that this method is called.
+- **Dedup**: one row per `(element, role, via)`; reached by several paths, the strongest confidence wins (exact > heuristic > ambiguous), then `EXTERNAL` on a tie. A direct-match row is dropped when the same element and role also has a row linked through a contract.
+- **Order** (total, stable across runs): `EXTERNAL` first, then role (handler, client, producer, topic, consumer, saga), path, line, name, via.
+
+#### Pagination and truncation
+Same rules as `smart_search`: a page holds at most `limit` rows (default 100, max 200) and never more than fit the 48 KB payload budget; the footer gives the exact `offset` of the next page. An `offset` past the end answers with the row count instead of an empty table.
 
 #### JSON Schema
 ```json
@@ -337,11 +350,19 @@ Maps asynchronous events, Kafka topics, queues, post-processors, and sagas — d
   "properties": {
     "target": {
       "type": "string",
-      "description": "Name of event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga to analyze."
+      "description": "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga."
     },
     "depth": {
       "type": "integer",
       "description": "How many causal hops to traverse past the direct producers/consumers/topics of `target` (default: 1, direct only). Each extra hop follows a real graph edge — a transitive consumer that itself produces onto another topic pulls in that topic's own consumers too — not another text search. Clamped to 5."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Maximum number of matrix rows returned in this page (1-200, default 100). DO NOT raise it to see everything; page with `offset` instead."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "Number of matrix rows to skip (default 0). Use the `offset` value given in a previous page's 'More rows' footer."
     }
   },
   "additionalProperties": false
@@ -349,20 +370,18 @@ Maps asynchronous events, Kafka topics, queues, post-processors, and sagas — d
 ```
 
 #### Sample Response
+Real output on `examples/polyglot-shop` for `analyze_impact(target: "ProcessPayment")`:
 ```markdown
-## Causal Blast Radius Report for `EVENT_CREATED`
+## Impact Matrix for `ProcessPayment`
+*Contract(s): `shop.payment.v1/PaymentService.ProcessPayment` (`payment.proto:6`)*
+*Owner root(s): `services/payment-worker` — INTERNAL = same root as the handlers implementing the contract (else its `.proto`, or the event producers); EXTERNAL = any other root or none.*
+*Rows: 3 (2 EXTERNAL, 1 INTERNAL)*
 
-⚠️ **Impact Severity**: HIGH (Cross-Service Contract Mutation)
-
-### Impacted Microservices (4 total):
-1. `services/billing-service` (Direct Server Implementation)
-2. `api-gateway` (Direct gRPC Client)
-3. `services/checkout-worker` (Async Consumer via Kafka topic `payment.settled.v1`)
-4. `services/analytics-pipeline` (Data Lake Streaming ETL)
-
-### Recommended Action Plan:
-- Verify backwards compatibility: Protobuf tag numbers must not be deleted or renumbered.
-- Commit `proto-registry` contract changes independently before updating downstream services.
+| # | Scope | Role | Element | Root | Location | Confidence | Via |
+|---|---|---|---|---|---|---|---|
+| 1 | EXTERNAL | client | `constructor` | `services/order-gateway` | `order.service.ts:19` | heuristic | `PaymentService` |
+| 2 | EXTERNAL | client | `rpc:ProcessPayment` | `services/order-gateway` | `order.service.ts:29` | heuristic | `PaymentService.ProcessPayment` |
+| 3 | INTERNAL | handler | `ProcessPayment` | `services/payment-worker` | `main.go:15` | heuristic | `PaymentService.ProcessPayment` |
 ```
 
 ---

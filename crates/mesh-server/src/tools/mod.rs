@@ -1086,6 +1086,8 @@ roots = ["."]
         let impact_args = super::analyze_impact::AnalyzeImpactArgs {
             target: mesh_core::CompactStr::new("EVENT_CREATED"),
             depth: None,
+            limit: None,
+            offset: None,
             _meta: None,
         };
         let hint_impact = AnalyzeImpactTool::truncation_hint(&impact_args, &state).unwrap();

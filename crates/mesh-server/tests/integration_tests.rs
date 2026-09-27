@@ -353,7 +353,7 @@ async fn test_analyze_impact_success() {
     assert!(res.is_ok());
     let val = res.unwrap();
     let text = val["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Asynchronous Causal Impact Analysis for `user.created`"));
+    assert!(text.contains("Impact Matrix for `user.created`"), "{text}");
     assert!(text.contains("UserRegistrationService"));
     assert!(text.contains("WelcomeEmailConsumer"));
 

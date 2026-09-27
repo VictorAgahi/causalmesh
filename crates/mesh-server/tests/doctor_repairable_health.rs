@@ -195,7 +195,10 @@ fn a_different_projects_workspace_cache_is_never_touched() {
     );
 }
 
+// Unix-only: stands in for a live daemon with a `UnixListener`; on Windows meshd
+// listens on a named pipe, which this harness does not simulate.
 #[test]
+#[cfg(unix)]
 fn daemon_version_mismatch_is_reported_and_fix_stops_the_live_daemon() {
     let home = tempfile::tempdir().expect("home");
     let project = tempfile::tempdir().expect("project");
@@ -392,7 +395,10 @@ fn socket_permissions_are_reported_then_repaired_by_fix() {
 /// behind it (the process that bound it crashed or was killed without
 /// cleaning up) is reported and, on `--fix`, removed — mirroring `meshd`'s own
 /// `cleanup_stale_socket` startup check, but from `doctor` on demand.
+// Unix-only: stands in for a live daemon with a `UnixListener`; on Windows meshd
+// listens on a named pipe, which this harness does not simulate.
 #[test]
+#[cfg(unix)]
 fn orphaned_socket_is_reported_and_removed_by_fix() {
     let home = tempfile::tempdir().expect("home");
     let project = tempfile::tempdir().expect("project");
@@ -460,7 +466,10 @@ fn audit_db_corruption_is_reported_but_never_fixed() {
 /// `orphaned_socket_is_reported_and_removed_by_fix`; this test combines the
 /// two that legitimately coexist — a corrupt cache and a live, reachable,
 /// wrong-version daemon — plus confirms a second `doctor` run is clean.
+// Unix-only: stands in for a live daemon with a `UnixListener`; on Windows meshd
+// listens on a named pipe, which this harness does not simulate.
 #[test]
+#[cfg(unix)]
 fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() {
     let home = tempfile::tempdir().expect("home");
     let project = tempfile::tempdir().expect("project");

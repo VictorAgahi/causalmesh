@@ -1022,6 +1022,29 @@ parser. Shrinking the registry (shared keys, no staging `Vec`) changes a residen
 the rest of the indexer reads, so it is left out of this step. The flattened-output budget only
 guarantees that the cost stays proportional to the file.
 
+## Update (2026-09-27, Plan 4 step 4.6a — impact matrix)
+
+- **What changed**: `analyze_impact` now answers with an impact matrix (one Markdown table row per
+  impacted element, `EXTERNAL`/`INTERNAL` scope, edge confidence) and covers proto/gRPC methods
+  and services, not only async events. Classification, dedup and ordering rules are in
+  `docs/mcp-tools.md` (Tool 4).
+- **Fixture**: `examples/polyglot-shop` had Go, Rust and proto files but no Go or Rust gRPC
+  wiring (`analyze_grpc("ProcessPayment")` found 0 server handlers, `ReserveStock` 0 handlers and
+  0 clients). The Go worker now registers `PaymentService` and builds an `InventoryService`
+  client; the Rust manager implements `InventoryService`. `crates/mesh-server/tests/impact_matrix.rs`
+  asserts the exact matrices: `ProcessPayment` → 2 `EXTERNAL` TypeScript clients (order-gateway),
+  1 `INTERNAL` Go handler (payment-worker); `InventoryService.ReserveStock` → 1 `EXTERNAL` Go
+  client (payment-worker), 1 `INTERNAL` Rust handler (inventory-manager).
+- **Latency** (release, Apple M2, through `ToolRegistry::call_tool` with the in-memory audit,
+  median of 51 calls after one warm-up, `ProcessPayment` on the fixture): 26.7 µs, 26.5 µs,
+  24.5 µs over three runs (max 52.8 µs). Budget: < 100 ms; the test asserts it.
+- **Found, not fixed (out of scope)**: `analyze_impact_with_depth` expects `Consumes` edges as
+  consumer → topic, while `reconcile_edges` emits them topic → consumer, and pattern-declared
+  producers are distinct `produce:` nodes from the `consume:` nodes of the same service; so on an
+  indexed workspace a hop past the first can add the topics a frontier node produces onto but
+  never their consumers (`order-created-topic` on the fixture: 7 rows at depth 1, 8 at depth 3).
+  The existing depth tests build edges by hand in the direction the traversal expects.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct AnalyzeImpactArgs {
     #[schemars(
         with = "String",
-        description = "Name of event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga to analyze."
+        description = "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga."
     )]
     pub target: CompactStr,
 
@@ -21,6 +21,18 @@ pub struct AnalyzeImpactArgs {
     )]
     pub depth: Option<u8>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Maximum number of matrix rows returned in this page (1-200, default 100). DO NOT raise it to see everything; page with `offset` instead."
+    )]
+    pub limit: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Number of matrix rows to skip (default 0). Use the `offset` value given in a previous page's 'More rows' footer."
+    )]
+    pub offset: Option<u32>,
+
     #[serde(default)]
     // Accepted for W3C trace propagation, hidden from `tools/list`: the model
     // cannot use it, and it cost every session ~200 schema tokens.
@@ -28,11 +40,15 @@ pub struct AnalyzeImpactArgs {
     pub _meta: Option<RequestMeta>,
 }
 
+/// Rows per page when `limit` is omitted, and the most a caller may ask for.
+const DEFAULT_LIMIT: u32 = 100;
+const MAX_LIMIT: u32 = 200;
+
 pub struct AnalyzeImpactTool;
 
 impl McpTool for AnalyzeImpactTool {
     const NAME: &'static str = "analyze_impact";
-    const DESCRIPTION: &'static str = "Maps asynchronous events, Kafka topics, queues, post-processors, and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. DO NOT USE for synchronous direct HTTP/gRPC RPC calls (use analyze_grpc).";
+    const DESCRIPTION: &'static str = "Impact matrix of a change: for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue or saga, its producers, topics, consumers and sagas (direct by default, or through `depth` causal hops of real Produces/Consumes edges). Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage.";
     type Args = AnalyzeImpactArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -41,7 +57,7 @@ impl McpTool for AnalyzeImpactTool {
 
     fn truncation_hint(args: &Self::Args, _state: &AppState) -> Option<String> {
         Some(format!(
-            "Impact flow for target '{}' exceeds payload budget. Consider querying a specific downstream service or event name.",
+            "Impact matrix for target '{}' exceeds payload budget. Page with `offset`, or query a fully-qualified method (`Service.Method`) or a specific event name.",
             args.target
         ))
     }
@@ -53,11 +69,19 @@ impl McpTool for AnalyzeImpactTool {
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
         let snapshot = state.snapshot();
         let depth = args.depth.map(|d| d as usize).unwrap_or(1);
-        let flow = snapshot
+        let limit = args
+            .limit
+            .map(|l| l.clamp(1, MAX_LIMIT))
+            .unwrap_or(DEFAULT_LIMIT) as usize;
+        let offset = args.offset.unwrap_or(0) as usize;
+        let matrix = snapshot
             .contract_graph
-            .analyze_impact_with_depth(args.target.as_str(), depth);
-        Ok(ToolOutput::text(MarkdownFormatter::format_impact_flow(
-            &flow,
+            .impact_matrix(args.target.as_str(), depth);
+        Ok(ToolOutput::text(MarkdownFormatter::format_impact_matrix(
+            &matrix,
+            &state.allowed_roots,
+            offset,
+            limit,
         )))
     }
 }

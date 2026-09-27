@@ -555,7 +555,7 @@ mod libyaml {
     use std::ffi::CStr;
     use std::mem::MaybeUninit;
     use std::rc::Rc;
-    use unsafe_libyaml as sys;
+    use unsafe_libyaml as unsafe_sys;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum ScalarStyle {
@@ -593,27 +593,27 @@ mod libyaml {
     pub(super) struct Parser<'a> {
         /// Boxed so the initialized parser never moves (libyaml keeps pointers
         /// into its own buffers).
-        sys: Box<MaybeUninit<sys::yaml_parser_t>>,
+        sys: Box<MaybeUninit<unsafe_sys::yaml_parser_t>>,
         input: &'a str,
         failed: bool,
     }
 
     impl<'a> Parser<'a> {
         pub(super) fn new(input: &'a str) -> Result<Self> {
-            let mut sys = Box::new(MaybeUninit::<sys::yaml_parser_t>::uninit());
+            let mut sys = Box::new(MaybeUninit::<unsafe_sys::yaml_parser_t>::uninit());
             // SAFETY: `yaml_parser_initialize` fully initializes the parser it is
             // given (it zeroes it first). The input pointer stays valid for 'a,
             // which outlives the parser (it is dropped with `Self`).
             unsafe {
                 let parser = sys.as_mut_ptr();
-                if sys::yaml_parser_initialize(parser).fail {
+                if unsafe_sys::yaml_parser_initialize(parser).fail {
                     // Nothing was allocated that `yaml_parser_delete` could free
                     // safely; report and never touch it again.
                     std::mem::forget(sys);
                     return Err(Error::Scan("libyaml parser initialization failed".into()));
                 }
-                sys::yaml_parser_set_encoding(parser, sys::YAML_UTF8_ENCODING);
-                sys::yaml_parser_set_input_string(parser, input.as_ptr(), input.len() as _);
+                unsafe_sys::yaml_parser_set_encoding(parser, unsafe_sys::YAML_UTF8_ENCODING);
+                unsafe_sys::yaml_parser_set_input_string(parser, input.as_ptr(), input.len() as _);
             }
             Ok(Self {
                 sys,
@@ -626,20 +626,20 @@ mod libyaml {
             if self.failed {
                 return Err(Error::Scan("YAML parser already failed".into()));
             }
-            let mut event = MaybeUninit::<sys::yaml_event_t>::uninit();
+            let mut event = MaybeUninit::<unsafe_sys::yaml_event_t>::uninit();
             // SAFETY: the parser was initialized in `new` and is only used through
             // `&mut self`; `yaml_parser_parse` initializes `event` on success, and
             // the event is converted (copying or re-borrowing everything it
             // points to) before `yaml_event_delete` frees it.
             unsafe {
                 let parser = self.sys.as_mut_ptr();
-                if sys::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+                if unsafe_sys::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
                     self.failed = true;
                     return Err(parse_error(&*parser));
                 }
                 let event = event.as_mut_ptr();
                 let raw = convert(&*event, self.input);
-                sys::yaml_event_delete(event);
+                unsafe_sys::yaml_event_delete(event);
                 raw
             }
         }
@@ -649,12 +649,12 @@ mod libyaml {
         fn drop(&mut self) {
             // SAFETY: initialized in `new` (a failed initialization never builds
             // a `Parser`), deleted exactly once here.
-            unsafe { sys::yaml_parser_delete(self.sys.as_mut_ptr()) }
+            unsafe { unsafe_sys::yaml_parser_delete(self.sys.as_mut_ptr()) }
         }
     }
 
     /// SAFETY: `parser` is an initialized parser whose last call failed.
-    unsafe fn parse_error(parser: &sys::yaml_parser_t) -> Error {
+    unsafe fn parse_error(parser: &unsafe_sys::yaml_parser_t) -> Error {
         let problem = if parser.problem.is_null() {
             "libyaml parser failed".to_string()
         } else {
@@ -715,19 +715,19 @@ mod libyaml {
     }
 
     /// SAFETY: `event` was just produced by `yaml_parser_parse` and not deleted.
-    unsafe fn convert<'a>(event: &sys::yaml_event_t, input: &'a str) -> Result<Raw<'a>> {
+    unsafe fn convert<'a>(event: &unsafe_sys::yaml_event_t, input: &'a str) -> Result<Raw<'a>> {
         // SAFETY (all union reads): `type_` names the active union member.
         unsafe {
             Ok(match event.type_ {
-                sys::YAML_STREAM_START_EVENT => Raw::StreamStart,
-                sys::YAML_STREAM_END_EVENT | sys::YAML_NO_EVENT => Raw::StreamEnd,
-                sys::YAML_DOCUMENT_START_EVENT => Raw::DocumentStart,
-                sys::YAML_DOCUMENT_END_EVENT => Raw::DocumentEnd,
-                sys::YAML_ALIAS_EVENT => Raw::Alias(
+                unsafe_sys::YAML_STREAM_START_EVENT => Raw::StreamStart,
+                unsafe_sys::YAML_STREAM_END_EVENT | unsafe_sys::YAML_NO_EVENT => Raw::StreamEnd,
+                unsafe_sys::YAML_DOCUMENT_START_EVENT => Raw::DocumentStart,
+                unsafe_sys::YAML_DOCUMENT_END_EVENT => Raw::DocumentEnd,
+                unsafe_sys::YAML_ALIAS_EVENT => Raw::Alias(
                     c_bytes(event.data.alias.anchor)
                         .ok_or_else(|| Error::Scan("YAML alias without anchor".into()))?,
                 ),
-                sys::YAML_SCALAR_EVENT => {
+                unsafe_sys::YAML_SCALAR_EVENT => {
                     let s = event.data.scalar;
                     let value: &[u8] = if s.value.is_null() || s.length == 0 {
                         &[]
@@ -744,24 +744,28 @@ mod libyaml {
                             event.end_mark.index as usize,
                         )?,
                         style: match s.style {
-                            sys::YAML_SINGLE_QUOTED_SCALAR_STYLE => ScalarStyle::SingleQuoted,
-                            sys::YAML_DOUBLE_QUOTED_SCALAR_STYLE => ScalarStyle::DoubleQuoted,
-                            sys::YAML_LITERAL_SCALAR_STYLE => ScalarStyle::Literal,
-                            sys::YAML_FOLDED_SCALAR_STYLE => ScalarStyle::Folded,
+                            unsafe_sys::YAML_SINGLE_QUOTED_SCALAR_STYLE => {
+                                ScalarStyle::SingleQuoted
+                            }
+                            unsafe_sys::YAML_DOUBLE_QUOTED_SCALAR_STYLE => {
+                                ScalarStyle::DoubleQuoted
+                            }
+                            unsafe_sys::YAML_LITERAL_SCALAR_STYLE => ScalarStyle::Literal,
+                            unsafe_sys::YAML_FOLDED_SCALAR_STYLE => ScalarStyle::Folded,
                             _ => ScalarStyle::Plain,
                         },
                     }
                 }
-                sys::YAML_SEQUENCE_START_EVENT => Raw::SequenceStart {
+                unsafe_sys::YAML_SEQUENCE_START_EVENT => Raw::SequenceStart {
                     anchor: c_bytes(event.data.sequence_start.anchor),
                     tag: c_tag(event.data.sequence_start.tag)?,
                 },
-                sys::YAML_SEQUENCE_END_EVENT => Raw::SequenceEnd,
-                sys::YAML_MAPPING_START_EVENT => Raw::MappingStart {
+                unsafe_sys::YAML_SEQUENCE_END_EVENT => Raw::SequenceEnd,
+                unsafe_sys::YAML_MAPPING_START_EVENT => Raw::MappingStart {
                     anchor: c_bytes(event.data.mapping_start.anchor),
                     tag: c_tag(event.data.mapping_start.tag)?,
                 },
-                sys::YAML_MAPPING_END_EVENT => Raw::MappingEnd,
+                unsafe_sys::YAML_MAPPING_END_EVENT => Raw::MappingEnd,
                 _ => return Err(Error::Scan("unknown libyaml event".into())),
             })
         }
@@ -997,7 +1001,11 @@ mod tests {
             match (ours, theirs) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b, "yaml: {yaml:?}"),
                 (Err(_), Err(_)) => {}
-                (a, b) => panic!("yaml {yaml:?}: ours {a:?} vs serde_yaml {b:?}"),
+                (a, b) => assert_eq!(
+                    a.is_ok(),
+                    b.is_ok(),
+                    "yaml {yaml:?}: ours {a:?} vs serde_yaml {b:?}"
+                ),
             }
         }
     }

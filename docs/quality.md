@@ -766,6 +766,114 @@ hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are 
 cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
 were not loosened to make larger corpora pass.
 
+## Update (2026-09-27, step 4.9 — YAML / Markdown memory under a per-file budget)
+
+**Method.** `scripts/bench/gen_yaml_md_corpus.py` generates a deterministic corpus, and each
+file sits just under the per-file cap `AstGuard::within_size_budget` applies to it:
+`openapi.yaml` / `asyncapi.yaml` at 1.5 MB (the schema cap), `application.yml` and the `.md`
+files at 384 KB. `openapi.json` is not in the corpus because `.json` maps to
+`LanguageKind::Unknown` and no YAML or JSON parser reads it. `scripts/bench/yaml_md_peak.py
+--runs 3` reads the "peak memory footprint" line of `/usr/bin/time -l` (not `ps`) and reports
+medians of 3 runs:
+
+- **parser delta**: `crates/mesh-server/examples/parse_peak.rs <mode> <file>` minus the same
+  probe in `read` mode. The probe reads the file exactly as `process_file` does, then runs only
+  the parser under test (`props` = `PropertyRegistry::ingest_yaml_str`, `spec` =
+  `PolyglotIndexer::extract_with_config`, `docs` = `DocIndex::parse_sections`). It is an
+  example, so it is not part of the shipped binary.
+- **process delta**: `mesh-mcp graph --format fingerprint` in a workspace that holds only that
+  file, minus the same command in an empty workspace (default config, isolated `HOME`,
+  `MESH_SOCKET_PATH=/tmp/m49.sock`). This figure also includes the resident index and the
+  fingerprint's canonical copy, so it is larger than the parser delta.
+
+The decision rule (`parser delta > 4 x file size`) applies to the parser delta. Alias fan-out
+cases run under a kill switch at 2 GB or 60 s. Measured on an Apple M2 with 16 GB, while other
+builds were running. Peak memory does not depend on CPU contention; no timing is reported.
+
+**Before (`serde_yaml` 0.9, head `97b7a3b`)**: the threshold is crossed.
+
+| file | size | parser | delta | ratio | process delta |
+|---|---:|---|---:|---:|---:|
+| openapi.yaml | 1,570,793 | props / spec | 48.00 / 42.92 MB | **32.0x / 28.7x** | 65.88 MB |
+| asyncapi.yaml | 1,570,748 | props / spec | 39.86 / 35.53 MB | **26.6x / 23.7x** | 72.30 MB |
+| application.yml | 391,124 | props | 12.64 MB | **33.9x** | 25.03 MB |
+| handbook.md (6,244 short sections) | 391,164 | docs | 3.11 MB | **8.3x** | 6.33 MB |
+| essay.md (one section) | 391,060 | docs | 0.73 MB | 2.0x | 2.16 MB |
+| code.md (one code block) | 391,146 | docs | 0.72 MB | 1.9x | 1.89 MB |
+
+`serde_yaml` loads a whole document's event list (one heap event per node, plus its position)
+before any visitor runs. Plan 3.5's "streaming" visitors removed the `Value` tree but kept this
+list, and it alone was 24–34x the file size.
+
+**Security finding: alias fan-out.** In `serde_yaml` 0.9 (`de.rs`, `jump`), the only alias
+guard errors once alias *jumps* exceed 100x the event count. A single large anchored mapping
+replayed by many one-line aliases makes one jump per alias, which stays far under that limit,
+yet each jump replays the whole anchor. As a result, the property flattener and the OpenAPI
+`paths` view grow as anchor size x alias count. Measured before (process delta):
+
+| file | size | before |
+|---|---:|---:|
+| fan-out openapi.yaml | 6,138 | 77.78 MB |
+| fan-out openapi.yaml | 14,325 | 444.88 MB |
+| fan-out openapi.yaml | 30,711 | **1,847.70 MB** |
+| fan-out openapi.yaml | 1,570,803 | **killed at 2 GB** |
+
+The classic nested "billion laughs" (9x9 aliases, 1.3 KB) *was* stopped by that guard
+(3.53 MB).
+
+**Change.**
+
+- `mesh_core::yaml_stream` pulls libyaml events one at a time (`unsafe-libyaml`, the parser
+  `serde_yaml` already runs, so accepted syntax is unchanged) and drives the existing serde
+  visitors from them. Only anchored nodes are recorded, as scalars borrowed from the input, so
+  aliases can be replayed. Recording and replay are charged to a per-file **alias budget** of
+  1 event per input byte (minimum 64 Ki). Over budget, the document fails and ingests nothing.
+  I first tried the pure-Rust `saphyr-parser` / `yaml-rust2`; both reject otel-demo's
+  `compose.yaml` (a flow sequence closed at its key's indentation) that libyaml accepts.
+- `PropertyRegistry::ingest_yaml_str` gets a second per-file budget on **flattened output**
+  (dotted key + value bytes <= 8x the input, minimum 64 KB). Real files reach at most 2.2x:
+  the 376 YAML files of `~/.cache/mesh-golden` peak at 0.87x, the synthetic `application.yml`
+  at 2.17x (`yaml_output_ratio_on_dir`).
+- `DocIndex::parse_sections` walks the file line by line with an explicit **section budget**
+  (estimated resident bytes <= 3x the file, minimum 64 KB). Past it, later headings stop
+  opening sections and the rest of the file stays searchable in the last one. Below it, the
+  split is unchanged. The fixed per-section cost was also cut:
+  - one shared `Arc<Path>` per file instead of a `PathBuf` per section;
+  - `title_lower` as a `CompactStr` (inline for short titles);
+  - `content_lower` as a `Box<str>`;
+  - the section `Vec` sized from a heading pre-count, so it carries no growth slack;
+  - `sanitize_prompt_injections` matching case-insensitively in place, without a lowercased
+    copy of the whole file.
+- Equivalence: the `serde_yaml`-driven and stream-driven outputs (flattened pairs, AsyncAPI and
+  OpenAPI views) are identical on all 376 golden YAML files and the three synthetic specs
+  (`MESH_YAML_EQUIV_DIR=... cargo test --release -p mesh-core yaml_output_ratio_on_dir -- --ignored`,
+  and `-p mesh-parsers spec_views_match_on_dir`). Unit tests pin scalar resolution, tags, merge
+  keys, multi-document, error and recursion parity against `serde_yaml`.
+
+**After (this branch):**
+
+| file | size | parser | delta | ratio | process delta |
+|---|---:|---|---:|---:|---:|
+| openapi.yaml | 1,570,793 | props / spec | 18.97 / 3.36 MB | 12.7x / **2.2x** | 49.52 MB |
+| asyncapi.yaml | 1,570,748 | props / spec | 18.42 / 3.23 MB | 12.3x / **2.2x** | 58.77 MB |
+| application.yml | 391,124 | props | 9.16 MB | 24.5x | 25.03 MB |
+| handbook.md | 391,164 | docs | 1.08 MB | **2.9x** | 5.03 MB |
+| essay.md | 391,060 | docs | 0.72 MB | 1.9x | 2.34 MB |
+| code.md | 391,146 | docs | 0.72 MB | 1.9x | 2.11 MB |
+| fan-out openapi.yaml | 30,711 | props / spec | 2.30 / 1.58 MB | — | **3.00 MB** (was 1.85 GB) |
+| fan-out openapi.yaml | 1,570,803 | props / spec | 107.14 / 29.50 MB | — | **106.30 MB** (was killed at 2 GB) |
+| fan-out application.yml | 391,167 | props | 23.91 MB | — | 24.44 MB |
+| nested billion laughs | 1,329 | props | 0.78 MB | — | 0.53 MB |
+
+**What is still over 4x, and why.** The `props` deltas (12–25x) are now almost entirely the
+*output*, not the parser. Short dotted keys flatten into one `(String, String)` pair each,
+which then land in `PropertyRegistry`'s two maps (`raw_values` and `flat_properties`, each with
+its own key copy). With ~11 input bytes per leaf in `application.yml`, that representation costs
+~270 bytes per leaf. The spec path, which keeps only keys, dropped from 29x to 2.2x on the same
+parser. Shrinking the registry (shared keys, no staging `Vec`) changes a resident structure that
+the rest of the indexer reads, so it is left out of this step. The flattened-output budget only
+guarantees that the cost stays proportional to the file.
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*

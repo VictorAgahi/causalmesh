@@ -386,19 +386,35 @@ impl PropertyRegistry {
     /// used before, rejected multi-document files outright, ingesting nothing.)
     /// The pairs are only inserted once the document parsed cleanly, so a
     /// malformed file still contributes nothing rather than a partial prefix.
+    ///
+    /// The flattened output has its own per-file budget
+    /// ([`Self::yaml_output_budget`]): dotted keys repeat their whole prefix per
+    /// leaf, so even inside the stream's alias budget an aliased subtree
+    /// replayed under long prefixes could otherwise flatten into far more bytes
+    /// than the file holds. Over budget, the file ingests nothing (as for any
+    /// failed document).
     pub fn ingest_yaml_str(&mut self, content: &str) -> Result<(), crate::yaml_stream::Error> {
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        crate::yaml_stream::first_document(
-            content,
-            yaml_flatten::FlattenSeed {
-                prefix: String::new(),
-                out: &mut pairs,
-            },
-        )?;
-        for (key, value) in pairs {
+        let mut out = yaml_flatten::Output::with_budget(Self::yaml_output_budget(content.len()));
+        crate::yaml_stream::first_document(content, yaml_flatten::FlattenSeed::root(&mut out))?;
+        for (key, value) in out.pairs {
             self.insert_sanitized(&key, &value);
         }
         Ok(())
+    }
+
+    /// Flattened bytes (dotted key + value, summed over every pair) allowed per
+    /// input byte of a YAML property file. Measured on the 376 YAML files of the
+    /// golden corpora and the 4.9 synthetic specs, real files flatten to at most
+    /// 2.2x their size (`yaml_output_ratio_on_dir`); 8x leaves headroom for deep
+    /// nesting while cutting alias fan-outs.
+    pub const YAML_OUTPUT_BYTES_PER_INPUT_BYTE: usize = 8;
+    /// Floor of the output budget, so tiny files with anchors are never cut.
+    pub const MIN_YAML_OUTPUT_BUDGET: usize = 64 * 1024;
+
+    /// The flattened-output budget of a `len`-byte YAML property file.
+    pub fn yaml_output_budget(len: usize) -> usize {
+        len.saturating_mul(Self::YAML_OUTPUT_BYTES_PER_INPUT_BYTE)
+            .max(Self::MIN_YAML_OUTPUT_BUDGET)
     }
 }
 
@@ -423,9 +439,45 @@ mod yaml_flatten {
     use std::collections::HashSet;
     use std::fmt;
 
+    /// Flattened pairs plus the running byte count checked against `budget`.
+    pub(super) struct Output {
+        pub(super) pairs: Vec<(String, String)>,
+        bytes: usize,
+        budget: usize,
+    }
+
+    impl Output {
+        pub(super) fn with_budget(budget: usize) -> Self {
+            Self {
+                pairs: Vec::new(),
+                bytes: 0,
+                budget,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn unbounded() -> Self {
+            Self::with_budget(usize::MAX)
+        }
+
+        #[cfg(test)]
+        pub(super) fn bytes(&self) -> usize {
+            self.bytes
+        }
+    }
+
     pub(super) struct FlattenSeed<'a> {
-        pub(super) prefix: String,
-        pub(super) out: &'a mut Vec<(String, String)>,
+        prefix: String,
+        out: &'a mut Output,
+    }
+
+    impl<'a> FlattenSeed<'a> {
+        pub(super) fn root(out: &'a mut Output) -> Self {
+            Self {
+                prefix: String::new(),
+                out,
+            }
+        }
     }
 
     impl<'de> DeserializeSeed<'de> for FlattenSeed<'_> {
@@ -437,8 +489,17 @@ mod yaml_flatten {
     }
 
     impl FlattenSeed<'_> {
-        fn scalar(self, value: String) {
-            self.out.push((self.prefix, value));
+        fn scalar<E: de::Error>(self, value: String) -> Result<(), E> {
+            let out = self.out;
+            out.bytes = out.bytes.saturating_add(self.prefix.len() + value.len());
+            if out.bytes > out.budget {
+                return Err(E::custom(format!(
+                    "flattened YAML properties exceed the per-file budget ({} bytes)",
+                    out.budget
+                )));
+            }
+            out.pairs.push((self.prefix, value));
+            Ok(())
         }
     }
 
@@ -450,33 +511,27 @@ mod yaml_flatten {
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
-            self.scalar(v.to_string());
-            Ok(())
+            self.scalar(v.to_string())
         }
 
         fn visit_string<E: de::Error>(self, v: String) -> Result<(), E> {
-            self.scalar(v);
-            Ok(())
+            self.scalar(v)
         }
 
         fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
-            self.scalar(v.to_string());
-            Ok(())
+            self.scalar(v.to_string())
         }
 
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
-            self.scalar(serde_yaml::Number::from(v).to_string());
-            Ok(())
+            self.scalar(serde_yaml::Number::from(v).to_string())
         }
 
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
-            self.scalar(serde_yaml::Number::from(v).to_string());
-            Ok(())
+            self.scalar(serde_yaml::Number::from(v).to_string())
         }
 
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
-            self.scalar(serde_yaml::Number::from(v).to_string());
-            Ok(())
+            self.scalar(serde_yaml::Number::from(v).to_string())
         }
 
         fn visit_unit<E: de::Error>(self) -> Result<(), E> {
@@ -656,18 +711,13 @@ anchors:
     url: http://x
   copy: *b
 "#;
-        let mut streamed = Vec::new();
-        crate::yaml_stream::first_document(
-            yaml,
-            yaml_flatten::FlattenSeed {
-                prefix: String::new(),
-                out: &mut streamed,
-            },
-        )
-        .expect("stream");
+        let mut streamed = yaml_flatten::Output::unbounded();
+        crate::yaml_stream::first_document(yaml, yaml_flatten::FlattenSeed::root(&mut streamed))
+            .expect("stream");
         let dom: serde_yaml::Value = serde_yaml::from_str(yaml).expect("dom");
         let mut expected = Vec::new();
         dom_flatten("", &dom, &mut expected);
+        let streamed = streamed.pairs;
         assert_eq!(streamed, expected);
         assert!(streamed
             .iter()
@@ -680,32 +730,26 @@ anchors:
     /// The flattener fed by `serde_yaml` (the pre-4.9 driver) and by
     /// `yaml_stream` must agree: same pairs, or both reject the document.
     fn assert_drivers_agree(yaml: &str) {
-        let mut old = Vec::new();
+        let mut old = yaml_flatten::Output::unbounded();
         let old_res = match serde_yaml::Deserializer::from_str(yaml).next() {
             Some(doc) => serde::de::DeserializeSeed::deserialize(
-                yaml_flatten::FlattenSeed {
-                    prefix: String::new(),
-                    out: &mut old,
-                },
+                yaml_flatten::FlattenSeed::root(&mut old),
                 doc,
             )
             .map_err(|e| e.to_string()),
             None => Ok(()),
         };
-        let mut new = Vec::new();
-        let new_res = crate::yaml_stream::first_document(
-            yaml,
-            yaml_flatten::FlattenSeed {
-                prefix: String::new(),
-                out: &mut new,
-            },
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string());
+        let mut new = yaml_flatten::Output::unbounded();
+        let new_res =
+            crate::yaml_stream::first_document(yaml, yaml_flatten::FlattenSeed::root(&mut new))
+                .map(|_| ())
+                .map_err(|e| e.to_string());
         match (&old_res, &new_res) {
-            (Ok(()), Ok(())) => assert_eq!(new, old, "{yaml:.200}"),
+            (Ok(()), Ok(())) => assert_eq!(new.pairs, old.pairs, "{yaml:.200}"),
             (Err(_), Err(_)) => {}
-            _ => panic!(
+            _ => assert_eq!(
+                old_res.is_ok(),
+                new_res.is_ok(),
                 "drivers disagree on {yaml:.200}: serde_yaml {old_res:?}, stream {new_res:?}"
             ),
         }
@@ -743,24 +787,43 @@ anchors:
         for i in 0..2000 {
             yaml.push_str(&format!("  p{i}: *big\n"));
         }
+        // Whichever budget trips first (alias replay or flattened output), the
+        // file is refused as a whole.
         let mut reg = PropertyRegistry::new();
-        assert!(matches!(
-            reg.ingest_yaml_str(&yaml),
-            Err(crate::yaml_stream::Error::BudgetExceeded { .. })
-        ));
+        assert!(reg.ingest_yaml_str(&yaml).is_err());
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// Plan 4.9: a fan-out small enough for the alias budget but replayed under
+    /// long prefixes is cut by the flattened-output budget, atomically.
+    #[test]
+    fn flattened_output_over_budget_ingests_nothing() {
+        let long = "x".repeat(200);
+        let fields: Vec<String> = (0..20).map(|j| format!("f{j}: {j}")).collect();
+        let mut yaml = format!("base: &b {{{}}}\n", fields.join(", "));
+        for i in 0..400 {
+            yaml.push_str(&format!("{long}{i}: *b\n"));
+        }
+        let mut out = yaml_flatten::Output::unbounded();
+        crate::yaml_stream::first_document(&yaml, yaml_flatten::FlattenSeed::root(&mut out))
+            .expect("within the alias budget");
+        assert!(out.bytes() > PropertyRegistry::yaml_output_budget(yaml.len()));
+        let mut reg = PropertyRegistry::new();
+        assert!(reg.ingest_yaml_str(&yaml).is_err());
         assert_eq!(reg.len(), 0);
     }
 
     /// Opt-in equivalence sweep over a directory of real YAML (e.g. the golden
     /// corpora): `MESH_YAML_EQUIV_DIR=~/.cache/mesh-golden cargo test --release
-    /// -p mesh-core stream_driver_matches_on_dir -- --ignored`.
+    /// -p mesh-core yaml_output_ratio_on_dir -- --ignored`.
     #[test]
     #[ignore]
-    fn stream_driver_matches_on_dir() {
+    fn yaml_output_ratio_on_dir() {
         let Ok(dir) = std::env::var("MESH_YAML_EQUIV_DIR") else {
             return;
         };
         let mut seen = 0usize;
+        let mut max_ratio = (0.0f64, String::new());
         for entry in ignore::WalkBuilder::new(dir)
             .hidden(false)
             .build()
@@ -781,9 +844,22 @@ anchors:
                 continue;
             }
             assert_drivers_agree(&text);
+            let mut out = yaml_flatten::Output::unbounded();
+            if crate::yaml_stream::first_document(&text, yaml_flatten::FlattenSeed::root(&mut out))
+                .is_ok()
+                && !text.is_empty()
+            {
+                let ratio = out.bytes() as f64 / text.len() as f64;
+                if ratio > max_ratio.0 {
+                    max_ratio = (ratio, path.display().to_string());
+                }
+            }
             seen += 1;
         }
-        eprintln!("compared {seen} YAML files");
+        eprintln!(
+            "compared {seen} YAML files; max flattened/input bytes {:.2}x ({})",
+            max_ratio.0, max_ratio.1
+        );
     }
 
     /// A multi-document Spring file used to be rejected wholesale; now its first
@@ -821,18 +897,15 @@ anchors:
                 dom_flatten("", &v, &mut out);
                 out
             });
-            let mut streamed = Vec::new();
+            let mut streamed = yaml_flatten::Output::unbounded();
             let result = crate::yaml_stream::first_document(
                 yaml,
-                yaml_flatten::FlattenSeed {
-                    prefix: String::new(),
-                    out: &mut streamed,
-                },
+                yaml_flatten::FlattenSeed::root(&mut streamed),
             );
             match dom {
                 Ok(expected) => {
                     assert!(result.is_ok(), "{yaml:?}: {result:?}");
-                    assert_eq!(streamed, expected, "{yaml:?}");
+                    assert_eq!(streamed.pairs, expected, "{yaml:?}");
                 }
                 Err(_) => assert!(result.is_err(), "{yaml:?} must be rejected"),
             }

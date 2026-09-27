@@ -387,14 +387,22 @@ components: {schemas: {User: {type: object}}}
         match (&a_old, &a_new) {
             (Ok(x), Ok(y)) => assert_eq!(x, y, "asyncapi view of {yaml:.200}"),
             (Err(_), Err(_)) => {}
-            _ => panic!("asyncapi drivers disagree on {yaml:.200}: {a_old:?} vs {a_new:?}"),
+            _ => assert_eq!(
+                a_old.is_ok(),
+                a_new.is_ok(),
+                "asyncapi drivers disagree on {yaml:.200}: {a_old:?} vs {a_new:?}"
+            ),
         }
         let o_old = serde_yaml::from_str::<OpenApiShape>(yaml).map(|s| s.paths.0);
         let o_new = from_yaml::<OpenApiShape>(yaml).map(|s| s.paths.0);
         match (&o_old, &o_new) {
             (Ok(x), Ok(y)) => assert_eq!(x, y, "openapi view of {yaml:.200}"),
             (Err(_), Err(_)) => {}
-            _ => panic!("openapi drivers disagree on {yaml:.200}: {o_old:?} vs {o_new:?}"),
+            _ => assert_eq!(
+                o_old.is_ok(),
+                o_new.is_ok(),
+                "openapi drivers disagree on {yaml:.200}: {o_old:?} vs {o_new:?}"
+            ),
         }
     }
 

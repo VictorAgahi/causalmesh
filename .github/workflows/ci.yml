@@ -122,6 +122,10 @@ jobs:
       - name: "Smoke Test: Diagnostic Doctor"
         run: ./target/release/mesh-mcp doctor
 
+      - name: "Pilot installer: two runs, same state (isolated HOME)"
+        shell: bash
+        run: MESH_BIN_DIR=target/release scripts/test_install_pilot.sh
+
       - name: "Smoke Test: JSON-RPC Stdio Handshake Loopback"
         shell: bash
         run: |

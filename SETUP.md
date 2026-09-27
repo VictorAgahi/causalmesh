@@ -53,6 +53,28 @@ cp target/release/mesh-mcp target/release/meshd ~/.local/bin/
 Both binaries are needed: `mesh-mcp` is the MCP server your agent talks to, `meshd` is the
 shared background index it connects to.
 
+### Pilot install (one command, from a checkout)
+
+For a pilot, `scripts/install_pilot.sh` does Step 1 and the IDE part of Step 5 in one go, and
+can be re-run safely (a second run changes nothing):
+
+```bash
+cd /path/to/your/workspace
+/path/to/causalmesh/scripts/install_pilot.sh            # builds with cargo --release, asks before init
+/path/to/causalmesh/scripts/install_pilot.sh --bin-dir ~/Downloads/mesh-mcp --yes   # prebuilt binaries, no prompt
+```
+
+It detects the OS and architecture (macOS and Linux, x86-64 and arm64), copies `mesh-mcp` and
+`meshd` into `~/.local/bin` (`--prefix` to change) only when they differ, runs
+`mesh-mcp init --auto --write-ide-config` in the workspace (`--workspace` to change) after
+confirmation — merging into `.cursor/mcp.json` and `.vscode/mcp.json` without dropping your other
+servers, and keeping an existing `.agents/mesh-mcp.toml` byte-for-byte — then checks the result
+with `mesh-mcp doctor --json` and fails loudly on any `error` check. It never downloads anything.
+
+During the pilot, `mesh-mcp stats --since all` reports per-tool latency p50/p95, the `isError`
+rate, the index cache hit rate and `meshd` restarts from the local audit database. The A/B
+measurement protocol is in [`docs/pilot-scorecard.md`](docs/pilot-scorecard.md).
+
 ### Try it on the bundled demo
 
 Before touching your own repo, confirm the install works on the sample monorepo:

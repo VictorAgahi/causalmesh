@@ -172,4 +172,33 @@ mod tests {
         assert!(text.contains("still indexing"), "{text}");
         assert_eq!(result["isError"], json!(true));
     }
+
+    /// Plan 4 step 4.8: every audited tool call (success, tool error, refused
+    /// arguments) gets a latency row joined to its audit entry, and building the
+    /// state records one process start — the data `mesh-mcp stats` reads.
+    #[tokio::test]
+    async fn tool_calls_persist_latency_and_state_records_process_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("audit.db");
+        let cfg =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let audit = Arc::new(AuditLogger::new(Some(db.clone())).expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![], audit, rescan));
+
+        // Refused arguments (unknown field) and a regular call.
+        let _ = respond(tools_call("smart_search"), &state, false).await;
+        let mut ok = tools_call("smart_search");
+        ok.params = Some(json!({ "name": "smart_search", "arguments": { "query": "x" } }));
+        let _ = respond(ok, &state, false).await;
+
+        let entries = AuditLogger::read_entries(&db, None).expect("entries");
+        let metrics = AuditLogger::read_metrics(&db, None).expect("metrics");
+        let latencies = metrics.tool_latencies_us.expect("latency table");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(latencies.len(), 2, "{latencies:?}");
+        assert!(latencies.iter().all(|(tool, _)| tool == "smart_search"));
+        assert_eq!(metrics.process_starts.map(|s| s.len()), Some(1));
+    }
 }

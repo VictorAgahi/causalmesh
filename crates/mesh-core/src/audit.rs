@@ -40,6 +40,26 @@ pub struct AuditEntry {
     pub chain_version: i64,
 }
 
+/// Summed persistent index cache lookups over the recorded indexing passes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexCacheTotals {
+    pub passes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub errors: u64,
+}
+
+/// Operational metrics read back from the audit database (plan 4 step 4.8). `None`
+/// means the table is absent (database written before these metrics existed).
+#[derive(Debug, Clone, Default)]
+pub struct AuditMetrics {
+    /// `(tool, duration_us)` per timed call.
+    pub tool_latencies_us: Option<Vec<(String, u64)>>,
+    pub index_cache: Option<IndexCacheTotals>,
+    /// `(process, workspace)` per recorded start.
+    pub process_starts: Option<Vec<(String, String)>>,
+}
+
 /// Robust cryptographic multi-process AuditLogger backed by SQLite in WAL mode per RFC-001 Commandment 7.
 pub struct AuditLogger {
     conn: Mutex<Connection>,
@@ -120,7 +140,26 @@ impl AuditLogger {
              -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
              -- table's B-tree key. The secondary index earlier versions created on it
              -- only doubled every insert's write cost.
-             DROP INDEX IF EXISTS idx_audit_seq;",
+             DROP INDEX IF EXISTS idx_audit_seq;
+             -- Operational metrics (plan 4 step 4.8), deliberately outside the hash chain.
+             CREATE TABLE IF NOT EXISTS tool_call_metrics (
+                 entry_seq INTEGER PRIMARY KEY,
+                 duration_us INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS index_cache_metrics (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp TEXT NOT NULL,
+                 hits INTEGER NOT NULL,
+                 misses INTEGER NOT NULL,
+                 errors INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS process_starts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp TEXT NOT NULL,
+                 process TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 workspace TEXT NOT NULL
+             );",
         )?;
 
         // Databases created before `chain_version` existed have the table but not the
@@ -434,6 +473,168 @@ impl AuditLogger {
         Ok(out)
     }
 
+    /// Records how long the tool call audited as `entry_seq` took, in microseconds
+    /// (plan 4 step 4.8, read back by `mesh-mcp stats`).
+    ///
+    /// Operational metrics live in their own tables, outside the SHA-256 chain: they are
+    /// measurements, not audit evidence, and folding them into the chain would change the
+    /// hash formula of every future row. `stats` reads them; `verify_db` ignores them.
+    pub fn record_tool_latency(&self, entry_seq: u64, duration_us: u64) -> Result<(), AuditError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| std::io::Error::other("AuditLogger db mutex poisoned"))?;
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO tool_call_metrics (entry_seq, duration_us) VALUES (?1, ?2)",
+        )?
+        .execute(params![entry_seq, duration_us as i64])?;
+        Ok(())
+    }
+
+    /// Records the persistent index cache lookups of one indexing pass (the delta of
+    /// `PersistentIndexCache::stats()` over that pass). Those counters are otherwise
+    /// in-memory only and die with the process.
+    pub fn record_index_cache_pass(
+        &self,
+        hits: u64,
+        misses: u64,
+        errors: u64,
+    ) -> Result<(), AuditError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| std::io::Error::other("AuditLogger db mutex poisoned"))?;
+        conn.prepare_cached(
+            "INSERT INTO index_cache_metrics (timestamp, hits, misses, errors)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![
+            chrono_fallback_utc_now(),
+            hits as i64,
+            misses as i64,
+            errors as i64
+        ])?;
+        Ok(())
+    }
+
+    /// Records that a process holding an `AppState` started (`process` is its executable
+    /// name, e.g. `meshd`; `workspace` identifies the roots it serves). `stats` derives
+    /// daemon restarts from these rows.
+    pub fn record_process_start(&self, process: &str, workspace: &str) -> Result<(), AuditError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| std::io::Error::other("AuditLogger db mutex poisoned"))?;
+        conn.prepare_cached(
+            "INSERT INTO process_starts (timestamp, process, pid, workspace)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![
+            chrono_fallback_utc_now(),
+            process,
+            i64::from(std::process::id()),
+            workspace
+        ])?;
+        Ok(())
+    }
+
+    /// Reads the operational metrics recorded in `path` since `since_epoch_secs`.
+    /// Each field is `None` when its table does not exist, i.e. the database was
+    /// written by a version that did not record that metric: "not recorded" must
+    /// never be reported as zero.
+    pub fn read_metrics(
+        path: &Path,
+        since_epoch_secs: Option<f64>,
+    ) -> Result<AuditMetrics, AuditError> {
+        let mut metrics = AuditMetrics::default();
+        if !path.exists() {
+            return Ok(metrics);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_table = |name: &str| -> Result<bool, AuditError> {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        };
+        let in_window = |ts: &str| {
+            since_epoch_secs.is_none_or(|cutoff| parse_timestamp_to_epoch_secs(ts) >= cutoff)
+        };
+
+        if has_table("tool_call_metrics")? {
+            let mut stmt = conn.prepare(
+                "SELECT e.tool, m.duration_us, e.timestamp
+                 FROM tool_call_metrics m JOIN audit_entries e ON e.entry_seq = m.entry_seq
+                 ORDER BY m.entry_seq ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (tool, duration_us, ts) = row?;
+                if in_window(&ts) {
+                    out.push((tool, duration_us.max(0) as u64));
+                }
+            }
+            metrics.tool_latencies_us = Some(out);
+        }
+
+        if has_table("index_cache_metrics")? {
+            let mut stmt =
+                conn.prepare("SELECT timestamp, hits, misses, errors FROM index_cache_metrics")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut totals = IndexCacheTotals::default();
+            for row in rows {
+                let (ts, hits, misses, errors) = row?;
+                if in_window(&ts) {
+                    totals.passes += 1;
+                    totals.hits += hits.max(0) as u64;
+                    totals.misses += misses.max(0) as u64;
+                    totals.errors += errors.max(0) as u64;
+                }
+            }
+            metrics.index_cache = Some(totals);
+        }
+
+        if has_table("process_starts")? {
+            let mut stmt = conn
+                .prepare("SELECT timestamp, process, workspace FROM process_starts ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ts, process, workspace) = row?;
+                if in_window(&ts) {
+                    out.push((process, workspace));
+                }
+            }
+            metrics.process_starts = Some(out);
+        }
+
+        Ok(metrics)
+    }
+
     /// Exports all audit entries to a JSON Lines (JSONL) flat file for compliance tooling
     pub fn export_to_jsonl(&self, dest: &Path) -> Result<usize, AuditError> {
         let conn = self
@@ -566,6 +767,53 @@ fn parse_timestamp_to_epoch_secs(ts: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 4 step 4.8: a database written before the metrics tables existed reports
+    /// every metric as "not recorded" (`None`), never as zero.
+    #[test]
+    fn read_metrics_on_legacy_db_reports_not_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("legacy.db");
+        let conn = Connection::open(&db).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (entry_seq INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL,
+             timestamp TEXT NOT NULL, session_id TEXT NOT NULL, trace_id TEXT, tool TEXT NOT NULL,
+             args_digest TEXT NOT NULL, status TEXT NOT NULL, files_accessed TEXT NOT NULL,
+             secrets_redacted_count INTEGER NOT NULL, entry_hash TEXT NOT NULL);",
+        )
+        .expect("legacy schema");
+        drop(conn);
+        let m = AuditLogger::read_metrics(&db, None).expect("read");
+        assert!(m.tool_latencies_us.is_none());
+        assert!(m.index_cache.is_none());
+        assert!(m.process_starts.is_none());
+    }
+
+    /// Metrics rows are outside the hash chain: recording them must not break it.
+    #[test]
+    fn metrics_rows_do_not_affect_chain_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("audit.db");
+        let logger = AuditLogger::new(Some(db.clone())).expect("logger");
+        let e = logger
+            .record_entry("s", None, "smart_search", "{}", "SUCCESS", vec![], 0)
+            .expect("entry");
+        logger.record_tool_latency(e.entry_seq, 1234).expect("latency");
+        logger.record_index_cache_pass(1, 2, 0).expect("cache");
+        logger.record_process_start("meshd", "/ws").expect("start");
+        assert!(AuditLogger::verify_db(&db).expect("verify"));
+
+        let m = AuditLogger::read_metrics(&db, None).expect("read");
+        assert_eq!(
+            m.tool_latencies_us,
+            Some(vec![("smart_search".to_string(), 1234)])
+        );
+        // A window starting in the future excludes every row.
+        let future = AuditLogger::read_metrics(&db, Some(f64::MAX)).expect("read");
+        assert_eq!(future.tool_latencies_us, Some(vec![]));
+        assert_eq!(future.index_cache.map(|c| c.passes), Some(0));
+        assert_eq!(future.process_starts, Some(vec![]));
+    }
 
     #[test]
     fn test_audit_hash_chain() {

@@ -118,8 +118,11 @@ def call(method, params):
 call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "storm", "version": "0"}})
 
 # Ready = watcher registered + the post-spawn catch-up reload done, then quiet.
+# Any backend's startup line counts: "FileWatcher (FSEvents, recursive) watching root:",
+# "FileWatcher (polling) watching root:", "FileWatcher watching N directories under root:".
+ready = re.compile(r"FileWatcher .*watching (?:root|\d+ director(?:y|ies) under root):")
 deadline = time.time() + 300
-while "watching root" not in log_text():
+while not ready.search(log_text()):
     if time.time() > deadline:
         raise SystemExit("watcher never started; see " + log_path)
     time.sleep(0.2)
@@ -195,7 +198,7 @@ if ! (cd "$REPO" && "$BIN" --config "$REPO/mesh-mcp.toml" graph --format fingerp
   exit 1
 fi
 
-python3 - "$SUMMARY" "$COLD" <<'PY'
+if ! python3 - "$SUMMARY" "$COLD" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
 cold = open(sys.argv[2]).readline().split()[-1]
@@ -230,6 +233,10 @@ if fail:
     sys.exit(1)
 print("✔ git storm: one generation after the checkout, none during it, fingerprint matches a cold index")
 PY
+then
+  echo "✖ git storm failed; logs in $WORK" >&2
+  exit 1
+fi
 
 if [[ "${KEEP_WORK:-0}" != "1" && -z "${1:-}" ]]; then
   rm -rf "$WORK"

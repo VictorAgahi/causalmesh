@@ -989,7 +989,7 @@ mod tests {
         std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
         std::fs::write(root.join("pkg/.gitignore"), "!keep.gen.ts\n").expect("nested");
         let matcher = ExcludeMatcher::compile(&["vendor/**".to_string()]);
-        let mut f = EventFilter::new(&[root.clone()], &[None], matcher);
+        let mut f = EventFilter::new(std::slice::from_ref(&root), &[None], matcher);
 
         assert!(f.keeps(&root.join("src/a.ts")));
         assert!(!f.keeps(&root.join("vendor/x/a.go")), "exclude_patterns");

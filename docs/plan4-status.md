@@ -4,7 +4,7 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `c234960` (passation vers la session cloud).
+> **Dernière mise à jour** : 2026-09-27 — `main` = `483fcc1` (après merge de #46, #47, #48).
 
 ---
 
@@ -15,16 +15,17 @@
 | 4.0 filtre CI PR empilées | ✅ mergé | #36 | — | — |
 | 4.12a déterminisme CI macOS | ✅ mergé | #38 | — | — |
 | 4.5 recall gRPC TS + golden CI | ✅ mergé | #39 | — | — |
-| 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
+| 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | — |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
-| 4.4-fix éviction intermittente | ✅ PR ready, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1) ; N/N sous charge Linux (12/12) et N/N macOS/Windows (5/5 chacun, sur reruns successifs du même run CI) faits ; repro sur l'ancien code (8/8) faite ; passée en ready. Reste : accord de l'utilisateur pour merger |
+| 4.4-fix éviction intermittente | ✅ mergé | #47 | — | — |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
 | 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
-| 4.1 diagnostics d'indexation | ✅ review faite, correctifs poussés | #46 `p3/4.1-index-diagnostics` | `8f0709d` | review adversariale complète faite (§2.3) : 2 MAJOR + 2 MINOR corrigés, tests de régression ajoutés ; clippy/fmt/déterminisme/tests verts ; reste la CI puis passer en ready |
+| 4.1 diagnostics d'indexation | ✅ mergé | #46 | — | — |
+| doc de statut (celui-ci) | ✅ mergé | #48 | — | — |
+| 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ✅ PR ready, verte | #49 `p3/4.12b-e-debt-batch` | `04208f3` | review groupée faite par l'orchestrateur (§2.5), aucun finding ; CI verte (10/10) ; reste l'accord de l'utilisateur pour merger |
+| 4.7 `doctor --fix`, socket, version | 🔍 review adversariale en cours | #50 `p3/4.7-doctor-fix` | `af66a89` | CI non encore vérifiée ; sous-agent de review adversariale complète lancé (§2.6) |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
-| 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
-| 4.12b–e dette (audit, fences, homonymes, outil inconnu) | ⏳ à faire | — | — | tout |
 | 4.12f empreinte sans chemins absolus | ⏳ à faire (après 4.9) | — | — | tout (§3.3) |
 | 4.10 sandbox réseau Linux | ⏳ à faire (après 4.7) | — | — | tout |
 | 4.8 install pilote + `stats` | ⏳ à faire (après 4.7) | — | — | partie agent seulement (§5) |
@@ -99,7 +100,39 @@ budget 48 Ko. Findings, tous corrigés (commit `8f0709d`) :
 Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+171 tests ciblés
 (`mesh-server`/`mesh-core`) verts après correctif.
 
-### 2.4 Limites connues, documentées, non bloquantes
+### 2.4 Review groupée de 4.12b–e (#49) — aucun finding
+Auto-review par l'orchestrateur (barème §4 : review groupée, pas de sous-agent) sur les quatre
+correctifs indépendants (`crates/mesh-core/src/socket.rs` non touché ici ; `tools/mod.rs`,
+`lib.rs`, `markdown.rs`, `indexer.rs`). Chaque correctif vérifié isolément et par test dédié :
+- 4.12b (audit des refus) : `record_refusal` couvre bien les deux sorties anticipées
+  (arguments invalides, refus RSAH), sans dupliquer la logique du chemin normal ; comportement
+  inchangé sur le chemin non déclenchant (nom d'outil inconnu, refus non RSAH).
+- 4.12c (fences) : la clôture est dimensionnée sur le plus long run de backticks du extrait,
+  jamais en dessous de 3 ; testé avec un extrait contenant lui-même un bloc ``` et un extrait de
+  5 backticks.
+- 4.12d (racines homonymes) : désambiguïsation symétrique (les deux racines en collision, pas
+  seulement la seconde) et déterministe (indépendante de l'ordre de scan) ; racine sans parent
+  (`/`) retombe sur le nom nu sans crash.
+- 4.12e (outil inconnu) : vérifié avant la porte `still_indexing`, sans changer le comportement du
+  chemin normal (même résultat `-32602` qu'avant, juste plus tôt).
+
+Aucun finding. CI verte sur les trois OS (10/10). PR passée en ready ; reste l'accord de
+l'utilisateur pour merger.
+
+### 2.5 Review adversariale complète de 4.7 (#50) — en cours
+Sous-agent unique (budget §4) lancé sur `crates/mesh-core/src/socket.rs` (nouveau :
+`DaemonMeta`, `process_is_alive`, `terminate_process`, permissions du socket),
+`crates/mesh-daemon/src/{server,main}.rs`, `crates/mesh-server/src/main.rs` (avertissement de
+version), `crates/mesh-server/src/cli/doctor.rs` (les six nouvelles vérifications réparables) et
+les 11 tests d'intégration. Points prioritaires du brief : sécurité de la terminaison de
+processus (fenêtre TOCTOU entre `process_is_alive` et `terminate_process`), portée exacte du
+nettoyage des répertoires de cache orphelins (jamais un autre projet), garantie d'absence d'effet
+de bord de `PRAGMA quick_check` en lecture seule, solidité du remplacement du contrôle de version
+par un fichier sidecar plutôt que l'interception littérale d'`initialize`, et le code Windows
+(`OpenProcess`/`TerminateProcess`) vérifié contre les signatures exactes de `windows-sys` 0.59
+sans compilation croisée possible dans cette session. Résultat à venir.
+
+### 2.6 Limites connues, documentées, non bloquantes
 - 4.5 : un client TS construit au niveau module et utilisé seulement depuis une `function` de premier
   niveau ou une arrow `const` n'a pas d'arête. Les imports CommonJS `require()` ne sont pas gérés.
 - 4.6b : sans `base` explicite, un dossier hors dépôt Git ou un `git` absent donne une note
@@ -113,11 +146,6 @@ Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+1
 ---
 
 ## 3. Notes de conception pour les jalons à faire
-
-### 3.1 4.1 — diagnostics d'indexation
-4.4 a modifié `crates/mesh-core/src/state.rs` (ajout de `AppState::index_cache`, `open_index_cache`) :
-repartir de `main`. 4.2 a ajouté 7 lignes dans `ToolRegistry::invoke` (`tools/mod.rs`) pour la note
-« opération Git en cours » ; la note de rejet de 4.1 doit coexister avec elle.
 
 ### 3.2 4.6a — matrice d'impact (exploration déjà faite)
 - `examples/polyglot-shop` couvre Go, Rust et proto : pas besoin de nouvelle fixture.
@@ -198,18 +226,19 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 ## 6. Ordre de reprise recommandé
 
 1. ✅ #42 (4.9) mergé.
-2. ✅ Correctif de l'éviction intermittente (§2.1) fait, PR #47 ready, verte (5/5 macOS, 5/5
-   Windows) ; reste l'accord de l'utilisateur pour merger.
-3. ✅ 4.1 (#46) : code, hygiène et review adversariale complète faits (§2.3, 2 MAJOR + 2 MINOR
-   corrigés) ; reste la CI, puis passer en ready, puis merge.
-4. 4.12b–e, avec une review groupée.
-5. 4.7, puis sa review complète.
-6. 4.10, puis sa review complète.
-7. 4.6a.
-8. 4.8 (partie agent).
-9. 4.12f.
-10. 4.3, sur une machine calme.
-11. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
+2. ✅ #47 (correctif de l'éviction, §2.1) mergé.
+3. ✅ #46 (4.1) mergé.
+4. ✅ #48 (statut) mergé.
+5. ✅ 4.12b–e (#49) : review groupée faite (§2.4, aucun finding), CI verte ; reste l'accord de
+   l'utilisateur pour merger.
+6. 🔍 4.7 (#50) : code et tests faits ; review adversariale complète en cours (§2.5, sous-agent
+   lancé) ; reste sa CI, les correctifs des findings MINOR et au-delà, puis passer en ready.
+7. 4.10, puis sa review complète.
+8. 4.6a.
+9. 4.8 (partie agent).
+10. 4.12f.
+11. 4.3, sur une machine calme.
+12. Clôture (plan §5). En plus du plan : nettoyer dans `docs/quality.md` les lignes périmées par 4.5
     (les puces otel-demo de « What's NOT measured yet », la phrase « not yet wired in » de « Ratchet
     policy ») ; consolider `changelog.d/` ; lister ce qui reste humain (4.8 pilote, 4.11, 4.3 réel).
 

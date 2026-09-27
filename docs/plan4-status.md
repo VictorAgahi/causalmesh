@@ -28,7 +28,7 @@
 | 4.13 texte du plan corrigé après relecture adversariale | ✅ mergé | #52 | — | — |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
-| 4.7 `doctor --fix`, socket, version | 🔧 correctif CI poussé, run en cours | #50 `p3/4.7-doctor-fix` | `4a4b9d0` | CI du correctif en cours (§2.5) ; si verte, passer en ready |
+| 4.7 `doctor --fix`, socket, version | 🔧 2 correctifs CI Windows poussés, run en cours | #50 `p3/4.7-doctor-fix` | `f95ed46` | CI du second correctif en cours (§2.6) ; si verte, passer en ready |
 | 4.12f empreinte sans chemins absolus | ⏳ à faire (après 4.9) | — | — | tout (§3.3) |
 | 4.13 implémentation (scope multi-racines `smart_search.rs`, budget payload mesuré, stdio — spec corrigée par #52) | ⏳ à faire (après 4.7) | — | — | tout (§3.5) ; REX pilote réel `meta` |
 | 4.10 sandbox réseau Linux | ⏳ à faire (après 4.7) | — | — | tout |
@@ -124,7 +124,7 @@ jamais toucher le jail, uniquement `smart_search.rs` ; (2) le nouveau `DEFAULT_L
 mesure d'abord. Détail complet en §3.5. Texte du plan et de ce fichier réécrits en conséquence,
 mergé.
 
-### 2.6 Review adversariale complète de 4.7 (#50) — en cours, un correctif de CI poussé
+### 2.6 Review adversariale complète de 4.7 (#50) — en cours, deux correctifs de CI Windows poussés
 Sous-agent unique (budget §4) lancé sur `crates/mesh-core/src/socket.rs` (`DaemonMeta`,
 `process_is_alive`, `terminate_process`, permissions du socket), `crates/mesh-daemon/src/{server,main}.rs`,
 `crates/mesh-server/src/main.rs` (avertissement de version) et `crates/mesh-server/src/cli/doctor.rs`
@@ -133,13 +133,20 @@ Sous-agent unique (budget §4) lancé sur `crates/mesh-core/src/socket.rs` (`Dae
 TOCTOU microseconde) — corrigé par un garde-fou `daemon_is_reachable` qui exige un socket
 connectable réel avant toute terminaison de processus (commit `52d8905`).
 
-Séparément, en poussant ce correctif, la CI a révélé une régression réelle et non liée à la review :
-`check_socket`'s paramètre `fix` n'est lu que dans les branches `#[cfg(unix)]` ; sous `-D warnings`,
-cela devient une erreur de compilation dure sur le job `Test Suite (windows-latest)` (`error: unused
-variable: fix`, `doctor.rs:504`). Corrigé (`#[cfg_attr(not(unix), allow(unused_variables))]`, portée
-limitée au cfg non-unix pour ne pas masquer un vrai `fix` mort côté unix) et poussé (commit `4a4b9d0`) ;
-build release, clippy et les 11 tests d'intégration de `doctor_repairable_health.rs` revérifiés en
-local avant le push. Nouveau run CI en cours ; si vert, passer en ready.
+Séparément de la review, deux erreurs de compilation Windows-only (jamais vues dans cette session
+cloud, Linux uniquement — seul le job CI `windows-latest` les fait apparaître) sont apparues coup sur
+coup en poussant ce correctif :
+1. `check_socket`'s paramètre `fix` n'est lu que dans les branches `#[cfg(unix)]` ; sous `-D warnings`,
+   cela devient une erreur de compilation dure (`error: unused variable: fix`, `doctor.rs:504`).
+   Corrigé (`#[cfg_attr(not(unix), allow(unused_variables))]`, portée limitée au cfg non-unix pour ne
+   pas masquer un vrai `fix` mort côté unix), commit `4a4b9d0`.
+2. Le module `#[cfg(all(test, windows))] mod windows_tests` de `crates/mesh-daemon/src/server.rs`
+   appelle directement `run_named_pipe_server` et avait été manqué par le script de mise à jour des
+   ~10 sites d'appel vers la nouvelle signature (`workspace_id`, `version`) — il ne type-check que sur
+   un runner Windows, jamais en local ici. Corrigé, commit `f95ed46`.
+
+Build release, clippy et les 11 tests d'intégration de `doctor_repairable_health.rs` revérifiés en
+local avant chaque push. Nouveau run CI en cours ; si vert, passer en ready.
 
 ### 2.7 Limites connues, documentées, non bloquantes
 - 4.5 : un client TS construit au niveau module et utilisé seulement depuis une `function` de premier
@@ -273,7 +280,7 @@ réelles, mais deux des trois correctifs proposés étaient mal calibrés. Le pl
 6. ✅ #52 (relecture du texte de 4.13) : review adversariale du plan faite (§2.5, 2 correctifs de
    calibrage), mergé.
 7. 🔧 4.7 (#50) : code et tests faits ; review adversariale complète faite (§2.6, 1 finding PID-reuse
-   corrigé) ; un correctif de CI Windows séparé poussé (§2.6) ; reste ce run CI, puis passer en ready,
+   corrigé) ; deux correctifs de CI Windows séparés poussés (§2.6) ; reste ce run CI, puis passer en ready,
    puis l'accord de l'utilisateur pour merger.
 8. 4.10, puis sa review complète.
 9. 4.13 implémentation (spec corrigée par #52, §3.5 ; après 4.7 ci-dessus).

@@ -4,7 +4,7 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `d81ca50`.
+> **Dernière mise à jour** : 2026-09-27 — `main` = `a873f52`.
 
 ---
 
@@ -18,9 +18,9 @@
 | 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
 | 4.4-fix éviction intermittente | 🔧 en cours | `p3/4.4-fix-eviction` (pas encore poussée) | — | cause racine, correctif, preuve N/N, PR |
-| 4.2 watcher macOS + Git | 🔍 en review | #43 `p3/4.2-watcher-git` | `45b39c7` | fin de review adversariale, puis merge |
+| 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
 | 4.9 mémoire YAML/Markdown | 🔍 en review | #42 `p3/4.9-yaml-md-memory` | `9af9ecc` | fin de review adversariale, puis merge |
-| 4.1 diagnostics d'indexation | ⏳ à faire (débloqué) | — | — | tout |
+| 4.1 diagnostics d'indexation | ⏸️ démarré puis arrêté (quota) | `p3/4.1-index-diagnostics` (draft PR éventuelle) | — | reprendre depuis la branche si elle existe, sinon tout |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
@@ -151,7 +151,7 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 
 ## 6. Ordre de reprise recommandé
 
-1. Merger ce qui est prêt : #43 (4.2) et #42 (4.9) quand leurs reviews sont vertes.
+1. Merger #42 (4.9) quand sa review est verte (#43 et #44 sont mergées).
 2. Correctif de l'éviction intermittente (§2.1).
 3. 4.1, puis sa review complète.
 4. 4.12b–e, avec une review groupée.

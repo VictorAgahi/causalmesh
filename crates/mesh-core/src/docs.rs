@@ -1,11 +1,13 @@
-use crate::types::CompactStr;
+use crate::types::{CompactStr, FilePath};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocSection {
-    pub file_path: PathBuf,
+    /// Shared by every section of the same file (one allocation per file, not
+    /// one path copy per section — plan 4.9).
+    pub file_path: FilePath,
     pub title: CompactStr,
     pub level: usize,
     pub start_line: usize,
@@ -14,13 +16,13 @@ pub struct DocSection {
     /// Lowercased title/content computed once at index time; scoring is
     /// case-insensitive and used to re-lowercase every section on every query.
     #[serde(skip)]
-    title_lower: String,
+    title_lower: CompactStr,
     /// Lowercased content, kept only when `content` is non-ASCII. For ASCII
     /// text (nearly all docs) lowercasing is byte-wise, so
     /// [`DocSection::content_lower_contains`] tests the original bytes directly
     /// instead of keeping a second full copy of every indexed doc resident.
     #[serde(skip)]
-    content_lower: Option<String>,
+    content_lower: Option<Box<str>>,
 }
 
 impl DocSection {
@@ -43,13 +45,13 @@ impl DocSection {
     /// The lowercased content, materialized only for the rare fuzzy pass.
     fn content_lower(&self) -> std::borrow::Cow<'_, str> {
         match &self.content_lower {
-            Some(lower) => std::borrow::Cow::Borrowed(lower.as_str()),
+            Some(lower) => std::borrow::Cow::Borrowed(&**lower),
             None => std::borrow::Cow::Owned(self.content.to_ascii_lowercase()),
         }
     }
 
     fn new(
-        file_path: &Path,
+        file_path: &FilePath,
         title: CompactStr,
         level: usize,
         start_line: usize,
@@ -57,9 +59,9 @@ impl DocSection {
         content: String,
     ) -> Self {
         Self {
-            file_path: file_path.to_path_buf(),
-            title_lower: title.as_str().to_lowercase(),
-            content_lower: (!content.is_ascii()).then(|| content.to_lowercase()),
+            file_path: FilePath::clone(file_path),
+            title_lower: CompactStr::new(title.as_str().to_lowercase()),
+            content_lower: (!content.is_ascii()).then(|| content.to_lowercase().into_boxed_str()),
             title,
             level,
             start_line,
@@ -135,7 +137,7 @@ impl DocIndex {
 
     /// Drops every section that came from `path` (used before re-indexing a changed file).
     pub fn remove_file(&mut self, path: &Path) {
-        self.sections.retain(|s| s.file_path != path);
+        self.sections.retain(|s| &*s.file_path != path);
     }
 
     /// [`Self::remove_file`] for a whole batch in one pass over the sections.
@@ -143,8 +145,7 @@ impl DocIndex {
     /// O(k·N) on a mass change (branch switch) over a large doc index.
     pub fn remove_files(&mut self, paths: &std::collections::HashSet<&Path>) {
         if !paths.is_empty() {
-            self.sections
-                .retain(|s| !paths.contains(s.file_path.as_path()));
+            self.sections.retain(|s| !paths.contains(&*s.file_path));
         }
     }
 
@@ -175,8 +176,48 @@ impl DocIndex {
         lines
     }
 
+    /// Resident bytes the sections of one file may cost, per input byte
+    /// (plan 4.9). See [`Self::parse_sections`].
+    pub const SECTION_BYTES_PER_INPUT_BYTE: usize = 3;
+    /// Floor of the per-file section budget, so small files are never coalesced.
+    pub const MIN_SECTION_BUDGET: usize = 64 * 1024;
+
+    /// The resident-bytes budget of a `len`-byte Markdown file's sections.
+    pub fn section_budget(len: usize) -> usize {
+        len.saturating_mul(Self::SECTION_BYTES_PER_INPUT_BYTE)
+            .max(Self::MIN_SECTION_BUDGET)
+    }
+
+    /// Estimated resident bytes of one section: the struct plus its heap parts
+    /// (the section `Vec` is sized up front, so no growth slack).
+    fn section_cost(s: &DocSection) -> usize {
+        let heap = |c: &CompactStr| if c.is_heap_allocated() { c.len() } else { 0 };
+        std::mem::size_of::<DocSection>()
+            + s.content.capacity()
+            + heap(&s.title)
+            + heap(&s.title_lower)
+            + s.content_lower.as_ref().map_or(0, |l| l.len())
+    }
+
+    /// `Some(level)` when `line` is an ATX heading (`#`..`######` then a space).
+    fn heading_level(line: &str) -> Option<usize> {
+        let trimmed = line.trim_start();
+        let hashes = trimmed.bytes().take_while(|&c| c == b'#').count();
+        ((1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' '))
+            .then_some(hashes)
+    }
+
     /// Splits a markdown document into sections without touching the index —
     /// pure, so it can run on the Rayon pool during a workspace scan.
+    ///
+    /// The document is walked line by line; each section's text is only joined
+    /// once its end is known. Resident cost is bounded per file (plan 4.9): every
+    /// section carries a fixed ~150-byte struct, so a file of many tiny sections
+    /// used to cost 8.3x its size. Once the sections already built reach
+    /// [`Self::section_budget`], later headings no longer open a new section —
+    /// the rest of the file is kept, searchable, in the last one (so the total is
+    /// at most the budget plus that final section). Files under budget split
+    /// exactly as before.
     pub fn parse_sections(&self, path: &Path, raw_content: &str) -> Vec<DocSection> {
         let content = if self.sanitize_injections {
             Self::sanitize_prompt_injections(raw_content)
@@ -184,7 +225,19 @@ impl DocIndex {
             std::borrow::Cow::Borrowed(raw_content)
         };
 
-        let mut sections = Vec::new();
+        let file_path: FilePath = FilePath::from(path);
+        let budget = Self::section_budget(raw_content.len());
+        let mut spent = 0usize;
+        let mut coalescing = false;
+        // Sized once from a heading pre-count (capped by what the budget can
+        // hold), so the section list never carries `Vec` growth slack.
+        let headings = content
+            .lines()
+            .filter(|l| Self::heading_level(l).is_some())
+            .count();
+        // +2: the section that crosses the budget and the final one.
+        let max_sections = budget / std::mem::size_of::<DocSection>() + 2;
+        let mut sections = Vec::with_capacity((headings + 1).min(max_sections));
         let mut current_title = CompactStr::new(
             path.file_stem()
                 .and_then(|s| s.to_str())
@@ -197,24 +250,28 @@ impl DocIndex {
 
         for line in content.lines() {
             line_num += 1;
-            let trimmed = line.trim_start();
-
-            if trimmed.starts_with('#') {
-                let hashes = trimmed.bytes().take_while(|&c| c == b'#').count();
-                if hashes <= 6 && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+            if !coalescing {
+                if let Some(hashes) = Self::heading_level(line) {
                     if !section_lines.is_empty() {
-                        sections.push(DocSection::new(
-                            path,
+                        let section = DocSection::new(
+                            &file_path,
                             current_title.clone(),
                             current_level,
                             current_start_line,
                             line_num - 1,
                             section_lines.join("\n"),
-                        ));
+                        );
+                        spent += Self::section_cost(&section);
+                        sections.push(section);
                         section_lines.clear();
+                        if spent + std::mem::size_of::<DocSection>() > budget {
+                            // Over budget: this heading opens the last section,
+                            // which takes the rest of the file.
+                            coalescing = true;
+                        }
                     }
 
-                    current_title = CompactStr::new(trimmed[hashes..].trim());
+                    current_title = CompactStr::new(line.trim_start()[hashes..].trim());
                     current_level = hashes;
                     current_start_line = line_num;
                     continue;
@@ -226,7 +283,7 @@ impl DocIndex {
 
         if !section_lines.is_empty() {
             sections.push(DocSection::new(
-                path,
+                &file_path,
                 current_title,
                 current_level,
                 current_start_line,
@@ -263,10 +320,15 @@ impl DocIndex {
         ];
         const REPLACEMENT: &str = "[FILTERED_ADVERSARIAL_INPUT]";
 
-        let lower = text.to_ascii_lowercase();
+        // Case-insensitive match on the original bytes: no lowercase copy of
+        // the whole document (plan 4.9). Patterns are ASCII and lowercase, so
+        // byte offsets are the same as in a lowercased copy.
         let mut hits: Vec<(usize, usize)> = INJECTION_PATTERNS
             .iter()
-            .flat_map(|pat| lower.match_indices(pat).map(|(i, m)| (i, i + m.len())))
+            .flat_map(|pat| {
+                ascii_ci_match_indices(text.as_bytes(), pat.as_bytes())
+                    .map(move |i| (i, i + pat.len()))
+            })
             .collect();
         if hits.is_empty() {
             return std::borrow::Cow::Borrowed(text);
@@ -448,9 +510,35 @@ impl DocIndex {
     }
 }
 
+/// Non-overlapping start offsets of `needle` (ASCII, lowercase) in `hay`,
+/// compared ASCII-case-insensitively — `str::match_indices` on an
+/// ASCII-lowercased copy of `hay`, without the copy.
+fn ascii_ci_match_indices<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
+        }
+        while pos + needle.len() <= hay.len() {
+            let at = pos;
+            if hay[at..at + needle.len()]
+                .iter()
+                .zip(needle)
+                .all(|(h, n)| h.to_ascii_lowercase() == *n)
+            {
+                pos = at + needle.len();
+                return Some(at);
+            }
+            pos += 1;
+        }
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn remove_files_drops_a_whole_batch() {
@@ -459,7 +547,11 @@ mod tests {
             index.extend_sections(index.parse_sections(Path::new(f), "# T\nbody"));
         }
         index.remove_files(&[Path::new("a.md"), Path::new("c.md")].into_iter().collect());
-        let left: Vec<_> = index.sections.iter().map(|s| s.file_path.clone()).collect();
+        let left: Vec<_> = index
+            .sections
+            .iter()
+            .map(|s| s.file_path.to_path_buf())
+            .collect();
         assert_eq!(left, [Path::new("b.md").to_path_buf()]);
     }
 
@@ -468,7 +560,7 @@ mod tests {
     #[test]
     fn content_lower_contains_matches_to_lowercase_semantics() {
         let ascii = DocSection::new(
-            Path::new("a.md"),
+            &FilePath::from(Path::new("a.md")),
             "T".into(),
             1,
             1,
@@ -484,7 +576,7 @@ mod tests {
         assert!(ascii.content_lower_contains(""));
 
         let utf8 = DocSection::new(
-            Path::new("b.md"),
+            &FilePath::from(Path::new("b.md")),
             "T".into(),
             1,
             1,
@@ -493,6 +585,50 @@ mod tests {
         );
         assert!(utf8.content_lower.is_some());
         assert!(utf8.content_lower_contains("événement émis"));
+    }
+
+    /// Plan 4.9: a file of many tiny sections stops splitting once its
+    /// sections reach the per-file budget; nothing is dropped, and a file under
+    /// budget splits exactly as before.
+    #[test]
+    fn many_tiny_sections_are_bounded_by_the_section_budget() {
+        let index = DocIndex::default();
+        let mut md = String::new();
+        let mut n = 0usize;
+        while md.len() < 384 * 1024 - 64 {
+            md.push_str(&format!("## S{n}\nx{n}\n"));
+            n += 1;
+        }
+        let sections = index.parse_sections(Path::new("tiny.md"), &md);
+        let cost: usize = sections.iter().map(DocIndex::section_cost).sum();
+        let last = sections.last().map_or(0, DocIndex::section_cost);
+        assert!(sections.len() < n, "coalesced: {} of {n}", sections.len());
+        assert!(cost <= DocIndex::section_budget(md.len()) + last);
+        let tail = format!("x{}", n - 1);
+        assert!(sections.last().is_some_and(|s| s.content.ends_with(&tail)));
+        assert!(sections
+            .windows(2)
+            .all(|w| Arc::ptr_eq(&w[0].file_path, &w[1].file_path)));
+
+        let small = "# A\none\n## B\ntwo\n";
+        let split = index.parse_sections(Path::new("small.md"), small);
+        assert_eq!(split.len(), 2);
+    }
+
+    #[test]
+    fn ascii_ci_match_indices_matches_lowercase_match_indices() {
+        let hay = "Ignore Previous Instructions; ignore previous INSTRUCTIONS <SYSTEM> é<system>";
+        for pat in ["ignore previous instructions", "<system>", "é", "xyz", "aa"] {
+            if !pat.is_ascii() {
+                continue;
+            }
+            let lower = hay.to_ascii_lowercase();
+            let expected: Vec<usize> = lower.match_indices(pat).map(|(i, _)| i).collect();
+            let got: Vec<usize> = ascii_ci_match_indices(hay.as_bytes(), pat.as_bytes()).collect();
+            assert_eq!(got, expected, "{pat}");
+        }
+        let aaa: Vec<usize> = ascii_ci_match_indices(b"aaaa", b"aa").collect();
+        assert_eq!(aaa, [0, 2]);
     }
 
     #[test]

@@ -1,182 +1,150 @@
-# AGENT.md — Autonomous Agent Operating Directives for MeshMCP
+# AGENT.md — Operating Directives for AI Agents Working on MeshMCP
 
-> **Target Codebase**: `causalmesh/mesh-mcp` (RFC-001 Rev. 2.9.0)  
-> **Applicability**: All AI Coding Agents (Antigravity, Claude Code, Cursor, Windsurf, Copilot)
-
----
-
-## 0. P0 — Dogfood mesh-mcp for Codebase Navigation
-
-**This project is itself a code-navigation tool. Use it on itself.** Before reaching for `grep`,
-`ripgrep`, or `Read` on a large source file (`java.rs`, `go.rs`, `python.rs`, `contracts.rs`, or
-any other file north of ~1,000 lines), prefer the running MeshMCP server's own tools:
-`smart_search` to locate a symbol/definition, `find_dependents` to find callers/importers before
-changing a shared type, `analyze_impact` to check blast radius before editing a hot file,
-`analyze_grpc` for gRPC schema tracing, `search_docs` for architecture/ADR lookups. Brute-forcing
-a 1,000+ line parser file with `Read` end-to-end is a fallback for when the MCP tools genuinely
-can't answer the question (e.g. reading exact surrounding context to edit), not the default first
-move. This is both a real quality bar (if the tools aren't good enough to navigate this repo,
-that's a bug worth fixing) and a token-efficiency practice.
-
-**Before your first `smart_search` call in a session, read this repo's `.agents/mesh-mcp.toml`
-(or whichever config the running server was pointed at).** Its `[workspace] roots` list is the
-*only* thing `scope` may resolve inside — the repo root itself is deliberately excluded from a
-typical `roots = ["../crates/*", "../deploy*", "../docs", "../k8s*"]` config, so `scope: "."` or
-the bare repo path is correctly rejected by the `ValidatedScope` jail with "Sandbox escape
-attempt detected" (Commandment 4 — this is intended behavior, not a bug to work around). Always
-pass an absolute path to a specific subdirectory the config actually lists (e.g.
-`crates/mesh-core`, `docs`), never the workspace root.
-
-Three behaviors worth knowing up front, so you don't burn round-trips rediscovering them:
-- `smart_search`'s `query` matches **declared symbol names**, not free text — searching a bare
-  keyword like `fn` or `fn derive` returns zero matches by design. If you don't know the exact
-  symbol name, pass `fuzzy: true` to fall back to a full-text scan of the scope, rather than
-  retrying variations of a keyword query.
-- A single `include_body: true` result can be truncated at the ~48 KB response cap (Commandment
-  3) — a large `impl` block may come back showing only its first method. When you need the full
-  body of something that large, drop to `Read` with `offset`/`limit` on the specific line range
-  `smart_search` already told you about, instead of re-querying `smart_search` for more.
-- The project's `PreToolUse:Read` hook blocks a whole-file `Read` on anything over ~300 lines and
-  points you back at `smart_search` first — expected, not a bug — so locate the symbol/line range
-  with `smart_search` (or an earlier successful `Read`) before your next `Read` call, rather than
-  retrying the same full-file read.
-
-## 1. Identity & Behavioral Constitution
-
-You are operating as a **Principal Distributed Systems Architect & Staff Rust Engineer** on MeshMCP: an industrial-grade, local-first multi-root architecture mesh and high-performance MCP server.
-
-### The Zero-Mock Doctrine
-1. **Never write pseudo-code, mock objects, or unverified stubs (`todo!()`, `unimplemented!()`).**
-2. Every file modified or created must **compile cleanly** under `cargo build --workspace`.
-3. Every file must satisfy strict Clippy lints with zero warnings:  
-   `cargo clippy --workspace --all-targets -- -D warnings`.
-4. Tests are mandatory for every new feature or parser: `cargo test --workspace`.
-5. Production code must **never use `unwrap()` or `expect()`**. Use idiomatic `Result<T, E>` with `thiserror`. Tests may use unwrap under `#![cfg_attr(test, allow(clippy::unwrap_used))]`.
+> **Repository**: `VictorAgahi/causalmesh` (MeshMCP)
+> **Applicability**: any AI coding agent (Claude Code, Cursor, Windsurf, Copilot, ...)
+> **Authoritative rules**: the 7 Commandments and code style in [`CLAUDE.md`](CLAUDE.md). This
+> file summarises them and adds navigation help; if the two disagree, `CLAUDE.md` wins.
 
 ---
 
-## 2. The 7 Invariant Commandments (RFC-001)
+## 0. Dogfood MeshMCP for navigation
 
-Before executing any file write, code refactor, or architectural change, you must verify adherence to the 7 Invariant Commandments:
+This project is a code-navigation tool; use it on itself. Before grepping or reading a large
+source file (`java.rs`, `go.rs`, `python.rs`, `typescript.rs`, `contracts.rs`, `indexer.rs`, or
+anything over ~1,000 lines), prefer the running MeshMCP server's tools: `smart_search` to locate a
+symbol, `find_dependents` before changing a shared type, `analyze_impact` / `analyze_grpc` for
+cross-service effects, `search_docs` for the docs. Reading a whole large file is the fallback,
+not the first move. If the tools are not good enough to navigate this repository, that is a bug
+worth reporting.
+
+This repository's own config is `.agents/mesh-mcp.toml`
+(`roots = ["../crates/*", "../deploy*", "../docs", "../k8s*"]`). The repository root is not a
+root itself, but `smart_search` treats an omitted `scope`, `"."`, `"*"` or the exact workspace
+root as "all configured roots". Any other path outside the roots is rejected by the
+`ValidatedScope` jail ("Sandbox escape attempt detected"); that is intended behaviour.
+
+Behaviours worth knowing:
+
+- `smart_search`'s `query` matches **declared symbol names** (case-insensitive substring), not
+  free text. A keyword like `fn` returns nothing by design; pass `fuzzy: true` for a full-text
+  scan of the scope.
+- A page stops at about 8 KB of results (`limit` default 20); follow the `offset` given in the
+  footer instead of raising `limit`. A single large `include_body: true` result can still hit the
+  48 KB cap; then read the exact line range `smart_search` reported.
+- The project's `PreToolUse:Read` hook blocks whole-file reads of files over ~300 lines and points
+  back at `smart_search`; read with `offset`/`limit` instead.
+
+---
+
+## 1. Engineering rules
+
+1. No mock code, pseudo-code or stubs (`todo!()`, `unimplemented!()`).
+2. Every change compiles: `cargo build --workspace`.
+3. Clippy is clean: `cargo clippy --workspace --all-targets -- -D warnings`.
+4. New behaviour comes with tests: `cargo test --workspace`.
+5. No `unwrap()` / `panic!()` in production code (workspace lints deny them); use `?` and
+   `thiserror`. Tests may `unwrap`.
+6. Numbers in documentation come from a measurement recorded in `docs/quality.md` (date,
+   platform, command), or they are not written.
+
+---
+
+## 2. The 7 Commandments (summary of `CLAUDE.md`)
 
 ```
-[1] ZERO ALLOCATION IN THE HOT LOOP
-    - Global mimalloc: #[global_allocator] static GLOBAL: mimalloc::MiMalloc
-    - Identifiers use compact_str::CompactString (<= 24 bytes inline stack)
-    - Interned repository indices: RepoId = u16 (up to 65,535 repos)
-    - Lock-free snapshots via ArcSwap<MeshSnapshot> (0ns read lock contention)
+[1] NO DYNAMIC ALLOCATION IN THE HOT LOOP
+    - mimalloc global allocator; CompactStr (<= 24 bytes inline) for names and IDs
+    - RepoId = u16 for roots; FilePath = Arc<Path> interned once per file
+    - ArcSwap<MeshSnapshot>: lock-free reads, one atomic snapshot swap per reload
 
-[2] BOUNDED TREE-SITTER & IOPS GUARDS (AstGuard)
-    - File size <= 384 KB; Line length <= 1024 bytes
-    - Null-byte binary sniffing over first 4096 bytes
-    - AST nesting depth <= 64 (reject before C-FFI parser to avoid stack overflow)
-    - Hardware parser timeout: ts_parser_set_timeout_micros(15_000) (15ms)
-    - Anti-ReDoS match step limit: 10,000 steps
+[2] BOUNDED TREE-SITTER (AstGuard)
+    - files <= 384 KB (1.5 MB for contracts/schemas); lines <= 1,024 bytes
+    - null-byte sniff over the first 4,096 bytes; nesting depth <= 64 before the C parser
+    - parse timeouts: indexing 2 s (INDEX_PARSE_TIMEOUT_MICROS, a hang guard),
+      smart_search decapitation 500 ms (QUERY_PARSE_TIMEOUT_MICROS); never share one constant
+    - indexing parse failures are counted in IndexHealth and retried once, never folded as empty
+    - query cursor: match limit 500, 10,000 iteration steps
 
-[3] STDIO ISOLATION & AFFORDANCE TRUNCATION
-    - Stdout is owned exclusively by Tokio StdioFramingActor via BufWriter<Stdout>
-    - Zero stdout pollution: NO println!, print!, or dbg! in codebase
-    - Stderr is exclusively reserved for tracing logs
-    - Responses exceeding 48 KB are truncated with sub-scope affordance tips
+[3] STDIO ISOLATION & OUTPUT BOUNDS
+    - stdout belongs to the StdioFramingActor (BufWriter<Stdout>); no println!/print!/dbg!
+      on the server path; logs go to stderr through tracing
+    - responses capped at 48 KB with narrowing guidance; smart_search pages ~8 KB
 
-[4] SECURITY CONFINEMENT (ValidatedScope JAIL)
-    - No raw PathBuf or &str paths passed to internal engines
-    - dunce::canonicalize + lowercase normalization (APFS / NTFS case-folding)
-    - follow_links(false) enforced: Symlink traversal outside roots errors with -32602
+[4] SECURITY JAIL (ValidatedScope)
+    - no raw PathBuf/&str paths in query engines; ValidatedScope::resolve*
+    - path_clean + dunce::canonicalize; case-folded comparison on macOS/Windows only
+    - follow_links(false) on every walk; an escape is classified -32602 and returned to the
+      client as an isError tool result
 
 [5] STRICT SCHEMAS & NEGATIVE PROMPTING
-    - JSON Schemas derived with schemars and #[serde(deny_unknown_fields)]
-    - Tool descriptions include explicit negative constraints (Miller's Law)
-    - Secrets masked with [REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]
+    - schemars::JsonSchema + #[serde(deny_unknown_fields)] on every args struct
+    - every tool description has a "DO NOT USE ... (use <other tool>)" clause
+    - secrets masked as [REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]
 
-[6] ACTIVE DOUBLE-BARRIER GOVERNANCE (RSAH)
-    - Mutating guarded roots (proto-registry) triggers RSAH structured refusal
-    - Provides pre-drafted delegation message for human engineer handoff
-    - Physical OS pre-commit hook installed via 'mesh-mcp install-hooks'
+[6] ACTIVE GOVERNANCE (RSAH)
+    - stop rules refuse mutating calls on guarded paths, and read calls when
+      read_governance_mode = "enforce_refusal"; structured handoff message for the human
+    - Git pre-commit hook via `mesh-mcp install-hooks` (contract-first, from proto_dirs)
 
-[7] OS POLITENESS, W3C TRACING & CRYPTOGRAPHIC AUDIT
-    - Rayon rescan pool throttled via QOS_CLASS_BACKGROUND (macOS) / nice(10) (Linux)
-    - W3C Trace Context (traceparent) parsed and propagated
-    - Append-only SQLite audit DB (~/.cache/mesh-mcp/audit.db) with chained SHA-256 (0600)
+[7] OS POLITENESS, TRACING & AUDIT
+    - reload pool at QOS_CLASS_BACKGROUND (macOS) / nice 10 (Linux) / below-normal (Windows)
+    - W3C traceparent trace id recorded in the audit row
+    - append-only SQLite audit DB (~/.cache/mesh-mcp/audit.db, 0600), chained SHA-256
 ```
 
 ---
 
-## 3. Codebase Architecture & Navigation
-
-The workspace is strictly partitioned into three crates:
+## 3. Codebase map
 
 ```
 causalmesh/
-├── Cargo.toml                       # Root workspace manifest (thin LTO, mimalloc)
-├── mesh-mcp.toml                    # Declarative production config
-├── bin/mesh-mcp.js                  # Enterprise corporate Node.js runner
-├── deploy/                          # Systemd unit & launchd plist
-├── docs/                            # Deep engineering documentation
-│   ├── architecture.md              # Systems architecture & memory layout
-│   ├── mcp-tools.md                 # MCP tools specification & JSON schemas
-│   ├── development.md               # Developer guide & Tree-sitter instructions
-│   ├── governance-rsah.md           # RSAH protocol & Git pre-commit hooks
-│   └── benchmarks.md                # Benchmarks & token economy data
+├── Cargo.toml                 # workspace manifest, release profile (thin LTO), lints
+├── mesh-mcp.toml              # annotated example configuration
+├── .agents/                   # this repo's own mesh-mcp.toml and coding-agent skills
+├── install.sh                 # prebuilt-binary installer (GitHub releases)
+├── scripts/                   # install_pilot.sh, determinism.sh, golden/, bench/, test_git_storm.sh
+├── deploy/                    # systemd unit, launchd plist
+├── bin/mesh-mcp.js            # npm runner (downloads a release binary)
+├── docs/                      # architecture, tools, governance, quality (measurements), benchmarks
 └── crates/
-    ├── mesh-core/                   # Core engine & domain models
-    │   ├── src/types.rs             # CompactStr, RepoId = u16, ContractNode, Edge
-    │   ├── src/security.rs          # ValidatedScope, Dunce jail, case-folding
-    │   ├── src/config.rs            # Configuration model & root expansion
-    │   ├── src/properties.rs        # PropertyRegistry & secret redaction
-    │   ├── src/contracts.rs         # ContractGraph reverse index & gRPC tracing
-    │   ├── src/docs.rs              # DocIndex & prompt-injection defense
-    │   ├── src/audit.rs             # Cryptographic SHA-256 chained audit logger
-    │   ├── src/governance.rs        # RSAH structured refusal engine
-    │   ├── src/crawler.rs           # Filesystem crawler with follow_links(false)
-    │   ├── src/rescan.rs            # Rayon pool with OS QoS throttling
-    │   └── src/state.rs             # Lock-free AppState (ArcSwap)
-    ├── mesh-parsers/                # Tree-sitter & Markdown formatting
-    │   ├── src/guard.rs             # AstGuard limits, ReDoS counter, C-FFI timeout
-    │   ├── src/decapitate.rs        # Polyglot AST body decapitator (Java, Go, TS, Py, Rs)
-    │   ├── src/markdown.rs          # 48 KB capped high-density Markdown formatter
-    │   └── src/languages/           # Proto, Java, Go, Python, TS, Rust, AsyncAPI YAML
-    └── mesh-server/                 # JSON-RPC 2.0 stdio actor & CLI commands
-        ├── src/framing.rs           # StdioFramingActor (bounded MPSC 64, BufWriter)
-        ├── src/protocol.rs          # JSON-RPC frames & W3C traceparent extraction
-        ├── src/tools/               # The 5 MCP tools (smart_search, etc.)
-        ├── src/cli/                 # doctor, init, install-hooks
-        └── src/main.rs              # Entry point, mimalloc, SIGINT handler
+    ├── mesh-core/src/         # types, contracts (graph), state (snapshot), security (jail),
+    │                          # crawler, vfs, watcher (+ watcher/git.rs), index_cache, audit,
+    │                          # governance, properties, docs, yaml_stream, health, socket, rescan
+    ├── mesh-parsers/src/      # guard (AstGuard), decapitate (LanguageKind), languages/*,
+    │                          # markdown (formatter, 48 KB), graph + topology (rendering)
+    ├── mesh-server/src/       # main (CLI, proxy), lib (JSON-RPC loop), framing, protocol,
+    │                          # indexer (WorkspaceIndexer), watcher, tools/ (6 MCP tools),
+    │                          # cli/ (doctor, init, graph, hooks, stats)
+    └── mesh-daemon/src/       # main, server (socket / named pipe), idle, sandbox (Linux seccomp)
 ```
 
----
-
-## 4. Verification Workflow for Agents
-
-Whenever making modifications, execute these steps sequentially:
-
-1. **Format & Lint**:
-   ```bash
-   cargo clippy --workspace --all-targets -- -D warnings
-   ```
-2. **Run All Tests**:
-   ```bash
-   cargo test --workspace
-   ```
-3. **Verify Diagnostic Health**:
-   ```bash
-   cargo run -p mesh-server -- doctor
-   ```
-4. **Build Release Binary** (if verifying release profile or LTO):
-   ```bash
-   cargo build --workspace --release
-   ```
+Task-specific guides: [`.agents/skills/README.md`](.agents/skills/README.md).
 
 ---
 
-## 5. Agent Decision Matrix for MCP Tools
+## 4. Verification workflow
 
-When servicing user queries or acting on codebase tasks:
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p mesh-server -- doctor
+```
 
-| User Need | Correct MCP Tool | Negative Constraint |
+If a tool argument changes, update the schema in `docs/mcp-tools.md`
+(`test_mcp_tools_md_schema_drift_check` enforces it). A change that can move precision/recall is
+checked by `.github/workflows/golden.yml`; a change to indexing order or concurrency by
+`scripts/determinism.sh`.
+
+---
+
+## 5. Which MCP tool to use
+
+| Need | Tool | Do not |
 | :--- | :--- | :--- |
-| Find function/class definitions | `smart_search` | Do NOT use for reading full files or docs; do NOT pass generic keywords (`fn`, `class`) expecting a text match — use the exact symbol name or `fuzzy: true` |
-| Find who calls or imports a symbol | `find_dependents` | Do NOT pass short generic names (`id`, `err`) |
-| Trace gRPC schema to server & client | `analyze_grpc` | Do NOT use for Kafka/RabbitMQ |
-| Calculate blast radius of a file edit | `analyze_impact` | Do NOT pass arbitrary non-file strings |
-| Read architecture docs & ADRs | `search_docs` | Do NOT use to search source code |
+| Find a function, class or method declaration | `smart_search` | use it for docs or whole files; pass generic keywords expecting a text match (use the symbol name, or `fuzzy: true`) |
+| Find who imports or depends on a type, package or contract | `find_dependents` | pass very short generic names (`id`, `err`) |
+| Trace a gRPC method from `.proto` to handlers and clients; check wire-format breaks | `analyze_grpc` | use it for Kafka or other async messaging |
+| Impact of changing an RPC, service, topic or event | `analyze_impact` | expect test coverage (the graph does not link tests) |
+| Read architecture docs and ADRs | `search_docs` | search source code with it |
+| See the service topology | `visualize_mesh` | raise `max_services` to see everything; zoom with `service` |

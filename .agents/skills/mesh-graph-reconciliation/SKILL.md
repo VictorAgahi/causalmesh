@@ -30,7 +30,8 @@ by every MCP tool.
     (variant kept for `mesh-parsers::graph`'s render match arms; `reconcile_edges` no longer
     constructs it — see section 4)
   - `EdgeConfidence`: `Exact` (FQCN/fully-qualified match, or a structural edge derived from
-    node identity) vs. `Heuristic` (bare-name, case-insensitive or substring match).
+    node identity), `Heuristic` (bare-name, case-insensitive or substring match) and
+    `Ambiguous` (several candidates tied; one edge per candidate).
     `ContractEdge.confidence` carries it; `MarkdownFormatter` and `GraphRenderer` surface it
     so an agent can weigh a result instead of treating every edge as fact.
   - `CanonicalMethodId::new(package, service, method)` → `package.Service/Method`,
@@ -38,17 +39,23 @@ by every MCP tool.
 - **Graph engine**: [`crates/mesh-core/src/contracts.rs`](../../../crates/mesh-core/src/contracts.rs)
   - build: `add_node`, `add_edge`, `add_dependency`, `add_producer`, `add_consumer`, `add_rpc_call`
   - maintain: `patch_file`, `patch_files`, `reconcile_edges`
-  - query: `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_symbols`,
-    `get_nodes_for_file`, `get_node`, `all_nodes`, `all_edges`, `node_count`, `edge_count`
-  - results borrow: `GrpcTrace<'g>`, `ImpactFlow<'g>` hold `Vec<&'g ContractNode>`
+  - query: `find_dependents`, `analyze_grpc`, `analyze_impact`, `analyze_impact_with_depth`,
+    `impact_matrix`, `search_symbols`, `get_nodes_for_file`, `get_node`, `all_nodes`,
+    `all_edges`, `node_count`, `edge_count`
+  - determinism: `canonical_lines`, `canonical_lines_rooted`, `fingerprint` (backs
+    `mesh-mcp graph --format fingerprint` and `scripts/determinism.sh`)
+  - results borrow: `GrpcTrace<'g>` (`(&'g ContractNode, EdgeConfidence)` pairs),
+    `ImpactFlow<'g>`, `ImpactMatrix<'g>` / `ImpactRow<'g>`
 - **Snapshot / state**: [`crates/mesh-core/src/state.rs`](../../../crates/mesh-core/src/state.rs)
-  - `MeshSnapshot { contract_graph, doc_index, property_registry, generation }`
-  - `AppState { config, allowed_roots, governance, snapshot: ArcSwap<MeshSnapshot>, audit, rescan, vfs, reload_pending }`
+  - `MeshSnapshot { contract_graph, doc_index, property_registry, generation, health, roots, .. }`
+  - `AppState { config, allowed_roots, governance, snapshot: ArcSwap<MeshSnapshot>, audit, rescan,
+    vfs, reload_pending, pending_reload_paths, reload_lock, search_cache, index_cache }`
   - read: `state.snapshot()`; publish: `state.install_snapshot(snap)`; mutate-a-copy: `state.snapshot_clone()`
 - **Who builds it**: [`crates/mesh-server/src/indexer.rs`](../../../crates/mesh-server/src/indexer.rs) —
   see [`mesh-indexing-pipeline`](../mesh-indexing-pipeline/SKILL.md)
 - **Rendering**: [`crates/mesh-parsers/src/graph.rs`](../../../crates/mesh-parsers/src/graph.rs)
-  (`GraphRenderer::to_mermaid` / `to_json` / `to_html`, `WebGraphPayload`)
+  (`GraphRenderer::to_mermaid` / `to_json` / `to_html`, `WebGraphPayload`) and
+  `crates/mesh-parsers/src/topology.rs` (per-service aggregated view behind `visualize_mesh`)
 
 ---
 
@@ -64,6 +71,11 @@ pub struct AppState {
     pub rescan: Arc<BackgroundRescanEngine>,
     pub vfs: Mutex<DifferentialVfs>,
     pub reload_pending: AtomicBool,
+    pub pending_reload_paths: Mutex<Vec<PathBuf>>,
+    pub reload_lock: Mutex<()>,
+    pub search_cache: SearchCache,
+    pub index_cache: OnceLock<PersistentIndexCache>,
+    // ...
 }
 ```
 
@@ -92,13 +104,13 @@ never mutate a snapshot that has been installed.
 ## 3. Indices: what exists and what it is keyed by
 
 ```rust
-nodes: HashMap<NodeId, ContractNode>,
+nodes: BTreeMap<NodeId, ContractNode>,   // BTreeMap: iteration order must not depend on a random hasher
 edges: Vec<ContractEdge>,
 
 name_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
 package_to_nodes: HashMap<CompactStr, Vec<NodeId>>,
 file_to_nodes: HashMap<FilePath, Vec<NodeId>>,
-fqcn_to_node: HashMap<CompactStr, NodeId>,
+fqcn_to_node: HashMap<CompactStr, Vec<NodeId>>,   // several nodes may share an FQCN
 reverse_deps: HashMap<CompactStr, Vec<NodeId>>,
 topic_producers: HashMap<CompactStr, Vec<NodeId>>,
 topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
@@ -119,37 +131,42 @@ leaks stale `NodeId`s.
 
 ## 4. `reconcile_edges`: one pass, after the whole fold
 
-Run exactly once per snapshot, after every `FileIndex` has been applied. Five stages, in
-order, per its doc comment:
+Run exactly once per snapshot, after every `FileIndex` has been applied. It **clears
+`self.edges` and rebuilds every edge** from the raw fact indices (`reverse_deps`,
+`topic_producers`, `topic_consumers`, `rpc_calls`, node kinds), which `patch_files` keeps
+current. That is what makes an incremental reload converge to the same graph as a full
+rebuild (`derive(derive(g)) == derive(g)`): an unchanged file's edge to a re-indexed target is
+recomputed, never left stale. Five stages, in order:
 
-1. Resolve or drop placeholder import edges. `add_dependency` pushes an `Imports` edge
-   with `to: 0` and the import string in `metadata`; reconcile resolves it via
-   `resolve_import_target(from, target)` and **drops** it when unresolvable — that is how
-   external packages like `@nestjs/common` disappear instead of pointing at node 0. The
-   resolved edge's `confidence` comes from which strategy matched (see below).
+1. Imports: `add_dependency` only records the fact in `reverse_deps`. Reconcile resolves every
+   (target, importer) pair, sorted, via `resolve_import_targets` (memoized per target and
+   importer repo) and emits one `Imports` edge per winner, or one `Ambiguous` edge per tied
+   candidate; an unresolvable target (an external package such as `@nestjs/common`) produces
+   no edge.
 2. & 3. Topic hubs and dispatch: for each key in `topic_producers ∪ topic_consumers`, find or
    synthesise the hub node, then wire `Produces` (`producer -> topic`) / `Consumes`
    (`topic -> consumer`), both tagged `Exact` (they derive from producer/consumer
    registration, not name matching). **`DispatchesTo` is no longer generated here** — it used
    to materialize one direct edge per `(producer, consumer)` pair, which is
    `O(producers * consumers)` per topic (a 50×50 hub topic alone produced 2,500 edges,
-   growing with the square — see ROADMAP item 11). The same information is available via the
-   two-hop `producer -> topic -> consumer` walk through `Produces`/`Consumes`, which is what
-   `analyze_impact` already reads directly from `topic_producers`/`topic_consumers`, not from
-   edges. Do not resurrect direct dispatch edges without a cap; if you need them, bound the
+   growing with the square). The same information is available via the
+   two-hop `producer -> topic -> consumer` walk through `Produces`/`Consumes`. Note the
+   direction when traversing: `Consumes` edges point topic → consumer
+   (`analyze_impact_with_depth` follows whichever end is new, fixed in plan 4 step 4.6a). Do not resurrect direct dispatch edges without a cap; if you need them, bound the
    pair count per topic and document the behaviour at the limit.
 4. `Implements`: service handlers to their protobuf RPC declarations, tagged `Exact` for an
    FQCN match, `Heuristic` for a case-insensitive/PascalCase/substring match.
-5. `CallsRpc`: client call sites to proto methods, same confidence split as above.
+5. `CallsRpc`: client call sites to proto methods (`resolve_rpc_target`), same confidence split;
+   `grpc.health.v1.Health` is filtered as infrastructure.
 
-De-duplication is a set, seeded once from the existing edges:
+De-duplication is a set, started empty after the clear:
 
 ```rust
-let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> =
-    self.edges.iter().map(|e| (e.from, e.to, e.kind)).collect();
+self.edges.clear();
+let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
 ```
 
-`resolve_import_target` tries, in order: (1) a fully-qualified name — Java `a.b.C`, Rust
+`resolve_import_targets` tries, in order: (1) a fully-qualified name — Java `a.b.C`, Rust
 `a::b::C`, or `package/Name` — split via `split_fully_qualified` and matched against an
 package+name pair or `fqcn_to_node`, tagged `Exact`; (2) an exact bare name hit in
 `name_to_nodes`, tagged `Heuristic` (two unrelated types sharing a bare name would collide);
@@ -190,7 +207,8 @@ pub fn patch_files<'a>(&mut self, file_paths: impl IntoIterator<Item = &'a Path>
 Collects the stale `NodeId`s from `file_to_nodes` for every given path and removes them
 from all the secondary indices in a single pass, instead of one full `retain` sweep per
 file. `patch_file` is the single-path wrapper. Call it for changed **and** deleted files
-before folding the new fragments in — `WorkspaceIndexer::reload` does exactly that.
+before folding the new fragments in — `WorkspaceIndexer::apply_incremental` (behind both
+`reload` and `reload_paths`) does exactly that.
 
 ---
 
@@ -215,8 +233,12 @@ before folding the new fragments in — `WorkspaceIndexer::reload` does exactly 
   `Implements`/`CallsRpc` graph edge to the proto definition below, never by path alone
   (a directory merely named `*service` is not evidence of anything on its own — every
   service in a typical microservices repo satisfies it).
-- `analyze_impact(target)` — `ImpactFlow<'_>` with `upstream_producers`, `topics`,
-  `downstream_consumers`, `related_sagas`.
+- `analyze_impact(target)` / `analyze_impact_with_depth(target, depth)` — `ImpactFlow<'_>` with
+  `upstream_producers`, `topics`, `downstream_consumers`, `related_sagas`.
+- `impact_matrix(target, depth)` — `ImpactMatrix<'_>` behind the `analyze_impact` MCP tool: gRPC
+  handlers/clients (through `Implements`/`CallsRpc`) plus the async flow, one `ImpactRow` per
+  element, classified `EXTERNAL`/`INTERNAL` against the contract's owner roots, deduplicated and
+  totally ordered. Rules in `docs/mcp-tools.md` (Tool 4).
 - `search_symbols(query, scope_filter)` — exact-name fast path through `name_to_nodes`
   first, then a substring walk restricted to files under `scope_filter` via
   `file_to_nodes`, de-duplicated with a `HashSet<NodeId>`, exact hits first. Case
@@ -230,7 +252,8 @@ nodes to escape a lifetime.
 
 ## 7. Invariants
 
-1. One `reconcile_edges` per snapshot, after the fold. Never per file.
+1. One `reconcile_edges` per snapshot, after the fold. Never per file. It rebuilds all edges;
+   never add an edge outside it that it would not recompute.
 2. Every index is populated in `add_node` and purged in `patch_files`.
 3. No linear scan over `nodes` or `edges` in a query or in reconcile.
 4. `NodeId` is not stable across generations — resolve by name, package or file.

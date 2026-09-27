@@ -3,14 +3,15 @@ name: mesh-parser-engineering
 description: >-
   Use when adding a language to MeshMCP, writing or changing a tree-sitter extractor,
   touching AST decapitation, or changing the AstGuard limits. Covers LanguageKind,
-  with_parser, bounded queries and the extractor contract.
+  parse_with / with_parser, bounded queries and the extractor contract.
 ---
 
 # MeshMCP Parser Engineering Skill
 
-Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today:
-Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, Ruby, PHP,
-Swift, Scala, plus Protobuf and YAML handled without tree-sitter.
+Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today, all
+through tree-sitter: Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#,
+Ruby, PHP, Swift, Scala and Protobuf (`tree-sitter-proto`). YAML (OpenAPI / AsyncAPI specs,
+Spring properties) is handled without tree-sitter (`spec_shape.rs`, `mesh_core::yaml_stream`).
 
 ---
 
@@ -19,20 +20,27 @@ Swift, Scala, plus Protobuf and YAML handled without tree-sitter.
 - **Safety guard**: [`crates/mesh-parsers/src/guard.rs`](../../../crates/mesh-parsers/src/guard.rs)
   - constants: `MAX_FILE_SIZE_BYTES = 384 * 1024`, `MAX_SCHEMA_FILE_SIZE_BYTES = 1536 * 1024`,
     `BINARY_SNIFF_LEN = 4096`, `MAX_LINE_LEN_BYTES = 1024`, `MAX_NESTING_DEPTH = 64`,
-    `PARSER_TIMEOUT_MICROS = 15_000`, `QUERY_MATCH_LIMIT = 500`, `MAX_QUERY_STEPS = 10_000`
+    `INDEX_PARSE_TIMEOUT_MICROS = 2_000_000` (indexing), `QUERY_PARSE_TIMEOUT_MICROS = 500_000`
+    (on-demand decapitation), `QUERY_MATCH_LIMIT = 500`, `MAX_QUERY_STEPS = 10_000`
   - `is_contract_or_schema()`, `size_budget()`, `within_size_budget()`, `looks_binary()`
   - `should_parse_path()`, `should_parse()`, `should_parse_with_budget()`, `max_nesting_depth()`
-  - `with_parser()` — thread-local parser cache, the normal path
-  - `create_bounded_parser()` — the constructor behind it; `verify_all_parsers()`
+  - `parse_with(lang, content, timeout_micros, |tree| ..) -> ParseOutcome<R>` — the indexing
+    path: thread-local parser cache, per-call timeout, and a distinct `ParseFailed` outcome
+    (vs `NoGrammar` / `Parsed(R)`) so failures are counted, never folded as empty
+  - `with_parser()` — thread-local parser cache used by on-demand decapitation
+  - `create_bounded_parser()` — the constructor behind both; `verify_all_parsers()`
   - `execute_bounded_query()`, `BoundedMatch<'tree>`, `ParserError`
 - **Language kinds & decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](../../../crates/mesh-parsers/src/decapitate.rs)
   - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Yaml, Unknown }`
   - `LanguageKind::TREE_SITTER_COUNT`, `as_str()`, `language()`, `from_path()`, `tree_sitter_slot()`
-  - `AstDecapitator::decapitate_auto()`, `::decapitate()`, `BOUNDED_ERROR_STUB`
+  - `AstDecapitator::decapitate_auto()`, `::decapitate_auto_mapped()` (keeps original line
+    numbers), `::decapitate()`, `BOUNDED_ERROR_STUB`
 - **Extraction dispatch**: [`crates/mesh-parsers/src/languages/mod.rs`](../../../crates/mesh-parsers/src/languages/mod.rs)
-  - `PolyglotIndexer::extract()`, `::extract_custom_patterns()`, `::index_file()`, `::apply_custom_patterns()`
-  - `FileIndex`, `CompiledPattern`
-- **Extractors**: [`proto.rs`](../../../crates/mesh-parsers/src/languages/proto.rs) (no tree-sitter),
+  - `PolyglotIndexer::extract_with_config()` (the production path), `::extract()` (default
+    config), `::extract_custom_patterns()`, `::index_file()`, `::apply_custom_patterns()`
+  - `FileIndex` (incl. `parse_failed`), `CompiledPattern`, `ExtractConfig`
+- **Extractors**: [`proto.rs`](../../../crates/mesh-parsers/src/languages/proto.rs) (also the wire-format
+  compatibility rules used by `analyze_grpc`, `wire_types_compatible`),
   [`java.rs`](../../../crates/mesh-parsers/src/languages/java.rs),
   [`go.rs`](../../../crates/mesh-parsers/src/languages/go.rs),
   [`python.rs`](../../../crates/mesh-parsers/src/languages/python.rs),
@@ -50,32 +58,39 @@ Swift, Scala, plus Protobuf and YAML handled without tree-sitter.
 
 ## 2. The extractor contract
 
-An extractor is a pure function that returns nodes; it never sees the graph.
+An extractor is a pure function over an already-parsed tree; it never sees the graph.
 
 ```rust
 pub fn extract(
     file_path: &Path,
     content: &str,
     repo_id: RepoId,
-    parser: &mut Parser,
+    tree: &Tree,
 ) -> Vec<ContractNode> {
     let file_path: FilePath = Arc::from(file_path);
     ...
 }
 ```
 
-Interning the path **once** per file into a `FilePath = Arc<Path>` and cloning the `Arc`
-per node is mandatory (Commandment 1). `proto.rs` is the exception to the signature: it
-takes no `Parser` because Protobuf is handled without a tree-sitter grammar.
+Richer extractors also return relations (`extract_with_relations`, `extract_relations`,
+`extract_index`, `extract_file_index`, depending on the language). Interning the path **once**
+per file into a `FilePath = Arc<Path>` and cloning the `Arc` per node is mandatory
+(Commandment 1).
 
-`PolyglotIndexer::extract` wraps each extractor and folds the result into a `FileIndex`:
+`PolyglotIndexer::extract_with_config` parses once per file through the `parsed!` macro
+(`AstGuard::parse_with` at `INDEX_PARSE_TIMEOUT_MICROS`, setting `out.parse_failed` on a real
+failure) and folds the result into a `FileIndex`:
 
 ```rust
-LanguageKind::Cpp => {
-    if let Some(nodes) = AstGuard::with_parser(lang_kind, |parser| {
-        cpp::CppExtractor::extract(file_path, content, repo_id, parser)
+LanguageKind::Go => {
+    if let Some((nodes, relations)) = parsed!(|tree| {
+        go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree)
     }) {
         out.nodes = nodes;
+        out.dependencies = relations.dependencies;
+        out.producers = relations.producers;
+        out.consumers = relations.consumers;
+        out.rpc_calls = relations.rpc_calls;
     }
 }
 ```
@@ -90,20 +105,29 @@ This is what allows extraction to run in parallel — see
 ## 3. Parsers are cached per thread
 
 ```rust
-pub fn with_parser<R>(lang_kind: LanguageKind, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
+pub fn parse_with<R>(
+    lang_kind: LanguageKind,
+    content: &str,
+    timeout_micros: u64,
+    f: impl FnOnce(&tree_sitter::Tree) -> R,
+) -> ParseOutcome<R> {
     thread_local! {
-        static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
-            const { RefCell::new([None, None, None, None, None, None, None, None]) };
+        static INDEX_PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
+            const { RefCell::new([ None, None, /* ... one per slot, 13 today */ ]) };
     }
     ...
 }
 ```
 
+`with_parser` has the same shape with its own `PARSERS` array, for on-demand decapitation.
+
 `Parser::new` + `set_language` is C-FFI allocation plus grammar binding; recreating one
 per file on a large workspace is pure overhead. Rayon workers and the tokio blocking pool
 each keep their own instance, so no locking is needed. `with_parser` returns `None` for a
-language with no grammar, and calls `parser.reset()` after `f`, because a timed-out parse
-leaves the parser mid-state.
+language with no grammar (`parse_with` returns `NoGrammar`), and both call `parser.reset()`
+after use, because a timed-out parse leaves the parser mid-state. Never share one timeout
+constant between indexing and decapitation (CLAUDE.md, Commandment 2): a short wall-clock
+timeout on the indexing path made outcomes depend on CPU contention.
 
 **Do not call `create_bounded_parser` on the indexing path.** It is the constructor
 `with_parser` uses, and is appropriate only for one-off checks like `verify_all_parsers`,
@@ -118,8 +142,8 @@ graph TD
     A[Add tree-sitter grammar to mesh-parsers/Cargo.toml] --> B[Add LanguageKind variant]
     B --> C[as_str, language, tree_sitter_slot, TREE_SITTER_COUNT]
     C --> D[from_path: register the extensions]
-    D --> E[languages/newlang.rs: extract -> Vec<ContractNode>]
-    E --> F[PolyglotIndexer::extract: add the match arm]
+    D --> E[languages/newlang.rs: extract over &Tree]
+    E --> F[PolyglotIndexer::extract_with_config: add the match arm]
     F --> G[AstDecapitator: body replacement rule]
     G --> H[verify_all_parsers + tests + clippy]
 ```
@@ -131,9 +155,9 @@ exactly this change set.
 
 **Step 2.** Add the variant to `LanguageKind` in `decapitate.rs` and update, in the same
 file, all four of: `as_str()` (a `&'static str`, never `format!("{:?}").to_lowercase()`),
-`language()`, `tree_sitter_slot()` and the `TREE_SITTER_COUNT` constant. The thread-local
-array is sized by `TREE_SITTER_COUNT` and initialised with one `None` per slot — both must
-grow together or you will index out of bounds.
+`language()`, `tree_sitter_slot()` and the `TREE_SITTER_COUNT` constant. The two thread-local
+arrays in `guard.rs` (`PARSERS`, `INDEX_PARSERS`) are sized by `TREE_SITTER_COUNT` and
+initialised with one `None` per slot — all must grow together or you will index out of bounds.
 
 **Step 3.** Register the extensions in `LanguageKind::from_path`, which matches on
 suffixes. For reference, `Cpp` claims `.cpp .cc .cxx .hpp .hh .hxx .h`, and `TypeScript`
@@ -143,8 +167,9 @@ claims `.ts .tsx .js`. Order matters where suffixes overlap.
 following the contract in section 2, and add `pub mod <lang>;` at the top of
 `languages/mod.rs`.
 
-**Step 5.** Add the arm in `PolyglotIndexer::extract` wrapping the call in
-`AstGuard::with_parser`.
+**Step 5.** Add the arm in `PolyglotIndexer::extract_with_config`, calling the extractor
+inside `parsed!(|tree| ...)`, and copy every relation it returns into `out.dependencies`,
+`out.producers`, `out.consumers`, `out.rpc_calls`.
 
 **Step 6.** Add the body replacement rule in `AstDecapitator`, so signatures survive and
 implementations do not.
@@ -154,7 +179,8 @@ relies on, and write a unit test asserting that a body is stripped while the sig
 annotations and docstrings remain.
 
 No change is needed in `crates/mesh-server/src/indexer.rs`: `process_file`'s `_` arm
-already routes any unrecognised extension to `PolyglotIndexer::extract`. Do check
+already routes any unrecognised extension to `PolyglotIndexer::extract_with_config` (through
+the parse cache). Do check
 `FileWatcherService::is_relevant_path` so edits to the new extension trigger a reload.
 
 ---
@@ -221,9 +247,11 @@ An empty `replacements` vector short-circuits to `content.to_string()`.
    touched, because a deeply nested payload overflows the native stack and kills the
    process. `max_nesting_depth` is context-aware: brackets inside strings and comments do
    not count, and there is a test pinning that.
-3. **C-FFI timeout.** `create_bounded_parser` sets
-   `parser.set_timeout_micros(Self::PARSER_TIMEOUT_MICROS)` (15 ms) on construction, so
-   every parser obtained through `with_parser` is already bounded.
+3. **C-FFI timeout.** `create_bounded_parser` sets `QUERY_PARSE_TIMEOUT_MICROS` (500 ms) on
+   construction, so every parser from `with_parser` is bounded; `parse_with` sets the caller's
+   budget before each parse (`INDEX_PARSE_TIMEOUT_MICROS`, 2 s, for indexing — a hang guard,
+   not a performance target). An indexing failure is `ParseOutcome::ParseFailed`, retried once
+   sequentially by `WorkspaceIndexer`, then counted in `IndexHealth`.
 4. **Bounded queries.** `execute_bounded_query` sets
    `cursor.set_match_limit(Self::QUERY_MATCH_LIMIT)` (500) and additionally counts
    iterations, breaking at `MAX_QUERY_STEPS` (10 000) with a `mesh::parser` warning. Never

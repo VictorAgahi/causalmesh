@@ -17,12 +17,13 @@ Six tools are exposed over MCP: `smart_search`, `find_dependents`, `analyze_grpc
 ## 1. Quick Navigation & Codebase References
 
 - **Trait and registry**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
-  - `McpTool { NAME, DESCRIPTION, Args, meta(), subject(), mutates(), run() }`
+  - `McpTool { NAME, DESCRIPTION, Args, meta(), run(), truncation_hint(), subject(), mutates(), returns_document() }`
   - `ToolOutput { text, files_accessed, secrets_redacted }`, `ToolOutput::text()`
   - `ToolError = (i32, String)`, `GOVERNANCE_BLOCKED_CODE = -32001`
   - `ToolRegistry::list_tools()` (built once in a `LazyLock`), `::describe::<T>()`
-  - `ToolRegistry::call_tool()` (dispatch by name), `::invoke::<T>()` (parse, governance gate,
-    `spawn_blocking`, audit, skill hint)
+  - `ToolRegistry::call_tool()` (dispatch by name; turns a tool's `Err` into an `isError`
+    result), `::is_known_tool()`, `::invoke::<T>()` (parse, governance gate, `spawn_blocking`,
+    skill and Git notes, 48 KB cap, audit + latency)
 - **Reference implementations**: [`smart_search.rs`](../../../crates/mesh-server/src/tools/smart_search.rs)
   (scope validation, index-first lookup, snippet budget), [`find_dependents.rs`](../../../crates/mesh-server/src/tools/find_dependents.rs)
   (the minimal shape), [`search_docs.rs`](../../../crates/mesh-server/src/tools/search_docs.rs),
@@ -30,7 +31,8 @@ Six tools are exposed over MCP: `smart_search`, `find_dependents`, `analyze_grpc
   [`analyze_impact.rs`](../../../crates/mesh-server/src/tools/analyze_impact.rs),
   [`visualize_mesh.rs`](../../../crates/mesh-server/src/tools/visualize_mesh.rs)
 - **Output rendering**: [`crates/mesh-parsers/src/markdown.rs`](../../../crates/mesh-parsers/src/markdown.rs)
-  - `MAX_OUTPUT_BYTES = 48 * 1024`, `MarkdownFormatter::format_*`, `SearchResult`
+  - `MAX_OUTPUT_BYTES = 48 * 1024`, `NON_RESULT_RESERVE_BYTES`, `MarkdownFormatter::format_*`,
+    `SearchResult`, `SearchPage`
 - **JSON-RPC surface**: [`crates/mesh-server/src/lib.rs`](../../../crates/mesh-server/src/lib.rs)
   (`tools/list`, `tools/call`) and [`crates/mesh-server/src/protocol.rs`](../../../crates/mesh-server/src/protocol.rs) (`RequestMeta`)
 - **Audit**: [`crates/mesh-core/src/audit.rs`](../../../crates/mesh-core/src/audit.rs) (`AuditLogger::record_entry`)
@@ -50,8 +52,10 @@ pub trait McpTool {
     fn meta(args: &Self::Args) -> Option<&RequestMeta>;
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError>;
 
+    fn truncation_hint(_args: &Self::Args, _state: &AppState) -> Option<String> { None }
     fn subject(_args: &Self::Args) -> Option<&str> { None }
     fn mutates(_args: &Self::Args) -> bool { false }
+    fn returns_document(_args: &Self::Args) -> bool { false }
 }
 ```
 
@@ -65,17 +69,22 @@ matching:
 
 ```rust
 fn subject(args: &Self::Args) -> Option<&str> {
-    Some(args.scope.as_str())   // smart_search
+    Some(args.scope.as_deref().unwrap_or(GLOBAL_SCOPE_LABEL))   // smart_search
 }
 ```
+
+`truncation_hint` supplies the narrowing advice appended when the output still exceeds 48 KB.
+`returns_document` is `true` for outputs that must stay parseable (`visualize_mesh` JSON/HTML):
+no note is inserted into them.
 
 `mutates` defaults to `false`. Every shipped tool is read-only and leaves it there. If your
 tool actually changes something on disk or in a downstream system, override it — `true`
 routes the call through the RSAH governance check (`state.governance.evaluate_guard(subject)`)
-before `run` executes, and a hit short-circuits with `GOVERNANCE_BLOCKED_CODE` (`-32001`)
-instead of running the tool. Read-only tools must never override this to `true`: it would
-make inspecting a guarded scope (e.g. reading `proto-registry`) fail for no reason — see the
-comment in `smart_search.rs` explaining why it stays read-only-permitted.
+before `run` executes, whatever `read_governance_mode` says, and a hit short-circuits with
+`GOVERNANCE_BLOCKED_CODE` (`-32001`), surfaced as an `isError` result carrying the RSAH JSON.
+Read-only tools are checked only when `[engines.policy] read_governance_mode` is `audit_warn`
+(log) or `enforce_refusal` (refuse). Read-only tools must never override `mutates` to `true`:
+it would make inspecting a guarded scope fail under the default `allow_all`.
 
 ---
 
@@ -96,6 +105,12 @@ pub struct FindDependentsArgs {
     pub target: CompactStr,
 
     #[serde(default)]
+    #[schemars(with = "String", description = "Result granularity: 'symbol' (default) ... or 'package' ...")]
+    pub granularity: Option<CompactStr>,
+
+    #[serde(default)]
+    // Accepted for W3C trace propagation, hidden from `tools/list`.
+    #[schemars(skip)]
     pub _meta: Option<RequestMeta>,
 }
 ```
@@ -107,8 +122,11 @@ Rules for the args type, all load-bearing:
 - `CompactStr` fields need `#[schemars(with = "String")]`, otherwise the generated schema
   describes `compact_str`'s internals.
 - Optional arguments get `#[serde(default)]`.
-- Always carry `pub _meta: Option<RequestMeta>` and return it from `meta()`, or W3C
-  `traceparent` propagation into the audit row breaks for your tool.
+- Always carry `pub _meta: Option<RequestMeta>` with `#[schemars(skip)]` and return it from
+  `meta()`, or W3C `traceparent` propagation into the audit row breaks for your tool. It is
+  hidden from `tools/list` because the model cannot use it and it cost schema tokens.
+- Reject an invalid enum-like value explicitly (see `validate_granularity`) instead of falling
+  back silently to a default.
 - Put a concrete example inside every `description` — these strings are the agent's only
   documentation.
 
@@ -117,12 +135,14 @@ Rules for the args type, all load-bearing:
 ```rust
 impl McpTool for FindDependentsTool {
     const NAME: &'static str = "find_dependents";
-    const DESCRIPTION: &'static str = "Resolves in-memory O(1) reverse dependency graph across packages, shared modules, gRPC services, and event streams. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
+    const DESCRIPTION: &'static str = "Resolves the reverse dependency graph across packages, shared modules, gRPC services, and event streams — at symbol granularity by default, or one result per (repo, package) with granularity: 'package'. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
     type Args = FindDependentsArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> { args._meta.as_ref() }
 
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
+        // Simplified: the real `run` also validates `granularity`, dedups by package,
+        // and appends the not-indexed-files note for rejected files in scope.
         let snapshot = state.snapshot();
         let dependents = snapshot.contract_graph.find_dependents(args.target.as_str());
         // Label each result with the root it was crawled from — a raw
@@ -161,22 +181,34 @@ Three edits in `tools/mod.rs`, all required:
 1. `pub mod <name>;` and the `use` for the tool type.
 2. A `ToolRegistry::describe::<YourTool>()` line in the `list_tools()` `json!` array.
 3. A `YourTool::NAME => Self::invoke::<YourTool>(arguments, state).await?` arm in
-   `call_tool`. The fallthrough is `unknown => return Err((-32601, …))`.
+   `call_tool`, and the name in `is_known_tool` (checked before the "still indexing" gate).
+   The fallthrough is `unknown => return Err((-32602, "Unknown tool: …"))`, as the MCP spec
+   prescribes.
 
 Forgetting (2) makes the tool invisible to clients; forgetting (3) makes it advertised
 and un-callable. `test_list_tools_contains_all_tools` asserts the array length, so it
-will catch a missing entry in (2) — bump the expected count there.
+will catch a missing entry in (2) — bump the expected count there. Then document the schema in
+`docs/mcp-tools.md` under a `### Tool N: \`<name>\`` heading: `test_mcp_tools_md_schema_drift_check`
+fails if the documented properties differ from the advertised ones.
 
 ### Step 4 — errors
 
-`ToolError` is `(i32, String)` and the code goes on the wire. Use the JSON-RPC codes the
-rest of the server uses: `-32602` for invalid params, which is what
-`SecurityError::jsonrpc_code()` returns for every sandbox failure (Commandment 4), and
-`-32601` for unknown methods. Propagate scope failures verbatim:
+`ToolError` is `(i32, String)`. The code classifies the failure internally; `call_tool` sends
+every tool failure to the client as a successful JSON-RPC response whose `CallToolResult` has
+`isError: true` and the message as text (MCP 2024-11-05), so the agent can correct its call.
+Only an unknown tool name (`-32602`) and a failed tool task (`-32603`) are JSON-RPC errors.
+Use `-32602` for invalid params, which is what `SecurityError::jsonrpc_code()` returns for
+every sandbox failure (Commandment 4). Propagate scope failures verbatim, through
+`resolve_with_aliases` so `[workspace.mount_aliases]` and the `workspace_root` anchor apply:
 
 ```rust
-let validated_scope = ValidatedScope::resolve(args.scope.as_str(), &state.allowed_roots)
-    .map_err(|e| (e.jsonrpc_code(), e.to_string()))?;
+let validated_scope = ValidatedScope::resolve_with_aliases(
+    raw_scope,
+    &state.allowed_roots,
+    &state.config.workspace.mount_aliases,
+    state.config.workspace.resolved_workspace_root.as_deref(),
+)
+.map_err(|e| (e.jsonrpc_code(), e.to_string()))?;
 ```
 
 Any tool taking a path-like argument must resolve it through `ValidatedScope` before
@@ -189,7 +221,7 @@ touching the filesystem. Never pass a raw `&str` or `PathBuf` to a reader or cra
 `MAX_OUTPUT_BYTES = 48 * 1024` in `crates/mesh-parsers/src/markdown.rs`. Render through a
 `MarkdownFormatter::format_*` function rather than building Markdown in the tool: the
 formatter is where the budget and the truncation affordance live.
-`format_search_results` checks before appending each entry:
+`format_search_page` checks before appending each entry:
 
 ```rust
 if header.len() + body.len() + entry_str.len() > MAX_OUTPUT_BYTES - 1024 {
@@ -215,19 +247,26 @@ slicing a multi-byte line at a fixed byte index panics.
 
 You get these for free; do not reimplement them in the tool:
 
-- **Argument parsing** into `T::Args`, with `-32602` and the tool name on failure.
-- **Governance gate**: if `T::mutates(&args)` is `true` and `T::subject(&args)` matches a
-  configured stop rule, the call is refused with `GOVERNANCE_BLOCKED_CODE` (`-32001`) before
-  `run` is ever called. Skipped entirely for the default `mutates() -> false`.
+- **Argument parsing** into `T::Args`, with `-32602` and the tool name on failure (audited as
+  `ERROR`).
+- **Governance gate**: if `T::subject(&args)` matches a configured stop rule and either
+  `T::mutates(&args)` is `true` or `read_governance_mode` is `enforce_refusal`, the call is
+  refused with `GOVERNANCE_BLOCKED_CODE` (`-32001`) before `run` is called, and audited as
+  `ERROR`; under `audit_warn` a read is only logged.
 - **`spawn_blocking`**, so `run` may block.
-- **Skill hint**: on `Ok`, `state.governance.recommend_skill(T::NAME, T::subject(&args))`
-  is consulted and, when it matches, a `Project skill for this area` footer naming the
-  configured file is appended to `out.text`. Implement `subject()` so your tool
-  participates; leave it defaulted if the tool has no meaningful subject.
-- **Audit**: `state.audit.record_entry(...)` is called on the same blocking thread with
-  the tool name, the serialized args, `SUCCESS`/`ERROR`, `files_accessed` and
-  `secrets_redacted`. It is best-effort — a failed write is logged to `mesh::audit`, never
-  returned. Populate `files_accessed` and `secrets_redacted` on `ToolOutput` yourself;
+- **Notes at the top**: on `Ok` (and unless `returns_document`), a matching
+  `recommend_skill(T::NAME, T::subject(&args))` inserts a `Project skill for this area` note at
+  the start of `out.text`, and `FileWatcherService::git_operation_note` inserts a "Git operation
+  in progress" note while reloads are held. They are prepended so the 48 KB cut never removes a
+  tool's own trailing note (such as the not-indexed files note). Implement `subject()` so your
+  tool participates.
+- **48 KB cap**: output over `MAX_TOOL_OUTPUT_BYTES` is cut on a line boundary, an open code
+  fence is closed, and a note with `T::truncation_hint` (or a generic hint) is appended.
+- **Audit**: unless `cryptographic_audit_trail = false`, `state.audit.record_entry(...)` is
+  called on the same blocking thread with the tool name, the serialized args,
+  `SUCCESS`/`ERROR`, `files_accessed` and `secrets_redacted`, followed by
+  `record_tool_latency` (wall-clock of the whole call, read by `mesh-mcp stats`). It is
+  best-effort — a failed write is logged to `mesh::audit`, never returned. Populate `files_accessed` and `secrets_redacted` on `ToolOutput` yourself;
   the registry only forwards them. `ToolOutput::text()` leaves both empty.
 
 Because the whole args struct is serialized into the audit row, never put a secret or a

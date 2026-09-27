@@ -30,7 +30,7 @@ for the rendered output.
 
 `[engines.policy.skills]` maps a key to a skill file path. `ToolRegistry::invoke`
 (in [`crates/mesh-server/src/tools/mod.rs`](../../crates/mesh-server/src/tools/mod.rs))
-appends a `Project skill for this area` footer to the tool's output when
+prepends a `Project skill for this area` note to the tool's output when
 `GovernanceEngine::recommend_skill(tool, subject)` returns a path, so the agent calling
 the tool is pointed at the playbook before it acts.
 
@@ -49,11 +49,11 @@ Matching order, from `GovernanceEngine::recommend_skill` in
 
 1. Exact match on the MCP tool name (`McpTool::NAME`) wins outright.
 2. Otherwise the lowercased subject (`McpTool::subject(args)`) is searched for each key
-   as a substring, and the longest matching key wins — the same shape as
-   `[engines.policy.stop_rules]`.
-3. No key matches, or `subject()` returns `None`: no footer.
+   as a substring, and the longest matching key wins. (`[engines.policy.stop_rules]`
+   differ: `evaluate_guard` matches a key as a whole path segment.)
+3. No key matches, or `subject()` returns `None`: no note.
 
-The footer prints the path plus, when the file's frontmatter has one, its `description`
+The note prints the path plus, when the file's frontmatter has one, its `description`
 line (falling back to the first `# ` heading). Write descriptions that read as a
 one-line trigger, because that string is what the calling agent sees first.
 
@@ -72,6 +72,7 @@ after editing the table.
 - Every technical claim must be checkable in the code as it stands. No remembered APIs.
 - Code blocks are copied from the source, not reconstructed.
 - No invented numbers. Only constants that exist (`MAX_FILE_SIZE_BYTES`,
-  `PARSER_TIMEOUT_MICROS`, `MAX_OUTPUT_BYTES`, `DEBOUNCE_INTERVAL`, …) or a measurement
-  you took yourself and labelled as such.
+  `INDEX_PARSE_TIMEOUT_MICROS`, `MAX_OUTPUT_BYTES`, `DEFAULT_PAGE_BUDGET_BYTES`,
+  `DEBOUNCE_INTERVAL`, …) or a measurement recorded in `docs/quality.md` with its date,
+  platform and command.
 - Every relative link must resolve, and every symbol named must still exist.

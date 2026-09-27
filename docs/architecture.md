@@ -1,60 +1,62 @@
-# MeshMCP Systems Architecture & Engineering Deep Dive
+# MeshMCP Architecture
 
-## 1. High-Level Architectural Vision
+This document describes how MeshMCP is built: the crates, the snapshot model, the indexing
+pipeline and its guards, the path jail, the transport, the daemon, the parse cache, the Linux
+network sandbox and the audit trail. Statements here are checked against the code; measured
+figures are not repeated here and live in [`quality.md`](quality.md).
 
-MeshMCP is engineered as a local-first, low-latency, memory-efficient polyglot architecture mesh for AI coding agents. Unlike traditional language servers (LSP) or indexing daemons that load full Abstract Syntax Trees (AST) and heavy symbol tables into memory, MeshMCP operates on a **contract-first, zero-copy architecture**.
+## 1. Overview
 
-It addresses the fundamental cognitive thermodynamics problem of Large Language Models:
-- LLM attention mechanisms degrade quadratically or logarithmically when overwhelmed with implementation logic.
-- Cross-service dependencies in microservice architectures (Protobuf, gRPC, REST, Kafka) require relational visibility, not line-by-line function implementations.
+MeshMCP indexes the *contracts* of a workspace (declarations, imports, gRPC services and calls,
+event producers and consumers, HTTP endpoints, OpenAPI/AsyncAPI specs, Spring properties,
+Markdown sections) into an in-memory graph and answers MCP tool calls from it. It does not keep
+full syntax trees in memory: each file is parsed, its facts are extracted, and the tree is
+dropped.
 
 ```mermaid
 graph TD
-    subgraph Stdio Subsystem
-        Agent[AI Agent Client] <-->|JSON-RPC 2.0 Stdio| StdioActor[Stdio Actor BufWriter]
+    subgraph Transport
+        Agent[AI agent] <-->|JSON-RPC 2.0 over stdio| Proxy[mesh-mcp run]
+        Proxy <-->|Unix socket / named pipe| Daemon[meshd]
     end
 
-    subgraph Security Boundary
-        StdioActor --> ValidatedScope[ValidatedScope Jail]
-        ValidatedScope --> CaseFolding[APFS / NTFS Case Normalizer]
-        CaseFolding --> SymlinkGuard[Symlink Traversal Guard]
+    subgraph Query path
+        Daemon --> Registry[ToolRegistry: parse args, governance, spawn_blocking, audit]
+        Registry --> Jail[ValidatedScope jail]
+        Registry --> Snap[MeshSnapshot via ArcSwap]
+        Snap --> Graph[ContractGraph]
+        Snap --> Docs[DocIndex]
+        Snap --> Props[PropertyRegistry]
+        Registry --> Fmt[MarkdownFormatter, 48 KB cap]
     end
 
-    subgraph Core Engine mesh-core
-        SymlinkGuard --> Router[Tool Dispatcher]
-        Router --> State[Lock-Free AppState CoW]
-        State --> Graph[ContractGraph Reverse Index]
-        State --> Registry[PropertyRegistry Secret Redacted]
-        State --> Docs[DocIndex Sanitized ADRs]
-    end
-
-    subgraph Parser Engine mesh-parsers
-        Router --> AstGuard[AstGuard Limits & Timeouts]
-        AstGuard --> TreeSitter[Tree-sitter C-FFI budget-specific timeout]
-        TreeSitter --> Decapitator[Polyglot Decapitator]
-        Decapitator --> Markdown[Dense Markdown 48KB Formatter]
-    end
-
-    subgraph Background Subsystem
-        RayonPool[Rayon QoS Background Worker] -.->|Low-Priority Tier-2 Updates| State
+    subgraph Index path
+        Crawl[crawl roots] --> Guard[AstGuard limits]
+        Guard --> Parse[tree-sitter + extractors, Rayon]
+        Parse --> Fold[fold + reconcile_edges]
+        Fold -->|install_snapshot| Snap
+        Watch[file watcher + Git gate] -->|changed paths| Crawl
+        Cache[(per-workspace parse cache)] <--> Parse
     end
 ```
+
+`mesh-mcp run --standalone` runs the same query and index paths inside one process, without the
+daemon.
 
 ---
 
-## 2. Workspace Crate Topology
-
-MeshMCP is structured into four specialized crates to enforce strict separation of concerns, rapid incremental compilation, and modular security auditing:
+## 2. Crates
 
 ```
 crates/
-├── mesh-core/       # Pure domain logic, memory models, security jail, VFS, audit & state
-├── mesh-parsers/    # Tree-sitter C-FFI bindings, AST decapitators, and Markdown engine
-├── mesh-server/     # Tokio JSON-RPC stdio actor, MCP protocol framing, and UDS client proxy
-└── mesh-daemon/     # meshd background daemon, UDS server, multiplexer, single file watcher & idle watchdog
+├── mesh-core/       # graph, snapshot state, config, path jail, crawler, VFS, watcher,
+│                    # parse cache, audit, governance, YAML streaming, doc index, properties
+├── mesh-parsers/    # AstGuard, tree-sitter grammars, per-language extractors,
+│                    # AST decapitation, Markdown formatting, graph rendering
+├── mesh-server/     # `mesh-mcp` binary: JSON-RPC loop, MCP tools, indexer, CLI, daemon proxy
+└── mesh-daemon/     # `meshd` binary: socket / named-pipe server, idle watchdog, Linux sandbox
 ```
 
-### Dependency Hierarchy
 ```mermaid
 graph TD
     Daemon[mesh-daemon] --> Server[mesh-server]
@@ -65,187 +67,203 @@ graph TD
     Parsers --> Core
 ```
 
-- **`mesh-core`** depends only on core runtime utilities (`tokio`, `compact_str`, `arc-swap`, `dunce`, `ring`, `rayon`). It has zero Tree-sitter dependencies.
-- **`mesh-parsers`** handles all grammar evaluation, C-FFI bindings, and AST body stripping.
-- **`mesh-server`** implements the JSON-RPC actor model, CLI subcommands (`doctor`, `init`, `install-hooks`), and the transparent UDS client proxy.
-- **`mesh-daemon`** (`meshd`) maintains the long-lived in-memory architecture graph, differential VFS, single OS watcher, and serves multiple agent sessions concurrently over Unix Domain Sockets.
+`mesh-core` has no tree-sitter dependency. All grammar code is in `mesh-parsers`.
 
 ---
 
-## 3. Memory Model & Zero-Copy Hot Loop
+## 3. Memory and concurrency model
 
-In high-concurrency agent workflows where thousands of definitions are searched and cross-referenced, dynamic heap allocation is the primary bottleneck. MeshMCP enforces zero allocation in hot loops:
+### 3.1 Allocator and strings
+Both binaries use `mimalloc` as the global allocator (`#[global_allocator]` in
+`mesh-server/src/main.rs` and `mesh-daemon/src/main.rs`). Symbol names, packages and similar
+identifiers are `CompactStr` (`compact_str::CompactString`), which stores strings up to 24 bytes
+inline. A file path is interned once per file as `FilePath = Arc<Path>` and shared by every node
+declared in that file. `RepoId = u16` numbers the configured roots; `RepoId::MAX` marks synthetic
+cross-root nodes such as event-bus topic hubs.
 
-### 3.1 Global Allocator: `mimalloc`
-MeshMCP replaces the system allocator with Microsoft's `mimalloc`:
-```rust
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-```
-`mimalloc` provides thread-local free lists, eliminating lock contention when background Rayon worker threads allocate scratch buffers while the Stdio actor serves foreground MCP queries.
+### 3.2 One immutable snapshot
+Everything that changes at runtime lives in one immutable `MeshSnapshot`, published through an
+`ArcSwap`:
 
-### 3.2 String Interning: `CompactString`
-Identifiers, repository names, method signatures, and file sub-paths never use Rust's standard `String` (which incurs a 24-byte pointer/capacity/length heap allocation). Instead, MeshMCP uses `compact_str::CompactString`:
-- **Small String Optimization (SSO)**: Strings up to 24 bytes (on 64-bit systems) are stored completely on the stack with zero heap indirection.
-- **Cache Locality**: Vectors of `CompactString` retain sequential CPU cache line locality during iterations.
-
-### 3.3 Interned Repository Identifiers: `RepoId = u16`
-In a 50-repository to 65,000-repository workspace, mapping strings in graph nodes consumes significant memory and induces pointer chasing. MeshMCP interns repository names into a compact 16-bit integer:
-```rust
-pub type RepoId = u16;
-```
-All graph lookups index into flat arrays or contiguous maps indexed by `RepoId`, scaling seamlessly to 65,535 microservices and libraries.
-
-### 3.4 Lock-Free State Management via `ArcSwap<MeshSnapshot>`
-State updates never acquire mutexes or read-write locks in the query path. Everything that
-changes at runtime lives in **one** immutable snapshot, so a reader can never observe a new
-contract graph next to a stale doc index:
 ```rust
 pub struct MeshSnapshot {
     pub contract_graph: ContractGraph,
     pub doc_index: DocIndex,
     pub property_registry: PropertyRegistry,
     pub generation: u64,
-}
-
-pub struct AppState {
-    pub config: Arc<Config>,            // fixed for the process lifetime
-    pub allowed_roots: Arc<[PathBuf]>,  // fixed
-    pub governance: Arc<GovernanceEngine>,
-    pub snapshot: ArcSwap<MeshSnapshot>, // the only hot-swapped state
+    pub health: IndexHealth,
     // ...
 }
 ```
-Queries take an atomic `state.snapshot()` guard using pointer copying. Background rescans
-build an updated snapshot and publish it atomically via `install_snapshot()`, delivering
-**0ns lock contention** for agent queries.
+
+A query takes one `state.snapshot()` guard (an atomic pointer load, no lock) and reads from it for
+the whole request. A reload builds a new snapshot off to the side and publishes it with
+`install_snapshot()`, which increments `generation`. A reader therefore never sees a new graph
+next to a stale doc index, and readers never wait for writers. Writers are serialised by a
+`reload_lock`.
+
+### 3.3 Blocking work
+Tools do disk, tree-sitter and SQLite work, so `McpTool::run` is synchronous and
+`ToolRegistry::invoke` runs it on Tokio's blocking pool; the JSON-RPC loop and, in daemon mode,
+other clients keep being served meanwhile. Indexing runs on Rayon (section 8).
 
 ---
 
-## 4. The Security Boundary: `ValidatedScope` Jail
+## 4. Path jail: `ValidatedScope`
 
-AI coding agents are vulnerable to path traversal attacks, malicious symlinks in `node_modules`, and arbitrary filesystem reads. MeshMCP introduces the `ValidatedScope` newtype pattern.
+Every path that a tool receives (the `scope` of `smart_search`, a `.proto` path given to
+`analyze_grpc`) goes through `ValidatedScope::resolve_with_aliases`:
 
-### Resolution Protocol:
-1. **Lexical Clean**: Paths pass through `path_clean::clean()`.
-2. **Canonicalization**: The path is resolved via `dunce::canonicalize()` (which resolves Windows UNC paths safely and eliminates virtual directory segments).
-3. **Case Folding Normalization**: On macOS (APFS) and Windows (NTFS), case insensitivity can bypass string prefix checks (e.g., `/Users/REPO` vs `/users/repo`). MeshMCP canonicalizes paths to lowercase before boundary validation.
-4. **Boundary Prefix Check**: The resolved path must start with at least one configured root in `mesh-mcp.toml`.
-5. **Symlink Prohibition**: `follow_links(false)` is enforced across all filesystem crawlers (`ignore::WalkBuilder`). Any traversal targeting symlinks pointing outside the workspace jail immediately fails the tool call with an MCP tool error (`isError: true`), which the agent can read and correct.
+1. Unicode NFC normalisation of the input.
+2. Container path translation through `[workspace.mount_aliases]`, if configured.
+3. A relative path is anchored on the resolved `workspace_root` (then, if it does not exist
+   there, on the process working directory).
+4. `path_clean::clean`, then `dunce::canonicalize`, which resolves symlinks. A path that does not
+   exist fails here (`PathNotFound`).
+5. The canonical path must start with one of the configured roots. On macOS and Windows the
+   comparison is case-folded (case-insensitive file systems); on Linux it is not, because folding
+   would widen the jail.
+
+A failure is a `SecurityError`, classified `-32602` and returned to the client as a tool result
+with `isError: true` (MCP 2024-11-05: a failure inside a tool is not a protocol error), so the
+agent can correct the call. The crawler uses `ignore::WalkBuilder` with `follow_links(false)`,
+always excludes `.git`, and honours `.gitignore` and `exclude_patterns`, so a symlink pointing out
+of a root is never indexed.
+
+`smart_search` additionally treats an omitted `scope`, `"."`, `"*"` or the exact workspace root as
+"all configured roots"; any other ancestor of the roots is still rejected. See
+[`mcp-tools.md`](mcp-tools.md).
 
 ```mermaid
 graph TD
-    RawPath["Raw Scope Input: ../../etc/passwd"] --> Clean["path_clean::clean"]
-    Clean --> Dunce["dunce::canonicalize"]
-    Dunce --> Fold["Case-Fold APFS/NTFS to lowercase"]
-    Fold --> Check{"Prefix within allowed_roots?"}
-    Check -->|No| Err["Reject: tool error, isError: true"]
-    Check -->|Yes| Valid["ValidatedScope Instance Created"]
+    Raw["raw scope"] --> NFC["NFC + mount alias"]
+    NFC --> Anchor["anchor on workspace_root"]
+    Anchor --> Clean["path_clean + dunce::canonicalize"]
+    Clean --> Check{"under an allowed root?<br/>(case-folded on macOS/Windows)"}
+    Check -->|no| Err["isError: true (-32602)"]
+    Check -->|yes| Valid["ValidatedScope"]
 ```
 
 ---
 
-## 5. Tree-Sitter & AstGuard Pipeline
+## 5. Parser guards (`AstGuard`)
 
-Tree-sitter is a powerful incremental parsing framework, but raw C-FFI invocations can crash processes through stack overflows or ReDoS attacks. MeshMCP sandwiches Tree-sitter behind strict defensive bounds:
+### 5.1 Before tree-sitter
+`AstGuard` (`crates/mesh-parsers/src/guard.rs`) rejects, before the C parser is touched:
 
-### 5.1 Pre-Parsing Lexical Guards
-Before passing any file to a Tree-sitter parser:
-1. **Size Bound**: Files > 384 KB are immediately rejected.
-2. **Line Length Bound**: Lines exceeding 1,024 bytes (e.g., minified JS bundles) are rejected.
-3. **Binary Sniffing**: The first 4,096 bytes are scanned for null bytes (`0x00`). If detected, parsing halts.
-4. **Nesting Depth Check**: Quick lexical scanner checks brace/parenthesis nesting depth. Files with depth > 64 are rejected to prevent C stack exhaustion.
+1. **Size**, from `stat` only, before reading: more than 384 KB (`MAX_FILE_SIZE_BYTES`), or
+   1.5 MB (`MAX_SCHEMA_FILE_SIZE_BYTES`) for contracts and generated stubs (`.proto`, `.pb.go`,
+   `_pb2.py`, `openapi.yaml`, ...).
+2. **Binary content**: a null byte in the first 4,096 bytes.
+3. **Long lines**: any line over 1,024 bytes (minified bundles).
+4. **Nesting**: a bracket depth over 64, measured by a lexical scan that ignores strings and
+   comments, to avoid overflowing the native stack in the C parser.
 
-### 5.2 C-FFI Timeout
-The timeout is budget-specific, not one constant shared everywhere — the two call sites want
-opposite things from it:
+Markdown, YAML and `.properties` files get only the binary check, since prose legitimately has
+long lines. Every rejected file is recorded in `IndexHealth` (path, reason, size), reported by
+`mesh-mcp doctor`, and named in `smart_search` / `find_dependents` answers whose scope contains
+it (source files only), so the agent knows to read it directly.
 
-- **Indexing** (`AstGuard::parse_with`, used by `PolyglotIndexer` for every full scan and
-  incremental reload) sets `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` — **2 seconds**. This used to
-  be 15ms, measured against an uncontended parse; under real load (multiple Rayon workers
-  competing for CPU), that budget tripped on ordinary files, and *which* files tripped it
-  depended on scheduling — a source of the index-determinism failures `scripts/determinism.sh`
-  now guards against. 2s is a hang guard, not a performance target: the lexical pre-checks in
-  §5.1 already reject anything that could make a real parse run long, so reaching this budget
-  means a genuine parser bug or a pathological file that slipped past them, either way worth
-  surfacing rather than silently swallowing.
-- **On-demand decapitation** (`AstGuard::with_parser`, used by `smart_search`'s
-  `include_body: false` path) keeps `AstGuard::QUERY_PARSE_TIMEOUT_MICROS` — **500ms** — since it
-  runs synchronously on an agent's request and must stay responsive even against a pathological
-  file; failure here falls back to `AstDecapitator::BOUNDED_ERROR_STUB`, unrelated to indexing.
+### 5.2 Parse timeouts
+The timeout depends on the caller:
 
-A parse failure during indexing does not silently produce an empty result: `FileIndex::parse_failed`
-is set, `WorkspaceIndexer` retries once, sequentially, outside the contended parallel pool (a
-transient timeout under CPU contention rarely recurs alone), and a still-failing file is counted
-in `IndexHealth` — surfaced by `mesh-mcp doctor` and any tool output whose scan wasn't fully
-healthy — instead of being indistinguishable from a file that is legitimately empty.
+- **Indexing** (`AstGuard::parse_with`, used by `PolyglotIndexer` for full scans and reloads):
+  `INDEX_PARSE_TIMEOUT_MICROS` = 2 s. This is a hang guard, not a performance budget. It used to
+  be 15 ms; under CPU contention that budget tripped on ordinary files, and which files tripped
+  depended on scheduling, which made the index non-deterministic.
+- **On-demand decapitation** (`AstGuard::with_parser`, used by `smart_search` when rendering a
+  result): `QUERY_PARSE_TIMEOUT_MICROS` = 500 ms, because it runs on the agent's request path.
+  On failure the snippet falls back to `AstDecapitator::BOUNDED_ERROR_STUB`.
 
-### 5.3 Streaming ReDoS Limits
-AST query matches are executed with a hard step counter:
-- Cursor iterations are limited to $10,000$ steps per query.
-- Match results are capped at $500$ captures.
+An indexing parse failure is not treated as an empty file: `FileIndex::parse_failed` is set, the
+file is retried once sequentially outside the parallel pool, and a file that still fails is
+counted in `IndexHealth`. On a reload, the file's last known-good facts are kept.
 
----
+### 5.3 Query limits
+Tree-sitter queries run through `AstGuard::execute_bounded_query`: the cursor match limit is 500
+(`QUERY_MATCH_LIMIT`) and iteration stops after 10,000 steps (`MAX_QUERY_STEPS`).
 
-## 6. Polyglot AST Decapitation Engine
-
-When an agent searches for functions or classes using `smart_search`, MeshMCP strips all implementation bodies, preserving only signatures, parameters, return types, and docstrings.
-
-```mermaid
-graph TD
-    FullCode["Full Source File (1,500 lines)"] --> Parser["Tree-sitter Parser"]
-    Parser --> AST["Syntax Tree Root"]
-    AST --> Inspector["AstDecapitator Inspector"]
-    Inspector -->|Java| JavaRule["Strip block to /* stripped */"]
-    Inspector -->|Go| GoRule["Strip block to /* stripped */"]
-    Inspector -->|TypeScript| TSRule["Strip body to /* stripped */"]
-    Inspector -->|Rust| RustRule["Strip block to /* stripped */"]
-    Inspector -->|Python| PyRule["Strip body to ..."]
-    JavaRule --> Assembler["Decapitated Source Code (35 lines)"]
-    GoRule --> Assembler
-    TSRule --> Assembler
-    RustRule --> Assembler
-    PyRule --> Assembler
-```
-
-### Representative AST Decapitation By Language
-In typical service codebases, function bodies comprise 50% to 80% of lines. Decapitation strips internal loops, temporary variables, and private business logic while preserving public contracts:
-
-| Language | Original Source Snippet | Decapitated AST Representation | Preserved Contract Elements |
-| :--- | :--- | :--- | :--- |
-| **Java** | `public UserResponse getUser(UserId id) { ... 120 lines ... }` | `public UserResponse getUser(UserId id) { /* stripped */ }` | Method name, arguments, types, annotations |
-| **Go** | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { ... 85 lines ... }` | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { /* stripped */ }` | Receiver, function name, parameters, return types |
-| **TypeScript**| `const getBilling = async (id: string): Promise<Billing> => { ... 90 lines ... };` | `const getBilling = async (id: string): Promise<Billing> => { /* stripped */ };` | Const binding, arrow signature, async, return type |
-| **Python** | `def get_user(self, user_id: str) -> UserResponse: ... 60 lines ...` | `def get_user(self, user_id: str) -> UserResponse: ...` | Function name, self, type hints, return annotations |
-| **Rust** | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { ... 140 lines ... }` | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { /* stripped */ }` | Visibility, async fn, parameters, Result types |
+### 5.4 YAML and Markdown memory
+YAML is read event by event (`mesh_core::yaml_stream`, driving libyaml through `unsafe-libyaml`)
+rather than loaded as a whole document. Alias replay is charged to per-file budgets (events and
+replayed bytes, proportional to the file size), and flattened Spring properties to an output
+budget; a file over budget ingests nothing. Markdown is split into sections under a per-file
+memory budget. The measurements that motivated this are in `quality.md`, step 4.9.
 
 ---
 
-## 7. Stdio Framing & Actor Isolation
+## 6. AST decapitation
 
-The Model Context Protocol operates over standard input/output. Mixing `println!` or logging into `stdout` corrupts JSON-RPC framing and crashes the client.
+`smart_search` returns declarations with their implementation bodies replaced, so the agent sees
+signatures, parameters, return types, annotations and docstrings without the body:
 
-### Architecture:
-- **Zero Stdout Pollution**: MeshMCP's `main.rs` initializes `tracing_subscriber` targeting strictly `std::io::stderr`. Not a single `println!` exists in the codebase.
-- **Dedicated Tokio Actor**: A single background task holds exclusive write access to `tokio::io::BufWriter<tokio::io::Stdout>`.
-- **Bounded Channels**: Ingestion and egress channels are bounded to 64 frames. If an agent floods queries, backpressure prevents memory ballooning.
-- **Graceful EOF Termination**: When the parent process closes Stdin, the Stdio actor detects `Ok(0)`, broadcasts cancellation tokens, and shuts down within 50ms.
+| Language | Example output |
+| :--- | :--- |
+| Java | `public UserResponse getUser(UserId id) { /* stripped */ }` |
+| Go | `func (s *Server) GetUser(ctx context.Context, req *Req) (*Res, error) { /* stripped */ }` |
+| TypeScript | `async getBilling(id: string): Promise<Billing> { /* stripped */ }` |
+| Python | `def get_user(self, user_id: str) -> UserResponse:` + docstring + `...` |
+| Rust | `pub async fn get_user(&self, id: &UserId) -> Result<User, Error> { /* stripped */ }` |
+
+Bodies are replaced by byte range (`collect_body_replacements`, applied bottom-up), with a
+recursion depth cap equal to `MAX_NESTING_DEPTH`. Line numbers in results are original-file
+coordinates. `include_body: true` returns the full implementation for one result. Protobuf and
+YAML are returned as-is (they are declarations already). How much a given file shrinks depends
+entirely on how much of it is function bodies; no general percentage is claimed.
 
 ---
 
-## 8. Operating System Politeness & Rayon QoS
+## 7. Stdio transport
 
-Background indexing must never cause IDE keystroke stuttering or fan spin on developer laptops.
+- `stdout` is written only by the `StdioFramingActor` writer task, through one
+  `BufWriter<Stdout>`, one JSON-RPC frame per line, flushed after each frame. Logs go to stderr
+  through `tracing` (`main.rs` configures the subscriber with `std::io::stderr`).
+  `println!` appears only in CLI commands that do not run the JSON-RPC loop
+  (`mesh-mcp doctor --json`, `mesh-mcp graph`).
+- Reader and writer channels are bounded (`MPSC_BUFFER_CAPACITY` = 64 frames), so a client that
+  floods requests gets backpressure instead of unbounded memory growth.
+- When the client closes stdin, the loop drops its sender and awaits the writer task, so the last
+  response is flushed before the process exits.
+- Notifications (no `id`) never receive a reply. Methods: `initialize`, `ping`, `tools/list`,
+  `tools/call`; anything else is `-32601`.
+- In proxy mode, `mesh-mcp run` copies bytes between stdio and the daemon socket without adding
+  any. If the daemon dies mid-session the proxy exits with status 1 and logs the daemon log path;
+  if it cannot connect right after a successful liveness check it falls back to standalone mode.
 
-MeshMCP schedules Tier-2 background rescans on a dedicated Rayon thread pool configured with operating system quality-of-service throttling:
+---
 
-- **macOS (Darwin)**: Sets thread priority using `libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_BACKGROUND, 0)`. macOS kernel delegates these threads to high-efficiency cores (E-cores) and deprioritizes disk I/O.
-- **Linux**: Calls `libc::setpriority(libc::PRIO_PROCESS, 0, 10)` to yield CPU cycles to IDE and language server processes.
-- **Windows**: Calls `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)` followed by `SetThreadPriority(.., THREAD_MODE_BACKGROUND_BEGIN)` — the latter alone does not change what `GetThreadPriority` reports, so the former is set first to guarantee the thread genuinely runs below normal CPU priority, with I/O and memory priority also dropped.
+## 8. Background work, file watching, daemon and cache
 
-The daemon transport itself is also platform-specific: a Unix domain socket on macOS/Linux, a
-named pipe (`\\.\pipe\mesh-mcp-<user>`) on Windows, so `meshd` sharing across IDE windows works
-on every supported OS, not only Unix.
+### 8.0 Thread priority and file watching
+
+The boot scan runs on the global Rayon pool at normal priority (the user is waiting for it).
+Incremental reloads run on `BackgroundRescanEngine`, a dedicated Rayon pool whose threads lower
+their own priority:
+
+- **macOS**: `pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)`.
+- **Linux**: `setpriority(PRIO_PROCESS, 0, 10)`.
+- **Windows**: `SetThreadPriority(.., THREAD_PRIORITY_BELOW_NORMAL)`, then
+  `THREAD_MODE_BACKGROUND_BEGIN` (the latter alone does not change the reported CPU priority).
+
+The file watcher (`crates/mesh-core/src/watcher.rs`) debounces events for 150 ms, coalesces a
+burst into one queued reload, and hands the changed paths to `WorkspaceIndexer::reload_paths`,
+which re-reads only those files. A change under `.git/refs` or `HEAD`, a directory event, or a
+path whose parent directory is gone falls back to a full differential reload (crawl, then re-read
+only files whose size or mtime changed, confirmed by content hash).
+
+- **macOS** watches each root with one recursive FSEvents stream and applies `.gitignore` and
+  `exclude_patterns` to events in memory. `PollWatcher` (2 s) is used only for a root FSEvents
+  refuses (network or unsupported volume), with a warning.
+- **Linux and Windows** use per-directory watches, capped at `MAX_WATCHED_DIRS` (2,048) across
+  all roots, beyond which the watcher falls back to polling.
+- **Git operations.** For each root the watcher resolves the real Git directory (following
+  `gitdir:` for worktrees and submodules) and holds reloads while `index.lock`, `rebase-merge/`
+  or `rebase-apply/` exists or `HEAD` is moving, then installs one generation when the operation
+  has settled. A hold lasts at most 60 s; an `index.lock` older than 30 s with no `git` process
+  is treated as orphaned. While a hold is open, tool answers come immediately from the last
+  complete snapshot and start with a note naming its generation.
+
+The daemon transport is a Unix domain socket on macOS/Linux and a named pipe on Windows.
 
 ### 8.1 One `meshd` per workspace (P0 step 1.8)
 
@@ -257,8 +275,11 @@ response must always concern the workspace of the session that asked, never some
 
 Each `mesh-mcp run` invocation now discovers its config first, derives a `workspace_id` — the
 first 16 hex characters of SHA-256(canonical base directory + `CARGO_PKG_VERSION`) — and resolves
-its daemon at a socket scoped to that id: `~/.cache/mesh/meshd-<workspace_id>.sock` (or
-`\\.\pipe\mesh-mcp-<user>-<workspace_id>` on Windows). If no daemon is listening there yet,
+its daemon at a socket scoped to that id: `meshd-<workspace_id>.sock` under
+`$XDG_RUNTIME_DIR/mesh/` if set, else `~/.cache/mesh/` (`MESH_SOCKET_PATH` overrides both), or
+`\\.\pipe\mesh-mcp-<user>-<workspace_id>` on Windows. The socket is created `0600` in a `0700`
+directory. `meshd` also writes its version next to the socket, so `mesh-mcp run` warns when it
+connects to a daemon of another version and `mesh-mcp doctor --fix` can stop it. If no daemon is listening there yet,
 `mesh-mcp` spawns one with `--socket <that path>` and `.current_dir(<canonical base>)` explicitly
 — it never relies on inherited environment or an ambient default to land on the right workspace.
 Upgrading the binary changes `workspace_id` too, so a stale daemon from a previous version is
@@ -345,9 +366,11 @@ own so a container runtime's default filter does not pass for it).
 
 ---
 
-## 9. Cryptographic Audit Trail (SOC2 & EU AI Act)
+## 9. Audit trail
 
-For compliance under SOC2 Type II and EU AI Act Article 14 (human-in-the-loop oversight for automated systems), MeshMCP generates an append-only cryptographic audit trail:
+MeshMCP records every tool call in a local, append-only, hash-chained log. It is meant to give an
+operator or reviewer tamper-evident evidence of what an agent queried; it is not a certified
+compliance control, and a user with access to the file can delete it.
 
 - **Location**: `~/.cache/mesh-mcp/audit.db` (SQLite, WAL mode; the `.log` naming in older docs is
   historical — `default_log_path()` is an alias for `default_db_path()`).
@@ -363,4 +386,15 @@ For compliance under SOC2 Type II and EU AI Act Article 14 (human-in-the-loop ov
   in the same row — meaning those three fields could be altered without breaking chain
   verification. v2 closes that.
 
-An auditor or CI verification script can replay the log from genesis (`0000000000000000000000000000000000000000000000000000000000000000`). Any modified, inserted, or removed record breaks all subsequent SHA-256 signatures. `mesh-mcp stats` reads this same database read-only for local usage reporting — it never writes to it and nothing it computes leaves the machine.
+- **What is recorded**: successful calls, and also calls refused before running (invalid
+  arguments, RSAH refusals), with status `ERROR`. Arguments are stored and committed to the chain
+  through their SHA-256 digest. The whole trail can be turned off with
+  `[engines.policy] cryptographic_audit_trail = false`.
+- **Metrics tables** (`tool_call_metrics`, `index_cache_metrics`, `process_starts`) sit next to
+  the chained table, outside the hash chain; `mesh-mcp stats` reads them.
+
+`AuditLogger::verify_db` replays the chain from the genesis hash (64 zeros): a modified row, or an
+inserted or removed row in the middle of the chain, breaks every later link. Removing the most
+recent rows (truncating the tail) is not detectable from the file alone. `mesh-mcp doctor` runs
+the verification and reports a broken chain; `doctor --fix` never modifies the audit database.
+`mesh-mcp stats` opens it read-only, and nothing it computes leaves the machine.

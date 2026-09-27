@@ -99,47 +99,26 @@ would match an RPC by bare name. Keep the filter if you touch this stage.
 
 ---
 
-## 3. Event propagation and the `DispatchesTo` shortcut
+## 3. Event propagation through topic hubs
 
 ```mermaid
 graph TD
     Producer[services/billing: BillingService] -->|Produces| Topic[event-bus: payment.settled]
     Topic -->|Consumes| Analytics[services/analytics]
     Topic -->|Consumes| Worker[services/checkout-worker]
-    Producer -.->|DispatchesTo| Analytics
-    Producer -.->|DispatchesTo| Worker
 ```
 
 Stage 2/3 of `reconcile_edges` creates the hub node if no `EventStream` node named
-`topic_key` with package `event-bus` exists, wires `Produces` from each producer and
-`Consumes` to each consumer, and then — only when the topic has both sides — adds a direct
-`DispatchesTo` edge per producer/consumer pair, skipping `prod_id == cons_id`:
+`topic_key` with package `event-bus` exists, and wires `Produces` (producer → topic) and
+`Consumes` (topic → consumer). It no longer adds a direct `DispatchesTo` edge per
+producer/consumer pair: that was `O(producers × consumers)` per topic. The `EdgeKind`
+variant still exists for rendering. A producer-to-consumer question is the two-hop walk through
+the hub.
 
-```rust
-for &prod_id in producers {
-    for &cons_id in consumers {
-        if prod_id != cons_id
-            && edge_set.insert((prod_id, cons_id, EdgeKind::DispatchesTo))
-        {
-            self.edges.push(ContractEdge {
-                from: prod_id,
-                to: cons_id,
-                kind: EdgeKind::DispatchesTo,
-                metadata: Some(dispatch_meta.clone()),
-            });
-        }
-    }
-}
-```
-
-This stage is the one quadratic shape left in reconcile, bounded by producers × consumers
-of a single topic rather than by the whole edge list. A topic fanned out to thousands of
-consumers is the case to watch; the `edge_set` insert makes it idempotent, not cheap.
-
-There is **no severity scoring** in the graph. `analyze_impact` returns the four buckets
-(`upstream_producers`, `topics`, `downstream_consumers`, `related_sagas`) and the
-formatter renders them. Any "HIGH SEVERITY above N services" rule would be new behaviour,
-not existing behaviour.
+There is **no severity scoring** in the graph. `analyze_impact` (the MCP tool) renders
+`ContractGraph::impact_matrix`: one row per impacted element with `EXTERNAL`/`INTERNAL` scope
+and edge confidence (rules in `docs/mcp-tools.md`, Tool 4). Any "HIGH SEVERITY above N
+services" rule would be new behaviour, not existing behaviour.
 
 ---
 

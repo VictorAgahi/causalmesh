@@ -8,15 +8,17 @@ description: >-
 
 # MeshMCP Security & Governance Skill
 
-Four separate mechanisms, often confused with each other:
+Six separate mechanisms, often confused with each other:
 
 | Mechanism | Enforced where | Status |
 | --- | --- | --- |
-| `ValidatedScope` sandbox | every tool taking a path | enforced at runtime |
-| Secret redaction | `PropertyRegistry` at index time | enforced at runtime |
-| Audit chain (v2, 8-field) | `ToolRegistry::invoke` after every call, gated by `[engines.policy] cryptographic_audit_trail` | enforced at runtime |
-| RSAH governance refusal (`evaluate_guard`) | git pre-commit hook, **and** `ToolRegistry::invoke` before `run` — but only when `McpTool::mutates(&args)` is `true` | wired in both places; the in-server check is a no-op today because every shipped tool is read-only (`mutates()` defaults to `false` and no tool overrides it) |
-| `[engines.policy.skills]` hint (`recommend_skill`) | `ToolRegistry::invoke` | wired, see section 4 |
+| `ValidatedScope` jail | every tool taking a path | enforced at runtime |
+| Secret redaction | `PropertyRegistry` at index time, and `smart_search` snippet lines | enforced at runtime, key-name based |
+| Audit chain (v2, 8-field) | `ToolRegistry::invoke` after every call, including refused/invalid calls; gated by `[engines.policy] cryptographic_audit_trail` | enforced at runtime |
+| RSAH refusal (`evaluate_guard`) | `ToolRegistry::invoke` before `run`, when `McpTool::mutates(&args)` is `true` (no shipped tool) **or** `read_governance_mode = "enforce_refusal"`; `audit_warn` only logs | wired; inactive under the default `allow_all` |
+| Git pre-commit hook | `mesh-mcp install-hooks` → `.git/hooks/pre-commit`, built from `[engines.contracts.grpc] proto_dirs` (not from stop rules) | opt-in |
+| `meshd` network sandbox | `crates/mesh-daemon/src/sandbox.rs`, Linux seccomp after the socket is bound | enforced on Linux, best-effort unless `MESH_DAEMON_SANDBOX=required` |
+| `[engines.policy.skills]` note (`recommend_skill`) | `ToolRegistry::invoke` | wired, see section 4 |
 
 ---
 
@@ -35,7 +37,8 @@ Four separate mechanisms, often confused with each other:
   - `::insert_sanitized()`, `::resolve_placeholder()`, `::ingest_properties_str()`,
     `::ingest_yaml_str()`, `::merge()`, `::redacted_count()`
 - **Governance**: [`crates/mesh-core/src/governance.rs`](../../../crates/mesh-core/src/governance.rs)
-  - `GovernanceEngine::new(stop_rules, skills)`, `::is_empty()`
+  - `GovernanceEngine::new(stop_rules, skills, read_governance_mode)`, `::is_empty()`,
+    `::read_governance_mode()`
   - `::evaluate_guard(target_or_scope) -> Option<RsahResponse>`
   - `::get_skill_path(tool_or_key)`, `::recommend_skill(tool, subject)`, `::skills()`
   - `RsahResponse { status, policy, violation, required_workflow, agent_next_action, message_to_user }`, `RsahWorkflow`
@@ -46,7 +49,9 @@ Four separate mechanisms, often confused with each other:
   - `::compute_sha256()`, `GENESIS_HASH`, `CHAIN_VERSION`, `AuditEntry { .., chain_version }`
 - **Governance gate in tool dispatch**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
   - `McpTool::mutates()`, `GOVERNANCE_BLOCKED_CODE = -32001`, the check inside `ToolRegistry::invoke`
-- **Git hook**: [`crates/mesh-server/src/cli/hooks.rs`](../../../crates/mesh-server/src/cli/hooks.rs) (`HooksCommand::run`)
+- **Git hook**: [`crates/mesh-server/src/cli/hooks.rs`](../../../crates/mesh-server/src/cli/hooks.rs) (`HooksCommand::run`, `build_hook_script`)
+- **Daemon sandbox**: `crates/mesh-daemon/src/sandbox.rs` (`apply_after_bind`, `confine_network`,
+  `POLICY_ENV = "MESH_DAEMON_SANDBOX"`); documented in `docs/architecture.md` §8.3
 - **Doctor**: [`crates/mesh-server/src/cli/doctor.rs`](../../../crates/mesh-server/src/cli/doctor.rs)
 - **Prompt-injection sanitising of docs**: [`crates/mesh-core/src/docs.rs`](../../../crates/mesh-core/src/docs.rs) (`DocIndex::sanitize_prompt_injections`)
 
@@ -96,26 +101,26 @@ Rules:
 
 ## 3. Secret redaction (Commandment 5)
 
-Redaction happens at **index** time, in `PropertyRegistry::insert_sanitized`, not at
-render time:
+Redaction happens at **index** time, in `PropertyRegistry::insert_sanitized`:
 
 ```rust
-let lower_key = key.to_lowercase();
-let is_sensitive = Self::SECRET_PATTERNS
-    .iter()
-    .any(|&pattern| lower_key.contains(pattern));
-
+let is_sensitive = self.is_sensitive_key(key);
 let sanitized_value = if is_sensitive {
-    self.redacted_count += 1;
     CompactStr::new(Self::REDACTED_PLACEHOLDER)
 } else {
     CompactStr::new(raw_val)
 };
+self.raw_values.insert(CompactStr::new(key), CompactStr::new(raw_val));
+self.flat_properties.insert(CompactStr::new(key), sanitized_value);
 ```
 
-`SECRET_PATTERNS` matches on the **key name** — `password`, `secret`, `token`,
-`credential`, `key`, `auth`, `private`, `jwt`, `apikey`, `cert`, `passphrase` — so the raw
-value is never stored in the registry at all. `REDACTED_PLACEHOLDER` is
+`is_sensitive_key` matches on the **key name**: any of `SECRET_PATTERNS` (`password`, `secret`,
+`token`, `credential`, `passphrase`, `private`, `jwt`, `cert`, `apikey`, `api_key`, `api-key`,
+`secret_key`, `access_key`, `signing_key`, `auth_token`) as a substring, plus key-like suffixes
+(`.key`, `_key`, `-key`, ...). It returns `false` for everything when
+`[engines.contracts.spring] auto_redact_secrets = false`. The raw value is kept in memory in
+`raw_values` (placeholder resolution needs it) but only `flat_properties`, the masked view, is
+ever read for output; `resolve_all_placeholders` never re-reads a redacted key's raw value. `REDACTED_PLACEHOLDER` is
 `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`: it tells the agent to use an env var or a
 local fallback instead of hunting for the real value.
 
@@ -123,9 +128,14 @@ local fallback instead of hunting for the real value.
 the default would be returned, it re-checks the key against `SECRET_PATTERNS` and returns
 the placeholder instead — a default password in a config file is still a password.
 
-`redacted_count()` is what tools report as `ToolOutput.secrets_redacted`, which the audit
-row records. Per-file registries are built in parallel and folded with `merge`, which sums
-the counts.
+`redacted_count()` counts masked values in `flat_properties`; tools report it as
+`ToolOutput.secrets_redacted`, which the audit row records. Per-file registries are built in
+parallel and folded with `merge`.
+
+`smart_search` returns raw source snippets, so it applies the same key test line by line
+(`SmartSearchTool::redact_sensitive_line`): a `key: value` / `key = value` line whose key is
+sensitive has its value replaced by the placeholder. A secret held by an innocuously named key,
+or embedded in a code string literal, is not detected by either mechanism.
 
 Adding a new source of properties means routing it through `insert_sanitized`. Inserting
 into `flat_properties` directly bypasses redaction entirely.
@@ -134,45 +144,47 @@ into `flat_properties` directly bypasses redaction entirely.
 
 ## 4. Governance: what actually runs
 
-### 4.1 RSAH is wired into `ToolRegistry::invoke`, gated on `mutates()`
+### 4.1 RSAH in `ToolRegistry::invoke`
 
-`GovernanceEngine::evaluate_guard(target_or_scope)` lowercases its input, tests it against
-each `[engines.policy.stop_rules]` key by substring, and returns a fully-formed
-`RsahResponse` (status `GOVERNANCE_BLOCKED`, a four-step `required_workflow`,
-`agent_next_action: "STOP_AND_REPORT_TO_USER"`, and a user-facing message, now in English).
-It has special-cased envelopes for `proto-registry` (policy `CONTRACT_FIRST_CASCADE_CI`) and
-`k8s-infrastructure` (`INFRASTRUCTURE_AS_CODE_REVIEW`), plus a generic fallback.
+`GovernanceEngine::evaluate_guard(target_or_scope)` lowercases its input and matches each
+`[engines.policy.stop_rules]` key as a **whole path segment** (`has_path_segment`, splitting on
+`/` and `\`): `proto` matches `proto/x.proto`, not `internal/prototype/x.go`. On a hit it returns
+a `RsahResponse` (status `GOVERNANCE_BLOCKED`, a four-step `required_workflow`,
+`agent_next_action: "STOP_AND_REPORT_TO_USER"`, a user-facing message). The envelope depends on
+the key: containing `proto` → `CONTRACT_FIRST_CASCADE_CI`; `k8s`, `infra` or `deploy` →
+`INFRASTRUCTURE_AS_CODE_REVIEW`; otherwise `ACTIVE_GOVERNANCE_POLICY`.
 
-`McpTool` carries a `mutates(&Self::Args) -> bool` method, defaulting to `false`. Right after
-parsing args and before `spawn_blocking`, `ToolRegistry::invoke` does:
+Right after parsing args, `ToolRegistry::invoke` does (simplified):
 
 ```rust
-if T::mutates(&args) {
+let is_mutating = T::mutates(&args);
+let mode = state.governance.read_governance_mode();
+if is_mutating || mode != ReadGovernanceMode::AllowAll {
     if let Some(subject) = T::subject(&args) {
         if let Some(rsah) = state.governance.evaluate_guard(subject) {
-            return Err((GOVERNANCE_BLOCKED_CODE, serde_json::to_string(&rsah)...));
+            if is_mutating || mode == ReadGovernanceMode::EnforceRefusal {
+                // audited as ERROR, then:
+                return Ok(Err((GOVERNANCE_BLOCKED_CODE, serde_json::to_string(&rsah)?)));
+            } else if mode == ReadGovernanceMode::AuditWarn {
+                tracing::warn!(target: "mesh::security", /* ... */);
+            }
         }
     }
 }
 ```
 
-`GOVERNANCE_BLOCKED_CODE` is `-32001` (an implementation-defined JSON-RPC server error, distinct
-from `-32602`/`-32601`). This is a real call path with its own integration test
-(`test_invoke_blocks_mutating_call_on_guarded_subject`, `crates/mesh-server/src/tools/mod.rs`) —
-but **every shipped tool leaves `mutates()` at its default `false`**, so in practice this check
-never fires today. It is deliberate and documented in `smart_search`:
+`GOVERNANCE_BLOCKED_CODE` is `-32001`; like every tool failure it reaches the client as an
+`isError: true` result carrying the RSAH JSON, not as a JSON-RPC error. Every shipped tool leaves
+`mutates()` at `false`, so under the default `read_governance_mode = "allow_all"` nothing is
+ever refused. The path is covered by `test_invoke_blocks_mutating_call_on_guarded_subject`
+(`crates/mesh-server/src/tools/mod.rs`).
 
-```rust
-// Note: smart_search is a read-only discovery tool. Read access to guarded contract
-// scopes (such as proto-registry) is permitted so agents can inspect schemas and signatures.
-// Active governance (RSAH) is reserved for mutations and commit verification.
-```
-
-The enforcement that actually bites *today* is the OS-level git hook installed by
-`mesh-mcp install-hooks` (`HooksCommand::run`, gated by `[engines.policy] enforce_git_hooks`): a
-`.git/hooks/pre-commit` script, mode `0755`, that fails the commit when staged files touch both
-`proto-registry/` or `proto/` and `services/` or `api-gateway/`. MeshMCP's shipped tools are all
-read-only; the commit boundary is where a mutation can currently be stopped.
+The Git hook is a separate mechanism: `mesh-mcp install-hooks` (`HooksCommand::run`, gated by
+`[engines.policy] enforce_git_hooks`) writes a `0755` `.git/hooks/pre-commit` generated by
+`build_hook_script` from `[engines.contracts.grpc] proto_dirs`. It fails a commit that stages
+both a `.proto` under those directories and a source file (`.go`, `.rs`, `.java`, `.kt`, `.ts`,
+`.tsx`, `.py`, `.cpp`, `.cs`, `.php`, `.rb`, `.swift`, `.scala`). With no `proto_dirs` it
+checks nothing. It does not read `stop_rules`.
 
 If you add a tool that mutates something, override `mutates()` to `true` for the args that do,
 say so in that tool's `DESCRIPTION`, and add an integration test proving the refusal fires
@@ -181,8 +193,8 @@ through the real `invoke` path — a refusal an agent cannot predict is worse th
 ### 4.2 Skill hints: key = tool name, or path fragment
 
 `GovernanceEngine::recommend_skill(tool, subject)` is called from `ToolRegistry::invoke`
-on every successful tool call, and appends a `Project skill for this area` footer naming
-the configured file. The convention:
+on every successful tool call, and inserts a `Project skill for this area` note naming the
+configured file at the start of the output (not for JSON/HTML documents). The convention:
 
 ```toml
 [engines.policy.skills]
@@ -194,21 +206,18 @@ Resolution order, from the function's own doc comment: an exact match on the MCP
 (`McpTool::NAME`) wins outright; otherwise the lowercased subject
 (`McpTool::subject(args)` — `scope` for `smart_search`, `target` for the graph tools) is
 searched for each key as a substring, and the **longest matching key wins**, so a specific
-rule beats a generic one regardless of `HashMap` iteration order. This is the same
-matching shape as `[engines.policy.stop_rules]`.
+rule beats a generic one regardless of `HashMap` iteration order. (Stop rules differ: they
+match whole path segments.)
 
 Relative paths are resolved against the config file's directory by
 `Config::resolve_skill_paths(base_dir)`, called from `WorkspaceIndexer::discover_config`,
 because the server is spawned by an IDE with an arbitrary working directory; a relative
 path that resolves nowhere is left verbatim so `doctor` reports what was actually written.
 
-A configured path that does not exist silently never fires — the footer is only rendered
-for a path that reads. `mesh-mcp doctor` validates every entry against disk and names the
+A configured path that does not exist still produces the note, but without a title, and the
+agent is pointed at a missing file. `mesh-mcp doctor` validates every entry against disk and names the
 missing ones; run it after editing the table. `GovernanceEngine::skills()` is the iterator
 doctor uses.
-
-Note that the checked-in `mesh-mcp.toml` at the repo root still points at a path that does
-not exist in this tree; treat `doctor`'s output as the source of truth, not the file.
 
 ---
 
@@ -246,7 +255,14 @@ alias for `verify_db()`.
   (`AuditLogger::CHAIN_VERSION`). If you add another stored field that should be tamper-evident,
   bump `CHAIN_VERSION` again and add a new match arm in `verify_db` — never change what an
   existing version number means.
-- `verify_db` replays the chain; `export_to_jsonl` dumps entries for compliance tooling;
+- Calls refused before `run` (invalid arguments, RSAH refusals) are recorded too, with status
+  `ERROR` (`ToolRegistry::record_refusal`).
+- Three metrics tables sit next to `audit_entries`, **outside** the hash chain:
+  `tool_call_metrics` (latency per audited call, `record_tool_latency`),
+  `index_cache_metrics` and `process_starts`. `mesh-mcp stats` reads them; `verify_db` ignores
+  them.
+- `verify_db` replays the chain (also run by `mesh-mcp doctor`, which never repairs the audit
+  database); `export_to_jsonl` dumps entries for compliance tooling;
   `read_entries` (read-only, `SQLITE_OPEN_READ_ONLY`) backs `mesh-mcp stats` and never mutates
   the file or its `0600` permissions.
 

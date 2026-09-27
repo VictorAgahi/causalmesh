@@ -1,188 +1,173 @@
-# MeshMCP Developer & Contributor Guide
+# MeshMCP Developer Guide
 
-This guide covers building, testing, extending, and maintaining MeshMCP (RFC-001 Rev. 2.9.0).
-
----
-
-## 1. Prerequisites & Toolchain
-
-MeshMCP requires a modern Rust toolchain:
-- **Rust**: 1.80.0 or later (stable)
-- **Cargo**: Included with Rust
-- **Operating Systems**: macOS (Apple Silicon / Intel), Linux (x86_64, aarch64), Windows (WSL2)
-- **C Compiler**: `clang` or `gcc` (required to build Tree-sitter C grammar runtimes)
+Building, testing and extending MeshMCP. The invariants every change must preserve are in
+[`CLAUDE.md`](../CLAUDE.md); task-specific guides for coding agents are in
+[`.agents/skills/`](../.agents/skills/README.md).
 
 ---
 
-## 2. Building the Project
+## 1. Prerequisites
 
-### Development Build (Fast Compilation)
-```bash
-cargo build --workspace
-```
-
-### Production Release Build (Thin LTO & mimalloc)
-```bash
-cargo build --workspace --release
-```
-The workspace root [`Cargo.toml`](../Cargo.toml) is pre-configured with:
-```toml
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-panic = "abort"
-strip = true
-```
-This produces self-contained binaries in `target/release/`:
-- `mesh-mcp`: Stdio MCP server and transparent UDS client proxy (~6.8 MB)
-- `meshd`: Background architecture daemon with UDS multiplexing (~6.5 MB)
-
-For comprehensive build and configuration walkthroughs, see [SETUP.md](../SETUP.md).
+- **Rust**: a current stable toolchain. CI builds with the latest stable release
+  (`dtolnay/rust-toolchain@stable`); no minimum supported version is pinned or tested.
+- **C compiler** (`clang` or `gcc`, MSVC on Windows): the tree-sitter grammars are C code
+  compiled by their build scripts.
+- **Platforms exercised by CI**: `ubuntu-latest`, `macos-latest`, `windows-latest` (test suite);
+  `ubuntu-latest` and `macos-latest` (determinism gate, release smoke test, pilot installer test).
 
 ---
 
-## 3. Testing & Code Quality Invariants
+## 2. Building
 
-MeshMCP adheres to a zero-warning, zero-compromise quality standard.
-
-### Run All Workspace Tests
 ```bash
-cargo test --workspace
-```
-Expected output (counts grow as languages and roadmap items are added — treat these as a
-floor, not an exact match):
-```
-test result: ok. 42 passed (mesh-core)
-test result: ok. 13 passed (mesh-daemon)
-test result: ok. 85 passed (mesh-parsers)
-test result: ok. 20 passed (mesh-server unit)
-test result: ok. 13 passed (mesh-server integration)
-Total: 173 passed; 0 failed
+cargo build --workspace              # debug
+cargo build --workspace --release    # release: thin LTO, codegen-units = 1, panic = abort, stripped
 ```
 
-### Run Strict Clippy
-Every pull request must pass Clippy with `-D warnings`:
-```bash
-cargo clippy --workspace --all-targets -- -D warnings
-```
+The release profile is in the root [`Cargo.toml`](../Cargo.toml). The build produces two
+binaries in `target/release/`: `mesh-mcp` (MCP server, CLI, daemon proxy) and `meshd` (the
+per-workspace daemon). Both are needed for the default daemon mode. Binary size depends on the
+target and toolchain and is not tracked.
 
-### Check Code Formatting
+Installation for users and pilots is covered in [`SETUP.md`](../SETUP.md) and
+`scripts/install_pilot.sh`.
+
+---
+
+## 3. Tests and quality gates
+
 ```bash
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
----
-
-## 4. How to Add a New Tree-Sitter Language Parser
-
-MeshMCP's [`crates/mesh-parsers`](../crates/mesh-parsers) crate uses Tree-sitter grammars to
-decapitate function bodies and extract signatures. Supported languages today: **Java, Go,
-Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala**, plus
-Protobuf and YAML handled without tree-sitter. The full walkthrough — with `cpp.rs` as the
-worked example — lives in
-[`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).
-In short, adding a language touches these places:
-
-### Step 1: Add the grammar crate
-Root `Cargo.toml` (`[workspace.dependencies]`) and `crates/mesh-parsers/Cargo.toml` — check the
-grammar's ABI version before picking one (see the "watch out" below):
-```toml
-tree-sitter-elixir = "0.3"
-```
-
-### Step 2: Extend `LanguageKind` in `crates/mesh-parsers/src/decapitate.rs`
-```rust
-pub enum LanguageKind {
-    Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala,
-    Elixir, // <-- new variant
-    Protobuf, Yaml, Unknown,
-}
-```
-Bump `TREE_SITTER_COUNT` and add the new variant's slot to `tree_sitter_slot()`, its grammar to
-`language()`, and its extensions to `from_path()` — all four must move together, and the
-thread-local parser array in `guard.rs::with_parser` must be resized to match `TREE_SITTER_COUNT`.
-
-### Step 3: Write the extractor
-`crates/mesh-parsers/src/languages/elixir.rs`, following the contract in the skill doc (`extract`
-returning `Vec<ContractNode>`), and register `pub mod elixir;` plus the `PolyglotIndexer::extract`
-dispatch arm in `languages/mod.rs`.
-
-### Step 4: Add Decapitation Grammar Rules
-In `crates/mesh-parsers/src/decapitate.rs`, update `AstDecapitator::collect_body_replacements`:
-```rust
-match lang_kind {
-    // ... existing match arms ...
-    LanguageKind::Elixir if kind == "do_block" => {
-        if let Some(body) = node.child_by_field_name("body") {
-            replacements.push((body.start_byte(), body.end_byte(), Cow::Borrowed("# stripped")));
-            return;
-        }
-    }
-    _ => {}
-}
-```
-
-**Watch out**: this workspace pins `tree-sitter = "0.24"`, which caps at grammar ABI 14. The
-latest published version of a grammar crate is often ABI 15+ and fails to compile against it
-with a `Language` type mismatch — this cost real time on both the Kotlin and C# additions.
-Check the grammar's ABI (`LANGUAGE_VERSION` in its generated `parser.c`) before committing to a
-Cargo.toml version, or just try a candidate version in a scratch build first.
-
-### Step 5: Wire the file watcher and `doctor`
-Add the extension(s) to `FileWatcherService::is_relevant_path`
-(`crates/mesh-core/src/watcher.rs`) — a language missing from this list parses correctly at boot
-but never hot-reloads on edit — and to `AstGuard::verify_all_parsers`, which backs the
-`mesh-mcp doctor` parser-initialization line.
-
-### Step 6: Add tests
-A unit test in the new extractor module asserting the expected `NodeKind`s, and a decapitation
-test in `crates/mesh-parsers/src/decapitate.rs` verifying that method bodies are stripped while
-the signature, annotations/attributes and docstrings survive. See `test_kotlin_decapitation` and
-`test_csharp_decapitation` for worked examples of both a fields-less grammar (Kotlin) and a
-grammar with named fields (C#).
-
----
-
-## 5. Debugging JSON-RPC Over Stdio
-
-Because MeshMCP communicates over `stdin`/`stdout`, you cannot test it using standard interactive terminal typing without proper JSON-RPC envelopes.
-
-### Testing Stdio Interaction via Python or Shell Script
-
-You can send a formatted JSON-RPC payload directly into the binary:
+All three run in CI (`.github/workflows/ci.yml`) on every pull request. The workspace lints deny
+`unwrap_used` and `panic` outside tests. Once per clone, enable the repository's pre-commit hook
+so these run before each commit:
 
 ```bash
-cat << 'EOF' | ./target/release/mesh-mcp run
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-EOF
+git config core.hooksPath .githooks
 ```
 
-Expected output on `stdout`:
-```json
-{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mesh-mcp","version":"2.9.0"}}}
-{"jsonrpc":"2.0","id":2,"result":{"tools":[...]}}
-```
+Other gates in CI:
 
-All diagnostic logs appear on `stderr`:
-```
-2026-09-20T20:22:45.123Z INFO mesh::framing: Initializing StdioFramingActor (MPSC bounded capacity=64)
-2026-09-20T20:22:45.124Z INFO mesh::server: Handling initialize handshake
-```
+- `scripts/determinism.sh`: one index fingerprint across sequential and concurrent runs of each
+  example workspace (`ubuntu-latest`, `macos-latest`).
+- `.github/workflows/golden.yml`: gRPC edge precision/recall on the pinned golden corpus, must
+  stay at 1.0/1.0.
+- `scripts/test_install_pilot.sh`: the pilot installer run twice under an isolated `HOME` must
+  leave the same state.
+- `crates/mesh-server/src/tools/mod.rs` `test_mcp_tools_md_schema_drift_check`: the JSON schemas
+  in [`mcp-tools.md`](mcp-tools.md) must list exactly the properties each tool advertises. Edit
+  that file whenever a tool argument changes.
+
+Measurement harnesses (scale, memory, cache, payload) are described in
+[`benchmarks.md`](benchmarks.md); their results go in [`quality.md`](quality.md).
 
 ---
 
-## 6. Diagnostic Doctor Architecture
+## 4. Adding a tree-sitter language
 
-MeshMCP provides an integrated diagnostic tool (`mesh-mcp doctor`) located in `crates/mesh-server/src/cli/doctor.rs`.
+Supported today: Java, Go, Python, TypeScript (`.ts`, `.tsx`, `.js`), Rust, C++, Kotlin, C#,
+Ruby, PHP, Swift, Scala and Protobuf, all through tree-sitter; YAML (OpenAPI, AsyncAPI, Spring
+properties), `.properties` and Markdown are parsed without it. The full walkthrough is
+[`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).
+In short:
 
-It inspects:
-1. **Configuration Syntax**: Validates `mesh-mcp.toml` parsing and checks for missing sections.
-2. **Jailed Roots**: Resolves environment variables and confirms that target directories exist on disk.
-3. **Symlink Boundary Checks**: Tests whether symlink protection is active.
-4. **Secret Redaction Filters**: Verifies that regex patterns mask test keys (`AKIA...`, `sk-ant-...`).
-5. **OS Kernel Event Subsystems**: Checks for APFS FSEvents/kqueue (macOS) or `inotify` watch limits (Linux).
-6. **Stdio Loopback Latency**: Measures the internal round-trip time between bounded MPSC queues.
-7. **Tree-Sitter Grammars**: Validates that all C-FFI grammar symbol tables initialize without faults.
-8. **Memory RSS Baseline**: Asserts that resident memory remains below the 20 MiB ceiling.
+### Step 1: grammar crate
+Add it to the root `Cargo.toml` (`[workspace.dependencies]`) and to
+`crates/mesh-parsers/Cargo.toml`.
+
+**Grammar ABI.** The workspace pins `tree-sitter = "0.24"`. The newest release of a grammar crate
+may target a newer ABI and fail to compile against it with a `Language` type mismatch; check the
+grammar's `LANGUAGE_VERSION` in its generated `parser.c`, or try the version in a scratch build
+first.
+
+### Step 2: `LanguageKind` (`crates/mesh-parsers/src/decapitate.rs`)
+Add the variant, then update together: `as_str()`, `language()`, `tree_sitter_slot()`,
+`from_path()` (extensions) and `TREE_SITTER_COUNT`. The two thread-local parser arrays in
+`guard.rs` (`with_parser`'s `PARSERS` and `parse_with`'s `INDEX_PARSERS`) are sized by
+`TREE_SITTER_COUNT` and initialised with one `None` per slot; extend both initialisers.
+
+### Step 3: extractor
+Create `crates/mesh-parsers/src/languages/<lang>.rs`. An extractor receives an already-parsed
+tree and returns nodes (and, for richer languages, relations), without touching the graph:
+
+```rust
+pub fn extract(file_path: &Path, content: &str, repo_id: RepoId, tree: &Tree) -> Vec<ContractNode>
+```
+
+Register `pub mod <lang>;` and add a match arm in `PolyglotIndexer::extract_with_config`
+(`languages/mod.rs`) that calls it through the `parsed!` macro (which uses
+`AstGuard::parse_with` with the indexing timeout and records parse failures). If the extractor
+returns relations, copy them into `out.dependencies`, `out.producers`, `out.consumers` and
+`out.rpc_calls`; a relation computed by the extractor but not copied there never reaches the graph.
+
+### Step 4: decapitation rule
+In `AstDecapitator::collect_body_replacements` (`decapitate.rs`), replace the body node of the
+language's functions and methods, keeping signatures, annotations and docstrings.
+
+### Step 5: watcher and doctor
+Add the extension to `FileWatcherService::is_relevant_path` (`crates/mesh-core/src/watcher.rs`),
+or edits to such files will never trigger a reload, and add the grammar to
+`AstGuard::verify_all_parsers`, which backs the parser line of `mesh-mcp doctor`.
+
+### Step 6: tests
+A unit test in the extractor module asserting the expected `NodeKind`s; a decapitation test in
+`decapitate.rs` (see `test_kotlin_decapitation` and `test_csharp_decapitation`); and, if the
+language produces relations, a test that goes through `PolyglotIndexer::index_file` rather than
+the extractor directly, so the dispatch wiring of step 3 is covered
+(`test_polyglot_indexer_wires_java_import_dependency` is the model).
+
+---
+
+## 5. Talking to the server by hand
+
+The server speaks newline-delimited JSON-RPC on stdio:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | ./target/release/mesh-mcp run --standalone
+```
+
+The `initialize` result has the shape:
+
+```json
+{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mesh-mcp","version":"<crate version>"}}
+```
+
+Logs are written to stderr (`RUST_LOG=debug` for more detail). Nothing but JSON-RPC frames is
+written to stdout.
+
+---
+
+## 6. `mesh-mcp doctor`
+
+`crates/mesh-server/src/cli/doctor.rs`. Output goes to stderr, except `--json`, which prints the
+repairable checks as JSON on stdout.
+
+What it actually checks:
+
+- **Configuration**: the config file parses, roots resolve, configured skill files exist,
+  `[engines.docs] paths`, `proto_dirs` and OpenAPI `spec_files` patterns match at least one file,
+  roots do not overlap.
+- **Secret masking**: two sample keys are inserted into a `PropertyRegistry` and must come back
+  masked.
+- **Linux**: the `fs.inotify.max_user_watches` limit (warns below 524,288).
+- **Parsers**: every tree-sitter grammar initialises (`AstGuard::verify_all_parsers`).
+- **Tools on `PATH`**: `git`, and whether `ripgrep` is present.
+- **Index health**: a full scan of the workspace, then the count of files rejected per reason and
+  the first 10 paths.
+- **Repairable checks** (also in `--json`, acted on by `--fix`): socket and socket-directory
+  permissions, orphaned socket, daemon version drift, daemon seccomp confinement (Linux),
+  legacy machine-wide cache, corrupt workspace cache, orphaned per-version cache directories, and
+  audit-chain verification (reported, never repaired).
+
+Some lines are informational rather than measured: the symlink line, the host event-subsystem
+line on macOS/Windows, the "memory baseline" line and the "stdio loopback latency" line (which
+times one small JSON serialisation) print fixed or trivial results, and the final "All systems
+operational" line is printed regardless of earlier warnings. Read the individual `⚠`/`✖` lines,
+or the `--json` output, rather than the last line.

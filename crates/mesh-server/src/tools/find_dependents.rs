@@ -1,7 +1,7 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr};
-use mesh_parsers::{LanguageKind, MarkdownFormatter, MAX_OUTPUT_BYTES};
+use mesh_parsers::{LanguageKind, MarkdownFormatter, MAX_OUTPUT_BYTES, NON_RESULT_RESERVE_BYTES};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -157,13 +157,14 @@ fn may_declare_dependents(path: &std::path::Path) -> bool {
 }
 
 /// Cuts `text` at a line boundary so it plus a `note_len`-byte note stays
-/// within the payload cap minus the 1 KB the registry keeps for its own
-/// additions — the registry's central truncation, which cuts the *tail*,
-/// then never reaches the note. `format_dependents` emits no code fences, so
-/// a line cut leaves valid Markdown.
+/// within the payload cap minus [`NON_RESULT_RESERVE_BYTES`], the headroom the
+/// registry needs for its own prepended additions (step 4.1 review) — the
+/// registry's central truncation, which cuts the *tail*, then never reaches
+/// the note. `format_dependents` emits no code fences, so a line cut leaves
+/// valid Markdown.
 fn fit_before_note(text: &mut String, note_len: usize, total: usize) {
     const CUT_NOTICE_UPPER_BOUND: usize = 256;
-    let budget = (MAX_OUTPUT_BYTES - 1024).saturating_sub(note_len);
+    let budget = (MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES).saturating_sub(note_len);
     if text.len() <= budget {
         return;
     }

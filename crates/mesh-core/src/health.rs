@@ -154,10 +154,20 @@ impl IndexHealth {
                 _ => out.push(r),
             }
         }
-        if out.len() > MAX_REJECTED_FILES {
-            self.rejected_overflow += out.len() - MAX_REJECTED_FILES;
-            out.truncate(MAX_REJECTED_FILES);
-        }
+        // Never accumulated (`+=` here drifted upward without bound over a long-running
+        // daemon's life: called on every incremental reload via `replace_rejected`, step
+        // 4.1 review) and never simply reassigned either: once a path is truncated off
+        // `self.rejected`, it is gone for good, so a later incremental call only ever
+        // sees the (already capped) survivors plus this pass's own new rejections — an
+        // outright reassignment would silently drop back toward 0 the very next reload
+        // even though the originally dropped paths are still out there, still rejected.
+        // `max` keeps the high-water mark until the next full rebuild (a fresh
+        // `IndexHealth::default()`, see the type's doc) legitimately recomputes it from
+        // an unbounded, not-yet-truncated list.
+        self.rejected_overflow = self
+            .rejected_overflow
+            .max(out.len().saturating_sub(MAX_REJECTED_FILES));
+        out.truncate(MAX_REJECTED_FILES);
         self.rejected = out;
     }
 
@@ -243,9 +253,13 @@ impl IndexHealth {
             }
         }
         if self.rejected_overflow > 0 {
+            // The breakdown above only covers the capped `rejected` list (step 4.1
+            // review): say so here, or it reads as a per-reason total that silently
+            // falls `rejected_overflow` short of the total line above it.
             let _ = writeln!(
                 out,
-                "    (+{} beyond the {MAX_REJECTED_FILES}-entry list)",
+                "    (+{} more not indexed, beyond the {MAX_REJECTED_FILES}-entry list \
+                 and not broken down by reason above)",
                 self.rejected_overflow
             );
         }
@@ -386,6 +400,37 @@ mod tests {
         assert_eq!(big.rejected.len(), MAX_REJECTED_FILES);
         assert_eq!(big.rejected_overflow, 5);
         assert_eq!(big.rejected[0].path, PathBuf::from("/r/000000"));
+    }
+
+    /// Regression (step 4.1 review): `rejected_overflow` must not accumulate
+    /// across every reload that ever pushed the list past the cap — the
+    /// original `+=` did, since `normalize_rejected` runs on every
+    /// `replace_rejected` call (one per incremental reload), drifting upward
+    /// without bound over a long-running daemon's life. It must also not fall
+    /// back to 0 on the very next incremental reload just because the paths
+    /// that overflowed the cap were already truncated off `self.rejected` (and
+    /// so invisible to a plain recomputation) — a naive fresh reassignment
+    /// does exactly that.
+    #[test]
+    fn rejected_overflow_reflects_the_current_excess_not_a_running_total() {
+        let mut h = IndexHealth::default();
+        for i in 0..MAX_REJECTED_FILES + 3 {
+            h.record_rejected_file(format!("/r/{i:06}").into(), RejectReason::Oversized, 1);
+        }
+        h.normalize_rejected();
+        assert_eq!(h.rejected_overflow, 3);
+
+        // Further incremental reloads that touch none of the over-cap files (a
+        // realistic pass over an unrelated part of the tree) must not add to the
+        // overflow already reported: it is still exactly 3 over, not 6, not 9.
+        let touched: HashSet<&Path> = HashSet::new();
+        for _ in 0..3 {
+            h.replace_rejected(&touched, &[]);
+            assert_eq!(
+                h.rejected_overflow, 3,
+                "overflow must not accumulate across repeated reloads"
+            );
+        }
     }
 
     #[test]

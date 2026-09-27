@@ -183,20 +183,37 @@ impl ToolRegistry {
         }
     }
 
+    /// Bounds how much of a skill file's `description:`/`# H1` line the hint can
+    /// quote: an unbounded value here fed straight into the 48 KB output budget
+    /// (step 4.1 review), leaving no reliable headroom for the diagnostics note
+    /// tools reserve room for.
+    const SKILL_TITLE_MAX_BYTES: usize = 200;
+
     fn skill_title(content: &str) -> Option<String> {
         for line in content.lines().take(20) {
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("description:") {
                 let rest = rest.trim().trim_matches(['"', '\'', '>', '|']).trim();
                 if !rest.is_empty() {
-                    return Some(rest.to_string());
+                    return Some(Self::clamp_title(rest));
                 }
             }
             if let Some(rest) = line.strip_prefix("# ") {
-                return Some(rest.trim().to_string());
+                return Some(Self::clamp_title(rest.trim()));
             }
         }
         None
+    }
+
+    fn clamp_title(title: &str) -> String {
+        if title.len() <= Self::SKILL_TITLE_MAX_BYTES {
+            return title.to_string();
+        }
+        let mut cut = Self::SKILL_TITLE_MAX_BYTES;
+        while !title.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &title[..cut])
     }
 
     /// Parses arguments, runs the tool body and the audit write on the blocking
@@ -253,12 +270,16 @@ impl ToolRegistry {
 
             // Surface the team's own playbook for this area, so the agent reads the
             // house rules before acting instead of inferring them from the code.
+            // Plan 4 step 4.1 review: prepended, like the Git-operation note below,
+            // instead of appended — a tool's own trailing note (e.g. smart_search's
+            // and find_dependents's rejected-file note, step 4.1) is the thing that
+            // must survive the 48 KB cap unclipped, so nothing else may sit after it.
             if let Ok(out) = &mut result {
                 if !T::returns_document(&args) {
                     if let Some(skill) =
                         state.governance.recommend_skill(T::NAME, T::subject(&args))
                     {
-                        out.text.push_str(&Self::render_skill_hint(skill));
+                        out.text.insert_str(0, &Self::render_skill_hint(skill));
                     }
                 }
 
@@ -439,6 +460,30 @@ mod tests {
         assert!(utf8.len() <= 51);
     }
 
+    /// Regression (step 4.1 review): an unbounded `description:` line in a skill
+    /// file fed straight into the 48 KB output budget, leaving no reliable
+    /// headroom for a tool's own trailing diagnostics note (`NON_RESULT_RESERVE_BYTES`
+    /// only budgets for a *bounded* hint). `render_skill_hint`'s total size must stay
+    /// small whatever the skill file says.
+    #[test]
+    fn skill_hint_stays_bounded_however_long_the_skill_file_description_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.md");
+        let long_desc = "x".repeat(5_000);
+        std::fs::write(&path, format!("---\ndescription: {long_desc}\n---\nBody\n"))
+            .expect("write skill file");
+        let hint = ToolRegistry::render_skill_hint(&path.to_string_lossy());
+        assert!(
+            hint.len() < 1024,
+            "hint must fit well inside NON_RESULT_RESERVE_BYTES: {} bytes",
+            hint.len()
+        );
+        assert!(
+            hint.contains('…'),
+            "long description must be clamped: {hint}"
+        );
+    }
+
     #[test]
     fn open_fence_follows_commonmark() {
         // A ```rust line inside an open block is content, not a close.
@@ -617,6 +662,56 @@ roots = ["."]
             .expect("no protocol fault");
         let text = result.expect("read-only call on a guarded subject stays allowed");
         assert!(text.contains("read services/proto-registry/auth.proto"));
+    }
+
+    /// Regression (step 4.1 review): a tool's own trailing note (e.g.
+    /// `smart_search`'s and `find_dependents`'s rejected-file note, whose size
+    /// callers reserve room for and which is documented to be "appended last,
+    /// whole") must still be the true tail of the payload when a project skill
+    /// hint also applies — the skill hint used to be appended *after* it,
+    /// silently pushing it out of last place.
+    #[tokio::test]
+    async fn tool_note_stays_last_even_with_a_skill_hint_configured() {
+        struct NotedTestTool;
+        impl McpTool for NotedTestTool {
+            const NAME: &'static str = "test_noted_tool";
+            const DESCRIPTION: &'static str = "Test-only tool with its own trailing note.";
+            type Args = MutatingToolArgs;
+            fn meta(_args: &Self::Args) -> Option<&RequestMeta> {
+                None
+            }
+            fn run(_args: &Self::Args, _state: &AppState) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text(
+                    "some results\n\n> [!WARNING]\n> TRAILING_NOTE_MARKER\n".to_string(),
+                ))
+            }
+        }
+
+        let config = Config::load_from_str(
+            r#"
+[workspace]
+name = "skill-hint-test"
+version = "0"
+roots = ["."]
+
+[engines.policy.skills]
+"test_noted_tool" = "docs/does-not-exist.md"
+"#,
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+
+        let text = ToolRegistry::invoke::<NotedTestTool>(json!({ "target": "x" }), state)
+            .await
+            .expect("no protocol fault")
+            .expect("tool ok");
+        assert!(
+            text.trim_end().ends_with("TRAILING_NOTE_MARKER"),
+            "the tool's own note must stay last, skill hint included: {text:?}"
+        );
+        assert!(text.contains("Project skill for this area"), "{text:?}");
     }
 
     /// The 48 KB cap holds for the whole payload — cut text, closing fence and

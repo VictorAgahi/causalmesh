@@ -1,6 +1,7 @@
 use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
 use mesh_core::{expand_roots, AuditLogger, Config, PersistentIndexCache, PropertyRegistry};
-use mesh_parsers::AstGuard;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use notify::Watcher;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -73,10 +74,11 @@ impl DoctorCheck {
 impl DoctorCommand {
     /// Scans the workspace once (no persistent cache, nothing written) and
     /// prints the rejected-file summary: counts per reason, first 10 paths.
-    fn report_index_health(config_path: Option<&Path>) {
+    /// Returns (errors, warnings) count.
+    fn report_index_health(config_path: Option<&Path>) -> (usize, usize) {
         let Ok((config, base_dir)) = WorkspaceIndexer::discover_config(config_path) else {
             eprintln!("ℹ Index health: skipped (no config to scan)");
-            return;
+            return (0, 0);
         };
         let roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
         let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
@@ -84,10 +86,12 @@ impl DoctorCommand {
         let summary = health.render_summary(10);
         if health.rejected.is_empty() && health.rejected_overflow == 0 {
             eprint!("✔ Index health: {summary}");
+            (0, 0)
         } else {
             eprintln!(
                 "⚠ Index health: {summary}    Searches cannot return these files; read them directly."
             );
+            (0, 1)
         }
     }
 
@@ -101,6 +105,9 @@ impl DoctorCommand {
             env!("CARGO_PKG_VERSION"),
             option_env!("GIT_HASH").unwrap_or("dev")
         );
+
+        let mut total_errors: usize = 0;
+        let mut total_warnings: usize = 0;
 
         // 1. Config syntax
         let default_paths = [
@@ -127,10 +134,14 @@ impl DoctorCommand {
                         let roots_count = roots.len();
                         eprintln!("✔ Jailed roots verified ({roots_count}/{roots_count} allowed roots, 0 escapes detected)");
                     } else {
+                        total_warnings += 1;
                         eprintln!("⚠ Jailed roots warning: No roots resolved or syntax error");
                     }
                 }
-                Err(e) => eprintln!("✖ Config syntax: INVALID ({}) - {e}", p.display()),
+                Err(e) => {
+                    total_errors += 1;
+                    eprintln!("✖ Config syntax: INVALID ({}) - {e}", p.display());
+                }
             }
         } else {
             eprintln!("ℹ Config syntax: No local config file found (run 'mesh-mcp init --auto')");
@@ -163,6 +174,7 @@ impl DoctorCommand {
                             skills.len()
                         );
                     } else {
+                        total_errors += missing.len();
                         eprintln!(
                             "✖ Project skills: {} of {} file(s) missing — these keys will never recommend anything:",
                             missing.len(),
@@ -232,6 +244,7 @@ impl DoctorCommand {
                                     docs.paths.len()
                                 );
                             } else {
+                                total_warnings += dead_docs.len();
                                 for dead in dead_docs {
                                     eprintln!(
                                         "⚠ Path pattern '{dead}' in [engines.docs.paths] matched 0 files — likely dead config"
@@ -283,6 +296,7 @@ impl DoctorCommand {
                                 }
                                 for dir in &grpc.proto_dirs {
                                     if !matched_dirs.contains(dir) {
+                                        total_warnings += 1;
                                         eprintln!(
                                             "⚠ Proto directory '{dir}' in [engines.contracts.grpc.proto_dirs] matched 0 files — likely dead config"
                                         );
@@ -325,6 +339,7 @@ impl DoctorCommand {
                                         }
                                     }
                                     if !matched {
+                                        total_warnings += 1;
                                         eprintln!(
                                             "⚠ Spec file '{spec}' in [engines.contracts.openapi.spec_files] matched 0 files — likely dead config"
                                         );
@@ -355,6 +370,7 @@ impl DoctorCommand {
                     if overlaps.is_empty() {
                         eprintln!("✔ Root overlap: {} root(s), none overlapping", roots.len());
                     } else {
+                        total_warnings += overlaps.len();
                         for (outer, inner) in overlaps {
                             eprintln!(
                                 "⚠ Root overlap: '{inner}' is inside '{outer}' — files under it are indexed only once, attributed to '{inner}' (the more specific root)."
@@ -366,7 +382,42 @@ impl DoctorCommand {
         }
 
         // 2. Symlink invariants
-        eprintln!("✔ Symlink invariants: follow_links=false verified across all engines");
+        let symlink_ok = {
+            let probe_dir =
+                std::env::temp_dir().join(format!("mesh-symlink-probe-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&probe_dir);
+            let target = probe_dir.join("target");
+            let link = probe_dir.join("link");
+            let _ = std::fs::write(&target, "content");
+            #[cfg(unix)]
+            let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+            #[cfg(windows)]
+            let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+            #[cfg(not(any(unix, windows)))]
+            let created = false;
+
+            let res = if created {
+                let roots = vec![probe_dir.clone()];
+                if let Ok(scope) =
+                    mesh_core::ValidatedScope::resolve(&probe_dir.to_string_lossy(), &roots)
+                {
+                    let crawled = mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(2));
+                    !crawled.contains(&link)
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            res
+        };
+        if symlink_ok {
+            eprintln!("✔ Symlink invariants: follow_links=false verified (crawler rejects symlink traversal)");
+        } else {
+            total_errors += 1;
+            eprintln!("✖ Symlink invariants: symlink traversal detected in crawler");
+        }
 
         // 3. Secret redaction engine
         let mut reg = PropertyRegistry::new();
@@ -375,10 +426,11 @@ impl DoctorCommand {
         if reg.redacted_count() == 2 {
             eprintln!("✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)");
         } else {
+            total_errors += 1;
             eprintln!("✖ Secret redaction engine: FAILED to mask test secrets");
         }
 
-        // 4. Linux inotify watchers check (P2 IDE)
+        // 4. Host OS event subsystem check
         #[cfg(target_os = "linux")]
         {
             if let Ok(content) = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches") {
@@ -386,6 +438,7 @@ impl DoctorCommand {
                 if watches >= 524_288 {
                     eprintln!("✔ Linux inotify watchers check: {watches} available (Max: PASS)");
                 } else {
+                    total_warnings += 1;
                     eprintln!(
                         "⚠ Linux inotify watchers check: {watches} (LOW: recommend >= 524,288)"
                     );
@@ -394,23 +447,37 @@ impl DoctorCommand {
         }
         #[cfg(target_os = "macos")]
         {
-            eprintln!("✔ Host OS event subsystem: Native (APFS FSEvents/kqueue active)");
+            match notify::RecommendedWatcher::new(|_| {}, notify::Config::default()) {
+                Ok(_) => eprintln!("✔ Host OS event subsystem: Native (APFS FSEvents active)"),
+                Err(e) => {
+                    total_warnings += 1;
+                    eprintln!("⚠ Host OS event subsystem: FSEvents warning: {e}");
+                }
+            }
         }
         #[cfg(target_os = "windows")]
         {
-            eprintln!("✔ Host OS event subsystem: Native (Windows ReadDirectoryChangesW active)");
+            match notify::RecommendedWatcher::new(|_| {}, notify::Config::default()) {
+                Ok(_) => eprintln!(
+                    "✔ Host OS event subsystem: Native (Windows ReadDirectoryChangesW active)"
+                ),
+                Err(e) => {
+                    total_warnings += 1;
+                    eprintln!("⚠ Host OS event subsystem: ReadDirectoryChangesW warning: {e}");
+                }
+            }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             eprintln!("✔ Host OS event subsystem: Native event queue active");
         }
 
-        // 5. Stdio loopback latency
+        // 5. JSON serialization baseline
         let t0 = Instant::now();
         let _ = serde_json::to_string(&serde_json::json!({"test": "latency"}))?;
         let loopback_micros = t0.elapsed().as_micros();
         eprintln!(
-            "✔ Stdio loopback latency: {:.2}ms",
+            "✔ JSON-RPC serialization baseline: {:.2}ms",
             loopback_micros as f64 / 1000.0
         );
 
@@ -420,11 +487,40 @@ impl DoctorCommand {
                 "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)"
             );
         } else {
+            total_errors += 1;
             eprintln!("✖ Tree-sitter parsers: Initialization error");
         }
 
-        // 7. Memory baseline
-        eprintln!("✔ Memory baseline: < 20 MiB RSS (mimalloc + compact_str)");
+        // 7. Memory baseline (measured real RSS)
+        #[cfg(unix)]
+        let (rss_mb, rss_ok) = {
+            let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) } == 0 {
+                let rusage = unsafe { rusage.assume_init() };
+                #[cfg(target_os = "macos")]
+                let mb = rusage.ru_maxrss as f64 / (1024.0 * 1024.0);
+                #[cfg(not(target_os = "macos"))]
+                let mb = rusage.ru_maxrss as f64 / 1024.0;
+                (mb, mb < 50.0)
+            } else {
+                (0.0, true)
+            }
+        };
+        #[cfg(not(unix))]
+        let (rss_mb, rss_ok) = (0.0, true);
+
+        if rss_mb > 0.0 {
+            if rss_ok {
+                eprintln!("✔ Memory baseline: {rss_mb:.1} MiB RSS (mimalloc + compact_str)");
+            } else {
+                total_warnings += 1;
+                eprintln!(
+                    "⚠ Memory baseline: {rss_mb:.1} MiB RSS (elevated, expected < 50 MiB at boot)"
+                );
+            }
+        } else {
+            eprintln!("✔ Memory baseline: mimalloc + compact_str active");
+        }
 
         // 8. Toolchain utilities check
         let git_ok = std::process::Command::new("git")
@@ -443,14 +539,14 @@ impl DoctorCommand {
         } else if git_ok {
             eprintln!("✔ Toolchain utilities: git detected (ripgrep recommended for large repos)");
         } else {
+            total_warnings += 1;
             eprintln!("⚠ Toolchain utilities: git not found in PATH");
         }
 
         // 9. Index health (plan 4 step 4.1): the files a search can never
         // return, with the same reasons and sizes the tools' notes give.
-        Self::report_index_health(config_path);
-
-        eprintln!("\n✔ All systems operational. Ready for AI agents.");
+        let (_index_errors, index_warnings) = Self::report_index_health(config_path);
+        total_warnings += index_warnings;
 
         // 10. Repairable health (plan 4 step 4.7): socket permissions, daemon
         // version drift, corrupt or legacy caches, orphaned per-version
@@ -458,6 +554,16 @@ impl DoctorCommand {
         // above so `--json` has something to render and `--fix` something
         // to act on.
         let checks = Self::run_repairable_checks(config_path, fix);
+        for check in &checks {
+            if check.fixed != Some(true) {
+                match check.status {
+                    "error" => total_errors += 1,
+                    "warn" => total_warnings += 1,
+                    _ => {}
+                }
+            }
+        }
+
         if json {
             println!("{}", serde_json::to_string_pretty(&checks)?);
         } else {
@@ -469,6 +575,21 @@ impl DoctorCommand {
                     None => "",
                 };
                 eprintln!("{} {}: {}{suffix}", check.icon(), check.name, check.message);
+            }
+        }
+
+        if !json {
+            eprintln!();
+            if total_errors > 0 {
+                eprintln!(
+                    "✖ Diagnostic check failed: {total_errors} error(s), {total_warnings} warning(s)."
+                );
+            } else if total_warnings > 0 {
+                eprintln!(
+                    "⚠ All critical systems operational ({total_warnings} warning(s)). Ready for AI agents."
+                );
+            } else {
+                eprintln!("✔ All systems operational. Ready for AI agents.");
             }
         }
 

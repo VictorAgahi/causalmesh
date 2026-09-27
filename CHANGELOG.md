@@ -5,6 +5,106 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.0] — 2026-09-27
+
+**Plan 4 (P3) complete: enterprise readiness, scale tiers, and field stabilization.** Major
+version because of the breaking changes below (wire-format break checks in `analyze_grpc`,
+optional search scope and 8 KiB default search page budget, relative graph fingerprints, and
+per-workspace index cache paths). All 14 milestones (4.0 through 4.13) completed and verified:
+stacked CI PRs (4.0), index health diagnostics and rejection reporting (4.1), FSEvents native
+watcher with Git lock hold (4.2), 5k / 50k / 200k synthetic and real repo size budgets (4.3),
+per-workspace index cache with bounded quota and LRU eviction (4.4), TypeScript gRPC recall
+ratchet to 100%/100% on otel-demo (4.5), impact matrix with proto/gRPC resolution (4.6a), wire-format
+breaking change analysis against Git base (4.6b), doctor repairable health `--fix` / `--json` (4.7),
+pilot installer and metrics stats (4.8), streaming YAML and bounded Markdown memory (4.9),
+Linux daemon seccomp sandbox (4.10), CI determinism gate resilience (4.12a), audit refusals and
+snippet fences (4.12b-e), relative fingerprints independent of checkout dir (4.12f), and
+global scope / 8 KiB search pagination (4.13).
+
+### Breaking Changes
+- **`analyze_grpc` checks `.proto` wire-format breaking changes against a Git base**:
+  Verifies target `.proto` files against a Git base (`origin/HEAD`, `origin/main`, `main`, or an
+  explicit `base` argument). Any reused field tag number, incompatible type or cardinality change,
+  or field deleted without `reserved` is reported as `WIRE_FORMAT_BREAKING_CHANGE`.
+- **`smart_search` scope is optional & default page budget is 8 KiB**: `scope` is no longer
+  required in the tool schema; omitting it or passing `"."`, `"*"` or the workspace root searches
+  across all configured workspace roots. Search pages cut at 8 KiB of rendered results by default
+  (`DEFAULT_PAGE_BUDGET_BYTES`), with `limit` (default 20) acting as a secondary cap.
+- **`mesh-mcp graph --format fingerprint` is independent of checkout directory**: Node,
+  doc-section, and property-source paths are fingerprinted as `<root index>:<relative path>` with
+  `/` separators instead of absolute filesystem paths, ensuring identical fingerprints across
+  machines, directories, and operating systems. Fingerprint values change once with this release.
+- **Per-workspace persistent parse cache**: The cache is relocated from machine-wide
+  `~/.cache/mesh-mcp/index-cache.db` to isolated per-workspace database
+  `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db` with schema version 4. Pre-4.4 legacy
+  cache is no longer read (can be cleaned via `mesh-mcp doctor --fix`).
+
+### Security
+- **Linux `meshd` network sandbox (step 4.10)**: Right after binding its UNIX domain socket, `meshd`
+  confines itself using a seccomp filter on Linux (`SECCOMP_FILTER_FLAG_TSYNC` + `PR_SET_NO_NEW_PRIVS`),
+  making `socket(AF_INET/AF_INET6)` and `io_uring_setup` fail with `EPERM`. The daemon cannot open
+  any outbound or inbound IP network connections. Configurable via `MESH_DAEMON_SANDBOX` (`required` / `disabled`).
+- **YAML alias and memory exhaustion protection (step 4.9)**: YAML parsing protects against
+  billion-laughs and memory exhaustion by charging anchor recording, alias replays, and scalar bytes
+  to strict per-file budgets (1 event per input byte, 4x replayed scalars, 8x output for Spring properties).
+- **Hardened daemon socket and directory permissions (step 4.7)**: Daemon socket files are created
+  explicitly with `0600` permissions and parent directories `0700`, irrespective of process umask.
+
+### Added
+- **`mesh-mcp doctor --fix` & `--json` (step 4.7)**: Repairs orphaned sockets, directory and file
+  permissions, corrupt or legacy caches, orphaned workspace cache directories left by upgrades, and
+  stops version-mismatched daemons. Emits structured JSON findings on stdout for installation scripts.
+- **Size-tier benchmark budgets & regression gates (step 4.3)**: `scripts/bench/tier_bench.py`
+  measures multi-run medians and validates against per-platform tier budget files (`budgets-50k.json`,
+  `budgets-200k.json`). Nightly CI benchmark gains a 50k-file job for plain and contract-mix corpora.
+- **`analyze_impact` impact matrix (step 4.6a)**: Returns a compact Markdown impact matrix covering
+  gRPC handlers/clients and async topics/producers/consumers with scope classification (`INTERNAL`/`EXTERNAL`)
+  and edge confidence (`exact`/`heuristic`/`ambiguous`), paginated with `limit` and `offset`.
+- **TypeScript gRPC client extraction & CI golden ratchet (step 4.5)**: Extractor identifies
+  `new <X>Client(...)` call sites in TypeScript, linking client calls to declared services. CI precision/recall
+  ratchet in `.github/workflows/golden.yml` holds all three golden repos (`online-boutique`,
+  `bank-of-anthos`, `otel-demo`) at 100% / 100% precision and recall.
+- **Idempotent pilot installer & metrics stats (step 4.8)**: `scripts/install_pilot.sh` installs
+  and configures `mesh-mcp` and `meshd` into `~/.local/bin`; `mesh-mcp stats` computes nearest-rank p50/p95
+  latencies, error rates, index cache hits, and process restarts from the SQLite audit database.
+  `docs/pilot-scorecard.md` documents the A/B evaluation protocol.
+- **Index health rejection reporting (step 4.1)**: `IndexHealth` tracks rejected files (oversized,
+  binary, guard, parse error); `smart_search` and `find_dependents` append in-scope rejection notes;
+  `doctor` summarizes index health.
+- **Per-workspace cache quota & LRU eviction (step 4.4)**: `[cache] max_size_mb` (default 2048 MB)
+  automatically trims LRU entries down to 80% when exceeded, followed by `incremental_vacuum`.
+
+### Changed
+- **Event-driven macOS watcher (step 4.2)**: Recursive FSEvents stream per root replaces directory
+  polling on macOS workspaces with >200 directories, eliminating idle polling CPU.
+- **Streaming YAML & bounded Markdown memory (step 4.9)**: YAML parser streams events on-the-fly
+  (`unsafe-libyaml`), dropping memory on large specs from 29x to 2.2x file size. Markdown section
+  splitting capped at 3x file size.
+- **`smart_search` filtered rejection notes (step 4.13)**: Notes only list relevant code and spec
+  files (excluding images, lockfiles, and documentation).
+- **Peak memory reporting in benchmarks (step 4.3)**: Uses OS-level max RSS (`/usr/bin/time -l` on
+  macOS, `getrusage` on Linux).
+- **Documentation refresh**: Complete overhaul of `README.md`, `docs/quality.md`, `SETUP.md`,
+  `docs/mcp-tools.md`, architecture and skills to reflect active code with sourced measurements only.
+
+### Fixed
+- **Git storm & lock coordination (step 4.2)**: File watcher holds reloads during Git operations
+  (`index.lock`, `rebase-merge/`, moving `HEAD`), reloading once settled into a single clean generation
+  without tearing or partial states.
+- **Audit log completeness (step 4.12b-e)**: Argument errors and RSAH refusals now log to SQLite
+  audit chain with `ERROR` status.
+- **Markdown fence escaping (step 4.12b-e)**: Code snippet fences dynamically expand beyond embedded
+  backtick runs to prevent syntax breakage.
+- **Root disambiguation (step 4.12b-e)**: Roots sharing directory names disambiguated by parent path.
+- **CI determinism script resilience (step 4.12a)**: Eliminates broken pipe (`EPIPE`) failures when
+  piping into `head`.
+- **Proxy session lifecycle (step 4.13)**: Proxy falls back to standalone if daemon connection drops
+  during startup, and exits cleanly with EOF on stderr if daemon terminates mid-session.
+- **Index cache eviction granularity (step 4.4)**: Eviction deletes only the required number of excess
+  entries rather than flushing entire 1,000-entry batches.
+- **gRPC Health check false-positive edge (step 4.5)**: Standard `grpc.health.v1.Health` excluded
+  from cross-service RPC call resolution.
+
 ## [6.0.1] — 2026-09-26
 
 ### Fixed

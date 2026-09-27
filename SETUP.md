@@ -199,7 +199,7 @@ mesh-mcp doctor
 Abridged output (the exact lines depend on the platform and configuration):
 
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (v6.0.1, commit: ...)...
+🔍 Running MeshMCP Diagnostic Healthcheck (v7.0.0, commit: ...)...
 
 ✔ Config syntax: Valid (.agents/mesh-mcp.toml)
 ✔ Jailed roots verified (6/6 allowed roots, 0 escapes detected)

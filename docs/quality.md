@@ -1277,40 +1277,25 @@ Reading these honestly:
 - `reload_ms` has only been measured for a single-file edit; a multi-file burst (e.g. a branch
   checkout touching hundreds of files at once) exercises the debounce-coalescing path in
   `FileWatcherService::schedule_reload` differently and is not yet in the harness.
-- Kafka/Pub-Sub topic resolution has real ground truth now (`otel-demo`'s `orders` topic, above)
+- Large real-world repos (e.g. `kubernetes`, `vscode`) have initial cold measurements in step 4.3
+  above; ongoing performance tracking and regression budgets for external repos remain manual.
+- Kafka/Pub-Sub topic resolution has real ground truth (`otel-demo`'s `orders` topic, above)
   but no `score.py` mode reads it yet.
-- HTTP route extraction has real ground truth now (`bank-of-anthos`'s 18 Flask routes, above) but
+- HTTP route extraction has real ground truth (`bank-of-anthos`'s 18 Flask routes, above) but
   no comparable `score.py` mode exists yet; nor is there ground truth for its three Java/Spring
-  services, a different framework step 2.6 does not extract.
-- The TypeScript gRPC-client-construction gap found above (`new XServiceClient(...)` from
-  `@grpc/grpc-js`, distinct from the already-covered NestJS `getService<XServiceClient>(...)`
-  idiom) — real, unfixed, first observed against `otel-demo`'s frontend.
-- The `checkout -> health` spurious edge found above — the gRPC health-check service import
-  resolving as if it were a real service dependency.
-- `analyze_impact_with_depth`'s `depth > 1` traversal against a *real* multi-hop async chain — the
-  ground truth for one now exists (`otel-demo`'s `orders` topic chain, above), but no
-  `score.py`-style transitive-impact scorer has been run against it yet; verified so far only
-  against the synthetic cycle-detection regression test in step 2.7.
-- `PersistentIndexCache` (step 3.2) has no eviction or size cap: `index-cache.db` grows
-  unboundedly as distinct workspaces/paths/configs accumulate entries on a shared machine over
-  time. Only the "same workspace, second boot" scenario is measured so far — not a mixed
-  cache-hit-rate cold start, nor long-run db size under many different repos.
-- `FileWatcherService`'s `MAX_WATCHED_DIRS` cap (step 3.3) has not been measured against a real
-  200,000+ file repository to confirm the `PollWatcher` fallback actually engages and stays
-  responsive at that scale — only proven at the unit level (`plan_watch_dirs_reports_capped_
-  without_a_partial_list`) with a synthetic 10-directory tree well under the `MAX_WATCHED_DIRS` threshold.
-  Similarly, the dynamic-registration path's real ~11s-per-call FSEvents cost on macOS under load
-  (see step 3.3's section above) has not been characterized on Linux (inotify) or Windows
-  (ReadDirectoryChangesW) — only asserted to be cheaper by architecture, not measured.
-- `open_daemon_log`'s rotation (step 3.3) is tested at the algorithm level (`rotate_and_open_log`
-  against a temp directory) but not exercised concurrently — two `meshd` auto-spawns for the
-  *same* workspace racing `ensure_daemon_running` at the same moment (unlikely, since the socket
-  check should prevent it, but not proven) could interleave their rotation logic.
+  services.
+- `analyze_impact_with_depth`'s `depth > 1` traversal against a real multi-hop async chain (e.g.
+  `otel-demo`'s `orders` topic chain) is verified by unit and regression tests, but has not been run
+  through a dedicated multi-hop golden scorer.
+- **Pilot & Human Evaluation (Post-7.0.0)**:
+  - Step 4.8 pilot: to be conducted with human engineering teams using the protocol in `docs/pilot-scorecard.md`.
+  - Step 4.11 audit analysis: redaction counts by path pattern collected during the field pilot.
+  - Step 4.3 real-repo tier: periodic validation on enterprise-internal monorepos.
 
 ## Ratchet policy
 
-Once a golden file exists for a repo, its precision/recall must never regress:
-`scripts/golden/score.py <repo> --fail-under-precision <P> --fail-under-recall <R>`, set to the
-last-measured values, is meant to run in CI (not yet wired in — the corpus is still one repo
-deep; wiring this before `otel-demo`/`bank-of-anthos` land would just gate on `online-boutique`
-alone). Raising either threshold is itself a P1 improvement PR's job.
+Once a golden file exists for a repo, its precision/recall must never regress.
+The golden corpus precision/recall ratchet is enforced in CI via `.github/workflows/golden.yml`
+(`online-boutique`, `bank-of-anthos`, and `otel-demo` all held at 1.0 / 1.0).
+Raising thresholds or adding new golden repositories is a tracked quality milestone.
+

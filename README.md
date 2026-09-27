@@ -262,7 +262,7 @@ Details: [docs/architecture.md](docs/architecture.md) (jail, sandbox, audit) and
 
 ## Status and known limitations
 
-- **Version 6.0.1** on `main`. Single Rust workspace (`mesh-core`, `mesh-parsers`,
+- **Version 7.0.0** on `main`. Single Rust workspace (`mesh-core`, `mesh-parsers`,
   `mesh-server`, `mesh-daemon`); CI runs formatting, strict Clippy, and the test suite on Linux,
   macOS and Windows, plus the determinism and golden-corpus gates.
 - **Ready for a pilot, not yet validated in production use.** The A/B pilot is the next

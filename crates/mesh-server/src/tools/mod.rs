@@ -253,20 +253,16 @@ impl ToolRegistry {
         tool: &'static str,
         trace_id: Option<String>,
         args_json: &str,
+        started: std::time::Instant,
     ) {
-        let audit_enabled = state
-            .config
-            .engines
-            .policy
-            .as_ref()
-            .is_none_or(|p| p.cryptographic_audit_trail);
-        if !audit_enabled {
+        if !state.audit_enabled() {
             return;
         }
         let state = Arc::clone(state);
         let args_json = args_json.to_string();
+        let duration_us = micros_since(started);
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = state.audit.record_entry(
+            match state.audit.record_entry(
                 "active-session",
                 trace_id.as_deref(),
                 tool,
@@ -275,7 +271,10 @@ impl ToolRegistry {
                 Vec::new(),
                 0,
             ) {
-                tracing::warn!(target: "mesh::audit", "Audit write failed for {tool}: {e}");
+                Ok(entry) => record_latency(&state, entry.entry_seq, duration_us),
+                Err(e) => {
+                    tracing::warn!(target: "mesh::audit", "Audit write failed for {tool}: {e}")
+                }
             }
         })
         .await;
@@ -290,10 +289,13 @@ impl ToolRegistry {
         arguments: Value,
         state: Arc<AppState>,
     ) -> Result<Result<String, ToolError>, ToolError> {
+        // Plan 4 step 4.8: wall-clock latency of the whole call (argument parsing,
+        // governance, tool body, output capping), persisted next to its audit row.
+        let started = std::time::Instant::now();
         let args: T::Args = match serde_json::from_value(arguments.clone()) {
             Ok(args) => args,
             Err(e) => {
-                Self::record_refusal(&state, T::NAME, None, &arguments.to_string()).await;
+                Self::record_refusal(&state, T::NAME, None, &arguments.to_string(), started).await;
                 return Ok(Err((
                     -32602,
                     format!("Invalid arguments for {}: {e}", T::NAME),
@@ -319,7 +321,7 @@ impl ToolRegistry {
                         });
                         let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
                         let args_json = serde_json::to_string(&args).unwrap_or_default();
-                        Self::record_refusal(&state, T::NAME, trace_id, &args_json).await;
+                        Self::record_refusal(&state, T::NAME, trace_id, &args_json, started).await;
                         return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
                     } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
                         tracing::warn!(
@@ -382,15 +384,10 @@ impl ToolRegistry {
             // gates the response but always happens on the same blocking thread —
             // unless `[engines.policy] cryptographic_audit_trail = false` turns the
             // whole audit trail off (absent config defaults to on).
-            let audit_enabled = state
-                .config
-                .engines
-                .policy
-                .as_ref()
-                .is_none_or(|p| p.cryptographic_audit_trail);
-            if audit_enabled {
+            if state.audit_enabled() {
+                let duration_us = micros_since(started);
                 let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
-                if let Err(e) = state.audit.record_entry(
+                match state.audit.record_entry(
                     "active-session",
                     trace_id.as_deref(),
                     T::NAME,
@@ -399,7 +396,10 @@ impl ToolRegistry {
                     files,
                     redacted,
                 ) {
-                    tracing::warn!(target: "mesh::audit", "Audit write failed for {}: {e}", T::NAME);
+                    Ok(entry) => record_latency(&state, entry.entry_seq, duration_us),
+                    Err(e) => {
+                        tracing::warn!(target: "mesh::audit", "Audit write failed for {}: {e}", T::NAME)
+                    }
                 }
             }
 
@@ -407,6 +407,18 @@ impl ToolRegistry {
         })
         .await
         .map_err(|e| (-32603, format!("Tool task failed: {e}")))
+    }
+}
+
+fn micros_since(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Persists the latency of the call audited as `entry_seq` (plan 4 step 4.8). The
+/// duration is taken before the audit write, so the SQLite insert is not part of it.
+fn record_latency(state: &AppState, entry_seq: u64, duration_us: u64) {
+    if let Err(e) = state.audit.record_tool_latency(entry_seq, duration_us) {
+        tracing::warn!(target: "mesh::audit", "Latency write failed for entry {entry_seq}: {e}");
     }
 }
 

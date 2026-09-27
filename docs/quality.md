@@ -1123,6 +1123,70 @@ and the actual threshold at which any given IDE diverts a response.
 never meant to parse. It is outside the 8 KiB entry budget by design (4.1 guarantees it is never
 cut), but is now the second-largest part of a typical page.
 
+## 2026-09-27 — step 4.1 not-indexed note limited to source files (4.13 review)
+
+The step 4.13 measurement above found the step 4.1 note costing 1.8–1.9 KB on every
+`smart_search` page, empty ones included, because it listed image files. The note is meant to
+name files a search *should* have covered. Rule kept: `smart_search` now uses the same filter
+`find_dependents` already had (`is_indexable_source`: a tree-sitter language or YAML). An
+extension filter was chosen over a reason filter because a large image is rejected as *oversized*,
+not by the binary guard, so dropping one reason would not have removed it. `mesh-mcp doctor` is
+unchanged and still counts and lists every rejected file.
+
+**Command** (same as above: release binary, `run --standalone`, isolated `HOME`, private
+`MESH_SOCKET_PATH`, `limit: 20`; macOS arm64). "Before" is `main` at `a1c58d2`:
+
+```bash
+cargo build --release -p mesh-server
+MESH_MCP_BIN=target/release/mesh-mcp python3 scripts/bench/search_payload.py --limit 20
+```
+
+**Before:**
+
+| corpus | query | page bytes | of which not-indexed note | entries | total matches | entry bytes | largest entry |
+|---|---|---:|---:|---:|---:|---:|---:|
+| online-boutique | `Service` | 9756 | 1797 | 11 | 25 | 7597 | 1147 |
+| online-boutique | `Request` | 7545 | 1797 | 13 | 13 | 5497 | 632 |
+| online-boutique | `Handler` | 8312 | 1797 | 7 | 7 | 6265 | 1146 |
+| online-boutique | `Client` | 7812 | 1797 | 7 | 7 | 5766 | 903 |
+| online-boutique | `get` | 10119 | 1797 | 16 | 35 | 7964 | 1185 |
+| bank-of-anthos | `Service` | 3303 | 1885 | 2 | 2 | 1169 | 707 |
+| bank-of-anthos | `Request` | 3015 | 1885 | 2 | 2 | 881 | 445 |
+| bank-of-anthos | `Handler` | 2134 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `Client` | 2133 | 1885 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `get` | 8495 | 1885 | 13 | 13 | 6364 | 709 |
+| otel-demo | `Service` | 9935 | 1767 | 11 | 22 | 7812 | 1140 |
+| otel-demo | `Request` | 7244 | 1767 | 11 | 11 | 5232 | 747 |
+| otel-demo | `Handler` | 4284 | 1767 | 2 | 2 | 2273 | 1140 |
+| otel-demo | `Client` | 8301 | 1767 | 10 | 10 | 6290 | 1106 |
+| otel-demo | `get` | 9861 | 1767 | 20 | 46 | 7742 | 867 |
+
+**After:**
+
+| corpus | query | page bytes | of which not-indexed note | entries | total matches | entry bytes | largest entry |
+|---|---|---:|---:|---:|---:|---:|---:|
+| online-boutique | `Service` | 8424 | 465 | 11 | 25 | 7597 | 1147 |
+| online-boutique | `Request` | 6213 | 465 | 13 | 13 | 5497 | 632 |
+| online-boutique | `Handler` | 6980 | 465 | 7 | 7 | 6265 | 1146 |
+| online-boutique | `Client` | 6480 | 465 | 7 | 7 | 5766 | 903 |
+| online-boutique | `get` | 8787 | 465 | 16 | 35 | 7964 | 1185 |
+| bank-of-anthos | `Service` | 1418 | 0 | 2 | 2 | 1169 | 707 |
+| bank-of-anthos | `Request` | 1130 | 0 | 2 | 2 | 881 | 445 |
+| bank-of-anthos | `Handler` | 249 | 0 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `Client` | 248 | 0 | 0 | 0 | 0 | 0 |
+| bank-of-anthos | `get` | 6610 | 0 | 13 | 13 | 6364 | 709 |
+| otel-demo | `Service` | 8629 | 461 | 11 | 22 | 7812 | 1140 |
+| otel-demo | `Request` | 5938 | 461 | 11 | 11 | 5232 | 747 |
+| otel-demo | `Handler` | 2978 | 461 | 2 | 2 | 2273 | 1140 |
+| otel-demo | `Client` | 6995 | 461 | 10 | 10 | 6290 | 1106 |
+| otel-demo | `get` | 8555 | 461 | 20 | 46 | 7742 | 867 |
+
+Entries are byte-identical; only the note changed. `bank-of-anthos` no longer carries a note
+(every rejected file was an image): its empty pages drop from 2,133–2,134 bytes to 248–249. On
+`online-boutique` and `otel-demo` the note falls from 1,797 / 1,767 bytes to 465 / 461 and still
+names two files each that a search would miss: generated `demo_pb2.py` files rejected by the
+lexical guard (binary / long line / deep nesting), and on `otel-demo` a 387 KB YAML fixture
+over the size budget.
 ## Update (2026-09-27, Plan 4 step 4.3 — size-tier budgets: 5k / 50k / 200k, plus two real repositories)
 
 **Harness.** `scripts/bench/tier_bench.py` runs `scale_bench.py` N times cold (fresh `HOME` per run,

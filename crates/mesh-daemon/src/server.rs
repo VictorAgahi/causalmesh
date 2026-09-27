@@ -90,7 +90,7 @@ async fn handle_client<S>(
 // ── Unix Domain Socket transport ─────────────────────────────────────────────
 
 #[cfg(unix)]
-pub use unix_impl::run_uds_server;
+pub use unix_impl::run_uds_server_then;
 
 #[cfg(unix)]
 mod unix_impl {
@@ -108,6 +108,10 @@ mod unix_impl {
     /// would overwrite the real winner's record with its own PID and immediately
     /// exit, leaving `doctor`'s version check pointed at a daemon that never
     /// existed on this socket.
+    ///
+    /// Unit tests only: `meshd` itself always goes through
+    /// [`run_uds_server_then`] with its network sandbox hook.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_uds_server(
         socket_path: &std::path::Path,
@@ -116,6 +120,33 @@ mod unix_impl {
         counter: ClientCounter,
         workspace_id: &str,
         version: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        run_uds_server_then(
+            socket_path,
+            state,
+            cancel_token,
+            counter,
+            workspace_id,
+            version,
+            || Ok(()),
+        )
+        .await
+    }
+
+    /// [`run_uds_server`], running `after_bind` once the socket is bound and
+    /// before the first `accept` (plan 4 step 4.10: `meshd` passes
+    /// `sandbox::apply_after_bind` here — the network sandbox can only be
+    /// installed once the socket exists). An `Err` from `after_bind` removes
+    /// the socket this process just bound and stops the server.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_uds_server_then(
+        socket_path: &std::path::Path,
+        state: Arc<AppState>,
+        cancel_token: CancellationToken,
+        counter: ClientCounter,
+        workspace_id: &str,
+        version: &str,
+        after_bind: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(parent) = socket_path.parent() {
             use std::os::unix::fs::PermissionsExt;
@@ -128,6 +159,11 @@ mod unix_impl {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = after_bind() {
+            drop(listener);
+            let _ = std::fs::remove_file(socket_path);
+            return Err(e.into());
         }
         mesh_core::socket::write_daemon_meta(workspace_id, version);
         tracing::info!(

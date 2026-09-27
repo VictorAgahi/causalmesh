@@ -135,7 +135,7 @@ impl McpTool for FindDependentsTool {
         // rejected file that could have declared a dependent (source, proto,
         // YAML — not prose) is named in a note appended last and never cut.
         let note = snapshot.health.scope_note(|p| {
-            state.allowed_roots.iter().any(|r| p.starts_with(r)) && may_declare_dependents(p)
+            state.allowed_roots.iter().any(|r| p.starts_with(r)) && is_indexable_source(p)
         });
         if let Some(note) = note {
             fit_before_note(&mut text, note.len(), dependent_count);
@@ -146,9 +146,13 @@ impl McpTool for FindDependentsTool {
 }
 
 /// Whether a file could hold contract nodes at all: one with a tree-sitter
-/// grammar, or a YAML file (OpenAPI/AsyncAPI specs). Keeps an oversized README
-/// or lockfile out of every `find_dependents` answer.
-fn may_declare_dependents(path: &std::path::Path) -> bool {
+/// grammar, or a YAML file (OpenAPI/AsyncAPI specs). The one filter of the
+/// step 4.1 not-indexed note in both `find_dependents` and `smart_search`: it
+/// names the source files a search *should* have covered, and keeps an
+/// oversized README, a lockfile or an image out of every answer (an image made
+/// the note cost 1.8-1.9 KB on every `smart_search` page of the golden
+/// corpora). `mesh-mcp doctor` still lists every rejected file.
+pub(crate) fn is_indexable_source(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
     LanguageKind::from_path(&s).language().is_some()
         || path
@@ -186,10 +190,10 @@ mod tests {
 
     #[test]
     fn only_files_that_can_declare_dependents_are_noted() {
-        assert!(may_declare_dependents(Path::new("/r/svc/api.ts")));
-        assert!(may_declare_dependents(Path::new("/r/openapi.YAML")));
-        assert!(!may_declare_dependents(Path::new("/r/README.md")));
-        assert!(!may_declare_dependents(Path::new("/r/package-lock.json")));
+        assert!(is_indexable_source(Path::new("/r/svc/api.ts")));
+        assert!(is_indexable_source(Path::new("/r/openapi.YAML")));
+        assert!(!is_indexable_source(Path::new("/r/README.md")));
+        assert!(!is_indexable_source(Path::new("/r/package-lock.json")));
     }
 
     #[test]

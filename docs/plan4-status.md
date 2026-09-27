@@ -4,7 +4,7 @@
 > des charges) et `CLAUDE.md`. Il est mis à jour à chaque merge. Une session qui reprend le Plan 4
 > (locale ou cloud) le lit en premier.
 >
-> **Dernière mise à jour** : 2026-09-27 — `main` = `a873f52`.
+> **Dernière mise à jour** : 2026-09-27 — `main` = `c234960` (passation vers la session cloud).
 
 ---
 
@@ -17,10 +17,10 @@
 | 4.5 recall gRPC TS + golden CI | ✅ mergé | #39 | — | — |
 | 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
-| 4.4-fix éviction intermittente | 🔧 en cours | `p3/4.4-fix-eviction` (pas encore poussée) | — | cause racine, correctif, preuve N/N, PR |
+| 4.4-fix éviction intermittente | ✅ PR ready, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1) ; N/N sous charge Linux (12/12) et N/N macOS/Windows (5/5 chacun, sur reruns successifs du même run CI) faits ; repro sur l'ancien code (8/8) faite ; passée en ready. Reste : accord de l'utilisateur pour merger |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
-| 4.9 mémoire YAML/Markdown | 🔍 en review | #42 `p3/4.9-yaml-md-memory` | `9af9ecc` | fin de review adversariale, puis merge |
-| 4.1 diagnostics d'indexation | ⏸️ démarré puis arrêté (quota) | `p3/4.1-index-diagnostics` (draft PR éventuelle) | — | reprendre depuis la branche si elle existe, sinon tout |
+| 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
+| 4.1 diagnostics d'indexation | ✅ review faite, correctifs poussés | #46 `p3/4.1-index-diagnostics` | `8f0709d` | review adversariale complète faite (§2.3) : 2 MAJOR + 2 MINOR corrigés, tests de régression ajoutés ; clippy/fmt/déterminisme/tests verts ; reste la CI puis passer en ready |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
@@ -37,23 +37,69 @@ Légende : ✅ mergé · 🔍 PR prête, review en cours · 🔧 correctif en co
 
 ## 2. Problèmes ouverts sur `main` ou dans les PR
 
-### 2.1 Éviction du cache intermittente (4.4, sur `main`) — MAJOR
+### 2.1 Éviction du cache intermittente (4.4, sur `main`) — MAJOR, correctif en PR #47
 `crates/mesh-server/tests/index_cache_quota.rs:340`, test `partially_evicted_cache_indexes_exactly_like_no_cache`.
 Il a échoué une fois en CI macOS (run 36304190590, tentative 1, job 108577531925) avec
 `CacheStats { hits: 0, misses: 6000, errors: 0, evicted: 6000 }`, puis il est passé à la relance.
 C'est exactement le symptôme d'origine : l'éviction vide tout le cache au lieu de redescendre à 80 %.
-Le correctif de la review (départage par `payload_rowid`, schéma v4, transaction `IMMEDIATE`) n'est
-donc pas déterministe. Pistes : la taille mesurée (base + WAL) ne baisse pas tant que le WAL n'est pas
-checkpointé, et la boucle continue d'évincer ; `incremental_vacuum` ; horodatages égaux ; timing
-macOS. **Exigence** : cause prouvée, correctif sans assouplir le test (≤ 80 % du quota **et** entrées
-conservées), N/N runs verts sous charge.
+
+**Cause prouvée** : l'éviction supprimait des lots fixes de 1 000 entrées ; un lot ratait la cible de
+80 % de quelques octets (selon la taille des entrées, elle-même dépendante de la longueur du chemin
+absolu du workspace — un `TMPDIR` long en CI macOS change cette taille), et le lot suivant vidait tout
+le reste du cache. Reproduit à 100 % sur l'ancien code (`d2a63c9^`, commit `d64d0ac`, PR #40) avec un
+`TMPDIR` long sous Linux : 8/8 échecs, même signature `CacheStats { hits: 0, misses: 6000, errors: 0,
+evicted: 6000 }`.
+
+**Correctif** (`d2a63c9`, PR #47) : chaque étape d'éviction supprime environ autant d'entrées que
+l'excès l'exige (au plus 1 000), jamais un lot fixe. Un nouveau test unitaire balaie les tailles
+d'entrée (900 à 1400 octets) sur 3 tours. Un second correctif, dans le même commit : le checkpoint WAL
+`TRUNCATE` tournait sous le `busy_timeout` de 5 s et bloquait les écrivains des autres processus
+pendant qu'il attendait un lecteur — piste probable du flake Windows `SQLITE_BUSY` (`errors: 1`,
+2.3) ; il tourne maintenant sans le busy handler.
+
+**Preuves rassemblées (session cloud)** : 14 tests unitaires de `mesh-core::index_cache` verts ; les
+6 tests d'intégration de `index_cache_quota.rs` verts ; 12/12 runs de la suite complète sous charge
+avec un `TMPDIR` long sous Linux ; clippy et fmt verts. CI GitHub verte sur les trois OS de la matrice
+(`Test Suite (ubuntu|macos|windows-latest)`), puis le run entier rerun 5 fois de suite (les outils
+disponibles n'exposent qu'un rerun du workflow entier, pas un rerun ciblé par job) : **`Test Suite
+(macos-latest)` 5/5 et `Test Suite (windows-latest)` 5/5**, aucun échec. PR #47 passée en ready ; reste
+l'accord de l'utilisateur pour merger.
 
 ### 2.2 Coût mémoire de `props` (4.9, PR #42)
 Il reste entre 12× et 25× la taille du fichier, au-dessus du seuil de 4×. Le coût vient du
 `PropertyRegistry` (deux maps, chacune avec ses copies de clés), pas du parseur. Il est borné à 8×
 de sortie et documenté dans `docs/quality.md`. Réduire le registre est hors périmètre de la 4.9.
 
-### 2.3 Limites connues, documentées, non bloquantes
+### 2.3 Review adversariale complète de 4.1 (#46) — 2 MAJOR + 2 MINOR, corrigés
+Sous-agent unique (budget §3), brief : `crates/mesh-core/src/health.rs`,
+`tools/smart_search.rs` et `find_dependents.rs` (note de rejet), `cli/doctor.rs` (section 9),
+interaction avec la note "opération Git en cours" de 4.2 (`tools/mod.rs`), et la réservation du
+budget 48 Ko. Findings, tous corrigés (commit `8f0709d`) :
+- **MAJOR** : l'invariant « la note du tool est ajoutée en dernier » était faux dès qu'un skill de
+  projet s'appliquait à l'appel — l'indice de skill était ajouté par `ToolRegistry::invoke` **après**
+  le retour de `T::run` (qui avait déjà ajouté la note de 4.1 à la fin de `out.text`), la reléguant en
+  avant-dernière position. Corrigé : l'indice de skill est maintenant préfixé (`insert_str(0, …)`),
+  comme la note Git de 4.2, si bien que rien ne suit plus jamais la note du tool.
+- **MAJOR** : la marge fixe de 1 Ko réservée par `smart_search`/`find_dependents` avant leur propre
+  note ne comptait ni l'indice de skill (dont le texte de description d'un fichier de skill était
+  recopié sans plafond) ni la note Git de 4.2. Corrigé : la description est plafonnée à 200 octets, et
+  la marge partagée (`NON_RESULT_RESERVE_BYTES`, mesh-parsers) est dimensionnée pour couvrir les deux
+  ajouts désormais bornés.
+- **MINOR** : `IndexHealth::rejected_overflow` s'accumulait (`+=`) à chaque rechargement incrémental
+  au lieu de refléter l'excès courant, dérivant sans borne sur la durée de vie d'un démon. Corrigé en
+  un plafond haute-marque (ne grandit que sur un excès réellement nouveau, ne se remet à zéro qu'à une
+  reconstruction complète) : une réassignation simple aurait au contraire fait retomber le compteur
+  vers 0 dès le premier rechargement suivant, les chemins tronqués étant perdus pour de bon.
+- **MINOR** : la ventilation par raison de `render_summary` ne comptait que la liste plafonnée
+  `rejected`, alors que le total additionnait `rejected_overflow` — sous-comptage silencieux dès que
+  l'overflow est non nul. Clarifié dans le texte plutôt que masqué (les compteurs exacts par raison
+  sont cumulatifs depuis la dernière reconstruction complète, pas un instantané, donc pas un
+  remplacement direct).
+
+Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+171 tests ciblés
+(`mesh-server`/`mesh-core`) verts après correctif.
+
+### 2.4 Limites connues, documentées, non bloquantes
 - 4.5 : un client TS construit au niveau module et utilisé seulement depuis une `function` de premier
   niveau ou une arrow `const` n'a pas d'arête. Les imports CommonJS `require()` ne sont pas gérés.
 - 4.6b : sans `base` explicite, un dossier hors dépôt Git ou un `git` absent donne une note
@@ -151,9 +197,11 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 
 ## 6. Ordre de reprise recommandé
 
-1. Merger #42 (4.9) quand sa review est verte (#43 et #44 sont mergées).
-2. Correctif de l'éviction intermittente (§2.1).
-3. 4.1, puis sa review complète.
+1. ✅ #42 (4.9) mergé.
+2. ✅ Correctif de l'éviction intermittente (§2.1) fait, PR #47 ready, verte (5/5 macOS, 5/5
+   Windows) ; reste l'accord de l'utilisateur pour merger.
+3. ✅ 4.1 (#46) : code, hygiène et review adversariale complète faits (§2.3, 2 MAJOR + 2 MINOR
+   corrigés) ; reste la CI, puis passer en ready, puis merge.
 4. 4.12b–e, avec une review groupée.
 5. 4.7, puis sa review complète.
 6. 4.10, puis sa review complète.

@@ -195,7 +195,11 @@ mod tests {
     fn fit_before_note_leaves_room_for_the_note() {
         let mut text = "[1] `Dep` (Import)\n- **File**: `a.ts:1-2`\n\n".repeat(3_000);
         fit_before_note(&mut text, 2_048, 3_000);
-        assert!(text.len() + 2_048 <= MAX_OUTPUT_BYTES - 1024, "{}", text.len());
+        assert!(
+            text.len() + 2_048 <= MAX_OUTPUT_BYTES - 1024,
+            "{}",
+            text.len()
+        );
         assert!(text.ends_with("or a more specific `target`.*\n"), "{text}");
         let mut small = "short\n".to_string();
         fit_before_note(&mut small, 2_048, 1);

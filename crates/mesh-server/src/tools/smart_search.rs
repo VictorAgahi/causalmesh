@@ -1203,9 +1203,17 @@ mod tests {
         crate::indexer::WorkspaceIndexer::reload(&state);
 
         let text = invoke_search(&state, "Long", &root).await;
-        assert!(text.len() <= mesh_parsers::MAX_OUTPUT_BYTES, "{}", text.len());
+        assert!(
+            text.len() <= mesh_parsers::MAX_OUTPUT_BYTES,
+            "{}",
+            text.len()
+        );
         assert!(text.contains("class Long00"), "other results still shown");
-        assert!(text.contains("offset: "), "the page was full: {}", text.len());
+        assert!(
+            text.contains("offset: "),
+            "the page was full: {}",
+            text.len()
+        );
         assert!(!text.contains("PAYLOAD TRUNCATED") && !text.contains("payload truncated"));
         let note = state
             .snapshot()
@@ -1213,7 +1221,10 @@ mod tests {
             .scope_note(|p| p.starts_with(&root))
             .expect("note");
         assert!(text.ends_with(&note), "note last and intact:\n{note}");
-        assert!(note.contains(&format!("`{}`: oversized, 450.0 KB", big.display())), "{note}");
+        assert!(
+            note.contains(&format!("`{}`: oversized, 450.0 KB", big.display())),
+            "{note}"
+        );
         assert!(note.contains("read the file directly"), "{note}");
     }
 
@@ -1231,7 +1242,10 @@ mod tests {
 
         let text = invoke_search(&state, "Widget", &root.join("a")).await;
         assert!(text.contains("class Widget"), "{text}");
-        assert!(!text.contains("huge.py") && !text.contains("not indexed"), "{text}");
+        assert!(
+            !text.contains("huge.py") && !text.contains("not indexed"),
+            "{text}"
+        );
         let whole = invoke_search(&state, "Widget", &root).await;
         assert!(whole.contains("huge.py"), "{whole}");
     }
@@ -1257,7 +1271,9 @@ mod tests {
                 .collect()
         };
         assert_eq!(paths(&state), vec![big.clone()]);
-        assert!(invoke_search(&state, "Keep", &root).await.contains("big.py"));
+        assert!(invoke_search(&state, "Keep", &root)
+            .await
+            .contains("big.py"));
 
         std::fs::write(&big, "class Big:\n    pass\n").expect("shrink");
         let other = root.join("other.py");
@@ -1265,7 +1281,10 @@ mod tests {
         crate::indexer::WorkspaceIndexer::reload_paths(&state, &[big.clone(), other.clone()]);
         assert_eq!(paths(&state), vec![other.clone()]);
         let text = invoke_search(&state, "Keep", &root).await;
-        assert!(text.contains("other.py") && !text.contains("big.py"), "{text}");
+        assert!(
+            text.contains("other.py") && !text.contains("big.py"),
+            "{text}"
+        );
 
         // An unchanged rejection is not a change: no new snapshot.
         let generation = state.snapshot().generation;
@@ -1275,6 +1294,8 @@ mod tests {
         std::fs::remove_file(&other).expect("rm");
         crate::indexer::WorkspaceIndexer::reload(&state);
         assert!(paths(&state).is_empty());
-        assert!(!invoke_search(&state, "Keep", &root).await.contains("not indexed"));
+        assert!(!invoke_search(&state, "Keep", &root)
+            .await
+            .contains("not indexed"));
     }
 }

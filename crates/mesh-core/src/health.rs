@@ -167,7 +167,8 @@ impl IndexHealth {
     /// rejection appears. Returns whether the list changed.
     pub fn replace_rejected(&mut self, touched: &HashSet<&Path>, fresh: &[RejectedFile]) -> bool {
         let before = self.rejected.clone();
-        self.rejected.retain(|r| !touched.contains(r.path.as_path()));
+        self.rejected
+            .retain(|r| !touched.contains(r.path.as_path()));
         self.rejected.extend(fresh.iter().cloned());
         self.normalize_rejected();
         self.rejected != before
@@ -400,7 +401,10 @@ mod tests {
         assert!(h.replace_rejected(&touched, &fresh));
         let paths: Vec<_> = h.rejected.iter().map(|r| r.path.clone()).collect();
         assert_eq!(paths, vec![new.clone(), PathBuf::from("/r/untouched.ts")]);
-        assert!(!h.replace_rejected(&touched, &fresh), "same outcome: unchanged");
+        assert!(
+            !h.replace_rejected(&touched, &fresh),
+            "same outcome: unchanged"
+        );
     }
 
     #[test]
@@ -424,6 +428,9 @@ mod tests {
         assert!(h.scope_note(|p| p.starts_with("/none")).is_none());
 
         let few = h.scope_note(|p| p.starts_with("/out")).expect("note");
-        assert!(few.contains("`/out/a.ts`") && !few.contains("more"), "{few}");
+        assert!(
+            few.contains("`/out/a.ts`") && !few.contains("more"),
+            "{few}"
+        );
     }
 }

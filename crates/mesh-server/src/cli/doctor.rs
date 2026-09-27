@@ -21,8 +21,8 @@ impl DoctorCommand {
         if health.rejected.is_empty() && health.rejected_overflow == 0 {
             eprint!("✔ Index health: {summary}");
         } else {
-            eprint!(
-                "⚠ Index health: {summary}    Searches cannot return these files; read them directly.\n"
+            eprintln!(
+                "⚠ Index health: {summary}    Searches cannot return these files; read them directly."
             );
         }
     }

@@ -8,9 +8,9 @@
 
 use mesh_core::{
     expand_roots, sha256, AppState, BackgroundRescanEngine, CacheEntry, Config, ContractGraph,
-    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth, RejectReason,
-    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RepoId,
-    ValidatedScope,
+    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth,
+    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RejectReason,
+    RepoId, ValidatedScope,
 };
 use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,

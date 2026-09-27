@@ -37,7 +37,20 @@ enum Commands {
     },
 
     /// Run diagnostic healthchecks on environment, permissions, and roots
-    Doctor,
+    Doctor {
+        /// Repair what can safely be repaired: socket permissions, a stale
+        /// daemon left over from before an upgrade (stopped, never another
+        /// process), a corrupt or pre-4.4 legacy cache, an orphaned
+        /// per-version workspace cache directory. Never touches the audit
+        /// trail — its corruption is reported, not erased.
+        #[arg(long, default_value = "false")]
+        fix: bool,
+
+        /// Emit the repairable-health checks (section 10) as JSON on stdout,
+        /// for install scripts. Sections 1-9's prose still goes to stderr.
+        #[arg(long, default_value = "false")]
+        json: bool,
+    },
 
     /// Automatically scan polyglot workspace and generate .agents/mesh-mcp.toml
     Init {
@@ -94,8 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Run { standalone: false }) {
-        Commands::Doctor => {
-            DoctorCommand::run(cli.config.as_deref())?;
+        Commands::Doctor { fix, json } => {
+            DoctorCommand::run(cli.config.as_deref(), fix, json)?;
         }
         Commands::Init {
             auto,
@@ -204,6 +217,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Compares an already-running daemon's recorded version (plan 4 step 4.7:
+/// written by `meshd` itself at startup, `mesh_core::socket::write_daemon_meta`)
+/// against this `mesh-mcp` binary's own, and warns once if they differ — a
+/// daemon left over from before an upgrade otherwise keeps serving an older
+/// snapshot format or behavior with no visible sign why. Silent (not an
+/// error) when no metadata is on record: an older daemon that predates this
+/// check, or one whose write failed, is not itself a fault.
+fn warn_on_daemon_version_mismatch(workspace_id: &str) {
+    if let Some(meta) = mesh_core::socket::read_daemon_meta(workspace_id) {
+        if meta.version != env!("CARGO_PKG_VERSION") {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "meshd (pid {}) is running version {}, but this mesh-mcp is {} — \
+                 restart it (`mesh-mcp doctor --fix` stops the mismatched daemon) \
+                 to pick up the newer version.",
+                meta.pid,
+                meta.version,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
 }
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
@@ -325,6 +361,7 @@ async fn ensure_daemon_running(
     explicit_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
+        warn_on_daemon_version_mismatch(&mesh_core::workspace_id(base_dir));
         return Ok(());
     }
 
@@ -420,6 +457,7 @@ async fn ensure_daemon_running_windows(
     use tokio::net::windows::named_pipe::ClientOptions;
 
     if ClientOptions::new().open(pipe_name).is_ok() {
+        warn_on_daemon_version_mismatch(&mesh_core::workspace_id(base_dir));
         return Ok(());
     }
 

@@ -101,13 +101,35 @@ mod unix_impl {
     use tokio_util::sync::CancellationToken;
 
     /// Binds to `socket_path` and accepts connections until `cancel_token` fires.
+    /// `workspace_id`/`version` are recorded (`mesh_core::socket::write_daemon_meta`)
+    /// only once the bind below actually succeeds, and removed on every return path
+    /// (plan 4 step 4.7 review): written any earlier, a daemon that loses a bind
+    /// race for this workspace (see `test_two_daemons_racing_to_bind_only_one_wins`)
+    /// would overwrite the real winner's record with its own PID and immediately
+    /// exit, leaving `doctor`'s version check pointed at a daemon that never
+    /// existed on this socket.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_uds_server(
         socket_path: &std::path::Path,
         state: Arc<AppState>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
+        workspace_id: &str,
+        version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(parent) = socket_path.parent() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
         let listener = UnixListener::bind(socket_path)?;
+        // `bind` creates the socket file with a mode shaped by the process umask, not a
+        // fixed one (plan 4 step 4.7): explicit 0600 so a permissive umask never leaves
+        // it group/world-accessible.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+        }
+        mesh_core::socket::write_daemon_meta(workspace_id, version);
         tracing::info!(
             target: "meshd::server",
             "meshd listening on {}",
@@ -139,6 +161,7 @@ mod unix_impl {
             }
         }
 
+        mesh_core::socket::remove_daemon_meta(workspace_id);
         Ok(())
     }
 }
@@ -169,14 +192,22 @@ mod windows_impl {
     }
 
     /// Creates the named pipe at `pipe_name` and accepts connections until
-    /// `cancel_token` fires.
+    /// `cancel_token` fires. `workspace_id`/`version` are recorded only once
+    /// pipe creation actually succeeds, and removed on every return path (see
+    /// `run_uds_server`'s doc for why: written any earlier, a losing side of a
+    /// bind race would leave `doctor` pointed at a PID that never served this
+    /// workspace).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_named_pipe_server(
         pipe_name: &str,
         state: Arc<AppState>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
+        workspace_id: &str,
+        version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut server = create_instance(pipe_name, true)?;
+        mesh_core::socket::write_daemon_meta(workspace_id, version);
         tracing::info!(
             target: "meshd::server",
             "meshd listening on named pipe {}",
@@ -213,6 +244,7 @@ mod windows_impl {
             }
         }
 
+        mesh_core::socket::remove_daemon_meta(workspace_id);
         Ok(())
     }
 }
@@ -273,9 +305,16 @@ mod unix_tests {
         let counter_clone = counter.clone();
 
         tokio::spawn(async move {
-            run_uds_server(&sock_path_clone, state_clone, token_clone, counter_clone)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_clone,
+                state_clone,
+                token_clone,
+                counter_clone,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         // Wait for socket to appear
@@ -285,6 +324,45 @@ mod unix_tests {
             sock_path.exists(),
             "Socket file must exist after daemon binds"
         );
+
+        token.cancel();
+    }
+
+    /// Plan 4 step 4.7: the socket file and its parent directory must be
+    /// owner-only, whatever the process umask (`bind` alone shapes the file's
+    /// mode from it, not a fixed value).
+    #[tokio::test]
+    async fn test_daemon_socket_and_parent_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("perm-meshd.sock");
+
+        let state = make_state();
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+
+        let sock_path_clone = sock_path.clone();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            run_uds_server(
+                &sock_path_clone,
+                state,
+                token_clone,
+                counter,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock_mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "socket file mode: {sock_mode:o}");
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "socket dir mode: {dir_mode:o}");
 
         token.cancel();
     }
@@ -304,9 +382,16 @@ mod unix_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -351,9 +436,16 @@ mod unix_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -401,9 +493,16 @@ mod unix_tests {
         let token_srv = token.clone();
         let counter_srv = counter.clone();
         tokio::spawn(async move {
-            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -484,7 +583,9 @@ mod unix_tests {
             let token = token.clone();
             let counter = counter.clone();
             tokio::spawn(async move {
-                run_uds_server(&sock, state, token, counter).await.unwrap();
+                run_uds_server(&sock, state, token, counter, "test-ws", "0.0.0")
+                    .await
+                    .unwrap();
             });
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -534,9 +635,16 @@ mod unix_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -618,14 +726,12 @@ mod unix_tests {
         let token_a2 = token_a.clone();
         let token_b2 = token_b.clone();
 
-        let handle_a =
-            tokio::spawn(
-                async move { run_uds_server(&path_a, state_a, token_a2, counter_a).await },
-            );
-        let handle_b =
-            tokio::spawn(
-                async move { run_uds_server(&path_b, state_b, token_b2, counter_b).await },
-            );
+        let handle_a = tokio::spawn(async move {
+            run_uds_server(&path_a, state_a, token_a2, counter_a, "test-ws", "0.0.0").await
+        });
+        let handle_b = tokio::spawn(async move {
+            run_uds_server(&path_b, state_b, token_b2, counter_b, "test-ws", "0.0.0").await
+        });
 
         let (res_a, res_b) = tokio::join!(
             tokio::time::timeout(std::time::Duration::from_millis(400), handle_a),
@@ -657,6 +763,85 @@ mod unix_tests {
         }
     }
 
+    /// Regression (step 4.7 review): the loser of a bind race must never
+    /// overwrite the winner's `DaemonMeta` (workspace_id-keyed, not tied to
+    /// the socket path) with its own PID before failing — `doctor`'s version
+    /// check and `--fix`'s termination target would otherwise point at a
+    /// process that never actually served this workspace's socket. Mutates
+    /// `HOME` for its duration (`write_daemon_meta`/`read_daemon_meta` have no
+    /// override), like `make_state()` in this same file already touches the
+    /// real audit db path — same accepted, pre-existing risk under parallel
+    /// tests, on a `workspace_id` unique to this test.
+    #[tokio::test]
+    async fn losing_a_bind_race_never_overwrites_the_winners_daemon_meta() {
+        let home = tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("test-meshd-race-meta.sock");
+        let workspace_id = "race-meta-ws";
+
+        let state = make_state();
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        let counter_a = ClientCounter::new();
+        let counter_b = ClientCounter::new();
+
+        let path_a = sock_path.clone();
+        let path_b = sock_path.clone();
+        let state_a = state.clone();
+        let state_b = state.clone();
+        let token_a2 = token_a.clone();
+        let token_b2 = token_b.clone();
+
+        let handle_a = tokio::spawn(async move {
+            run_uds_server(&path_a, state_a, token_a2, counter_a, workspace_id, "1.1.1").await
+        });
+        let handle_b = tokio::spawn(async move {
+            run_uds_server(&path_b, state_b, token_b2, counter_b, workspace_id, "2.2.2").await
+        });
+
+        let (res_a, res_b) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), handle_a),
+            tokio::time::timeout(std::time::Duration::from_millis(400), handle_b),
+        );
+        let a_won = res_a.is_err();
+        let winner_version = if a_won { "1.1.1" } else { "2.2.2" };
+
+        let meta = mesh_core::socket::read_daemon_meta(workspace_id)
+            .expect("winner must have written its meta");
+        assert_eq!(
+            meta.version, winner_version,
+            "the loser must never overwrite the winner's meta with its own"
+        );
+
+        if a_won {
+            token_a.cancel();
+            res_b
+                .unwrap()
+                .unwrap()
+                .expect_err("loser must fail to bind");
+        } else {
+            token_b.cancel();
+            res_a
+                .unwrap()
+                .unwrap()
+                .expect_err("loser must fail to bind");
+        }
+        // Let the winner's own shutdown run (removes its meta on a clean exit).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            mesh_core::socket::read_daemon_meta(workspace_id).is_none(),
+            "the winner must remove its own meta on clean shutdown"
+        );
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     /// An idle-timeout (or SIGINT) firing mid-request must not drop the
     /// in-flight response: cancellation is only observed by the
     /// per-client loop between reads, so a request already dispatched
@@ -676,9 +861,16 @@ mod unix_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_uds_server(&sock_path_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_uds_server(
+                &sock_path_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -746,9 +938,16 @@ mod windows_tests {
         let counter_srv = counter.clone();
 
         tokio::spawn(async move {
-            run_named_pipe_server(&pipe_name_srv, state_srv, token_srv, counter_srv)
-                .await
-                .unwrap();
+            run_named_pipe_server(
+                &pipe_name_srv,
+                state_srv,
+                token_srv,
+                counter_srv,
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

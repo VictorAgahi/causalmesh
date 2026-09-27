@@ -566,7 +566,7 @@ impl MarkdownFormatter {
                     .and_then(|c| r.strip_prefix(c).ok())
                     .filter(|p| !p.as_os_str().is_empty());
                 match rel {
-                    Some(p) => p.to_string_lossy().into_owned(),
+                    Some(p) => Self::slash_path(p),
                     None => r
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -578,11 +578,22 @@ impl MarkdownFormatter {
 
     /// `path:line`, the path relative to the node's root when it has one.
     fn location(node: &ContractNode, roots: &[PathBuf]) -> String {
-        let path = roots
+        match roots
             .get(node.repo_id as usize)
             .and_then(|root| node.file_path.strip_prefix(root).ok())
-            .unwrap_or(&node.file_path);
-        format!("{}:{}", path.display(), node.line_start)
+        {
+            Some(rel) => format!("{}:{}", Self::slash_path(rel), node.line_start),
+            None => format!("{}:{}", node.file_path.display(), node.line_start),
+        }
+    }
+
+    /// A relative path with `/` separators on every platform, so a matrix
+    /// reads (and compares) the same on Windows.
+    fn slash_path(rel: &Path) -> String {
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     /// An inline-code table cell: `|` escaped, line breaks flattened, and a

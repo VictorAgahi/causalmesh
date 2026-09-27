@@ -20,7 +20,7 @@
 | 4.4-fix éviction intermittente | ✅ PR ready, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1) ; N/N sous charge Linux (12/12) et N/N macOS/Windows (5/5 chacun, sur reruns successifs du même run CI) faits ; repro sur l'ancien code (8/8) faite ; passée en ready. Reste : accord de l'utilisateur pour merger |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
 | 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
-| 4.1 diagnostics d'indexation | 🔍 PR draft, verte | #46 `p3/4.1-index-diagnostics` | `4767a9c` | code quasi complet, `main` intégré, changelog ajouté, clippy/fmt/déterminisme verts ; reste la review adversariale complète |
+| 4.1 diagnostics d'indexation | ✅ review faite, correctifs poussés | #46 `p3/4.1-index-diagnostics` | `8f0709d` | review adversariale complète faite (§2.3) : 2 MAJOR + 2 MINOR corrigés, tests de régression ajoutés ; clippy/fmt/déterminisme/tests verts ; reste la CI puis passer en ready |
 | 4.6a matrice d'impact | ⏳ à faire | — | — | tout (notes §3.2) |
 | 4.3 budgets 5k/50k/200k | ⏳ à faire | — | — | tout ; machine calme requise (§4) |
 | 4.7 `doctor --fix`, socket, version | ⏳ à faire (après 4.1) | — | — | tout |
@@ -70,7 +70,36 @@ Il reste entre 12× et 25× la taille du fichier, au-dessus du seuil de 4×. Le 
 `PropertyRegistry` (deux maps, chacune avec ses copies de clés), pas du parseur. Il est borné à 8×
 de sortie et documenté dans `docs/quality.md`. Réduire le registre est hors périmètre de la 4.9.
 
-### 2.3 Limites connues, documentées, non bloquantes
+### 2.3 Review adversariale complète de 4.1 (#46) — 2 MAJOR + 2 MINOR, corrigés
+Sous-agent unique (budget §3), brief : `crates/mesh-core/src/health.rs`,
+`tools/smart_search.rs` et `find_dependents.rs` (note de rejet), `cli/doctor.rs` (section 9),
+interaction avec la note "opération Git en cours" de 4.2 (`tools/mod.rs`), et la réservation du
+budget 48 Ko. Findings, tous corrigés (commit `8f0709d`) :
+- **MAJOR** : l'invariant « la note du tool est ajoutée en dernier » était faux dès qu'un skill de
+  projet s'appliquait à l'appel — l'indice de skill était ajouté par `ToolRegistry::invoke` **après**
+  le retour de `T::run` (qui avait déjà ajouté la note de 4.1 à la fin de `out.text`), la reléguant en
+  avant-dernière position. Corrigé : l'indice de skill est maintenant préfixé (`insert_str(0, …)`),
+  comme la note Git de 4.2, si bien que rien ne suit plus jamais la note du tool.
+- **MAJOR** : la marge fixe de 1 Ko réservée par `smart_search`/`find_dependents` avant leur propre
+  note ne comptait ni l'indice de skill (dont le texte de description d'un fichier de skill était
+  recopié sans plafond) ni la note Git de 4.2. Corrigé : la description est plafonnée à 200 octets, et
+  la marge partagée (`NON_RESULT_RESERVE_BYTES`, mesh-parsers) est dimensionnée pour couvrir les deux
+  ajouts désormais bornés.
+- **MINOR** : `IndexHealth::rejected_overflow` s'accumulait (`+=`) à chaque rechargement incrémental
+  au lieu de refléter l'excès courant, dérivant sans borne sur la durée de vie d'un démon. Corrigé en
+  un plafond haute-marque (ne grandit que sur un excès réellement nouveau, ne se remet à zéro qu'à une
+  reconstruction complète) : une réassignation simple aurait au contraire fait retomber le compteur
+  vers 0 dès le premier rechargement suivant, les chemins tronqués étant perdus pour de bon.
+- **MINOR** : la ventilation par raison de `render_summary` ne comptait que la liste plafonnée
+  `rejected`, alors que le total additionnait `rejected_overflow` — sous-comptage silencieux dès que
+  l'overflow est non nul. Clarifié dans le texte plutôt que masqué (les compteurs exacts par raison
+  sont cumulatifs depuis la dernière reconstruction complète, pas un instantané, donc pas un
+  remplacement direct).
+
+Trois nouveaux tests de régression ; clippy, fmt, `determinism.sh` et les 101+171 tests ciblés
+(`mesh-server`/`mesh-core`) verts après correctif.
+
+### 2.4 Limites connues, documentées, non bloquantes
 - 4.5 : un client TS construit au niveau module et utilisé seulement depuis une `function` de premier
   niveau ou une arrow `const` n'a pas d'arête. Les imports CommonJS `require()` ne sont pas gérés.
 - 4.6b : sans `base` explicite, un dossier hors dépôt Git ou un `git` absent donne une note
@@ -171,8 +200,8 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 1. ✅ #42 (4.9) mergé.
 2. ✅ Correctif de l'éviction intermittente (§2.1) fait, PR #47 ready, verte (5/5 macOS, 5/5
    Windows) ; reste l'accord de l'utilisateur pour merger.
-3. 4.1 (#46) : code et hygiène (clippy/fmt/changelog/déterminisme) faits ; reste la review
-   adversariale complète, puis merge.
+3. ✅ 4.1 (#46) : code, hygiène et review adversariale complète faits (§2.3, 2 MAJOR + 2 MINOR
+   corrigés) ; reste la CI, puis passer en ready, puis merge.
 4. 4.12b–e, avec une review groupée.
 5. 4.7, puis sa review complète.
 6. 4.10, puis sa review complète.

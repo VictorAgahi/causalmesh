@@ -323,7 +323,11 @@ inherit it. `/proc/<pid>/task/*/status` shows `Seccomp: 2` for every thread.
 `seccomp(2)`, gVisor without TSYNC), `meshd` logs a `warn` and keeps serving: the filter is
 defence in depth, and a daemon that refuses to start pushes every IDE client into standalone mode,
 which is not confined either. `MESH_DAEMON_SANDBOX=required` makes `meshd` remove its socket and
-exit instead (on every OS, since the sandbox never exists outside Linux).
+exit instead (on every OS, since the sandbox never exists outside Linux; on Windows the check runs
+before the named pipe is created). Any other non-empty value is logged and treated as `required`,
+so a typo never silently leaves a host unconfined. `mesh-mcp doctor` reports, on Linux, whether the
+running `meshd` carries its own seccomp filter (`/proc/<pid>/status`, filter count compared to its
+own so a container runtime's default filter does not pass for it).
 
 **Limits.**
 - Only `meshd` is confined. `mesh-mcp run` (the stdio proxy, or `--standalone`, which indexes
@@ -333,6 +337,9 @@ exit instead (on every OS, since the sandbox never exists outside Linux).
 - `git` subprocesses inherit the filter: any git operation that would need the network (a remote
   helper, a lazy-fetch of a partial clone) fails with `EPERM` inside `meshd`. MeshMCP only runs
   local git commands.
+- The filter denies *creating* IP sockets. An IP socket file descriptor inherited without
+  `O_CLOEXEC` from whatever launched `meshd` would stay usable; `meshd` itself opens none before the
+  filter and has no code that would use one.
 - This is a network sandbox, not a filesystem one: `meshd` can still read and write every file its
   user can.
 

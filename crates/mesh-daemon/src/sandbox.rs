@@ -31,7 +31,9 @@
 //! with, so the filter is defence in depth, and refusing to start would
 //! silently push every IDE client into its standalone fallback — unconfined
 //! too. Operators who need the guarantee set `MESH_DAEMON_SANDBOX=required`:
-//! `meshd` then refuses to serve instead.
+//! `meshd` then refuses to serve instead (on every OS: outside Linux there is
+//! no sandbox, so `required` always refuses). Any other non-empty value is
+//! logged and treated as `required`.
 //!
 //! Limits: only `meshd` is confined — the `mesh-mcp run` stdio proxy,
 //! `mesh-mcp run --standalone` and `mesh-mcp graph --open` (which launches a
@@ -41,17 +43,42 @@
 pub const POLICY_ENV: &str = "MESH_DAEMON_SANDBOX";
 
 /// Whether a failure to install the sandbox must stop the daemon.
+///
+/// Unset or empty means best effort; `required` (any case) means fail closed.
+/// Any other value is a misconfiguration: it is logged and treated as
+/// `required`, since an operator who set the variable at all asked for more
+/// than the default (a `MESH_DAEMON_SANDBOX=1` or a typo such as `require`
+/// must never silently leave a host unconfined).
 fn sandbox_required() -> bool {
-    std::env::var(POLICY_ENV)
-        .map(|v| v.trim().eq_ignore_ascii_case("required"))
-        .unwrap_or(false)
+    policy_is_required(std::env::var_os(POLICY_ENV).as_deref())
+}
+
+fn policy_is_required(raw: Option<&std::ffi::OsStr>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let value = raw.to_string_lossy();
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if !value.eq_ignore_ascii_case("required") {
+        tracing::warn!(
+            target: "meshd::sandbox",
+            "Unrecognized {POLICY_ENV}={value:?} (only `required` is accepted); treating it as `required`."
+        );
+    }
+    true
 }
 
 /// Confines the calling process (all its threads) — see the module docs.
 /// Called by `meshd` right after its socket is bound. Returns `Err` only when
-/// the sandbox could not be installed **and** `MESH_DAEMON_SANDBOX=required`;
-/// otherwise a failure is logged and swallowed. Never panics.
+/// the sandbox could not be installed **and** `MESH_DAEMON_SANDBOX` asks for it
+/// to be required; otherwise a failure is logged and swallowed. Never panics.
 pub fn apply_after_bind() -> Result<(), String> {
+    // Parsed up front so a malformed value is reported even when the filter
+    // installs fine.
+    let required = sandbox_required();
     match confine_network() {
         Ok(()) => {
             tracing::info!(
@@ -60,7 +87,7 @@ pub fn apply_after_bind() -> Result<(), String> {
             );
             Ok(())
         }
-        Err(e) if sandbox_required() => Err(format!(
+        Err(e) if required => Err(format!(
             "network sandbox could not be installed ({e}) and {POLICY_ENV}=required"
         )),
         Err(e) => {
@@ -149,4 +176,22 @@ pub fn confine_network() -> Result<(), String> {
         std::env::consts::OS,
         std::env::consts::ARCH
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::policy_is_required;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn policy_fails_closed_on_anything_but_unset_or_empty() {
+        assert!(!policy_is_required(None));
+        assert!(!policy_is_required(Some(OsStr::new(""))));
+        assert!(!policy_is_required(Some(OsStr::new("  "))));
+        assert!(policy_is_required(Some(OsStr::new("required"))));
+        assert!(policy_is_required(Some(OsStr::new(" REQUIRED "))));
+        // Misspellings and truthy values are not silently ignored.
+        assert!(policy_is_required(Some(OsStr::new("require"))));
+        assert!(policy_is_required(Some(OsStr::new("1"))));
+    }
 }

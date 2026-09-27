@@ -11,7 +11,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod idle;
-#[cfg(unix)]
 mod sandbox;
 mod server;
 mod socket;
@@ -266,6 +265,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| e.to_string())?;
 
+    // No network sandbox on Windows: `apply_after_bind` only enforces the
+    // `MESH_DAEMON_SANDBOX=required` policy (refuse to serve) before the pipe
+    // is created, so the variable means the same thing on every OS.
+    #[cfg(windows)]
+    sandbox::apply_after_bind()?;
     #[cfg(windows)]
     server::run_named_pipe_server(
         &pipe_name,

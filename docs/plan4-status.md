@@ -17,7 +17,7 @@
 | 4.5 recall gRPC TS + golden CI | ✅ mergé | #39 | — | — |
 | 4.4 cache par workspace, quota | ✅ mergé | #40 (`d64d0ac`) | — | **bug intermittent, voir §2.1** |
 | 4.6b ruptures wire-format | ✅ mergé | #41 (`d81ca50`) | — | — |
-| 4.4-fix éviction intermittente | 🔍 PR draft, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1), N/N sous charge Linux fait, N/N macOS/Windows en cours (reruns du même run CI), repro sur l'ancien code faite ; passer en ready après |
+| 4.4-fix éviction intermittente | ✅ PR ready, verte | #47 `p3/4.4-fix-eviction` | `d76ca3c` | cause prouvée des deux tests (voir §2.1) ; N/N sous charge Linux (12/12) et N/N macOS/Windows (5/5 chacun, sur reruns successifs du même run CI) faits ; repro sur l'ancien code (8/8) faite ; passée en ready. Reste : accord de l'utilisateur pour merger |
 | 4.2 watcher macOS + Git | ✅ mergé | #43 (`a873f52`) | — | — |
 | 4.9 mémoire YAML/Markdown | ✅ mergé | #42 | — | — |
 | 4.1 diagnostics d'indexation | 🔍 PR draft, verte | #46 `p3/4.1-index-diagnostics` | `4767a9c` | code quasi complet, `main` intégré, changelog ajouté, clippy/fmt/déterminisme verts ; reste la review adversariale complète |
@@ -60,9 +60,10 @@ pendant qu'il attendait un lecteur — piste probable du flake Windows `SQLITE_B
 **Preuves rassemblées (session cloud)** : 14 tests unitaires de `mesh-core::index_cache` verts ; les
 6 tests d'intégration de `index_cache_quota.rs` verts ; 12/12 runs de la suite complète sous charge
 avec un `TMPDIR` long sous Linux ; clippy et fmt verts. CI GitHub verte sur les trois OS de la matrice
-(`Test Suite (ubuntu|macos|windows-latest)`) ; reruns supplémentaires du même run CI en cours pour un
-compte N/N par OS macOS/Windows (les runs disponibles n'exposent qu'un rerun du workflow entier, pas
-un rerun ciblé par job). Reste : clore le compte N/N par OS, puis passer #47 en ready.
+(`Test Suite (ubuntu|macos|windows-latest)`), puis le run entier rerun 5 fois de suite (les outils
+disponibles n'exposent qu'un rerun du workflow entier, pas un rerun ciblé par job) : **`Test Suite
+(macos-latest)` 5/5 et `Test Suite (windows-latest)` 5/5**, aucun échec. PR #47 passée en ready ; reste
+l'accord de l'utilisateur pour merger.
 
 ### 2.2 Coût mémoire de `props` (4.9, PR #42)
 Il reste entre 12× et 25× la taille du fichier, au-dessus du seuil de 4×. Le coût vient du
@@ -168,8 +169,8 @@ fixture ; (3) **un template de scorecard documente le protocole de mesure A/B**.
 ## 6. Ordre de reprise recommandé
 
 1. ✅ #42 (4.9) mergé.
-2. Correctif de l'éviction intermittente (§2.1) : fait, PR #47 draft, verte ; passer en ready puis
-   merger avec l'accord de l'utilisateur.
+2. ✅ Correctif de l'éviction intermittente (§2.1) fait, PR #47 ready, verte (5/5 macOS, 5/5
+   Windows) ; reste l'accord de l'utilisateur pour merger.
 3. 4.1 (#46) : code et hygiène (clippy/fmt/changelog/déterminisme) faits ; reste la review
    adversariale complète, puis merge.
 4. 4.12b–e, avec une review groupée.

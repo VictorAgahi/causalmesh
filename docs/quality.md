@@ -766,6 +766,107 @@ hold there. At 200k files boot (~15–17 s) and peak memory (~630–830 MB) are 
 cost is the parallel parse phase plus the resident graph, which Plan 3 did not target. Budgets
 were not loosened to make larger corpora pass.
 
+## Update (2026-09-26, Plan 4 step 4.5 — TypeScript generated-client recall, health filter, golden ratchet in CI)
+
+Measured with the release binary first on `PATH`, `scripts/golden/score.py <repo>` on the pinned
+corpus of `scripts/golden/repos.txt` (`~/.cache/mesh-golden`), same corpus before and after:
+
+| Corpus | Before (`02695de`, 6.0.1) | After (this step) |
+|---|---|---|
+| `online-boutique` | 100.0% precision / 100.0% recall (14/14) | 100.0% / 100.0% (14/14) |
+| `bank-of-anthos` | 100.0% / 100.0% (0 golden edges, 0 found) | 100.0% / 100.0% (0 / 0) |
+| `otel-demo` | 87.5% / 53.8% (7 of 8 found edges true, 7 of 13 golden) | 100.0% / 100.0% (13/13, 13 found) |
+
+- **`new <X>Client(...)`** (ts-proto / `@grpc/grpc-js` generated clients) is now a client call
+  site if and only if `<X>Client` is bound by one of the file's `import`s (named, aliased,
+  default, or as a member of an imported namespace) — and it only becomes a `CallsRpc` edge when
+  `<X>` (or, failing that, `<X>Service`) resolves against a gRPC service/method *declared in the
+  graph*, through the same `reconcile_edges` resolution `getService<XServiceClient>(...)` and Go's
+  `NewXServiceClient` use. No import-path heuristic: an imported `new S3Client()` or
+  `new QueryClient()` links nothing (otel-demo has two imported react-query `QueryClient`s; no edge).
+- otel-demo builds each client once at module level (`const client = new AdServiceClient(...)`),
+  where no class or method encloses the call site. Such a construction is now attributed to every
+  declaration of the file that *references* the binding (`client.getAds(...)` in `listAds`,
+  `{ client }` shorthand included; `this.client` is a property, not a reference) instead of being
+  dropped as before — that drop, not the missing pattern alone, is what the 6 missed
+  `frontend -> *` edges needed. No node is created for the purpose: a first version of this step
+  synthesized a `ServiceClass` node named after the binding, which cost 8 nodes on otel-demo (6
+  homonymous `client`s, plus 2 react-query `queryClient`s that carried an `Imports` edge but no
+  gRPC edge — any imported `new S3Client()` would have become a node too). Now a construction
+  that resolves to no declared service leaves no node and no edge (only the pending, unresolved
+  `rpc_calls` entry any undeclared `getService<...>` target leaves), and the callers are real
+  declarations with their own names (`listAds`, `getCart`, `placeOrder`, ...). `mesh-mcp graph`
+  on otel-demo against the synthetic-node version: exactly those 8 nodes gone, their `CallsRpc`
+  and `Imports` edges replaced by 14 `CallsRpc` edges from the gateway methods; `polyglot-shop`
+  and `volontariapp-fixture` unchanged. Known limit: a module-level client referenced only from
+  code the TypeScript extractor has no node for (a top-level `function`, an arrow-function
+  `const`) or not referenced in its own file at all (`export const ads = new AdServiceClient()`)
+  is dropped — no carrier, and a synthesized one is what the review rejected.
+- **`grpc.health.v1.Health`** is filtered from `CallsRpc` resolution as infrastructure: by full
+  name, or a `Health` service declared in the `grpc.health.v1` proto package, or one inferred from
+  code with no `.proto` behind it (Go's `healthpb.RegisterHealthServer`). A repo's own
+  `service Health` in its own proto package is kept. This removes otel-demo's `checkout -> health`.
+- **Ratchet wired**: `.github/workflows/golden.yml` scores all three corpora on every PR (to
+  `main` and `p*/**`) and push to `main`, failing under online-boutique 1.0/1.0,
+  bank-of-anthos 1.0/1.0, otel-demo 1.0/1.0. This supersedes the "not yet wired in" note of the
+  Ratchet policy below, and resolves the two otel-demo gaps (TypeScript client construction,
+  `checkout -> health`) still listed under "What's NOT measured yet".
+- Determinism: two independent `mesh-mcp graph` runs on otel-demo give identical node and edge
+  sets (compared by content, not ids); `mesh-mcp graph --format fingerprint` is identical over 5
+  fresh-`HOME` runs.
+
+## Update (2026-09-26, plan 4 step 4.4 — one parse cache per workspace, quota, LRU eviction)
+
+**Before.** `~/.cache/mesh-mcp/index-cache.db` was one file for every workspace on the machine,
+with no eviction. Measured with `scripts/bench/cache_growth.py` (new): a copy of
+`~/bench-repos/mesh-synth-5k` (5,000 code files) put under git, isolated `HOME`, then one
+simulated work week — 30 branch switches between 6 feature branches (50 edited files each) and
+`main`, and 10 rebases (upstream commit of 100 files, then `git rebase main`) — with a cold boot
+(`mesh-mcp run --standalone`, stdin closed) after each of the 40 events. A cold boot per event is
+the worst case: every content version the tree ever shows is parsed and written once. Size is
+database + `-wal` bytes, without forcing a checkpoint.
+
+| measurement (5k corpus) | 6.0.1 (`02695de`) | this step, no quota hit | this step, `max_size_mb = 6` |
+|---|---|---|---|
+| entries after the first boot | 5,000 | 5,000 | 5,000 |
+| size after the first boot | 5,349,376 B | 5,853,184 B | 5,857,280 B |
+| bytes per entry (payload alone: 802 B) | 1,070 | 1,171 | 1,171 |
+| entries after the week | 6,300 | 6,300 | 2,230 |
+| size after the week (db + WAL) | 6,664,192 B (×1.25) | 7,479,296 + 799,312 B WAL (×1.41) | 3,792,896 B |
+| largest size seen during the week | 6,664,192 B | 8,477,088 B | 6,193,152 B (quota 6,291,456) |
+| warm boot, median of 40 | 113–131 ms | 127–136 ms | 260 ms |
+
+Growth is 1,300 entries per week on this corpus (+1.31 MB before, +1.63 MB of database after),
+i.e. one entry per content version seen: before this step nothing is ever evicted, so a cache
+only grows, and every workspace adds to the same file. At the 2048 MB default the per-workspace
+quota holds ~1.8 million entries, over a thousand such weeks of this 5k corpus: it is a safety
+bound for large or long-lived workspaces, not a working-set limit.
+
+**What changed per entry.** +~100 B per entry: the `file_index_access(cache_key,
+last_accessed_at)` side table and its LRU index. Keeping the timestamp out of the payload row is
+deliberate — bumping it on every warm boot would otherwise rewrite every ~1 KB payload page into
+the WAL. The flush still leaves ~0.8–1.1 MB of WAL after a warm boot on this corpus (5,000
+access rows rewritten), counted in the quota, and costs ~10 ms of warm boot (113–115 vs
+127–136 ms over 3 runs each; cold first boots varied 314–1,417 ms across runs for both binaries,
+too noisy to compare).
+
+**Quota behaviour.** With `max_size_mb = 6`, just above the 5.9 MB working set, the size never
+exceeded the quota over the week (max 6,193,152 B), but the cache thrashes: each over-quota
+check evicts down to 80 % in 1,000-entry batches, the next boot re-parses the evicted files
+(warm boot 260 ms instead of ~130 ms). A quota below the working set trades boot time for disk,
+as expected from LRU.
+
+**Tests** (exit criteria): `index_cache::tests::inserts_past_a_10mb_quota_shrink_back_under_80_percent`
+(writes > 2× a 10 MB quota, file + WAL ≤ 8 MB after the check, hot entries kept);
+`index_cache_quota::four_processes_indexing_four_workspaces_hit_zero_sqlite_errors` (4 child
+processes, shared `HOME`, 3 scans each, 0 swallowed SQLite errors, one db per `workspace_id`,
+no legacy global file); `index_cache_quota::daemon_reloading_30_times_stays_under_quota`
+(an `AppState` with the cache attached, 30 `WorkspaceIndexer::reload` calls rewriting 150 files
+each, 1 MB quota, size ≤ quota after every reload, eviction observed).
+
+**Not measured**: a real long-lived `meshd` over a real week, and the cache on a real 200k-file
+repository (entry size depends on the language mix; the 5k corpus is synthetic).
+
 ## Update (2026-09-27, step 4.9 — YAML / Markdown memory under a per-file budget)
 
 **Method.** `scripts/bench/gen_yaml_md_corpus.py` generates a deterministic corpus, and each

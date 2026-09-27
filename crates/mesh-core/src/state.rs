@@ -4,14 +4,15 @@ use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
 use crate::health::IndexHealth;
+use crate::index_cache::PersistentIndexCache;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::search_cache::SearchCache;
 use crate::vfs::DifferentialVfs;
 use arc_swap::{ArcSwap, Guard};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One immutable, internally consistent view of the indexed workspace.
 ///
@@ -129,6 +130,11 @@ pub struct AppState {
     pub reload_lock: Mutex<()>,
     /// `smart_search` result pages, invalidated on every snapshot generation bump.
     pub search_cache: SearchCache,
+    /// This workspace's persistent index cache (plan 4 step 4.4), opened once at boot by
+    /// [`AppState::open_index_cache`] and shared by the boot scan and every later reload, so
+    /// reloads both hit it (a branch switch back to already-seen content) and keep it under
+    /// its quota. Empty when opening failed or in tests: indexing then parses everything.
+    pub index_cache: OnceLock<PersistentIndexCache>,
 }
 
 impl AppState {
@@ -170,6 +176,29 @@ impl AppState {
             pending_reload_paths: Mutex::new(Vec::new()),
             reload_lock: Mutex::new(()),
             search_cache: SearchCache::default(),
+            index_cache: OnceLock::new(),
+        }
+    }
+
+    /// Opens the persistent index cache of the workspace rooted at `base_dir`
+    /// (`~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`, quota from
+    /// `[cache] max_size_mb`) and attaches it to this state. A cache that cannot be opened
+    /// (permissions, disk full) degrades to "parse everything" with a warning instead of
+    /// failing the boot: it is a performance optimization, never a correctness dependency.
+    /// Idempotent: a second call returns the cache already attached.
+    pub fn open_index_cache(&self, base_dir: &Path) -> Option<&PersistentIndexCache> {
+        if let Some(cache) = self.index_cache.get() {
+            return Some(cache);
+        }
+        match PersistentIndexCache::open_for_workspace(base_dir, self.config.cache.max_size_mb) {
+            Ok(cache) => Some(self.index_cache.get_or_init(|| cache)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mesh::index_cache",
+                    "Failed to open persistent index cache, continuing without it: {e}"
+                );
+                None
+            }
         }
     }
 

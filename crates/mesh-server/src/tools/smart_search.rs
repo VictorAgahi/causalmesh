@@ -137,7 +137,13 @@ impl McpTool for SmartSearchTool {
             }
         }
 
-        let budget = MarkdownFormatter::search_page_entry_budget(query, args.scope.as_str());
+        // Files inside this scope the indexer rejected (plan 4 step 4.1): named in
+        // a note appended last, whose size is reserved *before* the page is laid
+        // out, so results share `48 KB − note` and the note is never cut.
+        let scope_path = validated_scope.as_path();
+        let gap_note = snapshot.health.scope_note(|p| p.starts_with(scope_path));
+        let budget = MarkdownFormatter::search_page_entry_budget(query, args.scope.as_str())
+            .saturating_sub(gap_note.as_ref().map_or(0, String::len));
         let ranked = Self::rank_indexed_files(
             snapshot
                 .contract_graph
@@ -170,8 +176,11 @@ impl McpTool for SmartSearchTool {
         drop(snapshot);
 
         let files_accessed: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
-        let text =
+        let mut text =
             MarkdownFormatter::format_search_page(query, args.scope.as_str(), &matches, &page);
+        if let Some(note) = &gap_note {
+            text.push_str(note);
+        }
 
         // A fuzzy page reflects files on disk the index does not track, which a
         // generation bump would not invalidate — only index-backed pages are cached.
@@ -1155,5 +1164,138 @@ mod tests {
         assert!(m.matches("let émetteur = 1;"));
         assert!(!m.matches("let emetteur = 1;"));
         assert!(QueryMatcher::new("widget").matches("WIDGET"));
+    }
+
+    /// Writes a Python file over the 384 KB budget (so the indexer rejects it).
+    fn write_oversized(path: &Path) {
+        std::fs::write(path, "x = 1\n".repeat(450 * 1024 / 6 + 1)).expect("write big");
+    }
+
+    async fn invoke_search(state: &Arc<AppState>, query: &str, scope: &Path) -> String {
+        let args = serde_json::json!({
+            "query": query,
+            "scope": scope.to_string_lossy(),
+            "limit": 100,
+        });
+        crate::tools::ToolRegistry::invoke::<SmartSearchTool>(args, Arc::clone(state))
+            .await
+            .expect("no protocol fault")
+            .expect("tool ok")
+    }
+
+    /// Plan 4 step 4.1: a 450 KB file inside the scope is named in a note at the
+    /// end, next to the other results, and a full page plus the note stays
+    /// within 48 KB with neither cut.
+    #[tokio::test]
+    async fn oversized_file_in_scope_is_named_after_a_full_page() {
+        let (_tmp, root) = py_workspace();
+        let long = "a".repeat(240);
+        for i in 0..30 {
+            let mut src = format!("class Long{i:02}:\n");
+            for j in 0..16 {
+                src.push_str(&format!("    f{j} = \"{long}\"\n"));
+            }
+            std::fs::write(root.join(format!("l{i:02}.py")), src).expect("write");
+        }
+        let big = root.join("big_long.py");
+        write_oversized(&big);
+        let state = make_state(&root, "");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+
+        let text = invoke_search(&state, "Long", &root).await;
+        assert!(
+            text.len() <= mesh_parsers::MAX_OUTPUT_BYTES,
+            "{}",
+            text.len()
+        );
+        assert!(text.contains("class Long00"), "other results still shown");
+        assert!(
+            text.contains("offset: "),
+            "the page was full: {}",
+            text.len()
+        );
+        assert!(!text.contains("PAYLOAD TRUNCATED") && !text.contains("payload truncated"));
+        let note = state
+            .snapshot()
+            .health
+            .scope_note(|p| p.starts_with(&root))
+            .expect("note");
+        assert!(text.ends_with(&note), "note last and intact:\n{note}");
+        assert!(
+            note.contains(&format!("`{}`: oversized, 450.0 KB", big.display())),
+            "{note}"
+        );
+        assert!(note.contains("read the file directly"), "{note}");
+    }
+
+    /// A rejected file outside the query's scope never shows up in its note.
+    #[tokio::test]
+    async fn rejected_file_outside_scope_is_not_mentioned() {
+        let (_tmp, root) = py_workspace();
+        std::fs::create_dir_all(root.join("a")).expect("mkdir");
+        std::fs::create_dir_all(root.join("b")).expect("mkdir");
+        std::fs::write(root.join("a/svc.py"), "class Widget:\n    pass\n").expect("write");
+        write_oversized(&root.join("b/huge.py"));
+        let state = make_state(&root, "");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        assert_eq!(state.snapshot().health.rejected.len(), 1);
+
+        let text = invoke_search(&state, "Widget", &root.join("a")).await;
+        assert!(text.contains("class Widget"), "{text}");
+        assert!(
+            !text.contains("huge.py") && !text.contains("not indexed"),
+            "{text}"
+        );
+        let whole = invoke_search(&state, "Widget", &root).await;
+        assert!(whole.contains("huge.py"), "{whole}");
+    }
+
+    /// The rejected list follows incremental reloads: a file that shrinks back
+    /// under the budget leaves it, a newly oversized one joins it, a deleted
+    /// one leaves it — and the search note follows (new generation, no stale cache).
+    #[tokio::test]
+    async fn rejected_list_tracks_incremental_reloads() {
+        let (_tmp, root) = py_workspace();
+        let big = root.join("big.py");
+        write_oversized(&big);
+        std::fs::write(root.join("ok.py"), "class Keep:\n    pass\n").expect("write");
+        let state = make_state(&root, "");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        let paths = |state: &Arc<AppState>| -> Vec<PathBuf> {
+            state
+                .snapshot()
+                .health
+                .rejected
+                .iter()
+                .map(|r| r.path.clone())
+                .collect()
+        };
+        assert_eq!(paths(&state), vec![big.clone()]);
+        assert!(invoke_search(&state, "Keep", &root)
+            .await
+            .contains("big.py"));
+
+        std::fs::write(&big, "class Big:\n    pass\n").expect("shrink");
+        let other = root.join("other.py");
+        write_oversized(&other);
+        crate::indexer::WorkspaceIndexer::reload_paths(&state, &[big.clone(), other.clone()]);
+        assert_eq!(paths(&state), vec![other.clone()]);
+        let text = invoke_search(&state, "Keep", &root).await;
+        assert!(
+            text.contains("other.py") && !text.contains("big.py"),
+            "{text}"
+        );
+
+        // An unchanged rejection is not a change: no new snapshot.
+        let generation = state.snapshot().generation;
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        assert_eq!(state.snapshot().generation, generation);
+
+        std::fs::remove_file(&other).expect("rm");
+        crate::indexer::WorkspaceIndexer::reload(&state);
+        assert!(paths(&state).is_empty());
+        assert!(!invoke_search(&state, "Keep", &root)
+            .await
+            .contains("not indexed"));
     }
 }

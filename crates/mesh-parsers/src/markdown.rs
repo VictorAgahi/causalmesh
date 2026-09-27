@@ -4,6 +4,12 @@ use std::path::Path;
 
 pub const MAX_OUTPUT_BYTES: usize = 48 * 1024; // 48 KB hard limit
 
+/// Headroom kept out of a page's own budget for content `ToolRegistry::invoke` adds
+/// around it (step 4.1 review): the bounded project-skill hint and the Git-operation
+/// note, both prepended, plus slack for the header. Neither is passed into this crate,
+/// so this is an upper bound on their combined size, not an exact count.
+pub const NON_RESULT_RESERVE_BYTES: usize = 1536;
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub file_path: String,
@@ -71,7 +77,7 @@ impl MarkdownFormatter {
     /// caller where to resume. Reserves an upper bound of the header.
     pub fn search_page_entry_budget(query: &str, scope: &str) -> usize {
         const HEADER_FIXED_UPPER_BOUND: usize = 384;
-        (MAX_OUTPUT_BYTES - 1024)
+        (MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES)
             .saturating_sub(HEADER_FIXED_UPPER_BOUND + query.len() + scope.len())
     }
 

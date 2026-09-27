@@ -1,4 +1,4 @@
-use crate::indexer::SCAN_DEPTH;
+use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
 use mesh_core::{expand_roots, Config, PropertyRegistry};
 use mesh_parsers::AstGuard;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,26 @@ use std::time::Instant;
 pub struct DoctorCommand;
 
 impl DoctorCommand {
+    /// Scans the workspace once (no persistent cache, nothing written) and
+    /// prints the rejected-file summary: counts per reason, first 10 paths.
+    fn report_index_health(config_path: Option<&Path>) {
+        let Ok((config, base_dir)) = WorkspaceIndexer::discover_config(config_path) else {
+            eprintln!("ℹ Index health: skipped (no config to scan)");
+            return;
+        };
+        let roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
+        let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
+        let health = &snapshot.health;
+        let summary = health.render_summary(10);
+        if health.rejected.is_empty() && health.rejected_overflow == 0 {
+            eprint!("✔ Index health: {summary}");
+        } else {
+            eprintln!(
+                "⚠ Index health: {summary}    Searches cannot return these files; read them directly."
+            );
+        }
+    }
+
     pub fn run(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "🔍 Running MeshMCP Diagnostic Healthcheck (v{}, commit: {})...\n",
@@ -357,6 +377,10 @@ impl DoctorCommand {
         } else {
             eprintln!("⚠ Toolchain utilities: git not found in PATH");
         }
+
+        // 9. Index health (plan 4 step 4.1): the files a search can never
+        // return, with the same reasons and sizes the tools' notes give.
+        Self::report_index_health(config_path);
 
         eprintln!("\n✔ All systems operational. Ready for AI agents.");
 

@@ -1,0 +1,27 @@
+{
+  "tier_files": 200000,
+  "corpus": "gen_synthetic.py <dir> 200000 --services 8 [--contracts]; mesh-mcp init --auto (8 roots)",
+  "rule": "budget = ceil(1.3 x median of 3 cold runs, fresh HOME each); checked against the median of 3 cold runs by tier_bench.py; never relaxed, only tightened",
+  "manual_only": "not run by the nightly (too long for a runner); run scripts/bench/tier_bench.py --files 200000 [--contracts] --runs 3 --budget-json scripts/bench/budgets-200k.json",
+  "platforms": {
+    "darwin": {
+      "machine": "Apple M2, 8 cores, 16 GB, macOS 26.6.2 (darwin numbers)",
+      "source": "3 cold runs per variant, 2026-09-27, binary 4c9589e (main 491c4e0 + this branch), calm machine: no rustc and load1 < 4 at the start of every run (see docs/quality.md)",
+      "provisional": false,
+      "plain": {
+        "boot_ms": 24661,
+        "rss_peak_mb": 833,
+        "search_p50_ms": 120,
+        "search_p95_ms": 255,
+        "reload_ms": 927
+      },
+      "contracts": {
+        "boot_ms": 28421,
+        "rss_peak_mb": 1226,
+        "search_p50_ms": 135,
+        "search_p95_ms": 294,
+        "reload_ms": 1755
+      }
+    }
+  }
+}

@@ -2,5 +2,45 @@
   "tier_files": 50000,
   "corpus": "gen_synthetic.py <dir> 50000 --services 8 [--contracts]; mesh-mcp init --auto (8 roots)",
   "rule": "budget = ceil(1.3 x median of 3 cold runs, fresh HOME each); checked against the median of 3 cold runs by tier_bench.py; never relaxed, only tightened",
-  "platforms": {}
+  "platforms": {
+    "darwin": {
+      "machine": "Apple M2, 8 cores, 16 GB, macOS 26.6.2 (darwin numbers)",
+      "source": "3 cold runs per variant, 2026-09-27, binary 4c9589e (main 491c4e0 + this branch), calm machine: no rustc and load1 < 4 at the start of every run (see docs/quality.md)",
+      "provisional": false,
+      "plain": {
+        "boot_ms": 5308,
+        "rss_peak_mb": 264,
+        "search_p50_ms": 26,
+        "search_p95_ms": 53,
+        "reload_ms": 573
+      },
+      "contracts": {
+        "boot_ms": 6344,
+        "rss_peak_mb": 349,
+        "search_p50_ms": 34,
+        "search_p95_ms": 63,
+        "reload_ms": 839
+      }
+    },
+    "linux": {
+      "machine": "GitHub Actions ubuntu-latest (Linux numbers, not comparable to darwin)",
+      "source": "workflow_dispatch run 36324854400 on 513c34d, 3 cold runs per variant, runner load1 2.5-3.4",
+      "provisional": true,
+      "provisional_reason": "one runner job only, on a binary before the 4.13 smart_search change merged from main; confirm or tighten from the nightly --propose output",
+      "plain": {
+        "boot_ms": 5054,
+        "rss_peak_mb": 267,
+        "search_p50_ms": 26,
+        "search_p95_ms": 55,
+        "reload_ms": 301
+      },
+      "contracts": {
+        "boot_ms": 6040,
+        "rss_peak_mb": 389,
+        "search_p50_ms": 33,
+        "search_p95_ms": 57,
+        "reload_ms": 573
+      }
+    }
+  }
 }

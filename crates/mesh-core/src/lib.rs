@@ -30,7 +30,7 @@ pub use contracts::{ContractGraph, GrpcTrace, ImpactFlow};
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
-pub use health::IndexHealth;
+pub use health::{IndexHealth, RejectReason, RejectedFile};
 pub use index_cache::{sha256, CacheEntry, IndexCacheError, PersistentIndexCache};
 pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};

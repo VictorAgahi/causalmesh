@@ -8,7 +8,7 @@
 
 use mesh_core::{
     expand_roots, sha256, AppState, BackgroundRescanEngine, CacheEntry, Config, ContractGraph,
-    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth,
+    DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth, RejectReason,
     MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RepoId,
     ValidatedScope,
 };
@@ -357,7 +357,7 @@ impl WorkspaceIndexer {
                     health.record_indexed();
                     fragments.push(frag);
                 }
-                Err(reason) => Self::record_rejection(&mut health, reason),
+                Err(reason) => Self::record_rejection(&mut health, reason, path),
             }
         }
 
@@ -379,9 +379,14 @@ impl WorkspaceIndexer {
                     );
                     health.record_indexed();
                     health.record_parse_failed();
+                    health.record_rejected_file(
+                        path.clone(),
+                        RejectReason::ParseFailed,
+                        Self::file_size(&path),
+                    );
                     fragments.push(frag);
                 }
-                Err(reason) => Self::record_rejection(&mut health, reason),
+                Err(reason) => Self::record_rejection(&mut health, reason, path),
             }
         }
 
@@ -395,16 +400,34 @@ impl WorkspaceIndexer {
             cache.put_batch(&writes);
         }
 
+        health.normalize_rejected();
         (fragments, health)
     }
 
-    #[inline]
-    fn record_rejection(health: &mut IndexHealth, reason: RejectKind) {
-        match reason {
-            RejectKind::Oversized => health.record_oversized(),
-            RejectKind::GuardRejected => health.record_guard_rejected(),
-            RejectKind::ReadError => health.record_read_error(),
-        }
+    /// Counts a rejection and remembers the file by path (plan 4 step 4.1), so a
+    /// tool can name it instead of silently returning nothing for it.
+    fn record_rejection(health: &mut IndexHealth, reason: RejectKind, path: PathBuf) {
+        let reason = match reason {
+            RejectKind::Oversized => {
+                health.record_oversized();
+                RejectReason::Oversized
+            }
+            RejectKind::GuardRejected => {
+                health.record_guard_rejected();
+                RejectReason::Guard
+            }
+            RejectKind::ReadError => {
+                health.record_read_error();
+                RejectReason::ReadError
+            }
+        };
+        let size = Self::file_size(&path);
+        health.record_rejected_file(path, reason, size);
+    }
+
+    /// Size on disk for a rejection record; 0 when the file can no longer be stat'ed.
+    fn file_size(path: &Path) -> u64 {
+        std::fs::metadata(path).map_or(0, |m| m.len())
     }
 
     // ── Incremental reload ──────────────────────────────────────────────────
@@ -445,6 +468,18 @@ impl WorkspaceIndexer {
             .map(Path::to_path_buf)
             .collect();
         drop(vfs);
+        // A rejected file never enters the VFS, so the sweep above cannot see it
+        // vanish; its entry in the rejected list must still go (plan 4 step 4.1).
+        let mut deleted = deleted;
+        deleted.extend(
+            state
+                .snapshot()
+                .health
+                .rejected
+                .iter()
+                .filter(|r| !present.contains(r.path.as_path()))
+                .map(|r| r.path.clone()),
+        );
 
         Self::apply_incremental(state, "VFS differential", files, deleted);
     }
@@ -704,7 +739,21 @@ impl WorkspaceIndexer {
         }
         drop(vfs);
 
-        if changed.is_empty() && deleted.is_empty() {
+        // Rejected-file list: every path this pass reprocessed or deleted takes
+        // this pass's outcome (a fixed file drops out, a new rejection appears),
+        // even when no fragment changed — a newly oversized file changes nothing
+        // else. A rejected file never enters the VFS, so it is reprocessed on
+        // every full reload; an unchanged outcome must not reinstall a snapshot.
+        let mut rejections = state.snapshot().health.clone();
+        let touched: HashSet<&Path> = candidates
+            .iter()
+            .map(|(_, p)| p.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+            .collect();
+        let rejections_changed = rejections.replace_rejected(&touched, &pass_health.rejected);
+        drop(touched);
+
+        if changed.is_empty() && deleted.is_empty() && !rejections_changed {
             return;
         }
         if changed.len() > 200 {
@@ -717,6 +766,8 @@ impl WorkspaceIndexer {
 
         let mut snapshot = state.snapshot_clone();
         snapshot.health.merge(&pass_health);
+        snapshot.health.rejected = rejections.rejected;
+        snapshot.health.rejected_overflow = rejections.rejected_overflow;
         let stale = changed
             .iter()
             .map(|f| f.path.as_path())

@@ -1,7 +1,7 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr};
-use mesh_parsers::MarkdownFormatter;
+use mesh_parsers::{LanguageKind, MarkdownFormatter, MAX_OUTPUT_BYTES};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -127,9 +127,78 @@ impl McpTool for FindDependentsTool {
                 (node, label)
             })
             .collect();
-        Ok(ToolOutput::text(MarkdownFormatter::format_dependents(
-            args.target.as_str(),
-            &labeled,
-        )))
+        let dependent_count = labeled.len();
+        let mut text = MarkdownFormatter::format_dependents(args.target.as_str(), &labeled);
+        drop(labeled);
+
+        // Plan 4 step 4.1: this tool's scope is every allowed root, so any
+        // rejected file that could have declared a dependent (source, proto,
+        // YAML — not prose) is named in a note appended last and never cut.
+        let note = snapshot.health.scope_note(|p| {
+            state.allowed_roots.iter().any(|r| p.starts_with(r)) && may_declare_dependents(p)
+        });
+        if let Some(note) = note {
+            fit_before_note(&mut text, note.len(), dependent_count);
+            text.push_str(&note);
+        }
+        Ok(ToolOutput::text(text))
+    }
+}
+
+/// Whether a file could hold contract nodes at all: one with a tree-sitter
+/// grammar, or a YAML file (OpenAPI/AsyncAPI specs). Keeps an oversized README
+/// or lockfile out of every `find_dependents` answer.
+fn may_declare_dependents(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    LanguageKind::from_path(&s).language().is_some()
+        || path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
+}
+
+/// Cuts `text` at a line boundary so it plus a `note_len`-byte note stays
+/// within the payload cap minus the 1 KB the registry keeps for its own
+/// additions — the registry's central truncation, which cuts the *tail*,
+/// then never reaches the note. `format_dependents` emits no code fences, so
+/// a line cut leaves valid Markdown.
+fn fit_before_note(text: &mut String, note_len: usize, total: usize) {
+    const CUT_NOTICE_UPPER_BOUND: usize = 256;
+    let budget = (MAX_OUTPUT_BYTES - 1024).saturating_sub(note_len);
+    if text.len() <= budget {
+        return;
+    }
+    let mut cut = budget.saturating_sub(CUT_NOTICE_UPPER_BOUND);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let cut = text[..cut].rfind('\n').map_or(0, |i| i + 1);
+    text.truncate(cut);
+    text.push_str(&format!(
+        "\n*Output truncated at 48 KB ({total} dependents in total). Narrow with `granularity: \"package\"` or a more specific `target`.*\n"
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn only_files_that_can_declare_dependents_are_noted() {
+        assert!(may_declare_dependents(Path::new("/r/svc/api.ts")));
+        assert!(may_declare_dependents(Path::new("/r/openapi.YAML")));
+        assert!(!may_declare_dependents(Path::new("/r/README.md")));
+        assert!(!may_declare_dependents(Path::new("/r/package-lock.json")));
+    }
+
+    #[test]
+    fn fit_before_note_leaves_room_for_the_note() {
+        let mut text = "[1] `Dep` (Import)\n- **File**: `a.ts:1-2`\n\n".repeat(3_000);
+        fit_before_note(&mut text, 2_048, 3_000);
+        assert!(text.len() + 2_048 <= MAX_OUTPUT_BYTES - 1024, "{}", text.len());
+        assert!(text.ends_with("or a more specific `target`.*\n"), "{text}");
+        let mut small = "short\n".to_string();
+        fit_before_note(&mut small, 2_048, 1);
+        assert_eq!(small, "short\n");
     }
 }

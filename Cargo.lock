@@ -606,6 +606,7 @@ dependencies = [
  "toml",
  "tracing",
  "unicode-normalization",
+ "unsafe-libyaml",
  "windows-sys 0.59.0",
 ]
 

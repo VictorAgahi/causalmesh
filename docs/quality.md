@@ -866,6 +866,161 @@ each, 1 MB quota, size ≤ quota after every reload, eviction observed).
 
 **Not measured**: a real long-lived `meshd` over a real week, and the cache on a real 200k-file
 repository (entry size depends on the language mix; the 5k corpus is synthetic).
+## Update (2026-09-27, Plan 4 step 4.2: macOS watcher without polling, reloads held during Git operations)
+
+**Idle CPU of `meshd` on macOS.** Corpus: `scripts/bench/gen_synthetic.py /tmp/m42/cpu 3000 --services 250 --contracts`, a Git repository with 503 directories (outside `.git`), `roots = ["."]`. `meshd --idle-timeout-minutes 0 --startup-grace-secs 0` with an isolated `HOME` and socket. After 60 s of startup, `ps -o %cpu= -p <pid>` was sampled every 5 s for 10 min (120 samples), and `ps -o time=` was read at the start and end of the window.
+
+| binary | watcher backend (from the log) | mean `%cpu` | CPU time over the window | load averages (`uptime`, start / 5 min / end) |
+|---|---|---|---|---|
+| before, `97b7a3b` | `falling back to polling every 2s` (`PollWatcher`) | 4.211 % | 0:04.17 → 0:28.80 (24.6 s) | 18.78 / 14.91 / 6.26 |
+| after, this PR | `FileWatcher (FSEvents, recursive) watching root` | 0.000 % | 0:00.61 → 0:00.65 (0.04 s) | 19.61 / 24.93 / 7.19 |
+
+Both runs happened on a shared machine with other agents compiling in parallel. The system load was comparable across the two runs, and the `%cpu` of `meshd` counts only its own process. In the after run's log, `polling` appears 0 times (`grep -ci polling meshd.log`). The only watcher backend built was the recursive FSEvents stream.
+
+**Git storm** (`scripts/test_git_storm.sh`, 3,000 generated files rewritten by `git checkout main → feature`, `smart_search` in a loop against `mesh-mcp run --standalone`):
+
+| binary | generations installed after the checkout started | answers carrying the Git note | fingerprint of the installed index vs a cold `graph --format fingerprint` of the same directory |
+|---|---|---|---|
+| before, `97b7a3b` | 3: gen 2 (5 files, during the checkout), gen 3 (84 files, during), gen 4 (2,911 files) | n/a | not logged by this binary |
+| after, this PR | 1: gen 2, after the hold was released, none between hold and release | 5,446 of 149,132, all naming generation 1 | equal (`98219d59…9ef3e3`) |
+
+Before this step, two partial generations mixing both branches were installed and served mid-checkout. The script exits non-zero on the before binary and passes on the after binary.
+
+**Tests added.**
+- Pure unit tests for the Git gate state machine:
+  - checkout order: lock, files, lock removed, then `HEAD`;
+  - a fast checkout seen only through `HEAD`;
+  - `git commit`, where the ref moves and `HEAD` does not;
+  - an index refresh that flushes nothing;
+  - late worktree events;
+  - the 60 s cap;
+  - two repositories.
+- Orphan-lock rules: a young lock is live, an old lock with no `git` process is declared orphan once, and the process check is rate-limited.
+- Git directory resolution: plain repository, worktree and submodule with synthetic and real `git` layouts.
+- The in-memory event filter: excludes, root `.gitignore`, nested re-include kept, recompilation.
+- The per-state tool note.
+- An end-to-end test on the real OS watcher: nothing is installed while `.git/index.lock` exists, the tool text carries the note, and exactly one generation is installed after release.
+- Review fix: a directory renamed inside a root (`mv pkg pkg2`) is reported by FSEvents as one event per directory, never per contained file, and was discarded by the extension filter: `pkg2/a.proto` was never indexed and `pkg/a.proto` stayed in the index (`renamed_directory_is_reindexed_on_recursive_backend`, failing before the fix). On the recursive backends an existing, non-excluded directory event (which also covers an FSEvents `MustScanSubDirs` hint) is now kept, and `reload_paths` turns it into a full reload.
+
+**Limits.**
+- The in-memory filter only uses each root's own ignore files. An event under a nested `.gitignore` is kept, and `reload_paths` decides.
+- A hold covers every root: a busy repository delays reloads of the other roots too.
+- An orphan lock is declared only when the process check answers "no `git` process". On Windows there is no check, so only the 60 s cap applies.
+- A directory event is recognised only for an extension-less name (`v1.2/` is not), and a directory moved *out of* every root leaves its files indexed until the next full reload. Linux/Windows per-directory watches still drop directory events, as before this step.
+
+## Update (2026-09-27, step 4.9 — YAML / Markdown memory under a per-file budget)
+
+**Method.** `scripts/bench/gen_yaml_md_corpus.py` generates a deterministic corpus, and each
+file sits just under the per-file cap `AstGuard::within_size_budget` applies to it:
+`openapi.yaml` / `asyncapi.yaml` at 1.5 MB (the schema cap), `application.yml` and the `.md`
+files at 384 KB. `openapi.json` is not in the corpus because `.json` maps to
+`LanguageKind::Unknown` and no YAML or JSON parser reads it. `scripts/bench/yaml_md_peak.py
+--runs 3` reads the "peak memory footprint" line of `/usr/bin/time -l` (not `ps`) and reports
+medians of 3 runs:
+
+- **parser delta**: `crates/mesh-server/examples/parse_peak.rs <mode> <file>` minus the same
+  probe in `read` mode. The probe reads the file exactly as `process_file` does, then runs only
+  the parser under test (`props` = `PropertyRegistry::ingest_yaml_str`, `spec` =
+  `PolyglotIndexer::extract_with_config`, `docs` = `DocIndex::parse_sections`). It is an
+  example, so it is not part of the shipped binary.
+- **process delta**: `mesh-mcp graph --format fingerprint` in a workspace that holds only that
+  file, minus the same command in an empty workspace (default config, isolated `HOME`,
+  `MESH_SOCKET_PATH=/tmp/m49.sock`). This figure also includes the resident index and the
+  fingerprint's canonical copy, so it is larger than the parser delta.
+
+The decision rule (`parser delta > 4 x file size`) applies to the parser delta. Alias fan-out
+cases run under a kill switch at 2 GB or 60 s. Measured on an Apple M2 with 16 GB, while other
+builds were running. Peak memory does not depend on CPU contention; no timing is reported.
+
+**Before (`serde_yaml` 0.9, head `97b7a3b`)**: the threshold is crossed.
+
+| file | size | parser | delta | ratio | process delta |
+|---|---:|---|---:|---:|---:|
+| openapi.yaml | 1,570,793 | props / spec | 48.00 / 42.92 MB | **32.0x / 28.7x** | 65.88 MB |
+| asyncapi.yaml | 1,570,748 | props / spec | 39.86 / 35.53 MB | **26.6x / 23.7x** | 72.30 MB |
+| application.yml | 391,124 | props | 12.64 MB | **33.9x** | 25.03 MB |
+| handbook.md (6,244 short sections) | 391,164 | docs | 3.11 MB | **8.3x** | 6.33 MB |
+| essay.md (one section) | 391,060 | docs | 0.73 MB | 2.0x | 2.16 MB |
+| code.md (one code block) | 391,146 | docs | 0.72 MB | 1.9x | 1.89 MB |
+
+`serde_yaml` loads a whole document's event list (one heap event per node, plus its position)
+before any visitor runs. Plan 3.5's "streaming" visitors removed the `Value` tree but kept this
+list, and it alone was 24–34x the file size.
+
+**Security finding: alias fan-out.** In `serde_yaml` 0.9 (`de.rs`, `jump`), the only alias
+guard errors once alias *jumps* exceed 100x the event count. A single large anchored mapping
+replayed by many one-line aliases makes one jump per alias, which stays far under that limit,
+yet each jump replays the whole anchor. As a result, the property flattener and the OpenAPI
+`paths` view grow as anchor size x alias count. Measured before (process delta):
+
+| file | size | before |
+|---|---:|---:|
+| fan-out openapi.yaml | 6,138 | 77.78 MB |
+| fan-out openapi.yaml | 14,325 | 444.88 MB |
+| fan-out openapi.yaml | 30,711 | **1,847.70 MB** |
+| fan-out openapi.yaml | 1,570,803 | **killed at 2 GB** |
+
+The classic nested "billion laughs" (9x9 aliases, 1.3 KB) *was* stopped by that guard
+(3.53 MB).
+
+**Change.**
+
+- `mesh_core::yaml_stream` pulls libyaml events one at a time (`unsafe-libyaml`, the parser
+  `serde_yaml` already runs, so accepted syntax is unchanged) and drives the existing serde
+  visitors from them. Only anchored nodes are recorded, as scalars borrowed from the input, so
+  aliases can be replayed. Recording and replay are charged to a per-file **alias budget** of
+  1 event per input byte (minimum 64 Ki). Over budget, the document fails and ingests nothing.
+  Counting events alone let one anchored *long scalar* through: each alias replays it for one
+  unit, and a visitor that keeps strings (the AsyncAPI `topics:` list) copied it per alias, so
+  a 107 KB file (a 100 KB scalar, 1,000 `- *a`) produced 100 MB of topics within budget (found
+  in review). Replayed scalar bytes now go to a second **replay byte budget** (4 bytes per input
+  byte, minimum 64 KB). Scalars that libyaml had to unescape are held once behind an `Rc`, so
+  recording and replay never copy them. The golden sweeps below are unchanged.
+  I first tried the pure-Rust `saphyr-parser` / `yaml-rust2`; both reject otel-demo's
+  `compose.yaml` (a flow sequence closed at its key's indentation) that libyaml accepts.
+- `PropertyRegistry::ingest_yaml_str` gets a second per-file budget on **flattened output**
+  (dotted key + value bytes <= 8x the input, minimum 64 KB). Real files reach at most 2.2x:
+  the 376 YAML files of `~/.cache/mesh-golden` peak at 0.87x, the synthetic `application.yml`
+  at 2.17x (`yaml_output_ratio_on_dir`).
+- `DocIndex::parse_sections` walks the file line by line with an explicit **section budget**
+  (estimated resident bytes <= 3x the file, minimum 64 KB). Past it, later headings stop
+  opening sections and the rest of the file stays searchable in the last one. Below it, the
+  split is unchanged. The fixed per-section cost was also cut:
+  - one shared `Arc<Path>` per file instead of a `PathBuf` per section;
+  - `title_lower` as a `CompactStr` (inline for short titles);
+  - `content_lower` as a `Box<str>`;
+  - the section `Vec` sized from a heading pre-count, so it carries no growth slack;
+  - `sanitize_prompt_injections` matching case-insensitively in place, without a lowercased
+    copy of the whole file.
+- Equivalence: the `serde_yaml`-driven and stream-driven outputs (flattened pairs, AsyncAPI and
+  OpenAPI views) are identical on all 376 golden YAML files and the three synthetic specs
+  (`MESH_YAML_EQUIV_DIR=... cargo test --release -p mesh-core yaml_output_ratio_on_dir -- --ignored`,
+  and `-p mesh-parsers spec_views_match_on_dir`). Unit tests pin scalar resolution, tags, merge
+  keys, multi-document, error and recursion parity against `serde_yaml`.
+
+**After (this branch):**
+
+| file | size | parser | delta | ratio | process delta |
+|---|---:|---|---:|---:|---:|
+| openapi.yaml | 1,570,793 | props / spec | 18.97 / 3.36 MB | 12.7x / **2.2x** | 49.52 MB |
+| asyncapi.yaml | 1,570,748 | props / spec | 18.42 / 3.23 MB | 12.3x / **2.2x** | 58.77 MB |
+| application.yml | 391,124 | props | 9.16 MB | 24.5x | 25.03 MB |
+| handbook.md | 391,164 | docs | 1.08 MB | **2.9x** | 5.03 MB |
+| essay.md | 391,060 | docs | 0.72 MB | 1.9x | 2.34 MB |
+| code.md | 391,146 | docs | 0.72 MB | 1.9x | 2.11 MB |
+| fan-out openapi.yaml | 30,711 | props / spec | 2.30 / 1.58 MB | — | **3.00 MB** (was 1.85 GB) |
+| fan-out openapi.yaml | 1,570,803 | props / spec | 107.14 / 29.50 MB | — | **106.30 MB** (was killed at 2 GB) |
+| fan-out application.yml | 391,167 | props | 23.91 MB | — | 24.44 MB |
+| nested billion laughs | 1,329 | props | 0.78 MB | — | 0.53 MB |
+
+**What is still over 4x, and why.** The `props` deltas (12–25x) are now almost entirely the
+*output*, not the parser. Short dotted keys flatten into one `(String, String)` pair each,
+which then land in `PropertyRegistry`'s two maps (`raw_values` and `flat_properties`, each with
+its own key copy). With ~11 input bytes per leaf in `application.yml`, that representation costs
+~270 bytes per leaf. The spec path, which keeps only keys, dropped from 29x to 2.2x on the same
+parser. Shrinking the registry (shared keys, no staging `Vec`) changes a resident structure that
+the rest of the indexer reads, so it is left out of this step. The flattened-output budget only
+guarantees that the cost stays proportional to the file.
 
 ## What's NOT measured yet
 

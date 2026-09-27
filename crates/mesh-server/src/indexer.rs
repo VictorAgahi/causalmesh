@@ -509,6 +509,16 @@ impl WorkspaceIndexer {
             );
             return Self::reload(state);
         }
+        // A directory stands for a whole subtree (a renamed or moved-in directory, an FSEvents
+        // `MustScanSubDirs` hint): its files never produce events of their own, so only a
+        // crawl finds them — and forgets the ones under a directory's old name.
+        if changed_paths.iter().any(|p| p.is_dir()) {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "Targeted reload: directory in event set, falling back to full reload."
+            );
+            return Self::reload(state);
+        }
 
         let config = &state.config;
         let roots = &state.allowed_roots;

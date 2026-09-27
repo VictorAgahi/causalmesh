@@ -18,6 +18,7 @@ pub mod state;
 pub mod types;
 pub mod vfs;
 pub mod watcher;
+pub mod yaml_stream;
 
 // Re-export common types
 pub use audit::{AuditEntry, AuditError, AuditLogger};

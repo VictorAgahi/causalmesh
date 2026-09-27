@@ -191,14 +191,39 @@ impl WorkspaceIndexer {
         }
     }
 
-    /// Display names for each root, indexed by `RepoId`.
+    /// Display names for each root, indexed by `RepoId`. Two roots that share a
+    /// directory name (`…/a/api` and `…/b/api`) get the same bare name, which
+    /// silently merges their nodes into one service in `visualize_mesh`'s
+    /// aggregation (`Aggregate::build` groups purely by this string, step 4.12d
+    /// review). Disambiguated with the parent directory segment, deterministically:
+    /// every root sharing a name, not just the later ones, so the same input
+    /// always renders the same names regardless of scan order.
     pub fn repo_names(roots: &[PathBuf]) -> Vec<String> {
-        roots
+        let bare: Vec<String> = roots
             .iter()
             .map(|r| {
                 r.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| r.display().to_string())
+            })
+            .collect();
+
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for name in &bare {
+            *counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+
+        roots
+            .iter()
+            .zip(bare.iter())
+            .map(|(root, name)| {
+                if counts.get(name.as_str()).copied().unwrap_or(0) <= 1 {
+                    return name.clone();
+                }
+                match root.parent().and_then(|p| p.file_name()) {
+                    Some(parent) => format!("{}/{name}", parent.to_string_lossy()),
+                    None => name.clone(),
+                }
             })
             .collect()
     }
@@ -1154,6 +1179,52 @@ mod tests {
         let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
         let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
         Arc::new(AppState::new(cfg, vec![root.to_path_buf()], audit, rescan))
+    }
+
+    /// Regression (step 4.12d review): two roots sharing a directory name
+    /// (`.../a/api`, `.../b/api`) used to render the same display name, silently
+    /// merging their nodes into one service in `visualize_mesh`'s aggregation
+    /// (`Aggregate::build`/`group_of` group purely by this string). Disambiguated
+    /// with the parent segment, symmetrically (both collide, not just the second)
+    /// and deterministically (independent of scan order).
+    #[test]
+    fn repo_names_disambiguates_same_named_roots_by_parent() {
+        let roots = vec![
+            PathBuf::from("/w/a/api"),
+            PathBuf::from("/w/b/api"),
+            PathBuf::from("/w/billing"),
+        ];
+        assert_eq!(
+            WorkspaceIndexer::repo_names(&roots),
+            vec![
+                "a/api".to_string(),
+                "b/api".to_string(),
+                "billing".to_string(),
+            ]
+        );
+
+        // No collision: unchanged, bare names.
+        let unique = vec![PathBuf::from("/w/a/api"), PathBuf::from("/w/billing")];
+        assert_eq!(
+            WorkspaceIndexer::repo_names(&unique),
+            vec!["api".to_string(), "billing".to_string()]
+        );
+
+        // Order-independent: swapping the colliding roots gives the same names,
+        // each still paired with its own root by position.
+        let swapped = vec![
+            PathBuf::from("/w/b/api"),
+            PathBuf::from("/w/a/api"),
+            PathBuf::from("/w/billing"),
+        ];
+        assert_eq!(
+            WorkspaceIndexer::repo_names(&swapped),
+            vec![
+                "b/api".to_string(),
+                "a/api".to_string(),
+                "billing".to_string(),
+            ]
+        );
     }
 
     #[test]

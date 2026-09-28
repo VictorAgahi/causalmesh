@@ -5,6 +5,17 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.15] — 2026-09-28
+
+MCP `initialize.instructions` routing payload for automatic tool discovery by AI agents.
+
+### Added
+- **MCP `initialize.instructions` payload (`crates/mesh-server/src/lib.rs`)**:
+  Injected comprehensive routing instructions into the standard MCP `initialize` handshake response.
+  When connected to Claude Code or compliant MCP clients, this injects explicit system-prompt
+  directives instructing agents to prioritize `analyze_grpc`, `analyze_impact`, and `find_dependents`
+  over fallback `grep`/`ripgrep` searches, solving the tool discovery gap observed in unprompted A/B benchmarks.
+
 ## [7.0.14] — 2026-09-28
 
 Authoritative negative assertions and agent anti-verification guardrails (A/B benchmark findings).

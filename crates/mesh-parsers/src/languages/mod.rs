@@ -23,6 +23,7 @@ use mesh_core::{
     PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Default TS decorator that marks a method as a gRPC handler when
@@ -278,6 +279,19 @@ impl CompiledPattern {
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
+    /// Whether `nodes[i]` sits inside no other node of the same file (a class,
+    /// not one of its methods). Of two nodes spanning the exact same lines, the
+    /// first one is the outer.
+    fn is_outermost(nodes: &[ContractNode], i: usize) -> bool {
+        let n = &nodes[i];
+        !nodes.iter().enumerate().any(|(j, m)| {
+            j != i
+                && m.line_start <= n.line_start
+                && m.line_end >= n.line_end
+                && ((m.line_start, m.line_end) != (n.line_start, n.line_end) || j < i)
+        })
+    }
+
     /// Ingests and indexes a source file into the ContractGraph.
     pub fn index_file(file_path: &Path, content: &str, repo_id: RepoId, graph: &mut ContractGraph) {
         Self::extract(file_path, content, repo_id).apply(graph);
@@ -400,21 +414,31 @@ impl PolyglotIndexer {
                 out.rpc_calls = rpc_calls;
 
                 if !imports.is_empty() {
+                    // Imports are file-level facts: they go to the file's
+                    // outermost declarations (classes, interfaces, functions),
+                    // never to each method inside them — 7.0.0 gave every
+                    // method of a file its own copy of every module import,
+                    // so `find_dependents` listed `constructor`, `getLogger`, …
+                    // once per method and once per import line.
                     let content_lines: Vec<&str> = content.lines().collect();
+                    let mut seen: HashSet<(usize, &str)> = HashSet::new();
                     for (i, node) in nodes.iter().enumerate() {
+                        if !Self::is_outermost(&nodes, i) {
+                            continue;
+                        }
                         let body = content_lines
                             .get(node.line_start.saturating_sub(1)..node.line_end)
                             .unwrap_or(&[]);
 
-                        for (_sym, imported) in &imports {
+                        for (symbol, imported) in &imports {
                             if imported.is_empty() {
                                 continue;
                             }
-                            let is_module_path_entry =
-                                imported.contains('/') || imported.starts_with('.');
-                            let is_used = is_module_path_entry
+                            // A module (empty `symbol`) is a dependency of the
+                            // whole file; a named symbol only where it is used.
+                            let is_used = symbol.is_empty()
                                 || body.iter().any(|l| l.contains(imported.as_str()));
-                            if is_used {
+                            if is_used && seen.insert((i, imported.as_str())) {
                                 out.dependencies.push((i, CompactStr::new(imported)));
                             }
                         }
@@ -882,6 +906,46 @@ impl Seeker<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 7.0.1 (Volontariapp report, point 2 and 5): a module import belongs to
+    /// the file's outermost declarations, once, whatever the number of import
+    /// lines; a bare package (`rxjs`) is a module, not a symbol to find in the
+    /// body; a subpath import counts for its package; a 1-2 character target
+    /// never falls back to substring matching.
+    #[test]
+    fn ts_imports_attach_once_to_top_level_declarations() {
+        let mut graph = ContractGraph::new();
+        let ts = r#"import { fromEvent } from 'rxjs';
+import { JobOutbox } from '@scope/messaging';
+import { OutboxStatus } from '@scope/messaging';
+import { testing } from '@scope/messaging/testing';
+
+export class JobOutboxFailedPostProcessor {
+  constructor(private readonly outbox: JobOutbox) {}
+  getLogger() { return null; }
+  handle() { return fromEvent(null, 'x'); }
+}
+"#;
+        PolyglotIndexer::index_file(Path::new("svc/src/job.processor.ts"), ts, 0, &mut graph);
+        graph.reconcile_edges();
+
+        for target in ["rxjs", "@scope/messaging"] {
+            let names: Vec<&str> = graph
+                .find_dependents(target)
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect();
+            assert_eq!(names, ["JobOutboxFailedPostProcessor"], "{target}");
+        }
+        let (_, how) = graph.find_dependents_matched("@scope/messaging");
+        assert_eq!(how, mesh_core::DependentsMatch::Import);
+        // Only through the `/testing` subpath import.
+        assert_eq!(graph.find_dependents("@scope/messaging/testing").len(), 1);
+        assert!(graph.find_dependents("sc").is_empty());
+        let (sub, how) = graph.find_dependents_matched("messag");
+        assert_eq!(how, mesh_core::DependentsMatch::Substring);
+        assert_eq!(sub.len(), 1);
+    }
 
     #[test]
     fn test_polyglot_indexer_cpp() {

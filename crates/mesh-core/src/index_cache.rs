@@ -59,7 +59,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v3: one database per workspace, `file_index_access.last_accessed_at` LRU side table,
 /// `auto_vacuum = INCREMENTAL` (plan 4 step 4.4).
 /// v4: `file_index_access.payload_rowid`, the LRU tie-breaker (step 4.4 review).
-const SCHEMA_VERSION: u8 = 4;
+/// v5: TypeScript module imports attached once to top-level declarations, bare
+/// packages kept (7.0.1).
+const SCHEMA_VERSION: u8 = 5;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

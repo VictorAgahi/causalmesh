@@ -248,10 +248,8 @@ impl MarkdownFormatter {
     /// find the one real answer. Grouping by that label surfaces "matched in
     /// N services" up front instead.
     pub fn format_dependents(target: &str, dependents: &[(&ContractNode, String)]) -> String {
-        let mut out = format!(
-            "## In-Memory Reverse Dependency Graph for `{target}`\n*Total Dependents: {} consumer node(s) found*\n\n",
-            dependents.len()
-        );
+        // Totals (all pages) are the caller's to print: this renders one page.
+        let mut out = format!("## Reverse dependencies of `{target}`\n\n");
 
         if dependents.is_empty() {
             out.push_str("No dependents found importing this symbol or package.\n");
@@ -330,6 +328,22 @@ impl MarkdownFormatter {
                 stub.line_start,
                 confidence.label()
             ));
+        }
+        if trace.client_stubs.is_empty() && !trace.service_level_clients.is_empty() {
+            out.push_str(&format!(
+                "\n**No call to this method was resolved**, but {} caller(s) construct a client for its \
+                 service. They may call this method: read them before concluding it has no clients.\n",
+                trace.service_level_clients.len()
+            ));
+            for (client, confidence) in &trace.service_level_clients {
+                out.push_str(&format!(
+                    "- `{}` in `{}:{}` _(service-level client, match: {})_\n",
+                    client.name,
+                    client.file_path.display(),
+                    client.line_start,
+                    confidence.label()
+                ));
+            }
         }
         out.push('\n');
 

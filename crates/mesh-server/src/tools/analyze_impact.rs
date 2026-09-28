@@ -33,6 +33,12 @@ pub struct AnalyzeImpactArgs {
     )]
     pub offset: Option<u32>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Include matches in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, …). Default false: they are left out and counted."
+    )]
+    pub include_tests: Option<bool>,
+
     #[serde(default)]
     // Accepted for W3C trace propagation, hidden from `tools/list`: the model
     // cannot use it, and it cost every session ~200 schema tokens.
@@ -74,14 +80,23 @@ impl McpTool for AnalyzeImpactTool {
             .map(|l| l.clamp(1, MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT) as usize;
         let offset = args.offset.unwrap_or(0) as usize;
-        let matrix = snapshot
+        let mut matrix = snapshot
             .contract_graph
             .impact_matrix(args.target.as_str(), depth);
-        Ok(ToolOutput::text(MarkdownFormatter::format_impact_matrix(
-            &matrix,
-            &state.allowed_roots,
-            offset,
-            limit,
-        )))
+        let before = matrix.rows.len();
+        if !args.include_tests.unwrap_or(false) {
+            matrix
+                .rows
+                .retain(|r| !mesh_core::is_test_path(&r.node.file_path));
+        }
+        let hidden_tests = before - matrix.rows.len();
+        let mut text =
+            MarkdownFormatter::format_impact_matrix(&matrix, &state.allowed_roots, offset, limit);
+        if hidden_tests > 0 {
+            text.push_str(&format!(
+                "\n*{hidden_tests} row(s) in test files left out (`include_tests: true` to list them).*\n"
+            ));
+        }
+        Ok(ToolOutput::text(text))
     }
 }

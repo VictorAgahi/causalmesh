@@ -77,7 +77,7 @@ impl TypeScriptExtractor {
         content: &str,
         repo_id: RepoId,
         parser: &mut Parser,
-        imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+        imports: &mut Vec<(String, String)>, // ("", module) or (symbol, symbol)
     ) -> Vec<ContractNode> {
         let Some(tree) = parser.parse(content, None) else {
             return Vec::new();
@@ -107,7 +107,7 @@ impl TypeScriptExtractor {
         content: &str,
         repo_id: RepoId,
         tree: &Tree,
-        imports: &mut Vec<(String, String)>, // (consumer_symbol, imported_package_or_symbol)
+        imports: &mut Vec<(String, String)>, // ("", module) or (symbol, symbol)
         rpc_calls: &mut Vec<(usize, CompactStr)>,
         grpc_annotations: &[String],
     ) -> Vec<ContractNode> {
@@ -393,10 +393,16 @@ impl TypeScriptExtractor {
 
                 if let Some(from_str) = from_str_opt {
                     if !from_str.is_empty() {
+                        // Module entries carry an empty first element, named
+                        // specifiers their own name: `languages::mod` attributes
+                        // a module to the file's declarations unconditionally
+                        // and a symbol only where it is used. Both used to be
+                        // `("", x)` and told apart by "contains '/'", which
+                        // dropped every bare package (`rxjs`, `lodash`).
                         imports.push((String::new(), from_str.to_string()));
 
                         for named in Self::collect_named_import_specifiers(node, source) {
-                            imports.push((String::new(), named));
+                            imports.push((named.clone(), named));
                         }
                     }
                 }

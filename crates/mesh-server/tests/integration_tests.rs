@@ -149,7 +149,7 @@ async fn test_find_dependents_success() {
     assert!(res.is_ok());
     let val = res.unwrap();
     let text = val["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("In-Memory Reverse Dependency Graph for `UserAuthRequest`"));
+    assert!(text.contains("Reverse dependencies of `UserAuthRequest`"));
     assert!(text.contains("AuthController"));
 }
 

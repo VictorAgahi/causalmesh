@@ -168,7 +168,18 @@ func (h *BillingHandler) ProcessPayment(ctx context.Context, req *pb.PaymentRequ
 ### Tool 2: `find_dependents`
 
 #### Description
-Reverse dependency search across repository and microservice boundaries. Identifies all upstream callers, client classes, and consumer services that depend on a given contract, class, or gRPC method — at symbol granularity by default, or one result per `(repo, package)` with `granularity: "package"`.
+Reverse dependency search across repository and microservice boundaries. Identifies the
+declarations, files and services that import a package (or any subpath of it: `@scope/pkg/sub`
+counts for `@scope/pkg`), import a declared symbol's package, or call an RPC — one result per
+dependent declaration by default, per file with `granularity: "file"`, per `(repo, package)` with
+`granularity: "package"`.
+
+A module import is attributed to the file's top-level declarations (its classes, interfaces,
+functions), not to each of their methods, and each declaration is listed once however many import
+lines it has. Dependents in test files (`*.spec.ts`, `*_test.go`, `__tests__/`, `test-utils/`, …)
+are left out and counted unless `include_tests: true`. Results are paged (`limit`, default 50;
+`offset` from the footer). When nothing matches exactly, the last-resort fallback lists import
+strings that merely contain `target` (3 characters at least), under an explicit heuristic warning.
 
 **Negative Constraints**: DO NOT USE to search freeform text or method signatures (use smart_search).
 
@@ -184,7 +195,19 @@ Reverse dependency search across repository and microservice boundaries. Identif
     },
     "granularity": {
       "type": "string",
-      "description": "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a tool error (`isError: true`), not a silent fallback to 'symbol'."
+      "description": "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair — use it to see which *services* depend on the target. Any other value is a tool error (`isError: true`), not a silent fallback to 'symbol'."
+    },
+    "include_tests": {
+      "type": "boolean",
+      "description": "Include dependents in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, test-utils/, …). Default false: they are left out and counted."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Maximum number of dependents returned in this page (1-200, default 50). DO NOT raise it to see everything; page with `offset` instead."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "Number of dependents to skip (default 0). Use the `offset` given in a previous page's footer."
     }
   },
   "additionalProperties": false
@@ -195,8 +218,7 @@ Reverse dependency search across repository and microservice boundaries. Identif
 Illustrative, in the format produced by `MarkdownFormatter::format_dependents` (results grouped by
 the root they were found in):
 ```markdown
-## In-Memory Reverse Dependency Graph for `UserAuthRequest`
-*Total Dependents: 2 consumer node(s) found*
+## Reverse dependencies of `UserAuthRequest`
 
 *Matched across 2 distinct services/roots — grouped below so same-named packages from unrelated services aren't flattened together.*
 
@@ -211,6 +233,10 @@ the root they were found in):
 [2] `CheckoutWorkflow` (ServiceClass)
 - **File**: `/work/shop/services/order-service/internal/workflow/checkout.go:30-140`
 - **Package**: `order-service`
+
+---
+*2 dependent(s) in 2 file(s); showing 1-2.*
+*1 dependent(s) in test files left out (`include_tests: true` to list them).*
 ```
 
 When the scope of the query contains files the indexer rejected (oversized, binary, guard, parse
@@ -241,6 +267,10 @@ Git base (see [Wire-format check](#wire-format-check) below).
     "base": {
       "type": ["string", "null"],
       "description": "Git revision to compare the .proto against for wire-format breaking changes (ex: 'main', 'origin/main', 'v1.4.0', a commit SHA). Omit to use the merge-base of HEAD with the first existing of origin/HEAD, origin/main, main (falling back to HEAD). NOT a file path; must not start with '-' or contain ':'."
+    },
+    "include_tests": {
+      "type": "boolean",
+      "description": "Include matches in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, …). Default false: they are left out and counted."
     }
   },
   "additionalProperties": false
@@ -390,6 +420,10 @@ Same rules as `smart_search`: a page holds at most `limit` rows (default 100, ma
     "offset": {
       "type": "integer",
       "description": "Number of matrix rows to skip (default 0). Use the `offset` value given in a previous page's 'More rows' footer."
+    },
+    "include_tests": {
+      "type": "boolean",
+      "description": "Include matches in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, …). Default false: they are left out and counted."
     }
   },
   "additionalProperties": false

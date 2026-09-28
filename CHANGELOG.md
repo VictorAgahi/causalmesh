@@ -5,6 +5,31 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.3] — 2026-09-28
+
+Answers that were wrong or incomplete while looking complete (Volontariapp report, points 2, 5, 8
+and the test noise of 3).
+
+### Fixed
+- **`find_dependents` on a shared package returned 502 results for 167 importing files, then
+  truncated.** A TypeScript module import is now attached once to the file's top-level
+  declarations instead of to every method, and once however many import lines name the module.
+  Subpath imports (`@scope/pkg/testing`) count for their package.
+- **Bare npm packages were dropped from TypeScript imports** (`import { fromEvent } from 'rxjs'`
+  lost `rxjs`): module and symbol entries were told apart by "contains `/`".
+- **`find_dependents` had no paging and no test filter.** It now takes `limit` / `offset`, a
+  `granularity: "file"`, and leaves test files out (`*.spec.ts`, `*_test.go`, `__tests__/`,
+  `test-utils/`, …), saying how many, unless `include_tests: true`. `analyze_grpc` and
+  `analyze_impact` apply the same test filter.
+- **`find_dependents("a")` returned everything** through its substring fallback. The fallback
+  now needs 3 characters and its results come under an explicit heuristic warning.
+- **`analyze_grpc` answered "0 clients" when a service's client was built but the method call
+  was not resolved.** It now lists those service-level callers with a note that they may call
+  the method.
+- **`smart_search` masked `password!: string;` in a DTO as a secret.** In source code only a
+  quoted literal value is masked; config files keep the key-based masking.
+- Index cache schema v5: cached extractions from earlier builds are recomputed.
+
 ## [7.0.2] — 2026-09-28
 
 Most installs are done by the user's own AI agent: this release gives that agent an accurate guide

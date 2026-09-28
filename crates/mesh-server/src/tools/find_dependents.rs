@@ -1,6 +1,6 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
-use mesh_core::{AppState, CompactStr};
+use mesh_core::{AppState, CompactStr, DependentsMatch};
 use mesh_parsers::{LanguageKind, MarkdownFormatter, MAX_OUTPUT_BYTES, NON_RESULT_RESERVE_BYTES};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,9 +18,27 @@ pub struct FindDependentsArgs {
     #[serde(default)]
     #[schemars(
         with = "String",
-        description = "Result granularity: 'symbol' (default) returns one result per declaring symbol; 'package' collapses results to one per distinct (repo, package) pair — use this to see which *services* depend on the target without every individual caller symbol. Any other value is a tool error, not a silent fallback to 'symbol'."
+        description = "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair — use it to see which *services* depend on the target. Any other value is a tool error, not a silent fallback to 'symbol'."
     )]
     pub granularity: Option<CompactStr>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Include dependents in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, test-utils/, …). Default false: they are left out and counted."
+    )]
+    pub include_tests: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Maximum number of dependents returned in this page (1-200, default 50). DO NOT raise it to see everything; page with `offset` instead."
+    )]
+    pub limit: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Number of dependents to skip (default 0). Use the `offset` given in a previous page's footer."
+    )]
+    pub offset: Option<u32>,
 
     #[serde(default)]
     // Accepted for W3C trace propagation, hidden from `tools/list`: the model
@@ -33,17 +51,69 @@ pub struct FindDependentsArgs {
 /// back to `"symbol"` — a typo'd or invented value (`"Package"`, `"packages"`)
 /// would otherwise look like a successful narrower query while quietly
 /// returning the full, undeduplicated result set.
-fn validate_granularity(args: &FindDependentsArgs) -> Result<bool, ToolError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Symbol,
+    File,
+    Package,
+}
+
+fn validate_granularity(args: &FindDependentsArgs) -> Result<Granularity, ToolError> {
     match args.granularity.as_deref() {
-        None | Some("symbol") => Ok(false),
-        Some("package") => Ok(true),
+        None | Some("symbol") => Ok(Granularity::Symbol),
+        Some("file") => Ok(Granularity::File),
+        Some("package") => Ok(Granularity::Package),
         Some(other) => Err((
             -32602,
             format!(
-                "Invalid granularity '{other}' for find_dependents: expected 'symbol' or 'package'."
+                "Invalid granularity '{other}' for find_dependents: expected 'symbol', 'file' or 'package'."
             ),
         )),
     }
+}
+
+/// Dependents per page when `limit` is omitted, and the most a caller may ask for.
+const DEFAULT_LIMIT: u32 = 50;
+const MAX_LIMIT: u32 = 200;
+
+/// The full, ordered answer before paging: what `run` renders and
+/// `truncation_hint` counts, computed one way for both.
+struct Resolved<'g> {
+    dependents: Vec<&'g mesh_core::ContractNode>,
+    how: DependentsMatch,
+    hidden_tests: usize,
+}
+
+fn resolve<'g>(
+    args: &FindDependentsArgs,
+    graph: &'g mesh_core::ContractGraph,
+    granularity: Granularity,
+) -> Resolved<'g> {
+    let (mut dependents, how) = graph.find_dependents_matched(args.target.as_str());
+    let before = dependents.len();
+    if !args.include_tests.unwrap_or(false) {
+        dependents.retain(|n| !mesh_core::is_test_path(&n.file_path));
+    }
+    let hidden_tests = before - dependents.len();
+    let dependents = match granularity {
+        Granularity::Symbol => dependents,
+        Granularity::File => dedup_by_file(dependents),
+        Granularity::Package => dedup_by_package(dependents),
+    };
+    Resolved {
+        dependents,
+        how,
+        hidden_tests,
+    }
+}
+
+/// One result per file, first declaration seen per file wins.
+fn dedup_by_file(dependents: Vec<&mesh_core::ContractNode>) -> Vec<&mesh_core::ContractNode> {
+    let mut seen: HashSet<&std::path::Path> = HashSet::new();
+    dependents
+        .into_iter()
+        .filter(|node| seen.insert(&node.file_path))
+        .collect()
 }
 
 /// One result per distinct `(repo, package)` pair, preserving the input's
@@ -61,7 +131,7 @@ pub struct FindDependentsTool;
 
 impl McpTool for FindDependentsTool {
     const NAME: &'static str = "find_dependents";
-    const DESCRIPTION: &'static str = "Resolves the reverse dependency graph across packages, shared modules, gRPC services, and event streams — at symbol granularity by default, or one result per (repo, package) with granularity: 'package'. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
+    const DESCRIPTION: &'static str = "Resolves the reverse dependency graph across packages, shared modules, gRPC services, and event streams: who imports a package (or any subpath of it), a declared symbol's package, or calls an RPC. One result per dependent declaration by default, per file with granularity: 'file', per (repo, package) with granularity: 'package'. Test files are left out unless include_tests: true. Paged with limit/offset. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
     type Args = FindDependentsArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -73,18 +143,13 @@ impl McpTool for FindDependentsTool {
         // to be called at all) — recomputing here must dedupe the same way, or
         // this hint reports the pre-dedup symbol count for a `granularity:
         // "package"` request whose caller never saw that many results.
-        let by_package = validate_granularity(args).ok()?;
+        let granularity = validate_granularity(args).ok()?;
         let snapshot = state.snapshot();
-        let dependents = snapshot
-            .contract_graph
-            .find_dependents(args.target.as_str());
-        let count = if by_package {
-            dedup_by_package(dependents).len()
-        } else {
-            dependents.len()
-        };
+        let count = resolve(args, &snapshot.contract_graph, granularity)
+            .dependents
+            .len();
         Some(format!(
-            "Target '{}' has {} dependent consumer(s). Consider searching for specific caller sub-packages or narrowing your query.",
+            "Target '{}' has {} dependent(s). Page with a smaller `limit`, or use granularity: \"file\" / \"package\".",
             args.target,
             count
         ))
@@ -95,29 +160,29 @@ impl McpTool for FindDependentsTool {
     }
 
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
-        let by_package = validate_granularity(args)?;
+        let granularity = validate_granularity(args)?;
+        let limit = args
+            .limit
+            .map(|l| l.clamp(1, MAX_LIMIT))
+            .unwrap_or(DEFAULT_LIMIT) as usize;
+        let offset = args.offset.unwrap_or(0) as usize;
         let snapshot = state.snapshot();
-        let dependents = snapshot
-            .contract_graph
-            .find_dependents(args.target.as_str());
-
-        // `granularity: "package"` collapses every dependent down to one
-        // result per distinct (repo, package) pair — useful for "which
-        // *services* depend on this" without a wall of individual caller
-        // symbols, several of which are very often declared in the same
-        // package. Default ("symbol") keeps today's one-result-per-symbol
-        // behavior unchanged; anything else was already rejected above.
-        let dependents = if by_package {
-            dedup_by_package(dependents)
-        } else {
-            dependents
-        };
+        let resolved = resolve(args, &snapshot.contract_graph, granularity);
+        let total = resolved.dependents.len();
+        let files: HashSet<&std::path::Path> =
+            resolved.dependents.iter().map(|n| &*n.file_path).collect();
+        let file_count = files.len();
+        drop(files);
 
         // Label each result with the root it was crawled from so the
         // formatter can group same-named packages from unrelated services
         // apart instead of flattening them into one undifferentiated list.
-        let labeled: Vec<(&_, String)> = dependents
-            .into_iter()
+        let labeled: Vec<(&_, String)> = resolved
+            .dependents
+            .iter()
+            .copied()
+            .skip(offset)
+            .take(limit)
             .map(|node| {
                 let label = state
                     .allowed_roots
@@ -128,8 +193,25 @@ impl McpTool for FindDependentsTool {
             })
             .collect();
         let dependent_count = labeled.len();
-        let mut text = MarkdownFormatter::format_dependents(args.target.as_str(), &labeled);
+        let mut text = String::new();
+        if resolved.how == DependentsMatch::Substring {
+            text.push_str(&format!(
+                "> ⚠ Nothing imports, declares or calls `{}` exactly. The results below are import strings that merely *contain* it (heuristic): check each one.\n\n",
+                args.target
+            ));
+        }
+        text.push_str(&MarkdownFormatter::format_dependents(
+            args.target.as_str(),
+            &labeled,
+        ));
         drop(labeled);
+        text.push_str(&page_footer(
+            total,
+            file_count,
+            offset,
+            dependent_count,
+            resolved.hidden_tests,
+        ));
 
         // Plan 4 step 4.1: this tool's scope is every allowed root, so any
         // rejected file that could have declared a dependent (source, proto,
@@ -143,6 +225,32 @@ impl McpTool for FindDependentsTool {
         }
         Ok(ToolOutput::text(text))
     }
+}
+
+/// Totals, paging and what was left out, after the listed results.
+fn page_footer(
+    total: usize,
+    file_count: usize,
+    offset: usize,
+    shown: usize,
+    hidden_tests: usize,
+) -> String {
+    let mut out = format!("---\n*{total} dependent(s) in {file_count} file(s)");
+    if total > 0 {
+        let first = (offset + 1).min(total);
+        let last = offset + shown;
+        out.push_str(&format!("; showing {first}-{last}"));
+        if last < total {
+            out.push_str(&format!(". More: `offset: {last}`"));
+        }
+    }
+    out.push_str(".*\n");
+    if hidden_tests > 0 {
+        out.push_str(&format!(
+            "*{hidden_tests} dependent(s) in test files left out (`include_tests: true` to list them).*\n"
+        ));
+    }
+    out
 }
 
 /// Whether a file could hold contract nodes at all: one with a tree-sitter

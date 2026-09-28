@@ -68,7 +68,7 @@ const SCHEMA_VERSION: u8 = 7;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.
-const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `[cache] max_size_mb` default: 2 GiB per workspace.
 pub const DEFAULT_MAX_SIZE_MB: u64 = 2048;
@@ -474,7 +474,10 @@ impl PersistentIndexCache {
             }
             let touched = std::mem::take(&mut inner.touched);
             let now = unix_now_ms();
-            let tx = match inner.conn.transaction() {
+            let tx = match inner
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+            {
                 Ok(tx) => tx,
                 Err(e) => {
                     self.record_error("Failed to open cache write transaction", &e);
@@ -504,25 +507,29 @@ impl PersistentIndexCache {
                     if let Err(e) = res {
                         self.record_error("Failed to write cache entry", &e);
                         failed = true;
+                        break;
                     }
                 }
-                for key in &touched {
-                    // `UPDATE`, not upsert: a key evicted between its `get` and this flush
-                    // must not come back as an access row without a payload.
-                    if let Err(e) = tx.execute(
-                        "UPDATE file_index_access SET last_accessed_at = ?2 WHERE cache_key = ?1",
-                        params![key.as_slice(), now],
-                    ) {
-                        self.record_error("Failed to record cache access", &e);
-                        failed = true;
+                if !failed {
+                    for key in &touched {
+                        // `UPDATE`, not upsert: a key evicted between its `get` and this flush
+                        // must not come back as an access row without a payload.
+                        if let Err(e) = tx.execute(
+                            "UPDATE file_index_access SET last_accessed_at = ?2 WHERE cache_key = ?1",
+                            params![key.as_slice(), now],
+                        ) {
+                            self.record_error("Failed to record cache access", &e);
+                            failed = true;
+                            break;
+                        }
                     }
                 }
+            }
+            if failed {
+                return;
             }
             if let Err(e) = tx.commit() {
                 self.record_error("Failed to commit cache batch", &e);
-                return;
-            }
-            if failed {
                 return;
             }
         }

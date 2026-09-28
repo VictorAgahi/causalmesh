@@ -1,6 +1,6 @@
 //! Socket path resolution and lifecycle management for the meshd Unix Domain Socket and Windows Named Pipes.
 //!
-//! Per RFC-001 Commandment 7, the socket lives at:
+//! Per Commandment 7 (CLAUDE.md), the socket lives at:
 //!   1. `$MESH_SOCKET_PATH` (env override)
 //!   2. `$XDG_RUNTIME_DIR/mesh/<name>` (Linux best practice)
 //!   3. `~/.cache/mesh/<name>` (macOS / portable fallback)

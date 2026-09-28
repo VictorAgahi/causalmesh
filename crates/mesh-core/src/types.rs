@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Re-export CompactString as CompactStr for zero-allocation hot loops per RFC-001 Commandment 1
+/// Re-export CompactString as CompactStr for zero-allocation hot loops per CLAUDE.md Commandment 1
 pub type CompactStr = compact_str::CompactString;
 
 pub type RepoId = u16;

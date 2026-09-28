@@ -43,7 +43,7 @@ pub struct DaemonStarts {
     pub starts: usize,
 }
 
-/// Local usage summary computed from the audit log (RFC-001 item 15). Nothing
+/// Local usage summary computed from the audit log. Nothing
 /// here leaves the machine: it is derived purely from an already-local SQLite
 /// file, read read-only. Every figure is counted or measured; nothing is estimated.
 #[derive(serde::Serialize)]

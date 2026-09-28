@@ -494,7 +494,7 @@ async fn test_real_benchmarks_regression_budgets() {
     let decapitated = AstDecapitator::decapitate_auto(ts_source, LanguageKind::TypeScript, false);
     let elapsed = start.elapsed();
 
-    // Must execute under 15 milliseconds in release mode (RFC-001 C-FFI timeout budget)
+    // Must execute under 15 milliseconds in release mode (Commandment 2 C-FFI timeout budget)
     let budget_ms = if cfg!(debug_assertions) { 150 } else { 15 };
     assert!(
         elapsed.as_millis() < budget_ms,

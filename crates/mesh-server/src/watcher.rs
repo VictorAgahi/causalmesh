@@ -3,7 +3,7 @@ use mesh_core::{AppState, ReloadFn};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// High-level FileWatcherService binding the workspace indexer to the in-kernel core watcher per RFC-001 Commandment 7.
+/// High-level FileWatcherService binding the workspace indexer to the in-kernel core watcher per CLAUDE.md Commandment 7.
 pub struct FileWatcherService;
 
 impl FileWatcherService {

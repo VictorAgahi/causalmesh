@@ -2,7 +2,7 @@
 
 > **Project**: MeshMCP (version: `[workspace.package]` in `Cargo.toml`)  
 > **Repository**: `VictorAgahi/causalmesh`  
-> **Environment**: stable Rust, no pinned MSRV (CI: macOS, Linux, Windows)
+> **Environment**: stable Rust, MSRV 1.90 (`rust-version` in `Cargo.toml`; CI: macOS, Linux, Windows)
 
 ---
 

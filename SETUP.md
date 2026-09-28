@@ -43,7 +43,7 @@ example) it falls back to `cargo install` from the repository, which needs a Rus
 
 ### From source
 
-Needs Rust 1.80+ (`rustup toolchain install stable`).
+Needs Rust 1.90+ (`rustup toolchain install stable`); the minimum is pinned as `rust-version` in `Cargo.toml`.
 
 ```bash
 git clone https://github.com/VictorAgahi/causalmesh.git

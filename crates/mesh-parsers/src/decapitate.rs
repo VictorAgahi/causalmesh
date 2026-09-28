@@ -187,7 +187,7 @@ impl LineTracker {
     }
 }
 
-/// Polyglot AST Decapitation Engine per RFC-001 Section 4.4
+/// Polyglot AST Decapitation Engine (CLAUDE.md §3, AST Decapitation)
 pub struct AstDecapitator;
 
 impl AstDecapitator {
@@ -233,7 +233,7 @@ impl AstDecapitator {
         let tree = match parser.parse(content, None) {
             Some(t) => t,
             None => {
-                // Commandment 2 & RFC-001: NEVER return the raw gigantic file on timeout or failure.
+                // Commandment 2: NEVER return the raw gigantic file on timeout or failure.
                 // Return bounded error stub <= 256 bytes protecting LLM context window.
                 tracing::warn!(
                     target: "mesh::parser",

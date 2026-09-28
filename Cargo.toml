@@ -10,6 +10,9 @@ members = [
 [workspace.package]
 version = "7.0.3"
 edition = "2021"
+# Verified with `cargo +1.90 check --workspace --all-targets`; set by dependencies
+# (tree-sitter-language requires 1.90).
+rust-version = "1.90"
 license = "Apache-2.0 OR MIT"
 authors = ["CausalMesh Enterprise Contributors"]
 repository = "https://github.com/VictorAgahi/causalmesh"

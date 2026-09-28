@@ -569,7 +569,7 @@ impl WorkspaceIndexer {
             // below, indexed) by where it actually points, not by the raw watched
             // path — a symlink created inside a watched root pointing outside
             // every allowed root must never be followed into indexing its
-            // target's content (RFC-001 Commandment 4: never follow symlinks
+            // target's content (CLAUDE.md Commandment 4: never follow symlinks
             // out of the sandbox). A path that no longer exists can't be
             // canonicalized; a deletion only needs to identify *that* a change
             // happened under some watched root, never a symlink target, so it
@@ -1513,7 +1513,7 @@ mod tests {
     /// A symlink created inside a watched root pointing at a file *outside*
     /// every allowed root must never have its target indexed — reload_paths
     /// canonicalizes before resolving a root specifically so this can't happen
-    /// (RFC-001 Commandment 4: never follow a symlink out of the sandbox).
+    /// (CLAUDE.md Commandment 4: never follow a symlink out of the sandbox).
     #[cfg(unix)]
     #[test]
     fn reload_paths_never_indexes_a_symlink_escaping_every_root() {

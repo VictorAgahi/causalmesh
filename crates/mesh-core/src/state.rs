@@ -138,7 +138,7 @@ impl MeshSnapshot {
     }
 }
 
-/// Central application state per RFC-001 Commandment 1.
+/// Central application state per CLAUDE.md Commandment 1.
 ///
 /// Only `snapshot` is hot-swapped (lock-free, copy-on-write). Everything else is
 /// fixed for the lifetime of the process and lives behind a plain `Arc`.

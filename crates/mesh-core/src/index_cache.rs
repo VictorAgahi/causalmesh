@@ -1,4 +1,4 @@
-//! Persistent, content-hash-keyed cache of parsed per-file extraction results (RFC-001 P2
+//! Persistent, content-hash-keyed cache of parsed per-file extraction results (P2
 //! step 3.2), backed by SQLite in WAL mode, one database per workspace at
 //! `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db` (plan 4 step 4.4; Commandment
 //! 7's audit db convention, mode `0600`). `<workspace_id>` is the same

@@ -60,7 +60,7 @@ pub struct AuditMetrics {
     pub process_starts: Option<Vec<(String, String)>>,
 }
 
-/// Robust cryptographic multi-process AuditLogger backed by SQLite in WAL mode per RFC-001 Commandment 7.
+/// Robust cryptographic multi-process AuditLogger backed by SQLite in WAL mode per CLAUDE.md Commandment 7.
 pub struct AuditLogger {
     conn: Mutex<Connection>,
     db_path: PathBuf,

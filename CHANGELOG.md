@@ -5,6 +5,24 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.9] — 2026-09-28
+
+`smart_search` secret masking (Volontariapp 7.0.6 report, defects 4 and 8). The report's six
+redaction cases on the Volontariapp workspace: secrets masked 2/2 (7.0.6: 1/2), non-secrets left
+alone 4/4 (7.0.6: 1/4).
+
+### Fixed
+- **A hard-coded secret in a declaration was printed in clear**: `const password =
+  'Password123!';` had a space in its "key", so the line was skipped. Declaration keywords and
+  modifiers (`const`, `let`, `var`, `readonly`, `private`, …) are now set aside before the key is
+  tested; prose and comments still are not keys.
+- **Non-secrets were masked**, printing wrong code or broken JSON: an enum member whose value is
+  its own name (`REFRESH_TOKEN = 'refresh_token'`), an environment variable name
+  (`"password": "DB_PASSWORD"` in node-config's `custom-env-vars.json`), an object opening
+  (`"auth": {`), `${…}` references and `true`/`false`/`null` are no longer masked.
+- **Masking replaced everything after the separator**: only the value (with its quotes) is
+  replaced now; a trailing `,` / `;` and a type annotation are kept.
+
 ## [7.0.8] — 2026-09-28
 
 Wire-format check covers enums (Volontariapp 7.0.6 report, critical defect 3). Measured on the

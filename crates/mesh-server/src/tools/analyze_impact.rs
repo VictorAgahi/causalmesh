@@ -54,7 +54,7 @@ pub struct AnalyzeImpactTool;
 
 impl McpTool for AnalyzeImpactTool {
     const NAME: &'static str = "analyze_impact";
-    const DESCRIPTION: &'static str = "Impact matrix of a change: for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue or saga, its producers, topics, consumers and sagas (direct by default, or through `depth` causal hops of real Produces/Consumes edges). Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage.";
+    const DESCRIPTION: &'static str = "Authoritative causal impact matrix: for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue or saga, its producers, topics, consumers and sagas (direct by default, or through `depth` causal hops of real Produces/Consumes edges). If 0 producers or consumers are reported, none exist in static code: DO NOT run fallback ripgrep/grep searches. Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage.";
     type Args = AnalyzeImpactArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {

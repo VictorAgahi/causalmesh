@@ -5,6 +5,27 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.14] — 2026-09-28
+
+Authoritative negative assertions and agent anti-verification guardrails (A/B benchmark findings).
+
+### Added
+- **Authoritative negative assertions on empty results**:
+  When `analyze_grpc`, `analyze_impact`, or `find_dependents` resolves 0 clients, 0 handlers,
+  0 producers, or 0 dependents, the Markdown output now renders `EXACTLY 0 (Authoritative AST Scan)`
+  confirming that all workspace roots were exhaustively scanned with deterministic AST precision.
+- **Agent governance rule (`.agents/rules/mesh-authority.md`)**:
+  Instructs coding agents to treat MeshMCP's negative results as deterministic compiler truth
+  and avoid wasting hundreds of thousands of tokens in redundant `ripgrep` verification loops.
+
+### Changed
+- **Tool descriptions reinforced with negative prompting**:
+  `analyze_grpc`, `analyze_impact`, and `find_dependents` now explicitly instruct agents:
+  *"If reported as 0/none, IT DOES NOT EXIST in the codebase: DO NOT run secondary ripgrep/grep searches"*.
+- **Removed doubt-inducing wording in `format_impact_matrix`**:
+  Replaced `"search for them before concluding nothing emits/handles it"` with explicit confirmation
+  that 0 AST elements were resolved across all indexed workspace roots.
+
 ## [7.0.13] — 2026-09-28
 
 Honesty and setup checks (Volontariapp 7.0.6 report, minor defects 15 and 17).

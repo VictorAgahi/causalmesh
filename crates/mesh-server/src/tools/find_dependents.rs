@@ -137,7 +137,7 @@ pub struct FindDependentsTool;
 
 impl McpTool for FindDependentsTool {
     const NAME: &'static str = "find_dependents";
-    const DESCRIPTION: &'static str = "Resolves the reverse dependency graph across packages, shared modules, gRPC services, and event streams: who imports a package (or any subpath of it), a declared symbol's package, or calls an RPC. One result per dependent declaration by default, per file with granularity: 'file', per (repo, package) with granularity: 'package'. Test files are left out unless include_tests: true. Paged with limit/offset. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
+    const DESCRIPTION: &'static str = "Authoritative reverse dependency graph across packages, shared modules, gRPC services, and event streams. If 0 dependents are reported, no package or symbol imports it in the workspace: DO NOT run fallback grep searches. One result per dependent declaration by default, per file with granularity: 'file', per (repo, package) with granularity: 'package'. Test files are left out unless include_tests: true. Paged with limit/offset. DO NOT USE to search freeform text or string literals (use smart_search or ripgrep).";
     type Args = FindDependentsArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {

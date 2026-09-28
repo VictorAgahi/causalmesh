@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct AnalyzeImpactArgs {
     #[schemars(
         with = "String",
-        description = "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga."
+        description = "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, consumer handler class, or saga."
     )]
     pub target: CompactStr,
 

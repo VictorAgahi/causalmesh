@@ -83,14 +83,18 @@ pub async fn run_server(
 ///
 /// `still_indexing` (meshd before its first snapshot) turns `tools/call` into a
 pub const MCP_SERVER_INSTRUCTIONS: &str = "\
-MeshMCP provides compiler-grade, deterministic AST graph analysis for microservices architectures across 14 languages.
+MeshMCP provides compiler-grade, deterministic AST graph analysis for polyglot microservices architectures across 14 languages.
 
-CRITICAL ROUTING INSTRUCTIONS FOR CODING AGENTS:
-1. gRPC inquiries: For ANY question regarding gRPC services, RPC methods, client stubs, or handlers: ALWAYS call `analyze_grpc` before grep.
-2. Event & Messaging inquiries: For ANY question regarding event queues, outbox topics, message producers, or consumers: ALWAYS call `analyze_impact` before grep.
-3. Symbol & Service dependencies: For ANY question regarding reverse dependencies, callers, or impact of modifying a symbol: ALWAYS call `find_dependents` before grep.
-4. Cross-service search: Use `smart_search` for semantic and symbol search across polyglot workspace roots.
-5. Deterministic negative assertions: MeshMCP results are exhaustive and compiler-verified across all indexed workspace roots. If an element is reported as 0/none, IT DOES NOT EXIST in the codebase: NEVER run redundant fallback ripgrep/grep searches to double-check negative results.";
+TOOL ACTIVATION (FOR CLIENTS WITH DEFERRED TOOL LOADING):
+If your client environment defers loading MCP tool schemas (such as Claude Code ToolSearch), activate MeshMCP tools first:
+  ToolSearch select:mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc,mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__smart_search
+
+ROUTING INSTRUCTIONS FOR CODING AGENTS:
+1. Event & Messaging inquiries: For questions regarding outbox events, message brokers, queues, topics, streams, event producers, or consumer handlers: ALWAYS use `analyze_impact` before grep.
+2. gRPC inquiries: For questions regarding gRPC services, RPC methods, client stubs, server controllers, or .proto wire-format checks: ALWAYS use `analyze_grpc` before grep.
+3. Symbol & Service dependencies: For questions regarding reverse dependencies, callers, or the blast radius of modifying a shared symbol or package: ALWAYS use `find_dependents` before grep.
+4. Cross-service search: Use `smart_search` for semantic and symbol declaration search across polyglot workspace roots.
+5. Negative assertions & Heuristics: When MeshMCP reports an authoritative 0 (labeled 'Authoritative AST Scan'), the negative result is compiler-verified across all workspace roots; do NOT run redundant fallback ripgrep/grep searches. If a result is explicitly marked 'heuristic', ambiguous, or notes potential unindexed runtime/dynamic strings, targeted verification is appropriate.";
 
 /// tool error the agent can retry on, instead of answering from an empty graph.
 /// `session_id` is what the call is audited under (see [`new_session_id`]).
@@ -277,6 +281,7 @@ mod tests {
         assert!(instructions.contains("analyze_impact"));
         assert!(instructions.contains("find_dependents"));
         assert!(instructions.contains("smart_search"));
-        assert!(instructions.contains("NEVER run redundant fallback ripgrep/grep searches"));
+        assert!(instructions.contains("ToolSearch select:"));
+        assert!(instructions.contains("do NOT run redundant fallback ripgrep/grep searches"));
     }
 }

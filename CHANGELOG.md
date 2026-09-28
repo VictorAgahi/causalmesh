@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.16] — 2026-09-28
+
+Conditional deferred tool activation instructions, heuristic-aware negative assertion rules, and generic architectural taxonomy.
+
+### Changed
+- **Conditional `ToolSearch` activation instructions (`crates/mesh-server/src/lib.rs`)**:
+  Updated the MCP `initialize.instructions` payload to include a client-agnostic conditional directive for deferred-loading environments (e.g. Claude Code `ToolSearch select:...`), guiding agents to unblock schemas without imposing client-specific constraints.
+- **Nuanced negative assertion rule for heuristics (`crates/mesh-server/src/lib.rs`)**:
+  Softened the absolute negative assertion guidance to distinguish authoritative compiler-verified results from heuristic, ambiguous, or dynamic/runtime matches, empowering agents to perform targeted follow-up verifications when appropriate.
+- **Generic architectural vocabulary**:
+  Refined tool descriptions and argument schemas to ensure generic microservices terminology (topics, queues, streams, brokers, event producers, consumer handlers) without benchmark-specific or corpus-specific overfitting.
+
 ## [7.0.15] — 2026-09-28
 
 MCP `initialize.instructions` routing payload for automatic tool discovery by AI agents.

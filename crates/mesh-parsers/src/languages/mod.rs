@@ -457,6 +457,30 @@ impl PolyglotIndexer {
                 .unwrap_or_default();
                 out.rpc_calls = rpc_calls;
                 Self::wire_ts_events(&nodes, &mut out);
+                let mut nodes = nodes;
+                // A file with imports and no declaration (a barrel of
+                // `export * from …`, a spec of `describe` calls) had nothing
+                // to attach them to, so `find_dependents` never listed it:
+                // Volontariapp 7.0.6, 34 of 57 importing specs and the
+                // `bridge` barrel missing. One `Module` node spans the file.
+                if nodes.is_empty() && !imports.is_empty() {
+                    let name = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("module");
+                    nodes.push(ContractNode {
+                        id: 0,
+                        name: CompactStr::new(name),
+                        kind: NodeKind::Module,
+                        file_path: std::sync::Arc::from(file_path),
+                        line_start: 1,
+                        line_end: content.lines().count().max(1),
+                        package: mesh_core::detect_service_package(file_path, None),
+                        repo_id,
+                        signature: Some(CompactStr::new("module (imports only)")),
+                        docstring: None,
+                    });
+                }
 
                 if !imports.is_empty() {
                     // Imports are file-level facts: they go to the file's

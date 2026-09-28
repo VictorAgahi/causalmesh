@@ -5,6 +5,24 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.12] — 2026-09-28
+
+`find_dependents` completeness (Volontariapp 7.0.6 report, defects 9 and 10). Measured on the
+Volontariapp workspace against the report's `rg` ground truth: `@volontariapp/messaging` with
+tests 201/201 files (7.0.6: 167), 18/18 packages (17); `@volontariapp/config` 117/117 with the
+`bridge` barrel (116).
+
+### Fixed
+- **Files with imports but no declaration were never dependents**: a barrel of `export * from …`
+  or a spec made only of `describe(…)` calls had no node to carry its imports. Such a TypeScript
+  file now gets one `Module` node spanning it (new `NodeKind::Module`, never a `smart_search`
+  result). Index cache schema v9.
+- **"N dependent(s) in test files left out" counted declarations** under a per-file or
+  per-package listing (7.0.6: "39 left out" for 34 files). It now counts in the listing's unit.
+- **Paging past the end said "No dependents found"** above "showing 167-180"; it now says there is
+  nothing at that offset and which offsets exist. A `granularity: "package"` footer counts
+  packages, not "dependent(s) in N file(s)".
+
 ## [7.0.11] — 2026-09-28
 
 `visualize_mesh` edges (Volontariapp 7.0.6 report, defects 7 and 14). Measured on the Volontariapp

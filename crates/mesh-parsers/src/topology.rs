@@ -100,6 +100,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::HttpEndpoint => "HTTP",
         NodeKind::ProtoMessage => "message",
         NodeKind::Interface => "interface",
+        NodeKind::Module => "module",
         NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => "topic",
         NodeKind::Saga => "saga",
         NodeKind::PostProcessor => "post-processor",

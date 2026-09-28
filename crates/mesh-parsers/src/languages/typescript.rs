@@ -1567,6 +1567,45 @@ export class Seed {
                     .is_some_and(|m| !m.starts_with(['=', '~']))));
     }
 
+    /// Volontariapp 7.0.6 report, defect 9: a barrel (`export * from …`) and
+    /// a spec made only of `describe` calls have no declaration, so their
+    /// imports had no node to hang on and `find_dependents` never listed them.
+    #[test]
+    fn files_without_declarations_are_dependents_through_a_module_node() {
+        let mut graph = ContractGraph::new();
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("npm-packages/packages/bridge/src/index.ts"),
+            "export * from '@volontariapp/config';\nexport * from './bridge';\n",
+            0,
+            &mut graph,
+        );
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("svc/test/users-trigger.int.spec.ts"),
+            "import { Streams } from '@volontariapp/config';\n\ndescribe('trigger', () => {\n  it('emits', () => expect(Streams).toBeDefined());\n});\n",
+            1,
+            &mut graph,
+        );
+        graph.reconcile_edges();
+        let files: Vec<String> = graph
+            .find_dependents("@volontariapp/config")
+            .iter()
+            .map(|n| n.file_path.display().to_string())
+            .collect();
+        assert!(
+            files.contains(&"npm-packages/packages/bridge/src/index.ts".to_string()),
+            "{files:?}"
+        );
+        assert!(
+            files.contains(&"svc/test/users-trigger.int.spec.ts".to_string()),
+            "{files:?}"
+        );
+        assert!(
+            graph.search_symbols("index", None).is_empty()
+                && graph.search_symbols("index.ts", None).is_empty(),
+            "a Module node is not a symbol"
+        );
+    }
+
     /// Volontariapp 7.0.6 report, defects 1 and 2: the gateway's call to
     /// `CreateEvent` goes through a field bound in a base class of another
     /// file, and a neighbour RPC (`CreateEventNode`) must not be traced as it.

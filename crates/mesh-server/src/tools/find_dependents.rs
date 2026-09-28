@@ -89,17 +89,23 @@ fn resolve<'g>(
     graph: &'g mesh_core::ContractGraph,
     granularity: Granularity,
 ) -> Resolved<'g> {
-    let (mut dependents, how) = graph.find_dependents_matched(args.target.as_str());
-    let before = dependents.len();
-    if !args.include_tests.unwrap_or(false) {
-        dependents.retain(|n| !mesh_core::is_test_path(&n.file_path));
-    }
-    let hidden_tests = before - dependents.len();
-    let dependents = match granularity {
-        Granularity::Symbol => dependents,
-        Granularity::File => dedup_by_file(dependents),
-        Granularity::Package => dedup_by_package(dependents),
+    let (dependents, how) = graph.find_dependents_matched(args.target.as_str());
+    let (dependents, tests): (Vec<_>, Vec<_>) = if args.include_tests.unwrap_or(false) {
+        (dependents, Vec::new())
+    } else {
+        dependents
+            .into_iter()
+            .partition(|n| !mesh_core::is_test_path(&n.file_path))
     };
+    let dedup = |nodes| match granularity {
+        Granularity::Symbol => nodes,
+        Granularity::File => dedup_by_file(nodes),
+        Granularity::Package => dedup_by_package(nodes),
+    };
+    // In the unit of the listing: 7.0.6 counted test *declarations* under a
+    // per-file listing ("39 left out" for 34 files).
+    let hidden_tests = dedup(tests).len();
+    let dependents = dedup(dependents);
     Resolved {
         dependents,
         how,
@@ -200,10 +206,16 @@ impl McpTool for FindDependentsTool {
                 args.target
             ));
         }
-        text.push_str(&MarkdownFormatter::format_dependents(
-            args.target.as_str(),
-            &labeled,
-        ));
+        if labeled.is_empty() && total > 0 {
+            // Past the last page: there *are* dependents, just not here
+            // (7.0.6 said "No dependents found" at `offset: 180` of 167).
+            text.push_str(&format!("## Reverse dependencies of `{}`\n\n", args.target));
+        } else {
+            text.push_str(&MarkdownFormatter::format_dependents(
+                args.target.as_str(),
+                &labeled,
+            ));
+        }
         drop(labeled);
         text.push_str(&page_footer(
             total,
@@ -211,6 +223,7 @@ impl McpTool for FindDependentsTool {
             offset,
             dependent_count,
             resolved.hidden_tests,
+            granularity == Granularity::Package,
         ));
 
         // Plan 4 step 4.1: this tool's scope is every allowed root, so any
@@ -234,10 +247,19 @@ fn page_footer(
     offset: usize,
     shown: usize,
     hidden_tests: usize,
+    per_package: bool,
 ) -> String {
-    let mut out = format!("---\n*{total} dependent(s) in {file_count} file(s)");
-    if total > 0 {
-        let first = (offset + 1).min(total);
+    let mut out = if per_package {
+        format!("---\n*{total} dependent package(s)")
+    } else {
+        format!("---\n*{total} dependent(s) in {file_count} file(s)")
+    };
+    if total > 0 && offset >= total {
+        out.push_str(&format!(
+            "; nothing at `offset: {offset}`, request an offset below {total}"
+        ));
+    } else if total > 0 {
+        let first = offset + 1;
         let last = offset + shown;
         out.push_str(&format!("; showing {first}-{last}"));
         if last < total {
@@ -247,7 +269,8 @@ fn page_footer(
     out.push_str(".*\n");
     if hidden_tests > 0 {
         out.push_str(&format!(
-            "*{hidden_tests} dependent(s) in test files left out (`include_tests: true` to list them).*\n"
+            "*{hidden_tests} more {} in test files left out (`include_tests: true` to list them).*\n",
+            if per_package { "package(s)" } else { "dependent(s)" }
         ));
     }
     out

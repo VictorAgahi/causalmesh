@@ -41,6 +41,8 @@ pub struct Group {
     pub internal_edges: usize,
     /// Groups folded into an `Other` node.
     pub folded: usize,
+    /// A zoom `Contract`'s declaration: `(file, line_start, line_end)`.
+    pub location: Option<(String, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +63,8 @@ pub struct Topology {
     pub total_groups: usize,
     pub total_contracts: usize,
     pub total_edges: usize,
+    /// Cross-service edges not drawn because they are `Ambiguous`.
+    pub ambiguous_omitted: usize,
     /// Every hidden group, `(name, contracts, kind)`, biggest first.
     pub hidden: Vec<(String, usize, GroupKind)>,
     /// What a "service" is here: `"root"` (one per workspace root) or `"package"`.
@@ -152,6 +156,10 @@ fn group_of<'a>(
     }
 }
 
+/// One ambiguous resolution: `(from node, edge kind, recorded target)`. Its
+/// edges are the candidates.
+type AmbiguityKey<'g> = (NodeId, u8, Option<&'g str>);
+
 /// One cross-group edge bundle before folding: `(from, to, kind)` → count and
 /// weakest confidence rank.
 #[derive(Debug, Clone)]
@@ -182,6 +190,8 @@ pub struct Aggregate {
     ranked: Vec<u32>,
     total_contracts: usize,
     total_edges: usize,
+    /// Cross-group edges left undrawn because they are `Ambiguous`.
+    ambiguous_omitted: usize,
     by_root: bool,
     focus: Option<String>,
 }
@@ -235,6 +245,11 @@ impl Aggregate {
                     by_kind: BTreeMap::new(),
                     internal_edges: 0,
                     folded: 0,
+                    location: Some((
+                        node.file_path.display().to_string(),
+                        node.line_start,
+                        node.line_end,
+                    )),
                 });
                 node_ids.push(node.id);
                 (groups.len() - 1) as u32
@@ -247,6 +262,7 @@ impl Aggregate {
                         by_kind: BTreeMap::new(),
                         internal_edges: 0,
                         folded: 0,
+                        location: None,
                     });
                     node_ids.push(0);
                     (groups.len() - 1) as u32
@@ -262,6 +278,8 @@ impl Aggregate {
         // Cross-group edge weights per (from, to, kind).
         let mut weights: HashMap<(u32, u32, u8), AggLink> = HashMap::new();
         let mut degree = vec![0usize; groups.len()];
+        let mut ambiguous_omitted = 0;
+        let mut ambiguous: BTreeMap<AmbiguityKey<'_>, Vec<(u32, u32, EdgeKind)>> = BTreeMap::new();
         let edges = graph.all_edges();
         for e in edges {
             let (Some(&from), Some(&to)) = (node_group.get(&e.from), node_group.get(&e.to)) else {
@@ -269,6 +287,18 @@ impl Aggregate {
             };
             if from == to {
                 groups[from as usize].internal_edges += 1;
+                continue;
+            }
+            // An `Ambiguous` edge is one of several candidates for a name
+            // declared in several places: at most one is real. Drawn, it read
+            // as a dependency (7.0.6 on Volontariapp: every backend service
+            // "imported" `nativapp` and `ms-event` through homonyms). Decided
+            // below, per ambiguity, once all its candidates are known.
+            if e.confidence == EdgeConfidence::Ambiguous {
+                ambiguous
+                    .entry((e.from, e.kind as u8, e.metadata.as_deref()))
+                    .or_default()
+                    .push((from, to, e.kind));
                 continue;
             }
             let w = weights
@@ -282,6 +312,29 @@ impl Aggregate {
                 });
             w.count += 1;
             w.weakest = w.weakest.max(confidence_rank(e.confidence));
+            degree[from as usize] += 1;
+            degree[to as usize] += 1;
+        }
+        // All candidates of one ambiguity in the same group: which node is
+        // meant is unknown, but the group-level link is not — drawn once,
+        // heuristic. Candidates spread over several groups: not drawn, counted.
+        for candidates in ambiguous.values() {
+            let (from, to, kind) = candidates[0];
+            if candidates.iter().any(|&(_, t, _)| t != to) {
+                ambiguous_omitted += 1;
+                continue;
+            }
+            let w = weights
+                .entry((from, to, kind as u8))
+                .or_insert_with(|| AggLink {
+                    from,
+                    to,
+                    kind,
+                    count: 0,
+                    weakest: 0,
+                });
+            w.count += 1;
+            w.weakest = w.weakest.max(confidence_rank(EdgeConfidence::Heuristic));
             degree[from as usize] += 1;
             degree[to as usize] += 1;
         }
@@ -310,6 +363,7 @@ impl Aggregate {
             ranked: Vec::new(),
             total_contracts: graph.node_count(),
             total_edges: edges.len(),
+            ambiguous_omitted,
             by_root,
             focus,
         };
@@ -402,6 +456,7 @@ impl Aggregate {
                     by_kind: BTreeMap::new(),
                     internal_edges: 0,
                     folded: 0,
+                    location: None,
                 });
                 (out_groups.len() - 1) as u32
             });
@@ -444,6 +499,7 @@ impl Aggregate {
             total_groups: self.groups.len(),
             total_contracts: self.total_contracts,
             total_edges: self.total_edges,
+            ambiguous_omitted: self.ambiguous_omitted,
             hidden,
             grouping: if self.by_root { "root" } else { "package" },
             focus: self.focus.clone(),
@@ -580,13 +636,15 @@ impl Topology {
             .map(|(i, g)| {
                 let (title, detail) = Self::caption(g);
                 let name = display_name(&g.name).into_owned();
+                let (file_path, line_start, line_end) =
+                    g.location.clone().unwrap_or((String::new(), 0, 0));
                 WebNode {
                     id: i as u32,
                     name: name.clone(),
                     kind: format!("{:?}", g.kind),
-                    file_path: String::new(),
-                    line_start: 0,
-                    line_end: 0,
+                    file_path,
+                    line_start,
+                    line_end,
                     package: name.clone(),
                     repo: name,
                     signature: Some(match detail {
@@ -627,6 +685,12 @@ impl Topology {
             self.total_groups,
             self.grouping,
         );
+        if self.ambiguous_omitted > 0 {
+            out.push_str(&format!(
+                "*{} ambiguous cross-service link(s) not drawn: a name declared in several services, linked to each candidate while at most one is real. Check one with `find_dependents`.*\n",
+                self.ambiguous_omitted
+            ));
+        }
         if !self.hidden.is_empty() {
             out.push_str(&format!(
                 "\n{} groups are folded into \"other\". Largest hidden:\n",
@@ -710,6 +774,61 @@ mod tests {
         g.add_edge(edge(b2, a1, EdgeKind::CallsRpc));
         g.add_edge(edge(a2, a1, EdgeKind::Imports));
         (g, vec!["orders-svc".into(), "billing-svc".into()])
+    }
+
+    /// An ambiguity whose candidates sit in one service is still a link to
+    /// that service; one spread over several services is not drawn but
+    /// counted. Zoomed contracts carry their file and line in JSON.
+    #[test]
+    fn ambiguous_links_drawn_only_when_their_service_is_certain() {
+        let mut g = ContractGraph::new();
+        let a = g.add_node(node("A", "svc-a", 0, NodeKind::ServiceClass));
+        let b1 = g.add_node(node("Dto", "svc-b", 1, NodeKind::ServiceClass));
+        let b2 = g.add_node(node("Dto2", "svc-b", 1, NodeKind::ServiceClass));
+        let c = g.add_node(node("Tag", "svc-c", 2, NodeKind::ServiceClass));
+        let amb = |from, to, meta: &str| ContractEdge {
+            from,
+            to,
+            kind: EdgeKind::Imports,
+            metadata: Some(CompactStr::new(meta)),
+            confidence: EdgeConfidence::Ambiguous,
+        };
+        g.add_edge(amb(a, b1, "Dto"));
+        g.add_edge(amb(a, b2, "Dto"));
+        g.add_edge(amb(a, b1, "Tag"));
+        g.add_edge(amb(a, c, "Tag"));
+        let repos = vec![
+            "svc-a".to_string(),
+            "svc-b".to_string(),
+            "svc-c".to_string(),
+        ];
+        let t = Topology::build(&g, &repos, &TopologyOptions::default());
+        let names = |i: usize| t.groups[i].name.as_str();
+        let drawn: Vec<(&str, &str, usize)> = t
+            .links
+            .iter()
+            .map(|l| (names(l.from), names(l.to), l.count))
+            .collect();
+        assert_eq!(drawn, vec![("svc-a", "svc-b", 1)], "{:?}", t.links);
+        assert_eq!(t.ambiguous_omitted, 1);
+        assert!(t.footer().contains("1 ambiguous"), "{}", t.footer());
+
+        let zoom = Topology::build(
+            &g,
+            &repos,
+            &TopologyOptions {
+                focus: Some("svc-a".into()),
+                ..TopologyOptions::default()
+            },
+        );
+        let payload = zoom.to_payload("ws");
+        let contract = payload
+            .nodes
+            .iter()
+            .find(|n| n.kind == "Contract")
+            .expect("zoomed contract");
+        assert_eq!(contract.file_path, "svc-a/A.rs");
+        assert_eq!(contract.line_start, 1);
     }
 
     #[test]

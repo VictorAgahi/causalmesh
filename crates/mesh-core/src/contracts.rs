@@ -621,6 +621,27 @@ impl ContractGraph {
             }
         }
 
+        // A Node.js built-in module name (`fs`, `path`, `os`) resolves to a
+        // symbol of the importer's own repository at most — never across
+        // repos: `import * as path from 'path'` matched a `const path =
+        // require(…)` in another repo, and 7.0.6's mesh drew every backend
+        // service importing `nativapp`. A local symbol that happens to be
+        // named `events` or `constants` still resolves.
+        if Self::is_node_builtin_module(target_str) {
+            let Some(ids) = self.name_to_nodes.get(target_str) else {
+                return Vec::new();
+            };
+            let same_repo: Vec<NodeId> = ids
+                .iter()
+                .copied()
+                .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
+                .collect();
+            if same_repo.is_empty() {
+                return Vec::new();
+            }
+            return self.pick_or_ambiguous(&same_repo, importer_repo, EdgeConfidence::Heuristic);
+        }
+
         // 2. Exact symbol name anywhere in the mesh — a bare name, so two
         // unrelated types sharing it would collide; heuristic.
         // Prioritize a symbol in the same repository as the importer to avoid cross-repo false links.
@@ -670,6 +691,58 @@ impl ContractGraph {
         }
 
         Vec::new()
+    }
+
+    /// `fs`, `node:fs`, `fs/promises`, … — a Node.js built-in module specifier.
+    fn is_node_builtin_module(specifier: &str) -> bool {
+        const BUILTINS: &[&str] = &[
+            "assert",
+            "async_hooks",
+            "buffer",
+            "child_process",
+            "cluster",
+            "console",
+            "constants",
+            "crypto",
+            "dgram",
+            "diagnostics_channel",
+            "dns",
+            "domain",
+            "events",
+            "fs",
+            "http",
+            "http2",
+            "https",
+            "inspector",
+            "module",
+            "net",
+            "os",
+            "path",
+            "perf_hooks",
+            "process",
+            "punycode",
+            "querystring",
+            "readline",
+            "repl",
+            "stream",
+            "string_decoder",
+            "timers",
+            "tls",
+            "trace_events",
+            "tty",
+            "url",
+            "util",
+            "v8",
+            "vm",
+            "wasi",
+            "worker_threads",
+            "zlib",
+        ];
+        if specifier.starts_with("node:") {
+            return true;
+        }
+        let head = specifier.split('/').next().unwrap_or(specifier);
+        BUILTINS.contains(&head)
     }
 
     /// Reconciles causal edges across microservices:
@@ -2837,6 +2910,46 @@ mod tests {
             .collect();
         out.sort_by_key(|(id, _)| *id);
         out
+    }
+
+    /// Volontariapp 7.0.6 report, defect 7: `import * as path from 'path'`
+    /// resolved to a `const path = require(…)` in another repo. A built-in
+    /// module name resolves within the importer's repo only.
+    #[test]
+    fn node_builtin_modules_never_resolve_across_repos() {
+        let mut g = ContractGraph::new();
+        g.add_node(memo_node(
+            "path",
+            "",
+            "app/scripts/setup-env.js",
+            1,
+            NodeKind::ServiceClass,
+        ));
+        let local_events = g.add_node(memo_node(
+            "events",
+            "",
+            "svc/src/events.ts",
+            0,
+            NodeKind::ServiceClass,
+        ));
+        let importer = g.add_node(memo_node(
+            "main",
+            "",
+            "svc/src/main.ts",
+            0,
+            NodeKind::ServiceClass,
+        ));
+        for m in ["path", "node:fs", "fs/promises", "events"] {
+            g.add_dependency(importer, m);
+        }
+        g.reconcile_edges();
+        let targets: Vec<NodeId> = g
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports && e.from == importer)
+            .map(|e| e.to)
+            .collect();
+        assert_eq!(targets, vec![local_events], "{:?}", g.all_edges());
     }
 
     /// The per-bucket memos in `reconcile_edges` (import strategies 1 and 3,

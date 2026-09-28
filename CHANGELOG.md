@@ -5,6 +5,29 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.11] — 2026-09-28
+
+`visualize_mesh` edges (Volontariapp 7.0.6 report, defects 7 and 14). Measured on the Volontariapp
+workspace: no service → `nativapp` arrow and no `api-gateway` → `ms-event` arrow any more (7.0.6:
+every backend service "imported" `nativapp`, 20–61 edges each).
+
+### Fixed
+- **Node.js built-in modules resolved to workspace symbols**: `import * as path from 'path'`
+  matched a `const path = require('path')` in `nativapp/scripts/setup-env.js`. A built-in module
+  name (`fs`, `path`, `os`, `node:*`, `fs/promises`, …) now resolves within the importer's own
+  repository only.
+- **Ambiguous edges were drawn as dependencies.** An ambiguity whose candidates all sit in one
+  service is still drawn as a link to that service (heuristic); one spread over several services
+  (`EventDTO` declared in `npm-packages` and `ms-event`) is not drawn, and the footer gives the
+  count (587 on Volontariapp).
+- **Zoomed JSON had no location**: every contract node had `file_path: ""` and `line_start: 0`.
+  Contracts of the focused service now carry their file and lines.
+
+### Known limit
+- A named import from an external npm package can still be linked by name to a homonymous symbol
+  of another repository (`import { Index } from 'typeorm'` → a `nativapp` component, 8 edges on
+  Volontariapp): the index does not yet record which module a named import comes from.
+
 ## [7.0.10] — 2026-09-28
 
 `analyze_impact` (Volontariapp 7.0.6 report, defects 5, 6 and 13). Measured on the Volontariapp

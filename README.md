@@ -153,7 +153,7 @@ classes, interfaces, functions/methods and similar symbols usable by `smart_sear
 | Java | yes | yes | `*ImplBase` servers, `@GrpcService`, `newBlockingStub/newStub/newFutureStub` clients | `@KafkaListener`, `KafkaTemplate` | Spring MVC / JAX-RS annotations |
 | Go | yes | yes | `Register*Server`, `New*Client` | kafka-go, sarama, confluent-kafka-go | — |
 | Python | yes | yes | `*Servicer` servers, `*_pb2_grpc.*Stub(...)` clients | confluent_kafka, aiokafka, Celery | Flask / FastAPI routes (path and method) |
-| TypeScript / JavaScript (`.ts`, `.tsx`, `.js`) | yes | yes | NestJS `@GrpcMethod`, `getService<...>()`, imported `new XClient(...)` (ts-proto, `@grpc/grpc-js`) | kafkajs, NestJS `@EventPattern`/`@MessagePattern`, BullMQ | — |
+| TypeScript / JavaScript (`.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) | yes | yes | NestJS `@GrpcMethod`, `getService<...>()` and the method calls on the client it returns (`this.users.signUp(…)`), imported `new XClient(...)` (ts-proto, `@grpc/grpc-js`) | kafkajs, NestJS `@EventPattern`/`@MessagePattern`, BullMQ | — |
 | Rust | yes | yes | tonic service implementations | rdkafka | — |
 | C++ | yes | yes (`#include`) | — | — | — |
 | Kotlin | yes | — | — | `@KafkaListener`, kafka-clients `subscribe`/`send` | Spring annotations |

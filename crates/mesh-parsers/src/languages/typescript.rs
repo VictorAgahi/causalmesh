@@ -135,6 +135,7 @@ impl TypeScriptExtractor {
             &mut raw_rpc_calls,
             0,
         );
+        Self::collect_method_rpc_calls(root, source_bytes, &mut raw_rpc_calls);
         Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);
         nodes
     }
@@ -154,7 +155,16 @@ impl TypeScriptExtractor {
         source: &[u8],
     ) {
         for call in raw_rpc_calls {
-            if let Some(idx) = Self::smallest_enclosing(nodes, call.line_start, call.line_end) {
+            // A module-level `const client = new XClient(…)` is itself a
+            // declaration now (7.0.1): the construction is attributed to the
+            // declarations that *use* `client`, never to `client` itself.
+            let enclosing =
+                Self::smallest_enclosing(nodes, call.line_start, call.line_end).filter(|&idx| {
+                    call.binding
+                        .as_ref()
+                        .is_none_or(|b| nodes[idx].name.as_str() != b.name)
+                });
+            if let Some(idx) = enclosing {
                 out.push((idx, call.service_name));
                 continue;
             }
@@ -165,7 +175,9 @@ impl TypeScriptExtractor {
             // order, so the output is independent of reference order.
             let mut callers = BTreeSet::new();
             for line in Self::binding_reference_lines(root, source, &binding) {
-                if let Some(idx) = Self::smallest_enclosing(nodes, line, line) {
+                if let Some(idx) = Self::smallest_enclosing(nodes, line, line)
+                    .filter(|&idx| nodes[idx].name.as_str() != binding.name)
+                {
                     callers.insert(idx);
                 }
             }
@@ -408,7 +420,69 @@ impl TypeScriptExtractor {
                 }
             }
 
-            "class_declaration" | "interface_declaration" => {
+            // `export * from '…'` / `export { X } from '…'`: a re-export is a
+            // dependency on that module, exactly like an import (barrel files).
+            "export_statement" => {
+                if let Some(module) = node
+                    .child_by_field_name("source")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.trim_matches(|c| c == '\'' || c == '"' || c == '`'))
+                    .filter(|m| !m.is_empty())
+                {
+                    imports.push((String::new(), module.to_string()));
+                }
+            }
+
+            // Top-level declarations other than classes: functions, enums,
+            // type aliases and `const`/`let` bindings (arrow-function
+            // components, `…Options` objects, constants). 7.0.0 indexed none
+            // of them, so `smart_search` could not find them without `fuzzy`
+            // and a file declaring only these was invisible to `find_dependents`.
+            "function_declaration"
+            | "generator_function_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+                if Self::is_top_level(node) =>
+            {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    let kind = if node.kind() == "type_alias_declaration" {
+                        NodeKind::Interface
+                    } else {
+                        NodeKind::ServiceClass
+                    };
+                    nodes.push(Self::declaration_node(ctx, node, name, kind, source));
+                }
+            }
+            "lexical_declaration" | "variable_declaration" if Self::is_top_level(node) => {
+                let mut cursor = node.walk();
+                for declarator in node.named_children(&mut cursor) {
+                    if declarator.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let Some(name_node) = declarator
+                        .child_by_field_name("name")
+                        .filter(|n| n.kind() == "identifier")
+                    else {
+                        continue;
+                    };
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        // The whole statement's range (`export const X = {…}`):
+                        // what an import attached to it covers.
+                        let mut decl =
+                            Self::declaration_node(ctx, node, name, NodeKind::ServiceClass, source);
+                        if node.named_child_count() > 1 {
+                            decl.line_start = declarator.start_position().row + 1;
+                            decl.line_end = declarator.end_position().row + 1;
+                        }
+                        nodes.push(decl);
+                    }
+                }
+            }
+
+            "class_declaration" | "abstract_class_declaration" | "interface_declaration" => {
                 let class_name = node
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
@@ -448,14 +522,29 @@ impl TypeScriptExtractor {
                 let mut kind = NodeKind::ServiceClass;
                 let mut grpc_target = None;
 
-                let mut full_text = String::new();
-                if let Some(prev) = node.prev_sibling() {
-                    if prev.kind() == "decorator" {
-                        if let Ok(t) = prev.utf8_text(source) {
-                            full_text.push_str(t);
-                            full_text.push(' ');
+                // Every decorator of the method — not just the one right above
+                // it: `@GrpcMethod(…)` followed by `@UseGuards(…)` lost the
+                // handler in 7.0.0 — plus its signature, never its body (a
+                // `"@Get"` string inside the body made it an HTTP endpoint).
+                let mut decorators: Vec<&str> = Vec::new();
+                let mut prev = node.prev_sibling();
+                while let Some(p) = prev {
+                    match p.kind() {
+                        "decorator" => {
+                            if let Ok(t) = p.utf8_text(source) {
+                                decorators.push(t);
+                            }
                         }
+                        "comment" => {}
+                        _ => break,
                     }
+                    prev = p.prev_sibling();
+                }
+                decorators.reverse();
+                let mut full_text = String::new();
+                for t in decorators {
+                    full_text.push_str(t);
+                    full_text.push(' ');
                 }
                 for child in node.children(&mut node.walk()) {
                     if child.kind() == "decorator" {
@@ -465,7 +554,13 @@ impl TypeScriptExtractor {
                         }
                     }
                 }
-                if let Ok(t) = node.utf8_text(source) {
+                let signature_end = node
+                    .child_by_field_name("body")
+                    .map_or(node.end_byte(), |b| b.start_byte());
+                if let Some(t) = source
+                    .get(node.start_byte()..signature_end)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                {
                     full_text.push_str(t);
                 }
 
@@ -623,6 +718,238 @@ impl TypeScriptExtractor {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             Self::visit_node(child, source, ctx, nodes, imports, raw_rpc_calls, depth + 1);
+        }
+    }
+
+    /// Whether a declaration sits at module level: directly under the program,
+    /// or under an `export` there.
+    fn is_top_level(node: Node) -> bool {
+        match node.parent() {
+            Some(p) if p.kind() == "program" => true,
+            Some(p) if p.kind() == "export_statement" => {
+                p.parent().is_some_and(|g| g.kind() == "program")
+            }
+            _ => false,
+        }
+    }
+
+    /// A declaration node spanning `node`, named `name`, with the first
+    /// source line (of the enclosing `export` when there is one) as signature.
+    fn declaration_node(
+        ctx: &VisitCtx,
+        node: Node,
+        name: &str,
+        kind: NodeKind,
+        source: &[u8],
+    ) -> ContractNode {
+        let first_line = node
+            .utf8_text(source)
+            .ok()
+            .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
+            .unwrap_or_else(|| name.to_string());
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: ctx.file_path.clone(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            package: ctx.package_name.clone(),
+            repo_id: ctx.repo_id,
+            signature: Some(CompactStr::new(first_line)),
+            docstring: None,
+        }
+    }
+
+    /// Method-level gRPC calls: `this.<field>.<method>(…)` where `<field>`
+    /// holds a generated client — assigned from `getService<XClient>(…)`, or
+    /// declared (field or constructor parameter property) with an `XClient`
+    /// type. Recorded as `=X.method`, resolved in the graph by exact
+    /// `Service.Method` only. A field that is never bound in this file (set
+    /// in a base class of another file) but *named* like a client
+    /// (`userService`, `userClient`) is recorded as `~UserService.method`: same
+    /// exact-only resolution, heuristic confidence. See
+    /// `mesh_core::contracts` for the prefixes. 7.0.0 only knew the
+    /// `getService` call site itself, so `analyze_grpc SignUp` found no client.
+    fn collect_method_rpc_calls(root: Node, source: &[u8], raw: &mut Vec<RawRpcCall>) {
+        let fields = Self::client_fields(root, source);
+        Self::walk(root, &mut |node| {
+            if node.kind() != "call_expression" {
+                return;
+            }
+            let Some(callee) = node
+                .child_by_field_name("function")
+                .filter(|c| c.kind() == "member_expression")
+            else {
+                return;
+            };
+            let Some(field) = callee
+                .child_by_field_name("object")
+                .and_then(|o| Self::this_member(o, source))
+            else {
+                return;
+            };
+            let Some(method) = callee
+                .child_by_field_name("property")
+                .and_then(|p| p.utf8_text(source).ok())
+            else {
+                return;
+            };
+            let class = Self::enclosing_class_start(node);
+            let target = match fields.get(&(class, field.to_string())) {
+                Some(service) => format!("={service}.{method}"),
+                None => match Self::service_from_field_name(field) {
+                    Some(service) => format!("~{service}.{method}"),
+                    None => return,
+                },
+            };
+            raw.push(RawRpcCall {
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                service_name: CompactStr::new(target),
+                binding: None,
+            });
+        });
+    }
+
+    /// `this.<name>` -> `<name>`.
+    fn this_member<'s>(node: Node, source: &'s [u8]) -> Option<&'s str> {
+        if node.kind() != "member_expression" {
+            return None;
+        }
+        if node.child_by_field_name("object")?.kind() != "this" {
+            return None;
+        }
+        node.child_by_field_name("property")?.utf8_text(source).ok()
+    }
+
+    /// Start byte of the class declaring `node`, if any: fields are per class.
+    fn enclosing_class_start(node: Node) -> Option<usize> {
+        let mut current = node.parent();
+        while let Some(n) = current {
+            if matches!(
+                n.kind(),
+                "class_declaration" | "abstract_class_declaration" | "class"
+            ) {
+                return Some(n.start_byte());
+            }
+            current = n.parent();
+        }
+        None
+    }
+
+    /// Fields of this file's classes that hold a generated gRPC client, keyed
+    /// by (declaring class start byte, field name), with the service each one
+    /// talks to.
+    fn client_fields(root: Node, source: &[u8]) -> HashMap<(Option<usize>, String), String> {
+        let mut fields = HashMap::new();
+        Self::walk(root, &mut |node| match node.kind() {
+            // `this.users = this.client.getService<UserServiceClient>(NAME)`
+            "assignment_expression" => {
+                let Some(field) = node
+                    .child_by_field_name("left")
+                    .and_then(|l| Self::this_member(l, source))
+                else {
+                    return;
+                };
+                let Some(call) = node
+                    .child_by_field_name("right")
+                    .filter(|r| r.kind() == "call_expression")
+                else {
+                    return;
+                };
+                let is_get_service = call
+                    .child_by_field_name("function")
+                    .and_then(|f| f.child_by_field_name("property"))
+                    .and_then(|p| p.utf8_text(source).ok())
+                    == Some("getService");
+                if is_get_service {
+                    if let Some(service) = Self::extract_get_service_target(call, source) {
+                        fields.insert(
+                            (Self::enclosing_class_start(node), field.to_string()),
+                            service,
+                        );
+                    }
+                }
+            }
+            // `private users!: WithMetadata<UserServiceClient>;`
+            // `constructor(private readonly users: UserServiceClient)`
+            "public_field_definition" | "required_parameter" | "optional_parameter" => {
+                let name_node = if node.kind() == "public_field_definition" {
+                    node.child_by_field_name("name")
+                } else {
+                    let mut cursor = node.walk();
+                    let is_property = node
+                        .children(&mut cursor)
+                        .any(|c| c.kind() == "accessibility_modifier");
+                    if !is_property {
+                        return;
+                    }
+                    node.child_by_field_name("pattern")
+                };
+                let Some(name) = name_node.and_then(|n| n.utf8_text(source).ok()) else {
+                    return;
+                };
+                let Some(service) = node
+                    .child_by_field_name("type")
+                    .and_then(|t| t.utf8_text(source).ok())
+                    .and_then(Self::service_from_client_type)
+                else {
+                    return;
+                };
+                fields
+                    .entry((Self::enclosing_class_start(node), name.to_string()))
+                    .or_insert(service);
+            }
+            _ => {}
+        });
+        fields
+    }
+
+    /// `WithMetadata<UserServiceClient>` / `IUserServiceClient` -> `UserService`.
+    fn service_from_client_type(type_text: &str) -> Option<String> {
+        type_text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter_map(|token| token.strip_suffix("Client"))
+            .find(|stem| stem.len() > 1 && stem.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|stem| {
+                let stripped = stem
+                    .strip_prefix('I')
+                    .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()));
+                stripped.unwrap_or(stem).to_string()
+            })
+    }
+
+    /// `userService` / `userClient` -> `UserService`; anything else -> `None`.
+    fn service_from_field_name(field: &str) -> Option<String> {
+        let stem = field
+            .strip_suffix("Client")
+            .or_else(|| field.strip_suffix("Service"))?;
+        if stem.is_empty() || !stem.starts_with(|c: char| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let mut chars = stem.chars();
+        let first = chars.next()?.to_ascii_uppercase();
+        Some(format!("{first}{}Service", chars.as_str()))
+    }
+
+    /// Pre-order walk of every node under `root`, iterative (no recursion
+    /// depth concern on deep files).
+    fn walk<'t>(root: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
+        let mut cursor = root.walk();
+        loop {
+            visit(cursor.node());
+            if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                continue;
+            }
+            loop {
+                if !cursor.goto_parent() {
+                    return;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
     }
 
@@ -836,7 +1163,7 @@ impl TypeScriptExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_core::{ContractGraph, EdgeKind};
+    use mesh_core::{ContractGraph, EdgeConfidence, EdgeKind};
 
     fn parse(code: &str) -> (Vec<ContractNode>, Vec<(String, String)>) {
         let mut parser = Parser::new();
@@ -851,6 +1178,223 @@ mod tests {
             &mut imports,
         );
         (nodes, imports)
+    }
+
+    fn extract_rpc_with(
+        path: &str,
+        code: &str,
+        lang: tree_sitter::Language,
+    ) -> (Vec<ContractNode>, Vec<(usize, CompactStr)>) {
+        let mut parser = Parser::new();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(code, None).expect("parse");
+        let mut imports = Vec::new();
+        let mut rpc_calls = Vec::new();
+        let nodes = TypeScriptExtractor::extract_with_config(
+            Path::new(path),
+            code,
+            1,
+            &tree,
+            &mut imports,
+            &mut rpc_calls,
+            &["@GrpcMethod".to_string()],
+        );
+        (nodes, rpc_calls)
+    }
+
+    /// 7.0.1 (report point 5): top-level functions, enums, type aliases,
+    /// `const` bindings and abstract classes are declarations; re-exports are
+    /// module dependencies.
+    #[test]
+    fn top_level_declarations_and_reexports_are_indexed() {
+        let code = r#"
+export * from './messaging.module';
+export { JobOutbox } from '@scope/outbox';
+export enum Streams { EVENT_CREATED = 'event.created' }
+export type EventPayload = { id: string };
+export function getEventStreamName(s: Streams): string { return s; }
+export const eventCreatedOptions = {
+  streamName: getEventStreamName(Streams.EVENT_CREATED),
+};
+const useThing = () => 1;
+export abstract class BaseGatherPostProcessor {}
+function outer() { const inner = 1; function nested() {} }
+"#;
+        let (nodes, imports) = parse(code);
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        for expected in [
+            "Streams",
+            "EventPayload",
+            "getEventStreamName",
+            "eventCreatedOptions",
+            "useThing",
+            "BaseGatherPostProcessor",
+            "outer",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"inner") && !names.contains(&"nested"),
+            "{names:?}"
+        );
+        let options = nodes
+            .iter()
+            .find(|n| n.name == "eventCreatedOptions")
+            .expect("options");
+        assert_eq!((options.line_start, options.line_end), (7, 9));
+        let modules: Vec<&str> = imports
+            .iter()
+            .filter(|(sym, _)| sym.is_empty())
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(modules, ["./messaging.module", "@scope/outbox"]);
+    }
+
+    /// 7.0.1 (report point 7): every decorator counts, whatever its order, and
+    /// the body never does.
+    #[test]
+    fn grpc_handler_survives_a_following_decorator_and_body_text_is_ignored() {
+        let code = r#"
+export class UserController {
+  @GrpcMethod('UserService', 'SignUp')
+  @UseGuards(GrpcInternalGuard)
+  signUp(req: SignUpRequest) { return this.users.create(req); }
+
+  helper() { const note = "@Get is only text here"; return note; }
+}
+"#;
+        let (nodes, _) = parse(code);
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "UserService.SignUp" && n.kind == NodeKind::GrpcMethod));
+        let helper = nodes.iter().find(|n| n.name == "helper").expect("helper");
+        assert_eq!(helper.kind, NodeKind::ServiceClass);
+    }
+
+    /// 7.0.1 (report point 1): the NestJS client pattern — a field assigned from
+    /// `getService<T>()`, then `this.<field>.<method>(…)` — is a method-level
+    /// call; a field only *named* like a client is an inferred one.
+    #[test]
+    fn nestjs_method_level_client_calls_are_recorded() {
+        let code = r#"
+export class UserAuthController implements OnModuleInit {
+  private userService!: WithMetadata<UserServiceClient>;
+  constructor(@Inject(USER) private readonly client: ClientGrpc,
+              private readonly posts: PostServiceClient) {}
+  onModuleInit() {
+    this.userService = this.client.getService<UserServiceClient>(USER_SERVICE_NAME);
+  }
+  signUp(body: SignUpDto) {
+    return firstValueFrom(this.userService.signUp(body, meta));
+  }
+  latest() { return this.posts.listPosts({}); }
+  me() { return this.eventService.getEvent({}); }
+  log() { this.logger.log('x'); }
+}
+"#;
+        let (nodes, rpc_calls) = extract_rpc_with(
+            "user-auth.controller.ts",
+            code,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        );
+        let calls: Vec<(&str, &str)> = rpc_calls
+            .iter()
+            .map(|(i, t)| (nodes[*i].name.as_str(), t.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("onModuleInit", "UserService")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&("signUp", "=UserService.signUp")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&("latest", "=PostService.listPosts")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&("me", "~EventService.getEvent")),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|(_, t)| t.contains("log")), "{calls:?}");
+    }
+
+    /// 7.0.1 (report point 4): `.tsx` goes through the TSX grammar.
+    #[test]
+    fn tsx_component_is_indexed() {
+        let code = "import { View } from 'react-native';\nexport const App = () => <View style={s}><Text>hi</Text></View>;\nexport default function Screen() { return <App/>; }\n";
+        let (nodes, _) =
+            extract_rpc_with("App.tsx", code, tree_sitter_typescript::LANGUAGE_TSX.into());
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["App", "Screen"]);
+        assert_eq!(
+            crate::decapitate::LanguageKind::from_path("a/App.tsx"),
+            crate::decapitate::LanguageKind::Tsx
+        );
+        assert_eq!(
+            crate::decapitate::LanguageKind::from_path("a/x.mts"),
+            crate::decapitate::LanguageKind::TypeScript
+        );
+    }
+
+    /// Graph side: exact `Service.Method` only for method-level calls; an
+    /// inferred service is heuristic; a method the service does not declare
+    /// never falls back to another service's homonym.
+    #[test]
+    fn method_level_calls_resolve_to_the_proto_method_only() {
+        let mut graph = ContractGraph::new();
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("proto/user.proto"),
+            "syntax = \"proto3\";\npackage u;\nservice UserService { rpc SignUp (A) returns (B); }\nservice PostService { rpc FindAll (A) returns (B); }\n",
+            0,
+            &mut graph,
+        );
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("gw/src/auth.controller.ts"),
+            r#"
+export class Auth {
+  private userService!: UserServiceClient;
+  a() { return this.userService.signUp({}); }
+  b() { return this.userService.findAll({}); }
+}
+export class Seed {
+  c() { return this.userService.signUp({}); }
+}
+"#,
+            1,
+            &mut graph,
+        );
+        graph.reconcile_edges();
+        let trace = graph.analyze_grpc("SignUp");
+        let clients: Vec<(&str, EdgeConfidence)> = trace
+            .client_stubs
+            .iter()
+            .map(|(n, c)| (n.name.as_str(), *c))
+            .collect();
+        assert!(
+            clients.contains(&("a", EdgeConfidence::Exact)),
+            "{clients:?}"
+        );
+        assert!(
+            clients.contains(&("c", EdgeConfidence::Heuristic)),
+            "{clients:?}"
+        );
+        let find_all = graph.analyze_grpc("FindAll");
+        assert!(
+            !find_all.client_stubs.iter().any(|(n, _)| n.name == "b"),
+            "UserService has no FindAll: no edge to PostService.FindAll"
+        );
+        assert!(graph
+            .all_edges()
+            .iter()
+            .all(|e| e.kind != EdgeKind::CallsRpc
+                || e.metadata
+                    .as_deref()
+                    .is_some_and(|m| !m.starts_with(['=', '~']))));
     }
 
     #[test]
@@ -1487,15 +2031,20 @@ export default AdGateway();
 
     /// Plan 4 step 4.5 — a module-level construction resolving to a declared
     /// service is attributed to the declaration that uses the client
-    /// (`listAds`), not to a node synthesized for the binding: the file's
-    /// node set is exactly its declarations.
+    /// (`listAds`), never to the binding itself. Since 7.0.1 top-level
+    /// `const`s are declarations, so `client` is a node — but no call is
+    /// attributed to it.
     #[test]
     fn imported_ts_proto_client_construction_links_to_declared_service() {
         let file = "src/frontend/gateways/rpc/Ad.gateway.ts";
         let (nodes, rpc_calls) = extract_rpc(file, AD_GATEWAY);
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names, vec!["listAds"], "no synthetic node for `client`");
-        assert_eq!(rpc_calls, vec![(0, CompactStr::new("AdService"))]);
+        assert_eq!(names, vec!["client", "AdGateway", "listAds"]);
+        let calls: Vec<(&str, &str)> = rpc_calls
+            .iter()
+            .map(|(i, t)| (nodes[*i].name.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(calls, vec![("listAds", "AdService")]);
 
         assert_eq!(
             rpc_edges_against(&["AdService", "CartService"], file, AD_GATEWAY),
@@ -1505,7 +2054,8 @@ export default AdGateway();
 
     /// Review finding (PR #39): a module-level `new XClient()` that resolves
     /// to no declared service — an SDK client, react-query's `QueryClient` —
-    /// leaves no trace at all: no node, no `CallsRpc`, no `Imports` edge.
+    /// leaves no trace: no `CallsRpc`, no `Imports` edge (its binding is an
+    /// ordinary declaration since 7.0.1, nothing more).
     #[test]
     fn module_level_client_without_declared_service_leaves_no_trace() {
         let code = r#"
@@ -1517,7 +2067,7 @@ const queryClient = new QueryClient();
 "#;
         let graph = index_against(&["AdService"], &[("src/frontend/pages/_app.tsx", code)]);
         let names: Vec<&str> = graph.all_nodes().map(|n| n.name.as_str()).collect();
-        assert_eq!(names, vec!["AdService"]);
+        assert_eq!(names, vec!["AdService", "s3", "queryClient"]);
         assert_eq!(graph.edge_count(), 0, "{:?}", graph.all_edges());
 
         // Used from a declaration, the client adds no node or edge either:
@@ -1537,14 +2087,17 @@ export const Store = () => ({
   },
 });
 "#;
-        let without = used.replace("const s3 = new S3Client({});", "");
+        let without = used.replace("const s3 = new S3Client({});", "const s3 = null;");
         let lines = |code: &str| {
             let mut lines =
                 index_against(&["AdService"], &[("src/web/store.ts", code)]).canonical_lines();
-            lines.retain(|l| !l.starts_with("rpc_call "));
+            // Edges only: the `s3` declaration itself (its signature, its
+            // `S3Client` symbol use) legitimately differs between the two.
+            lines.retain(|l| l.starts_with("edge "));
             lines
         };
         assert_eq!(lines(used), lines(&without));
+        assert!(lines(used).is_empty(), "{:?}", lines(used));
     }
 
     /// Several otel-demo gateways each bind `const client = new
@@ -1584,7 +2137,7 @@ export const Store = () => ({
                 (cart_file.into(), "getCart".into(), "CartService".into()),
             ]
         );
-        assert!(!graph.all_nodes().any(|n| n.name == "client"));
+        assert!(!edges.iter().any(|(_, caller, _)| caller == "client"));
 
         let reversed = index_against(&services, &[(cart_file, &cart), (ad_file, AD_GATEWAY)]);
         assert_eq!(graph.canonical_lines(), reversed.canonical_lines());

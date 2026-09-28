@@ -6,6 +6,10 @@ pub enum LanguageKind {
     Go,
     Python,
     TypeScript,
+    /// `.tsx`, and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`): the TSX grammar
+    /// parses JSX, which the TypeScript one turns into error nodes (7.0.0
+    /// parsed `.tsx` with it and missed `const App = () => <View/>`).
+    Tsx,
     Rust,
     Cpp,
     Kotlin,
@@ -21,8 +25,8 @@ pub enum LanguageKind {
 
 impl LanguageKind {
     /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
-    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf).
-    pub const TREE_SITTER_COUNT: usize = 13;
+    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Tsx).
+    pub const TREE_SITTER_COUNT: usize = 14;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -32,6 +36,7 @@ impl LanguageKind {
             Self::Go => "go",
             Self::Python => "python",
             Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
             Self::Rust => "rust",
             Self::Cpp => "cpp",
             Self::Kotlin => "kotlin",
@@ -63,6 +68,7 @@ impl LanguageKind {
             Self::Swift => Some(10),
             Self::Scala => Some(11),
             Self::Protobuf => Some(12),
+            Self::Tsx => Some(13),
             Self::Yaml | Self::Unknown => None,
         }
     }
@@ -74,6 +80,7 @@ impl LanguageKind {
             Self::Go => Some(tree_sitter_go::LANGUAGE.into()),
             Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
             Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Self::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
             Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
@@ -97,10 +104,17 @@ impl LanguageKind {
         } else if path_str.ends_with(".py") {
             Self::Python
         } else if path_str.ends_with(".ts")
-            || path_str.ends_with(".tsx")
-            || path_str.ends_with(".js")
+            || path_str.ends_with(".mts")
+            || path_str.ends_with(".cts")
         {
             Self::TypeScript
+        } else if path_str.ends_with(".tsx")
+            || path_str.ends_with(".js")
+            || path_str.ends_with(".jsx")
+            || path_str.ends_with(".mjs")
+            || path_str.ends_with(".cjs")
+        {
+            Self::Tsx
         } else if path_str.ends_with(".rs") {
             Self::Rust
         } else if path_str.ends_with(".kt") || path_str.ends_with(".kts") {
@@ -436,7 +450,7 @@ impl AstDecapitator {
                     return;
                 }
             }
-            LanguageKind::TypeScript
+            LanguageKind::TypeScript | LanguageKind::Tsx
                 if kind == "method_definition"
                     || kind == "function_declaration"
                     || kind == "function_item"

@@ -10,6 +10,13 @@ use std::path::Path;
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
 /// request is what the formatter never needed.
+/// Prefix of a recorded RPC call target naming one method (`=UserService.signUp`):
+/// resolved by exact `Service.Method` only, with the resolution's own confidence.
+pub const RPC_EXACT_METHOD_PREFIX: char = '=';
+/// Same as [`RPC_EXACT_METHOD_PREFIX`], but the service was inferred from a
+/// field name rather than read from a client binding: heuristic confidence.
+pub const RPC_INFERRED_METHOD_PREFIX: char = '~';
+
 /// How [`ContractGraph::find_dependents_matched`] found its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentsMatch {
@@ -910,8 +917,21 @@ impl ContractGraph {
         let proto_by_bare = self.group_by_package(proto_by_bare);
 
         let mut rpc_edges = Vec::new();
-        for (caller_id, target_rpc) in &self.rpc_calls {
-            let target_str = target_rpc.as_str();
+        for (caller_id, recorded) in &self.rpc_calls {
+            // Method-level call sites (`this.users.signUp(…)`) are recorded with
+            // a prefix: `=` resolves by exact `Service.Method` only — never by
+            // bare method name, which would link `this.users.findAll()` to any
+            // other service's `FindAll` — and `~` does the same with heuristic
+            // confidence (the service was inferred from the field's name).
+            let (target_str, method_level, inferred) =
+                if let Some(t) = recorded.strip_prefix(RPC_EXACT_METHOD_PREFIX) {
+                    (t, true, false)
+                } else if let Some(t) = recorded.strip_prefix(RPC_INFERRED_METHOD_PREFIX) {
+                    (t, true, true)
+                } else {
+                    (recorded.as_str(), false, false)
+                };
+            let target_rpc = CompactStr::new(target_str);
             // The standard gRPC health-checking protocol is infrastructure every
             // server exposes, not a service-to-service dependency: an edge to
             // it (a readiness probe in a test, a `NewHealthClient` in a
@@ -921,6 +941,37 @@ impl ContractGraph {
                 continue;
             }
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
+            if method_level {
+                let Some(candidates) = proto_by_fqcn.get(&target_str.to_lowercase()) else {
+                    continue;
+                };
+                let confidence = if inferred {
+                    EdgeConfidence::Heuristic
+                } else {
+                    EdgeConfidence::Exact
+                };
+                let picked = match caller_package.as_ref() {
+                    Some(pkg) => candidates.pick_or_ambiguous(pkg, confidence),
+                    None => candidates.ids.iter().map(|&id| (id, confidence)).collect(),
+                };
+                for (target_id, confidence) in picked {
+                    let confidence = if inferred && confidence == EdgeConfidence::Exact {
+                        EdgeConfidence::Heuristic
+                    } else {
+                        confidence
+                    };
+                    if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
+                        rpc_edges.push(ContractEdge {
+                            from: *caller_id,
+                            to: target_id,
+                            kind: EdgeKind::CallsRpc,
+                            metadata: Some(target_rpc.clone()),
+                            confidence,
+                        });
+                    }
+                }
+                continue;
+            }
             let mut matches = Self::resolve_rpc_target(
                 target_str,
                 caller_package.as_ref(),

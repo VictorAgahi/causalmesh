@@ -5,7 +5,7 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [Unreleased]
+## [7.0.1] — 2026-09-28
 
 Fixes from the first field report on a NestJS / TypeScript / React Native workspace (Volontariapp,
 15 repositories), measured on 7.0.0.

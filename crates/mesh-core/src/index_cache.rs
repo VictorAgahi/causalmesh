@@ -66,7 +66,8 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v7: TypeScript event producers/consumers registered; topic keys normalized.
 /// v8: TypeScript client-field bindings per class (`#field=Service`) and calls through
 /// inherited fields (`^Base#field.method`).
-const SCHEMA_VERSION: u8 = 8;
+/// v9: TypeScript `Module` node for a file with imports and no declaration.
+const SCHEMA_VERSION: u8 = 9;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

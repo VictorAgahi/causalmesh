@@ -79,6 +79,11 @@ pub enum NodeKind {
     Saga,
     ServiceClass,
     Interface,
+    /// A source file with imports but no declaration of its own — a barrel
+    /// of `export * from …`, a spec made only of `describe(…)` calls. It
+    /// holds the file's import facts so `find_dependents` can list the file;
+    /// it is not a symbol and never a `smart_search` result.
+    Module,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

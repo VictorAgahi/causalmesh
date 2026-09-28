@@ -176,7 +176,9 @@ dependent declaration by default, per file with `granularity: "file"`, per `(rep
 
 A module import is attributed to the file's top-level declarations (its classes, interfaces,
 functions), not to each of their methods, and each declaration is listed once however many import
-lines it has. Dependents in test files (`*.spec.ts`, `*_test.go`, `__tests__/`, `test-utils/`, …)
+lines it has. A TypeScript file with imports and no declaration — a barrel of `export * from …`, a
+spec made only of `describe(…)` calls — is listed through a `Module` node spanning the file (a
+`Module` is never a `smart_search` result). Dependents in test files (`*.spec.ts`, `*_test.go`, `__tests__/`, `test-utils/`, …)
 are left out and counted unless `include_tests: true`. Results are paged (`limit`, default 50;
 `offset` from the footer). When nothing matches exactly, the last-resort fallback lists import
 strings that merely contain `target` (3 characters at least), under an explicit heuristic warning.

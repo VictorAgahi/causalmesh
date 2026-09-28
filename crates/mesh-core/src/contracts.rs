@@ -2355,7 +2355,8 @@ impl ContractGraph {
         if let Some(ids) = self.name_to_nodes.get(query) {
             for id in ids {
                 if let Some(node) = self.nodes.get(id) {
-                    if scope_filter.is_none_or(|s| node.file_path.starts_with(s))
+                    if node.kind != NodeKind::Module
+                        && scope_filter.is_none_or(|s| node.file_path.starts_with(s))
                         && seen.insert(node.id)
                     {
                         matches.push(node);
@@ -2380,8 +2381,9 @@ impl ContractGraph {
                 continue;
             }
             if let Some(node) = self.nodes.get(id) {
-                if contains_ignore_ascii_case(node.name.as_str(), query)
-                    || Self::bare_names_match(node.name.as_str(), query)
+                if node.kind != NodeKind::Module
+                    && (contains_ignore_ascii_case(node.name.as_str(), query)
+                        || Self::bare_names_match(node.name.as_str(), query))
                 {
                     seen.insert(node.id);
                     matches.push(node);

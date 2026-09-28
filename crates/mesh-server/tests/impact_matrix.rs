@@ -89,6 +89,17 @@ async fn proto_method_change_lists_go_handler_and_ts_clients_by_scope() {
                 "heuristic",
                 "PaymentService",
             ]),
+            // 7.0.1: the method-level call `this.paymentClient.ProcessPayment(…)`
+            // inside the `CreateOrder` handler, the client bound by `getService`.
+            row([
+                "EXTERNAL",
+                "client",
+                "CheckoutService.CreateOrder",
+                "services/order-gateway",
+                "order.service.ts:27",
+                "exact",
+                "PaymentService.ProcessPayment",
+            ]),
             row([
                 "EXTERNAL",
                 "client",

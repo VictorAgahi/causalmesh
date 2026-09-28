@@ -61,7 +61,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v4: `file_index_access.payload_rowid`, the LRU tie-breaker (step 4.4 review).
 /// v5: TypeScript module imports attached once to top-level declarations, bare
 /// packages kept (7.0.1).
-const SCHEMA_VERSION: u8 = 5;
+/// v6: TypeScript top-level functions/enums/types/consts, re-exports, TSX grammar,
+/// method-level gRPC calls, every method decorator.
+/// v7: TypeScript event producers/consumers registered; topic keys normalized.
+const SCHEMA_VERSION: u8 = 7;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

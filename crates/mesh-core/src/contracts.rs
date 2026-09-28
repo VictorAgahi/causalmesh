@@ -10,6 +10,52 @@ use std::path::Path;
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
 /// request is what the formatter never needed.
+/// The registry key of an event / topic / queue name: lowercase, and for a
+/// *code reference* to an enum or constant member — `Streams.EVENT_CREATED`,
+/// `EventMessagingType.EVENT_CREATED`, `typeof Topics.EVENT_CREATED` — just the
+/// member (`event_created`), so a producer and a consumer that name the same
+/// member through different enums or type expressions share one topic.
+/// Conservative on purpose: only a dotted path of identifiers whose first
+/// segment starts with an uppercase letter and whose last is CONSTANT_CASE is
+/// reduced; a broker literal such as `orders.created` is kept whole.
+pub fn normalize_topic_key(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+        .trim();
+    let expr = trimmed.strip_prefix("typeof ").map_or(trimmed, str::trim);
+    let is_ident = |seg: &str| {
+        let mut chars = seg.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let segments: Vec<&str> = expr.split('.').collect();
+    let is_member_ref = segments.len() >= 2
+        && segments.iter().all(|s| is_ident(s))
+        && segments[0].starts_with(|c: char| c.is_ascii_uppercase())
+        && segments.last().is_some_and(|last| {
+            last.chars().any(|c| c.is_ascii_alphabetic())
+                && last
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        });
+    let key = if is_member_ref {
+        segments.last().copied().unwrap_or(expr)
+    } else {
+        expr
+    };
+    key.to_lowercase()
+}
+
+/// Prefix of a recorded RPC call target naming one method (`=UserService.signUp`):
+/// resolved by exact `Service.Method` only, with the resolution's own confidence.
+pub const RPC_EXACT_METHOD_PREFIX: char = '=';
+/// Same as [`RPC_EXACT_METHOD_PREFIX`], but the service was inferred from a
+/// field name rather than read from a client binding: heuristic confidence.
+pub const RPC_INFERRED_METHOD_PREFIX: char = '~';
+
 /// How [`ContractGraph::find_dependents_matched`] found its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentsMatch {
@@ -283,7 +329,7 @@ impl ContractGraph {
     }
 
     pub fn add_producer(&mut self, producer_node_id: NodeId, topic: &str) {
-        let key = CompactStr::new(topic.to_lowercase());
+        let key = CompactStr::new(normalize_topic_key(topic));
         self.topic_producers
             .entry(key)
             .or_default()
@@ -291,7 +337,7 @@ impl ContractGraph {
     }
 
     pub fn add_consumer(&mut self, consumer_node_id: NodeId, topic: &str) {
-        let key = CompactStr::new(topic.to_lowercase());
+        let key = CompactStr::new(normalize_topic_key(topic));
         self.topic_consumers
             .entry(key)
             .or_default()
@@ -910,8 +956,21 @@ impl ContractGraph {
         let proto_by_bare = self.group_by_package(proto_by_bare);
 
         let mut rpc_edges = Vec::new();
-        for (caller_id, target_rpc) in &self.rpc_calls {
-            let target_str = target_rpc.as_str();
+        for (caller_id, recorded) in &self.rpc_calls {
+            // Method-level call sites (`this.users.signUp(…)`) are recorded with
+            // a prefix: `=` resolves by exact `Service.Method` only — never by
+            // bare method name, which would link `this.users.findAll()` to any
+            // other service's `FindAll` — and `~` does the same with heuristic
+            // confidence (the service was inferred from the field's name).
+            let (target_str, method_level, inferred) =
+                if let Some(t) = recorded.strip_prefix(RPC_EXACT_METHOD_PREFIX) {
+                    (t, true, false)
+                } else if let Some(t) = recorded.strip_prefix(RPC_INFERRED_METHOD_PREFIX) {
+                    (t, true, true)
+                } else {
+                    (recorded.as_str(), false, false)
+                };
+            let target_rpc = CompactStr::new(target_str);
             // The standard gRPC health-checking protocol is infrastructure every
             // server exposes, not a service-to-service dependency: an edge to
             // it (a readiness probe in a test, a `NewHealthClient` in a
@@ -921,6 +980,37 @@ impl ContractGraph {
                 continue;
             }
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
+            if method_level {
+                let Some(candidates) = proto_by_fqcn.get(&target_str.to_lowercase()) else {
+                    continue;
+                };
+                let confidence = if inferred {
+                    EdgeConfidence::Heuristic
+                } else {
+                    EdgeConfidence::Exact
+                };
+                let picked = match caller_package.as_ref() {
+                    Some(pkg) => candidates.pick_or_ambiguous(pkg, confidence),
+                    None => candidates.ids.iter().map(|&id| (id, confidence)).collect(),
+                };
+                for (target_id, confidence) in picked {
+                    let confidence = if inferred && confidence == EdgeConfidence::Exact {
+                        EdgeConfidence::Heuristic
+                    } else {
+                        confidence
+                    };
+                    if edge_set.insert((*caller_id, target_id, EdgeKind::CallsRpc)) {
+                        rpc_edges.push(ContractEdge {
+                            from: *caller_id,
+                            to: target_id,
+                            kind: EdgeKind::CallsRpc,
+                            metadata: Some(target_rpc.clone()),
+                            confidence,
+                        });
+                    }
+                }
+                continue;
+            }
             let mut matches = Self::resolve_rpc_target(
                 target_str,
                 caller_package.as_ref(),
@@ -1371,7 +1461,19 @@ impl ContractGraph {
 
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
-        let norm_target = target.trim().to_lowercase();
+        let norm_target = normalize_topic_key(target);
+        // A topic whose key *is* the target wins over topics merely containing
+        // it: `EVENT_CREATED` must not pull in `WS_EVENT_CREATED_FEEDBACK`.
+        // Substring matching remains the fallback when no key is exact.
+        let exact = self.topic_producers.contains_key(norm_target.as_str())
+            || self.topic_consumers.contains_key(norm_target.as_str());
+        let key_matches = |key: &str| {
+            if exact {
+                key == norm_target
+            } else {
+                key.contains(norm_target.as_str())
+            }
+        };
         let mut upstream_producers = Vec::new();
         let mut topics = Vec::new();
         let mut downstream_consumers = Vec::new();
@@ -1384,7 +1486,7 @@ impl ContractGraph {
         let mut producer_topics: Vec<&CompactStr> = self.topic_producers.keys().collect();
         producer_topics.sort();
         for topic_name in producer_topics {
-            if topic_name.contains(norm_target.as_str()) {
+            if key_matches(topic_name) {
                 upstream_producers.extend(
                     self.topic_producers[topic_name]
                         .iter()
@@ -1396,7 +1498,7 @@ impl ContractGraph {
         let mut consumer_topics: Vec<&CompactStr> = self.topic_consumers.keys().collect();
         consumer_topics.sort();
         for topic_name in consumer_topics {
-            if topic_name.contains(norm_target.as_str()) {
+            if key_matches(topic_name) {
                 downstream_consumers.extend(
                     self.topic_consumers[topic_name]
                         .iter()
@@ -1415,7 +1517,26 @@ impl ContractGraph {
                     | NodeKind::Saga
                     | NodeKind::PostProcessor
             );
-            if !interesting || !contains_ignore_ascii_case(node.name.as_str(), &norm_target) {
+            if !interesting {
+                continue;
+            }
+            let name = node.name.as_str();
+            let pattern_topic = name
+                .strip_prefix("produce:")
+                .or_else(|| name.strip_prefix("consume:"));
+            // Named after its topic: a stream-like node, or a custom-pattern
+            // `produce:<topic>` / `consume:<topic>` node of any kind.
+            let is_topic_like = pattern_topic.is_some()
+                || matches!(
+                    node.kind,
+                    NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue
+                );
+            let matched = if exact && is_topic_like {
+                normalize_topic_key(pattern_topic.unwrap_or(name)) == norm_target
+            } else {
+                contains_ignore_ascii_case(node.name.as_str(), &norm_target)
+            };
+            if !matched {
                 continue;
             }
             match node.kind {
@@ -2271,6 +2392,23 @@ impl ContractGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_topic_key_reduces_member_references_only() {
+        for (raw, key) in [
+            ("Streams.EVENT_CREATED", "event_created"),
+            ("EventEventMessagingType.EVENT_CREATED", "event_created"),
+            ("typeof EventMessagingType.EVENT_CREATED", "event_created"),
+            ("'Topics.ORDER_PLACED_V2'", "order_placed_v2"),
+            ("orders.created", "orders.created"),
+            ("Order.Created", "order.created"),
+            ("event.created", "event.created"),
+            ("EVENT_CREATED", "event_created"),
+            ("config.topics.ORDERS", "config.topics.orders"),
+        ] {
+            assert_eq!(normalize_topic_key(raw), key, "{raw}");
+        }
+    }
     use std::path::PathBuf;
 
     /// `HandlerIndex` only prunes: every (handler, proto method) pair the

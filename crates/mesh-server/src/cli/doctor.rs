@@ -515,7 +515,7 @@ impl DoctorCommand {
         checks.push(if AstGuard::verify_all_parsers() {
             DoctorCheck::ok(
                 "Tree-sitter parsers",
-                "initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)",
+                "initialized (Java, Go, Python, TypeScript, TSX, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)",
             )
         } else {
             DoctorCheck::error("Tree-sitter parsers", "initialization error")

@@ -32,8 +32,8 @@ pub use config::{
     ReadGovernanceMode, WorkspaceConfig,
 };
 pub use contracts::{
-    ContractGraph, DependentsMatch, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow,
-    ImpactScope,
+    normalize_topic_key, ContractGraph, DependentsMatch, GrpcTrace, ImpactFlow, ImpactMatrix,
+    ImpactRole, ImpactRow, ImpactScope,
 };
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};

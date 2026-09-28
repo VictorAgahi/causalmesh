@@ -279,6 +279,50 @@ impl CompiledPattern {
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
+    /// TypeScript event facts, which 7.0.0 created as nodes but never registered
+    /// as producers or consumers (so `analyze_impact` could not link them):
+    /// - a method decorated `@EventPattern` / `@MessagePattern` (a `KafkaTopic`
+    ///   node named after its pattern) consumes that pattern;
+    /// - a call-site node (`consumer.subscribe`, `producer.send`, NestJS
+    ///   `client.emit` / `client.send`, BullMQ `new Queue` / `new Worker`)
+    ///   is attributed to the smallest declaration enclosing it — the method
+    ///   that publishes or subscribes — or to itself at module level.
+    fn wire_ts_events(nodes: &[ContractNode], out: &mut FileIndex) {
+        for (i, node) in nodes.iter().enumerate() {
+            let signature = node.signature.as_deref().unwrap_or("");
+            let produces = match (node.kind, signature) {
+                (NodeKind::KafkaTopic, "kafkajs producer.send")
+                | (NodeKind::KafkaTopic, "nestjs client.emit")
+                | (NodeKind::KafkaTopic, "nestjs client.send")
+                | (NodeKind::Queue, "bullmq new Queue()") => true,
+                (NodeKind::KafkaTopic, "kafkajs consumer.subscribe")
+                | (NodeKind::Queue, "bullmq new Worker()") => false,
+                // `@EventPattern('x')` / `@MessagePattern('x')` handler method.
+                (NodeKind::KafkaTopic, _) => {
+                    out.consumers.push((i, node.name.clone()));
+                    continue;
+                }
+                _ => continue,
+            };
+            let owner = nodes
+                .iter()
+                .enumerate()
+                .filter(|(j, n)| {
+                    *j != i
+                        && n.line_start <= node.line_start
+                        && n.line_end >= node.line_end
+                        && !matches!(n.kind, NodeKind::KafkaTopic | NodeKind::Queue)
+                })
+                .min_by_key(|(_, n)| n.line_end - n.line_start)
+                .map_or(i, |(j, _)| j);
+            if produces {
+                out.producers.push((owner, node.name.clone()));
+            } else {
+                out.consumers.push((owner, node.name.clone()));
+            }
+        }
+    }
+
     /// Whether `nodes[i]` sits inside no other node of the same file (a class,
     /// not one of its methods). Of two nodes spanning the exact same lines, the
     /// first one is the outer.
@@ -396,7 +440,7 @@ impl PolyglotIndexer {
                     out.rpc_calls = relations.rpc_calls;
                 }
             }
-            LanguageKind::TypeScript => {
+            LanguageKind::TypeScript | LanguageKind::Tsx => {
                 let mut imports = Vec::new();
                 let mut rpc_calls = Vec::new();
                 let nodes = parsed!(|tree| {
@@ -412,6 +456,7 @@ impl PolyglotIndexer {
                 })
                 .unwrap_or_default();
                 out.rpc_calls = rpc_calls;
+                Self::wire_ts_events(&nodes, &mut out);
 
                 if !imports.is_empty() {
                     // Imports are file-level facts: they go to the file's
@@ -945,6 +990,145 @@ export class JobOutboxFailedPostProcessor {
         let (sub, how) = graph.find_dependents_matched("messag");
         assert_eq!(how, mesh_core::DependentsMatch::Substring);
         assert_eq!(sub.len(), 1);
+    }
+
+    /// 7.0.1 (report point 6): TypeScript event facts reach the topic registry
+    /// through the real pipeline — producer and consumer meet on one topic.
+    #[test]
+    fn ts_events_link_producer_and_consumer_methods() {
+        let mut graph = ContractGraph::new();
+        PolyglotIndexer::index_file(
+            Path::new("orders/src/orders.service.ts"),
+            r#"
+export class OrdersService {
+  place() { return this.client.emit('order.placed', {}); }
+  async publish() { await producer.send({ topic: 'order.shipped', messages: [] }); }
+}
+"#,
+            0,
+            &mut graph,
+        );
+        PolyglotIndexer::index_file(
+            Path::new("billing/src/billing.controller.ts"),
+            r#"
+export class BillingController {
+  @EventPattern('order.placed')
+  onPlaced(data: unknown) {}
+  async start() { await consumer.subscribe({ topic: 'order.shipped' }); }
+}
+"#,
+            1,
+            &mut graph,
+        );
+        graph.reconcile_edges();
+        for (topic, producer, consumer) in [
+            ("order.placed", "place", "order.placed"),
+            ("order.shipped", "publish", "start"),
+        ] {
+            let flow = graph.analyze_impact(topic);
+            let producers: Vec<&str> = flow
+                .upstream_producers
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect();
+            let consumers: Vec<&str> = flow
+                .downstream_consumers
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect();
+            assert!(producers.contains(&producer), "{topic}: {producers:?}");
+            assert!(consumers.contains(&consumer), "{topic}: {consumers:?}");
+        }
+    }
+
+    /// 7.0.1 (report point 3): three spellings of one enum member — a type
+    /// argument, a `typeof` and a stream constant — are one topic, and the
+    /// exact topic wins over one merely containing its name.
+    #[test]
+    fn custom_pattern_topic_spellings_share_one_key() {
+        let patterns = CompiledPattern::compile_all(&[
+            CustomPatternConfig {
+                name: "producer".into(),
+                kind: PatternKind::TopicProducer,
+                file_pattern: Some("*.ts".into()),
+                regex: r"createEvent<([A-Za-z0-9_.]+)>".into(),
+                target_group: 1,
+                consumer_group: None,
+            },
+            CustomPatternConfig {
+                name: "stream".into(),
+                kind: PatternKind::TopicProducer,
+                file_pattern: Some("*.ts".into()),
+                regex: r"targetServices:\s*\[\s*(\w+\.\w+)".into(),
+                target_group: 1,
+                consumer_group: None,
+            },
+            CustomPatternConfig {
+                name: "options".into(),
+                kind: PatternKind::TopicConsumer,
+                file_pattern: Some("options.ts".into()),
+                regex: r"streamName:\s*get\w*StreamName\((\w+\.\w+)\)".into(),
+                target_group: 1,
+                consumer_group: None,
+            },
+            CustomPatternConfig {
+                name: "consumer".into(),
+                kind: PatternKind::TopicConsumer,
+                file_pattern: Some("*.ts".into()),
+                regex: r"class\s+(\w+)\s+extends\s+BatchPostProcessor<([^>]+)>".into(),
+                target_group: 2,
+                consumer_group: Some(1),
+            },
+        ]);
+        let mut graph = ContractGraph::new();
+        for (path, code) in [
+            ("a/repo.ts", "this.outbox.createEvent<EventEventMessagingType.EVENT_CREATED>(e);\n"),
+            ("a/pusher.ts", "const o = { targetServices: [Streams.EVENT_CREATED] };\nconst f = { targetServices: [Streams.WS_EVENT_CREATED_FEEDBACK] };\n"),
+            ("b/pp.ts", "export class EventCreatedPostProcessor extends BatchPostProcessor<typeof EventMessagingType.EVENT_CREATED> {}\n"),
+            ("c/feedback.options.ts", "export const o = { streamName: getEventStreamName(Streams.WS_EVENT_CREATED_FEEDBACK) };\n"),
+        ] {
+            PolyglotIndexer::extract_custom_patterns(Path::new(path), code, 0, &patterns)
+                .apply(&mut graph);
+        }
+        graph.reconcile_edges();
+        let flow = graph.analyze_impact("EVENT_CREATED");
+        let hubs: Vec<&str> = flow
+            .topics
+            .iter()
+            .filter(|n| n.package == "event-bus")
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(hubs, ["event_created"], "{hubs:?}");
+        let producers: Vec<&str> = flow
+            .upstream_producers
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(producers.len(), 2, "{producers:?}");
+        assert!(
+            producers.iter().all(|p| !p.contains("FEEDBACK")),
+            "{producers:?}"
+        );
+        let consumers: Vec<&str> = flow
+            .downstream_consumers
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            consumers.contains(&"EventCreatedPostProcessor"),
+            "{consumers:?}"
+        );
+        assert!(
+            consumers.iter().all(|c| !c.contains("FEEDBACK")),
+            "{consumers:?}"
+        );
+        // Same answer whichever spelling is asked.
+        let again = graph.analyze_impact("Streams.EVENT_CREATED");
+        assert_eq!(again.upstream_producers.len(), 2);
+        assert_eq!(
+            again.downstream_consumers.len(),
+            flow.downstream_consumers.len()
+        );
     }
 
     #[test]

@@ -215,7 +215,7 @@ Abridged output (the exact lines depend on the platform and configuration):
 ✔ Root overlap: 6 root(s), none overlapping
 ✔ Symlink invariants: follow_links=false verified (crawler rejects symlink traversal)
 ✔ Secret redaction engine: active (test secrets masked)
-✔ Tree-sitter parsers: initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
+✔ Tree-sitter parsers: initialized (Java, Go, Python, TypeScript, TSX, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
 ✔ Toolchain utilities: git and ripgrep detected
 ⚠ Index health: ... file(s) scanned, ... indexed, ... not indexed, first 10 listed
     (... non-source file(s) skipped: images, fonts, archives, lockfiles, bundles)

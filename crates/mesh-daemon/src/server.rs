@@ -545,14 +545,17 @@ mod unix_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (read_half, mut stream) = stream.into_split();
+        // One JSON-RPC frame per line: the `initialize` reply carries the
+        // routing `instructions` (7.0.15), well over a fixed 1 KiB read.
+        let mut replies = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(read_half));
 
         // `initialize` succeeds even though ingestion hasn't finished.
         let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
         stream.write_all(init.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        let line = replies.next_line().await.unwrap().unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(
             resp["result"].is_object(),
             "initialize must not block on ingestion"
@@ -561,8 +564,8 @@ mod unix_tests {
         // `tools/call` reports "still indexing" instead of an empty result.
         let call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"smart_search\",\"arguments\":{}}}\n";
         stream.write_all(call.as_bytes()).await.unwrap();
-        let n = stream.read(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        let line = replies.next_line().await.unwrap().unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         // A retryable tool error the agent can read, not a JSON-RPC error.
         assert!(resp["error"].is_null(), "{resp}");
         assert_eq!(resp["result"]["isError"], true);
@@ -575,11 +578,12 @@ mod unix_tests {
         // must be the answer to the ping sent right after it.
         let frames = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n";
         stream.write_all(frames.as_bytes()).await.unwrap();
-        let n = stream.read(&mut buf).await.unwrap();
-        let text = std::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(text.lines().count(), 1, "exactly one reply: {text}");
-        let resp: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(resp["id"], 3);
+        let line = replies.next_line().await.unwrap().unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            resp["id"], 3,
+            "the notification must not get a reply: {line}"
+        );
 
         token.cancel();
     }

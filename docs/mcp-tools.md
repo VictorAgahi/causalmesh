@@ -183,7 +183,7 @@ are left out and counted unless `include_tests: true`. Results are paged (`limit
 `offset` from the footer). When nothing matches exactly, the last-resort fallback lists import
 strings that merely contain `target` (3 characters at least), under an explicit heuristic warning.
 
-**Negative Constraints**: If 0 dependents are reported, no package or symbol imports it in the workspace: DO NOT run fallback grep searches. DO NOT USE to search freeform text or method signatures (use smart_search).
+**Negative Constraints**: If 0 dependents are reported, no indexed import or call resolves to it: DO NOT run broad fallback grep searches; a targeted check is appropriate only for dynamic or string-built references. DO NOT USE to search freeform text or method signatures (use smart_search).
 
 #### JSON Schema
 ```json
@@ -267,7 +267,7 @@ for the method's service in a file where no call to this method was resolved —
 client is not held in a typed field, whose calls are all recorded — are listed as "may call", even
 when other clients were found: the client list is never presented as complete when it may not be.
 
-**Negative Constraints**: If a client stub or handler is reported as 0/none, it does not exist in the codebase: DO NOT run secondary ripgrep/grep searches to double-check negative results. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
+**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' is exhaustive over the indexed workspace roots: DO NOT re-check it with ripgrep/grep. Rows marked heuristic or ambiguous may be verified with a targeted read. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema
 ```json
@@ -406,7 +406,7 @@ the trace is still valid there, only the comparison is impossible.
 #### Description
 Impact matrix of a change. For a proto/gRPC method or service: its server handlers and clients, resolved like `analyze_grpc` (`Implements` / `CallsRpc` edges). For an event, topic, queue or saga: its producers, topics, consumers and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. Each row is classified `EXTERNAL` or `INTERNAL` and carries the confidence of its edge (`exact` / `heuristic` / `ambiguous`).
 
-**Negative Constraints**: If 0 producers or consumers are reported, none exist in static code: DO NOT run fallback ripgrep/grep searches. DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
+**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' is exhaustive over the indexed workspace roots: DO NOT re-check it with ripgrep/grep. Rows marked heuristic or ambiguous may be verified with a targeted read. DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
 
 #### Topic matching
 Topic keys are lowercase. A code reference to an enum or constant member — `Streams.EVENT_CREATED`,

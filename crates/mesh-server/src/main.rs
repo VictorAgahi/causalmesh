@@ -248,6 +248,40 @@ fn warn_on_daemon_version_mismatch(workspace_id: &str) {
     }
 }
 
+/// Refuses to auto-spawn a sibling `meshd` built from another release (7.0.17).
+///
+/// The socket name is keyed by this `mesh-mcp`'s version, so a stale sibling
+/// binary (only `mesh-mcp` reinstalled) got a fresh socket, started, and then
+/// served every request — `initialize` included — with its own older
+/// behavior, while `warn_on_daemon_version_mismatch` only ever saw daemons
+/// that were already running. Measured on 7.0.15/7.0.16: the upgraded
+/// `initialize.instructions` never reached the agent. The error makes the
+/// caller fall back to the in-process server, which is this binary's code.
+fn check_sibling_meshd_version(meshd_path: &Path) -> Result<(), String> {
+    let output = std::process::Command::new(meshd_path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {} --version: {e}", meshd_path.display()))?;
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let version = reported.split_whitespace().nth(1).unwrap_or_default();
+    if version == env!("CARGO_PKG_VERSION") {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is version {}, but this mesh-mcp is {} — reinstall both binaries together; \
+             serving this session in-process instead",
+            meshd_path.display(),
+            if version.is_empty() {
+                "unknown"
+            } else {
+                version
+            },
+            env!("CARGO_PKG_VERSION")
+        ))
+    }
+}
+
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
 /// Rotates and opens this workspace's `meshd` auto-spawn log (P2 step 3.3), replacing the old
@@ -381,6 +415,7 @@ async fn ensure_daemon_running(
     if !meshd_path.exists() {
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
+    check_sibling_meshd_version(&meshd_path)?;
 
     let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
     let mut cmd = std::process::Command::new(&meshd_path);
@@ -596,6 +631,7 @@ async fn ensure_daemon_running_windows(
     if !meshd_path.exists() {
         return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
     }
+    check_sibling_meshd_version(&meshd_path)?;
 
     let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
     let mut cmd = std::process::Command::new(&meshd_path);
@@ -878,5 +914,38 @@ mod proxy_tests {
             .await
             .expect("read");
         assert_eq!(out, b"{\"id\":1}\n");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sibling_meshd_version_tests {
+    use super::check_sibling_meshd_version;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_meshd(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
+        let path = dir.join("meshd");
+        std::fs::write(&path, format!("#!/bin/sh\necho 'meshd {version}'\n")).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    #[test]
+    fn same_version_sibling_is_spawnable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meshd = fake_meshd(dir.path(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(check_sibling_meshd_version(&meshd), Ok(()));
+    }
+
+    /// Regression (7.0.17): only `mesh-mcp` was reinstalled, the older sibling
+    /// `meshd` was spawned and answered `initialize` without the new instructions.
+    #[test]
+    fn older_sibling_is_refused_with_both_versions_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meshd = fake_meshd(dir.path(), "0.0.1");
+        let err = check_sibling_meshd_version(&meshd).expect_err("mismatch must be refused");
+        assert!(
+            err.contains("0.0.1") && err.contains(env!("CARGO_PKG_VERSION")),
+            "{err}"
+        );
     }
 }

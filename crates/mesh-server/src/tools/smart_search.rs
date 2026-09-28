@@ -752,39 +752,133 @@ impl SmartSearchTool {
     /// come back to the caller verbatim — this is the same secret-masking
     /// convention `PropertyRegistry` already applies to *resolved* config
     /// values, applied here to raw snippet lines instead.
+    ///
+    /// Only the value is replaced — quotes included, trailing `,` / `;` kept —
+    /// so the snippet stays valid code or JSON. 7.0.6 replaced everything after
+    /// the separator, dropped the `const`/`let` lines entirely (a key with a
+    /// space was "not a key"), and masked non-secrets (Volontariapp report):
+    /// see [`Self::is_not_a_secret`].
     fn redact_sensitive_line(line: &str, is_code: bool) -> String {
-        let sep_pos = line.find([':', '=']);
-        let Some(sep_pos) = sep_pos else {
+        let Some(sep_pos) = line.find([':', '=']) else {
             return line.to_string();
         };
-        let (key_part, rest) = line.split_at(sep_pos);
-        let key = key_part
-            .trim()
-            .trim_start_matches('-')
-            .trim_matches('"')
-            .trim_matches('\'');
-        if key.is_empty() || key.contains(char::is_whitespace) {
+        let Some(key) = Self::assignment_key(&line[..sep_pos]) else {
             // Not a plausible `key: value` line (e.g. a URL "https://host:port"
             // or a comment) — leave it untouched rather than guess.
             return line.to_string();
-        }
+        };
         thread_local! {
             static REGISTRY: PropertyRegistry = PropertyRegistry::new();
         }
-        let is_sensitive = REGISTRY.with(|r| r.is_sensitive_key(key));
-        if !is_sensitive {
+        if !REGISTRY.with(|r| r.is_sensitive_key(key)) {
             return line.to_string();
         }
+        let value_start = sep_pos + 1;
+        let after_sep = &line[value_start..];
         // In source code the value after `:`/`=` is mostly a type, a parameter
         // or a lookup (`password!: string;`, `password: dto.password`,
         // `token = config.get(…)`): masking those printed wrong code (7.0.0
         // pilot feedback on a NestJS DTO). A hard-coded secret there is a
         // string literal, so that is what gets masked.
-        if is_code && !rest[1..].contains(['"', '\'', '`']) {
-            return line.to_string();
+        let span = match after_sep.find(['"', '\'', '`']) {
+            Some(open) => {
+                let quote = after_sep[open..].chars().next().unwrap_or('"');
+                let body = &after_sep[open + 1..];
+                let Some(close) = body.find(quote) else {
+                    return line.to_string();
+                };
+                let literal = &body[..close];
+                // Text before the quote other than a type annotation/`=`
+                // (`fn(`, `+`, `?`) means the literal is not the assigned value.
+                let lead = after_sep[..open].trim();
+                if is_code
+                    && !lead.is_empty()
+                    && !lead.trim_end_matches('=').trim().chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '<' | '>' | '|' | ' ')
+                    })
+                {
+                    return line.to_string();
+                }
+                if !is_code && !lead.is_empty() {
+                    return line.to_string();
+                }
+                if Self::is_not_a_secret(key, literal) {
+                    return line.to_string();
+                }
+                let start = value_start + open;
+                (start, start + 1 + close + quote.len_utf8())
+            }
+            None if is_code => return line.to_string(),
+            None => {
+                let trimmed = after_sep.trim();
+                let value = trimmed.trim_end_matches([',', ';']).trim_end();
+                if value.is_empty()
+                    || value.starts_with(['{', '[', '|', '>', '&', '*', '#'])
+                    || Self::is_not_a_secret(key, value)
+                {
+                    return line.to_string();
+                }
+                let start = value_start + (after_sep.len() - after_sep.trim_start().len());
+                (start, start + value.len())
+            }
+        };
+        format!(
+            "{}{}{}",
+            &line[..span.0],
+            PropertyRegistry::REDACTED_PLACEHOLDER,
+            &line[span.1..]
+        )
+    }
+
+    /// The key of `key: …` / `const key = …` / `"key": …` / `- key: …`, or
+    /// `None` when the text before the separator is not a single key once
+    /// declaration keywords and modifiers are set aside (prose, a comment).
+    fn assignment_key(key_part: &str) -> Option<&str> {
+        const DECL_WORDS: &[&str] = &[
+            "const",
+            "let",
+            "var",
+            "val",
+            "final",
+            "export",
+            "declare",
+            "readonly",
+            "private",
+            "public",
+            "protected",
+            "static",
+        ];
+        let mut words = key_part.trim().trim_start_matches('-').split_whitespace();
+        let last = words.next_back()?;
+        if !words.all(|w| DECL_WORDS.contains(&w)) {
+            return None;
         }
-        let sep = &rest[..1];
-        format!("{key_part}{sep} {}", PropertyRegistry::REDACTED_PLACEHOLDER)
+        let key = last.trim_matches(['"', '\'']).trim_end_matches(['!', '?']);
+        (!key.is_empty()).then_some(key)
+    }
+
+    /// Values a sensitive key commonly holds that are not secrets:
+    /// the key's own name (`REFRESH_TOKEN = 'refresh_token'`, an enum member),
+    /// an environment variable name (`"password": "DB_PASSWORD"` in a
+    /// node-config `custom-env-vars.json`), a `${…}` / `{{…}}` reference, or
+    /// `true` / `false` / `null`.
+    fn is_not_a_secret(key: &str, value: &str) -> bool {
+        let norm = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect()
+        };
+        let is_env_name = value.contains('_')
+            && value.starts_with(|c: char| c.is_ascii_uppercase())
+            && value
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        (!value.is_empty() && norm(value) == norm(key))
+            || is_env_name
+            || value.starts_with("${")
+            || value.starts_with("{{")
+            || matches!(value, "true" | "false" | "null" | "~")
     }
 }
 
@@ -865,7 +959,51 @@ mod tests {
         }
         assert_eq!(
             SmartSearchTool::redact_sensitive_line("  password: 'hunter2',", true),
-            format!("  password: {}", PropertyRegistry::REDACTED_PLACEHOLDER)
+            format!("  password: {},", PropertyRegistry::REDACTED_PLACEHOLDER)
+        );
+    }
+
+    /// Volontariapp 7.0.6 report, section 3.1: one secret printed in clear,
+    /// three non-secrets masked (one of them breaking the JSON around it).
+    #[test]
+    fn redaction_cases_from_the_volontariapp_report() {
+        let r = PropertyRegistry::REDACTED_PLACEHOLDER;
+        let code = |l: &str| SmartSearchTool::redact_sensitive_line(l, true);
+        let conf = |l: &str| SmartSearchTool::redact_sensitive_line(l, false);
+        // False negative: a `const` declaration was "not a key".
+        assert_eq!(
+            code("    const password = 'Password123!';"),
+            format!("    const password = {r};")
+        );
+        assert_eq!(
+            code("  private readonly apiToken: string = \"sk-live-1\";"),
+            format!("  private readonly apiToken: string = {r};")
+        );
+        // False positives.
+        for line in [
+            "  REFRESH_TOKEN = 'refresh_token',",
+            "  refreshToken: 'refreshToken',",
+            "  apiToken = this.config.get('API_TOKEN');",
+            "// the password: 'is documented elsewhere'",
+        ] {
+            assert_eq!(code(line), line);
+        }
+        for line in [
+            "    \"password\": \"DB_PASSWORD\",",
+            "  \"auth\": {",
+            "  password: ${DB_PASSWORD}",
+            "  auth: true",
+        ] {
+            assert_eq!(conf(line), line);
+        }
+        // Still masked, punctuation kept.
+        assert_eq!(
+            conf("      DB_PASSWORD: \"password\""),
+            format!("      DB_PASSWORD: {r}")
+        );
+        assert_eq!(
+            conf("    \"secret\": \"s3cr3t-value\","),
+            format!("    \"secret\": {r},")
         );
     }
 

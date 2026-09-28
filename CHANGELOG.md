@@ -5,6 +5,33 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.4] — 2026-09-28
+
+TypeScript depth (Volontariapp report, points 1, 4, 5 and 7). Measured on the Volontariapp
+workspace: `analyze_grpc SignUp` now lists exactly the two gateway call sites (7.0.0: none), and
+`find_dependents @volontariapp/messaging` returns exactly the 144 non-test files `grep` finds
+(7.0.0: 502 results, truncated; 7.0.3: 104 files).
+
+### Added
+- **Method-level gRPC clients in TypeScript.** `this.<field>.<method>(…)`, where the field is
+  bound by `getService<XServiceClient>(…)` or typed `XServiceClient` (field or constructor
+  parameter property), is a call to `XService.<Method>`, resolved by exact `Service.Method` only
+  (never by bare method name). A field only *named* like a client (`userService`, set in a base
+  class of another file) resolves the same way with heuristic confidence. Fields are per class.
+- **Top-level TypeScript declarations**: functions, enums, type aliases, `const` / `let`
+  bindings (arrow-function components, `…Options` objects) and abstract classes are indexed, so
+  `smart_search` finds them without `fuzzy` and a module declaring only these is visible to
+  `find_dependents`. `export … from` re-exports count as module dependencies.
+
+### Fixed
+- **`.tsx` was parsed with the TypeScript grammar** (JSX became error nodes; `const App = () =>
+  <View/>` was not indexed). `.tsx`, `.js`, `.jsx`, `.mjs` and `.cjs` use the TSX grammar;
+  `.mts` and `.cts` are recognized as TypeScript.
+- **A gRPC handler vanished when another decorator followed `@GrpcMethod`** (`@GrpcMethod(…)`
+  then `@UseGuards(…)`): only the decorator right above the method was read. Every decorator is
+  read now, and the method body no longer is (a `"@Get"` string in a body made it an endpoint).
+- Index cache schema v6.
+
 ## [7.0.3] — 2026-09-28
 
 Answers that were wrong or incomplete while looking complete (Volontariapp report, points 2, 5, 8

@@ -69,7 +69,8 @@ Measurement harnesses (scale, memory, cache, payload) are described in
 
 ## 4. Adding a tree-sitter language
 
-Supported today: Java, Go, Python, TypeScript (`.ts`, `.tsx`, `.js`), Rust, C++, Kotlin, C#,
+Supported today: Java, Go, Python, TypeScript (`.ts`, `.mts`, `.cts`; `.tsx`, `.js`, `.jsx`,
+`.mjs`, `.cjs` through the TSX grammar), Rust, C++, Kotlin, C#,
 Ruby, PHP, Swift, Scala and Protobuf, all through tree-sitter; YAML (OpenAPI, AsyncAPI, Spring
 properties), `.properties` and Markdown are parsed without it. The full walkthrough is
 [`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).

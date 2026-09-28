@@ -119,10 +119,17 @@ pub struct GrpcTrace<'g> {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImpactFlow<'g> {
     pub target: CompactStr,
+    /// The normalized topic key the target was matched as: `event.created`
+    /// is tried as `event_created` when nothing matches it as written.
+    pub key: CompactStr,
     pub upstream_producers: Vec<&'g ContractNode>,
     pub topics: Vec<&'g ContractNode>,
     pub downstream_consumers: Vec<&'g ContractNode>,
     pub related_sagas: Vec<&'g ContractNode>,
+    /// Hops past the first: producers declared in the file of a consumer
+    /// reached on the previous hop (a handler that re-emits), through which
+    /// the walk continued. Linked by file, not by a call edge.
+    pub downstream_producers: Vec<&'g ContractNode>,
 }
 
 /// Whether an impacted element lives in the service that owns the changed
@@ -203,6 +210,15 @@ pub struct ImpactMatrix<'g> {
     /// could be determined, in which case every row is `External`.
     pub owner_roots: Vec<RepoId>,
     pub rows: Vec<ImpactRow<'g>>,
+    /// An event matched (topics or consumers) but none of its producers was
+    /// resolved — a SQL trigger, a runtime-built topic name, a config-driven
+    /// publisher. Said explicitly rather than shown as an empty column.
+    pub no_producer_resolved: bool,
+    /// Producers or topics matched but no consumer was resolved.
+    pub no_consumer_resolved: bool,
+    /// The walk continued past the first hop through producers found in a
+    /// consumer's file ([`ImpactFlow::downstream_producers`]).
+    pub file_linked_hops: bool,
 }
 
 /// In-memory graph of polyglot architecture contracts and dependencies.
@@ -1647,7 +1663,23 @@ impl ContractGraph {
 
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
-        let norm_target = normalize_topic_key(target);
+        let mut norm_target = normalize_topic_key(target);
+        // The value a constant holds (`'event.created'`) is how people often
+        // name an event, while the index keys on the member (`event_created`):
+        // the tool description itself cited `event.created`, which 7.0.6 did
+        // not match. Tried only when the spelling as written matches no key.
+        let any_key = |key: &str| {
+            self.topic_producers
+                .keys()
+                .chain(self.topic_consumers.keys())
+                .any(|k| k.contains(key))
+        };
+        if !any_key(&norm_target) {
+            let alt = norm_target.replace(['.', ':', '-', '/'], "_");
+            if alt != norm_target && any_key(&alt) {
+                norm_target = alt;
+            }
+        }
         // A topic whose key *is* the target wins over topics merely containing
         // it: `EVENT_CREATED` must not pull in `WS_EVENT_CREATED_FEEDBACK`.
         // Substring matching remains the fallback when no key is exact.
@@ -1734,10 +1766,12 @@ impl ContractGraph {
 
         ImpactFlow {
             target: CompactStr::new(target),
+            key: CompactStr::new(&norm_target),
             upstream_producers,
             topics,
             downstream_consumers,
             related_sagas,
+            downstream_producers: Vec::new(),
         }
     }
 
@@ -1768,11 +1802,23 @@ impl ContractGraph {
             .map(|n| n.id)
             .collect();
         let mut frontier: HashSet<NodeId> = visited_nodes.clone();
+        let mut visited_producers: HashSet<NodeId> =
+            flow.upstream_producers.iter().map(|n| n.id).collect();
 
         for _hop in 2..=depth {
             if frontier.is_empty() {
                 break;
             }
+            // A consumer rarely carries the `Produces` edge itself: the
+            // re-emission is a separate producer node (a `produce:` pattern
+            // call site, a `client.emit` in another method) in the same file.
+            // 7.0.6 walked only the consumer's own edges, so `depth: 2` gave
+            // the depth-1 answer on Volontariapp's post-processors, silently.
+            let frontier_files: HashSet<&FilePath> = frontier
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .map(|n| &n.file_path)
+                .collect();
 
             // Every topic a node in the current frontier produces onto, in
             // stable edge-insertion order (not `HashSet` order) so the result
@@ -1782,10 +1828,24 @@ impl ContractGraph {
             let mut new_topics: Vec<NodeId> = Vec::new();
             let mut new_topics_set: HashSet<NodeId> = HashSet::new();
             for edge in &self.edges {
-                if edge.kind == EdgeKind::Produces
-                    && frontier.contains(&edge.from)
-                    && visited_topics.insert(edge.to)
-                {
+                if edge.kind != EdgeKind::Produces {
+                    continue;
+                }
+                let own = frontier.contains(&edge.from);
+                let same_file = !own
+                    && self
+                        .nodes
+                        .get(&edge.from)
+                        .is_some_and(|p| frontier_files.contains(&p.file_path));
+                if !(own || same_file) {
+                    continue;
+                }
+                if same_file && visited_producers.insert(edge.from) {
+                    if let Some(producer) = self.nodes.get(&edge.from) {
+                        flow.downstream_producers.push(producer);
+                    }
+                }
+                if visited_topics.insert(edge.to) {
                     new_topics.push(edge.to);
                     new_topics_set.insert(edge.to);
                 }
@@ -2022,7 +2082,30 @@ impl ContractGraph {
 
         // ── Async: producers / topics / consumers / sagas ──
         let flow = self.analyze_impact_with_depth(norm_target, depth);
-        let target_lc = norm_target.to_lowercase();
+        let target_lc = flow.key.to_lowercase();
+        let file_linked_hops = !flow.downstream_producers.is_empty();
+        let event_matched = !flow.topics.is_empty()
+            || !flow.upstream_producers.is_empty()
+            || !flow.downstream_consumers.is_empty();
+        let no_producer_resolved = event_matched
+            && !flow
+                .upstream_producers
+                .iter()
+                .any(|n| !crate::is_test_path(&n.file_path))
+            && !flow
+                .topics
+                .iter()
+                .any(|n| n.name.starts_with("produce:") && !crate::is_test_path(&n.file_path));
+        let no_consumer_resolved = event_matched
+            && !flow
+                .downstream_consumers
+                .iter()
+                .chain(
+                    flow.topics
+                        .iter()
+                        .filter(|n| n.name.starts_with("consume:")),
+                )
+                .any(|n| !crate::is_test_path(&n.file_path));
         let mut async_owners: Vec<RepoId> = flow
             .upstream_producers
             .iter()
@@ -2044,6 +2127,7 @@ impl ContractGraph {
             (&flow.topics, ImpactRole::Topic),
             (&flow.downstream_consumers, ImpactRole::Consumer),
             (&flow.related_sagas, ImpactRole::Saga),
+            (&flow.downstream_producers, ImpactRole::Producer),
         ] {
             for node in nodes {
                 // `analyze_impact`'s node scan lists a pattern-declared
@@ -2103,6 +2187,9 @@ impl ContractGraph {
             contracts,
             owner_roots,
             rows,
+            no_producer_resolved,
+            no_consumer_resolved,
+            file_linked_hops,
         }
     }
 
@@ -3619,6 +3706,90 @@ mod tests {
             vec!["aProducer", "mProducer", "zProducer"],
             "producers must be ordered by their matched topic name, not HashMap order"
         );
+    }
+
+    /// Volontariapp 7.0.6 report, defects 5, 6 and 13: the re-emission of a
+    /// post-processor is a separate `produce:` node in the consumer's file, so
+    /// `depth: 2` returned the depth-1 answer; a topic with no resolved
+    /// producer was not said; the value spelling `event.created` matched
+    /// nothing.
+    #[test]
+    fn impact_depth_follows_same_file_producers_and_reports_gaps() {
+        let mut graph = ContractGraph::new();
+        let origin = graph.add_node(memo_node(
+            "produce:Streams.EVENT_CREATED",
+            "",
+            "domain/repo.ts",
+            0,
+            NodeKind::EventStream,
+        ));
+        graph.add_producer(origin, "Streams.EVENT_CREATED");
+        let pp = graph.add_node(memo_node(
+            "EventCreatedPostProcessor",
+            "",
+            "pp/event-created.post-processor.ts",
+            1,
+            NodeKind::PostProcessor,
+        ));
+        graph.add_consumer(pp, "Streams.EVENT_CREATED");
+        let reemit = graph.add_node(memo_node(
+            "produce:Streams.WS_FEEDBACK",
+            "",
+            "pp/event-created.post-processor.ts",
+            1,
+            NodeKind::EventStream,
+        ));
+        graph.add_producer(reemit, "Streams.WS_FEEDBACK");
+        let ws = graph.add_node(memo_node(
+            "consume:Streams.WS_FEEDBACK",
+            "",
+            "ws/ws-feedback.options.ts",
+            2,
+            NodeKind::PostProcessor,
+        ));
+        graph.add_consumer(ws, "Streams.WS_FEEDBACK");
+        let orphan = graph.add_node(memo_node(
+            "consume:Streams.USER_CREATED",
+            "",
+            "ws/ws-user-created.options.ts",
+            2,
+            NodeKind::PostProcessor,
+        ));
+        graph.add_consumer(orphan, "Streams.USER_CREATED");
+        graph.reconcile_edges();
+
+        let names = |flow: &ImpactFlow| -> Vec<String> {
+            flow.downstream_consumers
+                .iter()
+                .map(|n| n.name.to_string())
+                .collect()
+        };
+        let direct = graph.analyze_impact_with_depth("EVENT_CREATED", 1);
+        assert!(!names(&direct).contains(&"consume:Streams.WS_FEEDBACK".to_string()));
+        let two = graph.analyze_impact_with_depth("EVENT_CREATED", 2);
+        assert!(
+            names(&two).contains(&"consume:Streams.WS_FEEDBACK".to_string()),
+            "{:?}",
+            names(&two)
+        );
+        assert_eq!(
+            two.downstream_producers
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+            vec![reemit]
+        );
+
+        let by_value = graph.analyze_impact("event.created");
+        assert_eq!(by_value.key.as_str(), "event_created");
+        assert!(by_value.downstream_consumers.iter().any(|n| n.id == pp));
+
+        let matrix = graph.impact_matrix("EVENT_CREATED", 2);
+        assert!(matrix.file_linked_hops);
+        assert!(!matrix.no_producer_resolved && !matrix.no_consumer_resolved);
+        let orphan_matrix = graph.impact_matrix("USER_CREATED", 1);
+        assert!(orphan_matrix.no_producer_resolved, "{orphan_matrix:?}");
+        assert!(!orphan_matrix.no_consumer_resolved);
     }
 
     /// Builds `orders.created` -[Consumes]-> `billingHandler` -[Produces]-> `payment.settled`

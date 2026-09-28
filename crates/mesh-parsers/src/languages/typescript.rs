@@ -158,8 +158,8 @@ impl TypeScriptExtractor {
             // A module-level `const client = new XClient(…)` is itself a
             // declaration now (7.0.1): the construction is attributed to the
             // declarations that *use* `client`, never to `client` itself.
-            let enclosing = Self::smallest_enclosing(nodes, call.line_start, call.line_end)
-                .filter(|&idx| {
+            let enclosing =
+                Self::smallest_enclosing(nodes, call.line_start, call.line_end).filter(|&idx| {
                     call.binding
                         .as_ref()
                         .is_none_or(|b| nodes[idx].name.as_str() != b.name)

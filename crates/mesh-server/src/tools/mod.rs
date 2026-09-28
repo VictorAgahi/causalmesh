@@ -1068,6 +1068,9 @@ roots = ["."]
         let find_deps_args = super::find_dependents::FindDependentsArgs {
             target: mesh_core::CompactStr::new("UserAuthRequest"),
             granularity: None,
+            include_tests: None,
+            limit: None,
+            offset: None,
             _meta: None,
         };
         let hint_deps = FindDependentsTool::truncation_hint(&find_deps_args, &state).unwrap();
@@ -1100,6 +1103,7 @@ roots = ["."]
             depth: None,
             limit: None,
             offset: None,
+            include_tests: None,
             _meta: None,
         };
         let hint_impact = AnalyzeImpactTool::truncation_hint(&impact_args, &state).unwrap();

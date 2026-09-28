@@ -10,6 +10,21 @@ use std::path::Path;
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
 /// request is what the formatter never needed.
+/// How [`ContractGraph::find_dependents_matched`] found its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentsMatch {
+    /// Files importing `target` (or a subpath of it) — structural.
+    Import,
+    /// `target` is a declared symbol: files importing its declaring package.
+    DeclaringPackage,
+    /// Callers linked to `target` by a `CallsRpc` / `Implements` edge.
+    GraphEdge,
+    /// Last resort: import strings merely *containing* `target` — a heuristic.
+    Substring,
+    /// Nothing matched.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GrpcTrace<'g> {
     pub target: CompactStr,
@@ -20,6 +35,12 @@ pub struct GrpcTrace<'g> {
     /// Each handler paired with the confidence of the match that linked it
     /// to the proto definition (bare-name scan vs. an exact `Implements` edge).
     pub server_handlers: Vec<(&'g ContractNode, EdgeConfidence)>,
+    /// Filled only when `client_stubs` is empty and the target is a method:
+    /// callers linked to the method's *service* (a client constructed for it,
+    /// `getService<UserServiceClient>(…)`) without the called method being
+    /// resolved. They may or may not call this method; the formatter says so
+    /// instead of answering "0 clients".
+    pub service_level_clients: Vec<(&'g ContractNode, EdgeConfidence)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1030,17 +1051,58 @@ impl ContractGraph {
     /// (e.g. a `GrpcService`'s name) — the latter is bridged to the package(s)
     /// it's declared in before falling back to a raw substring scan.
     pub fn find_dependents(&self, target: &str) -> Vec<&ContractNode> {
+        self.find_dependents_matched(target).0
+    }
+
+    /// Shortest target the last-resort substring fallback of
+    /// [`Self::find_dependents_matched`] runs for: `find_dependents("a")` used to
+    /// return every dependency edge in the workspace.
+    pub const SUBSTRING_FALLBACK_MIN_CHARS: usize = 3;
+
+    /// [`Self::find_dependents`], each node at most once (a file importing the
+    /// same module on several lines used to list its declarations once per
+    /// line), plus *how* the result was matched, so a caller can say when it is
+    /// only a substring heuristic.
+    pub fn find_dependents_matched(&self, target: &str) -> (Vec<&ContractNode>, DependentsMatch) {
+        let (nodes, how) = self.find_dependents_raw(target);
+        let mut seen: HashSet<NodeId> = HashSet::with_capacity(nodes.len());
+        let nodes = nodes.into_iter().filter(|n| seen.insert(n.id)).collect();
+        (nodes, how)
+    }
+
+    fn find_dependents_raw(&self, target: &str) -> (Vec<&ContractNode>, DependentsMatch) {
         let mut result = Vec::new();
         let target_key = CompactStr::new(target);
 
         // 1. Direct match in reverse_deps: `target` is itself the literal
-        // import-path/package string other files reference.
+        // import-path/package string other files reference — or a subpath of it
+        // (`@scope/pkg/testing`, `github.com/org/mod/pkg`): importing part of a
+        // package is depending on it. Sorted keys keep the order deterministic (I5).
         if let Some(node_ids) = self.reverse_deps.get(&target_key) {
             for &id in node_ids {
                 if let Some(node) = self.nodes.get(&id) {
                     result.push(node);
                 }
             }
+        }
+        if !target.is_empty() && !target.ends_with('/') {
+            let prefix = format!("{target}/");
+            let mut subpaths: Vec<&CompactStr> = self
+                .reverse_deps
+                .keys()
+                .filter(|k| k.starts_with(prefix.as_str()))
+                .collect();
+            subpaths.sort();
+            for key in subpaths {
+                for &id in &self.reverse_deps[key] {
+                    if let Some(node) = self.nodes.get(&id) {
+                        result.push(node);
+                    }
+                }
+            }
+        }
+        if !result.is_empty() {
+            return (result, DependentsMatch::Import);
         }
 
         // 2. Symbol bridge: `target` may instead be a declared contract name
@@ -1072,6 +1134,9 @@ impl ContractGraph {
                         }
                     }
                 }
+            }
+            if !result.is_empty() {
+                return (result, DependentsMatch::DeclaringPackage);
             }
         }
 
@@ -1115,6 +1180,9 @@ impl ContractGraph {
                     }
                 }
             }
+            if !result.is_empty() {
+                return (result, DependentsMatch::GraphEdge);
+            }
         }
 
         // 3. Last-resort fallback: unscoped substring match across every
@@ -1124,7 +1192,7 @@ impl ContractGraph {
         // package) — callers should group results by `ContractNode::repo_id`
         // before presenting this to a human/agent rather than treat it as a
         // single flat, disambiguated answer.
-        if result.is_empty() {
+        if target.chars().count() >= Self::SUBSTRING_FALLBACK_MIN_CHARS {
             // `reverse_deps` is a `HashMap`: iterated directly, its per-process
             // random hash seed would make this fallback return a different
             // node order on every run for identical input, violating I5.
@@ -1144,7 +1212,12 @@ impl ContractGraph {
             }
         }
 
-        result
+        let how = if result.is_empty() {
+            DependentsMatch::None
+        } else {
+            DependentsMatch::Substring
+        };
+        (result, how)
     }
 
     /// Synchronous end-to-end gRPC trace resolution
@@ -1209,12 +1282,51 @@ impl ContractGraph {
             }
         }
 
+        let mut service_level_clients: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
+        if client_stubs.is_empty() {
+            let services: HashSet<NodeId> = anchors
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .filter(|m| m.kind == NodeKind::GrpcMethod)
+                .filter_map(|m| self.enclosing_grpc_service(m))
+                .collect();
+            let mut edges: Vec<&ContractEdge> = self
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::CallsRpc && services.contains(&e.to))
+                .collect();
+            edges.sort_by_key(|e| e.from);
+            for edge in edges {
+                if let Some(client) = self.nodes.get(&edge.from) {
+                    if !service_level_clients.iter().any(|(c, _)| c.id == client.id) {
+                        service_level_clients.push((client, edge.confidence));
+                    }
+                }
+            }
+        }
+
         GrpcTrace {
             target: CompactStr::new(norm_target),
             proto_definition,
             client_stubs,
             server_handlers,
+            service_level_clients,
         }
+    }
+
+    /// The `service` declaration a `.proto` `rpc` node sits in: same file, its
+    /// line range enclosing the method's.
+    fn enclosing_grpc_service(&self, method: &ContractNode) -> Option<NodeId> {
+        self.nodes
+            .values()
+            .filter(|n| {
+                n.kind == NodeKind::GrpcService
+                    && n.file_path == method.file_path
+                    && n.line_start <= method.line_start
+                    && n.line_end >= method.line_end
+            })
+            .min_by_key(|n| (n.line_end - n.line_start, n.id))
+            .map(|n| n.id)
     }
 
     /// How `node` matches an `analyze_grpc` / `impact_matrix` target: `None`

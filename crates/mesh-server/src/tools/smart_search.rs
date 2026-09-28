@@ -709,10 +709,13 @@ impl SmartSearchTool {
             }
         };
 
+        // Source code (not YAML/.env/properties): `password!: string;` is a
+        // type annotation, not a secret — only a quoted literal value is masked.
+        let is_code = lang_kind.language().is_some();
         let snippet = window
             .iter()
             .map(|l| {
-                let redacted = Self::redact_sensitive_line(l);
+                let redacted = Self::redact_sensitive_line(l, is_code);
                 if redacted.len() > MAX_SNIPPET_LINE_BYTES {
                     let cut = Self::floor_char_boundary(&redacted, MAX_SNIPPET_LINE_BYTES - 3);
                     format!("{}...", &redacted[..cut])
@@ -749,7 +752,7 @@ impl SmartSearchTool {
     /// come back to the caller verbatim — this is the same secret-masking
     /// convention `PropertyRegistry` already applies to *resolved* config
     /// values, applied here to raw snippet lines instead.
-    fn redact_sensitive_line(line: &str) -> String {
+    fn redact_sensitive_line(line: &str, is_code: bool) -> String {
         let sep_pos = line.find([':', '=']);
         let Some(sep_pos) = sep_pos else {
             return line.to_string();
@@ -770,6 +773,14 @@ impl SmartSearchTool {
         }
         let is_sensitive = REGISTRY.with(|r| r.is_sensitive_key(key));
         if !is_sensitive {
+            return line.to_string();
+        }
+        // In source code the value after `:`/`=` is mostly a type, a parameter
+        // or a lookup (`password!: string;`, `password: dto.password`,
+        // `token = config.get(…)`): masking those printed wrong code (7.0.0
+        // pilot feedback on a NestJS DTO). A hard-coded secret there is a
+        // string literal, so that is what gets masked.
+        if is_code && !rest[1..].contains(['"', '\'', '`']) {
             return line.to_string();
         }
         let sep = &rest[..1];
@@ -830,26 +841,45 @@ mod tests {
     #[test]
     fn redact_sensitive_line_masks_secret_looking_keys() {
         assert_eq!(
-            SmartSearchTool::redact_sensitive_line("POSTGRES_PASSWORD: accounts-pwd"),
+            SmartSearchTool::redact_sensitive_line("POSTGRES_PASSWORD: accounts-pwd", false),
             format!(
                 "POSTGRES_PASSWORD: {}",
                 PropertyRegistry::REDACTED_PLACEHOLDER
             )
         );
         assert_eq!(
-            SmartSearchTool::redact_sensitive_line("api_token = \"sk-live-abc123\""),
+            SmartSearchTool::redact_sensitive_line("api_token = \"sk-live-abc123\"", false),
             format!("api_token = {}", PropertyRegistry::REDACTED_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_line_in_code_masks_only_literals() {
+        for decl in [
+            "  password!: string;",
+            "  password?: string;",
+            "  password: dto.password,",
+            "  apiToken = this.config.get(key);",
+        ] {
+            assert_eq!(SmartSearchTool::redact_sensitive_line(decl, true), decl);
+        }
+        assert_eq!(
+            SmartSearchTool::redact_sensitive_line("  password: 'hunter2',", true),
+            format!("  password: {}", PropertyRegistry::REDACTED_PLACEHOLDER)
         );
     }
 
     #[test]
     fn redact_sensitive_line_leaves_ordinary_lines_untouched() {
         let ordinary = "  const url = \"https://api.example.com:8080/health\";";
-        assert_eq!(SmartSearchTool::redact_sensitive_line(ordinary), ordinary);
+        assert_eq!(
+            SmartSearchTool::redact_sensitive_line(ordinary, false),
+            ordinary
+        );
 
         let non_secret_kv = "app.name: billing-service";
         assert_eq!(
-            SmartSearchTool::redact_sensitive_line(non_secret_kv),
+            SmartSearchTool::redact_sensitive_line(non_secret_kv, false),
             non_secret_kv
         );
     }

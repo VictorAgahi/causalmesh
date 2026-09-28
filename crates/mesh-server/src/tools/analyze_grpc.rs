@@ -30,6 +30,12 @@ pub struct AnalyzeGrpcArgs {
     )]
     pub base: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Include matches in test files and test-only directories (*.spec.ts, *_test.go, __tests__/, …). Default false: they are left out and counted."
+    )]
+    pub include_tests: Option<bool>,
+
     #[serde(default)]
     // Accepted for W3C trace propagation, hidden from `tools/list`: the model
     // cannot use it, and it cost every session ~200 schema tokens.
@@ -70,8 +76,25 @@ fn run_with_git(
     }
 
     let snapshot = state.snapshot();
-    let trace = snapshot.contract_graph.analyze_grpc(args.target.as_str());
+    let mut trace = snapshot.contract_graph.analyze_grpc(args.target.as_str());
+    let mut hidden_tests = 0;
+    if !args.include_tests.unwrap_or(false) {
+        for list in [
+            &mut trace.client_stubs,
+            &mut trace.server_handlers,
+            &mut trace.service_level_clients,
+        ] {
+            let before = list.len();
+            list.retain(|(n, _)| !mesh_core::is_test_path(&n.file_path));
+            hidden_tests += before - list.len();
+        }
+    }
     let mut text = MarkdownFormatter::format_grpc_trace(&trace);
+    if hidden_tests > 0 {
+        text.push_str(&format!(
+            "\n*{hidden_tests} match(es) in test files left out (`include_tests: true` to list them).*\n"
+        ));
+    }
 
     // The `.proto` whose wire format is checked: the target itself when it is a
     // `.proto` path, else the file of the resolved proto definition.
@@ -1013,6 +1036,7 @@ message User {
         let args = AnalyzeGrpcArgs {
             target: CompactStr::new(file.to_string_lossy()),
             base: Some("main".into()),
+            include_tests: None,
             _meta: None,
         };
         // string -> bytes is compatible, a new field is fine: no finding.
@@ -1039,6 +1063,7 @@ message User {
         let outside = AnalyzeGrpcArgs {
             target: CompactStr::new(repo.home.join("x.proto").to_string_lossy()),
             base: None,
+            include_tests: None,
             _meta: None,
         };
         std::fs::write(repo.home.join("x.proto"), "syntax = \"proto3\";\n").expect("write");

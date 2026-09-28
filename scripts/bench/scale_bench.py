@@ -207,6 +207,8 @@ def main():
 
     env = os.environ.copy()
     env.setdefault("MESH_SOCKET_PATH", f"/tmp/mesh-scale-{os.path.basename(args.repo_dir)}.sock")
+    # Keep benchmark calls out of the user's real audit trail (`mesh-mcp stats`).
+    env.setdefault("MESH_AUDIT_DB", f"/tmp/mesh-scale-{os.path.basename(args.repo_dir)}-audit.db")
 
     result = {"repo": os.path.basename(args.repo_dir), "ok": False, "budgets": budgets}
 

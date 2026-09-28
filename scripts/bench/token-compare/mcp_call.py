@@ -22,6 +22,8 @@ def main():
     mesh_mcp_bin = os.environ["MESH_MCP_BIN"]
     env = os.environ.copy()
     env["MESH_SOCKET_PATH"] = f"/tmp/mesh-tokcmp-{os.path.basename(repo_dir)}.sock"
+    # Keep benchmark calls out of the user's real audit trail (`mesh-mcp stats`).
+    env.setdefault("MESH_AUDIT_DB", f"/tmp/mesh-tokcmp-{os.path.basename(repo_dir)}-audit.db")
 
     # Time the whole cold-start-to-answer path: process spawn (which includes
     # the synchronous boot scan gating `initialize`, see the plan's point #3)

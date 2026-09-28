@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "7.0.17"
+version = "7.0.18"
 edition = "2021"
 # Verified with `cargo +1.90 check --workspace --all-targets`; set by dependencies
 # (tree-sitter-language requires 1.90).

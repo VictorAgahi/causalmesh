@@ -315,6 +315,24 @@ impl MarkdownFormatter {
         } else {
             out.push_str("*No formal .proto definition indexed for this target.*\n\n");
         }
+        if !trace.related_rpcs.is_empty() {
+            const SHOWN: usize = 10;
+            let names: Vec<String> = trace
+                .related_rpcs
+                .iter()
+                .take(SHOWN)
+                .map(|n| format!("`{}`", n.name))
+                .collect();
+            let more = trace.related_rpcs.len().saturating_sub(SHOWN);
+            out.push_str(&format!(
+                "*Not traced: {} other RPC(s)/service(s) whose name only contains `{}`: {}{}. \
+                 Their handlers and clients are not listed below; pass one's exact name to trace it.*\n\n",
+                trace.related_rpcs.len(),
+                trace.target,
+                names.join(", "),
+                if more > 0 { format!(" (+{more} more)") } else { String::new() }
+            ));
+        }
 
         out.push_str(&format!(
             "### 2. Client Stubs ({} found)\n",
@@ -329,12 +347,22 @@ impl MarkdownFormatter {
                 confidence.label()
             ));
         }
-        if trace.client_stubs.is_empty() && !trace.service_level_clients.is_empty() {
-            out.push_str(&format!(
-                "\n**No call to this method was resolved**, but {} caller(s) construct a client for its \
-                 service. They may call this method: read them before concluding it has no clients.\n",
-                trace.service_level_clients.len()
-            ));
+        if !trace.service_level_clients.is_empty() {
+            if trace.client_stubs.is_empty() {
+                out.push_str(&format!(
+                    "\n**No call to this method was resolved**, but {} caller(s) construct a client for its \
+                     service. They may call this method: read them before concluding it has no clients.\n",
+                    trace.service_level_clients.len()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\n**This list may be incomplete**: {} other caller(s) construct a client for this \
+                     method's service, with no call to this method resolved in their file (a call through \
+                     a field the index could not type is missed). Read them before treating the list above \
+                     as complete.\n",
+                    trace.service_level_clients.len()
+                ));
+            }
             for (client, confidence) in &trace.service_level_clients {
                 out.push_str(&format!(
                     "- `{}` in `{}:{}` _(service-level client, match: {})_\n",

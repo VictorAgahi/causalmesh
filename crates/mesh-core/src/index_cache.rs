@@ -64,7 +64,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v6: TypeScript top-level functions/enums/types/consts, re-exports, TSX grammar,
 /// method-level gRPC calls, every method decorator.
 /// v7: TypeScript event producers/consumers registered; topic keys normalized.
-const SCHEMA_VERSION: u8 = 7;
+/// v8: TypeScript client-field bindings per class (`#field=Service`) and calls through
+/// inherited fields (`^Base#field.method`).
+const SCHEMA_VERSION: u8 = 8;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

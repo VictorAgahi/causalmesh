@@ -1,4 +1,8 @@
-use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
+use mesh_core::{
+    service_from_client_field_name, CompactStr, ContractNode, FilePath, NodeKind, RepoId,
+    CLIENT_FIELD_BINDING_PREFIX, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
+    RPC_INHERITED_METHOD_PREFIX,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -135,8 +139,10 @@ impl TypeScriptExtractor {
             &mut raw_rpc_calls,
             0,
         );
-        Self::collect_method_rpc_calls(root, source_bytes, &mut raw_rpc_calls);
+        let fields = Self::client_fields(root, source_bytes);
+        Self::collect_method_rpc_calls(root, source_bytes, &fields, &mut raw_rpc_calls);
         Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);
+        Self::record_client_field_bindings(root, source_bytes, &fields, &nodes, rpc_calls);
         nodes
     }
 
@@ -814,13 +820,22 @@ impl TypeScriptExtractor {
     /// declared (field or constructor parameter property) with an `XClient`
     /// type. Recorded as `=X.method`, resolved in the graph by exact
     /// `Service.Method` only. A field that is never bound in this file (set
-    /// in a base class of another file) but *named* like a client
-    /// (`userService`, `userClient`) is recorded as `~UserService.method`: same
-    /// exact-only resolution, heuristic confidence. See
-    /// `mesh_core::contracts` for the prefixes. 7.0.0 only knew the
-    /// `getService` call site itself, so `analyze_grpc SignUp` found no client.
-    fn collect_method_rpc_calls(root: Node, source: &[u8], raw: &mut Vec<RawRpcCall>) {
-        let fields = Self::client_fields(root, source);
+    /// in a base class of another file) is recorded as
+    /// `^Base#field.method` when the class `extends Base` and does not declare
+    /// the field itself — the graph resolves it through `Base`'s own binding
+    /// (see [`Self::record_client_field_bindings`]), else from the field's
+    /// name. With no base class, a field *named* like a client (`userService`,
+    /// `userClient`) is recorded as `~UserService.method`: same exact-only
+    /// resolution, heuristic confidence. See `mesh_core::contracts` for the
+    /// prefixes. 7.0.0 only knew the `getService` call site itself, so
+    /// `analyze_grpc SignUp` found no client.
+    fn collect_method_rpc_calls(
+        root: Node,
+        source: &[u8],
+        fields: &HashMap<(Option<usize>, String), String>,
+        raw: &mut Vec<RawRpcCall>,
+    ) {
+        let declared = Self::declared_fields(root, source);
         Self::walk(root, &mut |node| {
             if node.kind() != "call_expression" {
                 return;
@@ -843,11 +858,18 @@ impl TypeScriptExtractor {
             else {
                 return;
             };
-            let class = Self::enclosing_class_start(node);
-            let target = match fields.get(&(class, field.to_string())) {
-                Some(service) => format!("={service}.{method}"),
-                None => match Self::service_from_field_name(field) {
-                    Some(service) => format!("~{service}.{method}"),
+            let class = Self::enclosing_class(node);
+            let key = (class.map(|c| c.start_byte()), field.to_string());
+            let base = class
+                .filter(|_| !declared.contains(&key))
+                .and_then(|c| Self::class_base_name(c, source));
+            let target = match (fields.get(&key), base) {
+                (Some(service), _) => format!("{RPC_EXACT_METHOD_PREFIX}{service}.{method}"),
+                (None, Some(base)) => {
+                    format!("{RPC_INHERITED_METHOD_PREFIX}{base}#{field}.{method}")
+                }
+                (None, None) => match service_from_client_field_name(field) {
+                    Some(service) => format!("{RPC_INFERRED_METHOD_PREFIX}{service}.{method}"),
                     None => return,
                 },
             };
@@ -871,19 +893,132 @@ impl TypeScriptExtractor {
         node.child_by_field_name("property")?.utf8_text(source).ok()
     }
 
-    /// Start byte of the class declaring `node`, if any: fields are per class.
-    fn enclosing_class_start(node: Node) -> Option<usize> {
+    fn is_class(node: Node) -> bool {
+        matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration" | "class"
+        )
+    }
+
+    /// The class declaring `node`, if any: fields are per class.
+    fn enclosing_class(node: Node) -> Option<Node> {
         let mut current = node.parent();
         while let Some(n) = current {
-            if matches!(
-                n.kind(),
-                "class_declaration" | "abstract_class_declaration" | "class"
-            ) {
-                return Some(n.start_byte());
+            if Self::is_class(n) {
+                return Some(n);
             }
             current = n.parent();
         }
         None
+    }
+
+    /// Start byte of the class declaring `node`, if any.
+    fn enclosing_class_start(node: Node) -> Option<usize> {
+        Self::enclosing_class(node).map(|c| c.start_byte())
+    }
+
+    /// `class X extends Base<T>` / `extends ns.Base` -> `Base`.
+    fn class_base_name<'s>(class: Node, source: &'s [u8]) -> Option<&'s str> {
+        let mut cursor = class.walk();
+        let heritage = class
+            .children(&mut cursor)
+            .find(|c| c.kind() == "class_heritage")?;
+        let mut cursor = heritage.walk();
+        let extends = heritage
+            .children(&mut cursor)
+            .find(|c| c.kind() == "extends_clause")?;
+        let value = extends.child_by_field_name("value")?;
+        let value = match value.kind() {
+            "member_expression" => value.child_by_field_name("property")?,
+            _ => value,
+        };
+        let text = value.utf8_text(source).ok()?;
+        let name = text.split('<').next()?.trim();
+        (!name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .then_some(name)
+    }
+
+    /// Every (class start byte, field name) a class declares itself — field
+    /// definitions and constructor parameter properties, typed or not — so a
+    /// call through one of them is never taken for an inherited field.
+    fn declared_fields(root: Node, source: &[u8]) -> HashSet<(Option<usize>, String)> {
+        let mut declared = HashSet::new();
+        Self::walk(root, &mut |node| {
+            let name_node = match node.kind() {
+                "public_field_definition" => node.child_by_field_name("name"),
+                "required_parameter" | "optional_parameter" => {
+                    let mut cursor = node.walk();
+                    let is_property = node
+                        .children(&mut cursor)
+                        .any(|c| matches!(c.kind(), "accessibility_modifier" | "readonly"));
+                    if !is_property {
+                        return;
+                    }
+                    node.child_by_field_name("pattern")
+                }
+                _ => return,
+            };
+            if let Some(name) = name_node.and_then(|n| n.utf8_text(source).ok()) {
+                declared.insert((Self::enclosing_class_start(node), name.to_string()));
+            }
+        });
+        declared
+    }
+
+    /// One [`CLIENT_FIELD_BINDING_PREFIX`] record (`#field=Service`) per
+    /// client field a named class binds, attached to that class's node, so a
+    /// subclass in another file can resolve `this.field.method()` (the
+    /// `^Base#field.method` records of [`Self::collect_method_rpc_calls`]).
+    /// Sorted, so the output does not depend on `HashMap` order.
+    fn record_client_field_bindings(
+        root: Node,
+        source: &[u8],
+        fields: &HashMap<(Option<usize>, String), String>,
+        nodes: &[ContractNode],
+        out: &mut Vec<(usize, CompactStr)>,
+    ) {
+        let mut bindings: Vec<(usize, String)> = Vec::new();
+        for ((class_start, field), service) in fields {
+            let Some(start) = *class_start else {
+                continue;
+            };
+            let Some(class) = root
+                .descendant_for_byte_range(start, start)
+                .and_then(|mut n| loop {
+                    if Self::is_class(n) && n.start_byte() == start {
+                        break Some(n);
+                    }
+                    n = n.parent()?;
+                })
+            else {
+                continue;
+            };
+            let Some(name) = class
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            else {
+                continue;
+            };
+            let line = class.start_position().row + 1;
+            let Some(idx) = nodes.iter().position(|n| {
+                n.kind == NodeKind::ServiceClass && n.name.as_str() == name && n.line_start == line
+            }) else {
+                continue;
+            };
+            bindings.push((
+                idx,
+                format!("{CLIENT_FIELD_BINDING_PREFIX}{field}={service}"),
+            ));
+        }
+        bindings.sort_unstable();
+        out.extend(
+            bindings
+                .into_iter()
+                .map(|(idx, record)| (idx, CompactStr::new(record))),
+        );
     }
 
     /// Fields of this file's classes that hold a generated gRPC client, keyed
@@ -966,19 +1101,6 @@ impl TypeScriptExtractor {
                     .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()));
                 stripped.unwrap_or(stem).to_string()
             })
-    }
-
-    /// `userService` / `userClient` -> `UserService`; anything else -> `None`.
-    fn service_from_field_name(field: &str) -> Option<String> {
-        let stem = field
-            .strip_suffix("Client")
-            .or_else(|| field.strip_suffix("Service"))?;
-        if stem.is_empty() || !stem.starts_with(|c: char| c.is_ascii_lowercase()) {
-            return None;
-        }
-        let mut chars = stem.chars();
-        let first = chars.next()?.to_ascii_uppercase();
-        Some(format!("{first}{}Service", chars.as_str()))
     }
 
     /// Pre-order walk of every node under `root`, iterative (no recursion
@@ -1443,6 +1565,139 @@ export class Seed {
                 || e.metadata
                     .as_deref()
                     .is_some_and(|m| !m.starts_with(['=', '~']))));
+    }
+
+    /// Volontariapp 7.0.6 report, defects 1 and 2: the gateway's call to
+    /// `CreateEvent` goes through a field bound in a base class of another
+    /// file, and a neighbour RPC (`CreateEventNode`) must not be traced as it.
+    #[test]
+    fn inherited_client_fields_resolve_and_neighbour_rpcs_are_not_anchors() {
+        let mut graph = ContractGraph::new();
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("proto/event.proto"),
+            "syntax = \"proto3\";\npackage ev;\nservice EventCommandService { rpc CreateEvent (A) returns (B); }\nservice ParticipationCommandService { rpc CreateEventNode (A) returns (B); }\n",
+            0,
+            &mut graph,
+        );
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("gw/src/base-grpc.controller.ts"),
+            r#"
+export abstract class BaseEventGrpcController implements OnModuleInit {
+  protected commandService!: WithMetadata<EventCommandServiceClient>;
+  constructor(@Inject(EVENT_PACKAGE) protected client: ClientGrpc) {}
+  onModuleInit() {
+    this.commandService = this.client.getService<EventCommandServiceClient>(EVENT_COMMAND_SERVICE_NAME);
+  }
+}
+"#,
+            1,
+            &mut graph,
+        );
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("gw/src/event.command-controller.ts"),
+            r#"
+@Controller('events')
+export class EventCommandController extends BaseEventGrpcController {
+  private readonly logger = new Logger({});
+  @Post()
+  createEvent(@Body() request: CreateEventRequestDTO) {
+    this.logger.log('x');
+    return this.commandService.createEvent(request.toCommand(), metadata);
+  }
+}
+"#,
+            1,
+            &mut graph,
+        );
+        crate::languages::PolyglotIndexer::index_file(
+            Path::new("social/src/participation.controller.ts"),
+            r#"
+export class ParticipationController {
+  @GrpcMethod('ParticipationCommandService', 'CreateEventNode')
+  createEventNode(req: any) { return req; }
+}
+"#,
+            2,
+            &mut graph,
+        );
+        graph.reconcile_edges();
+
+        let trace = graph.analyze_grpc("CreateEvent");
+        let clients: Vec<(&str, EdgeConfidence)> = trace
+            .client_stubs
+            .iter()
+            .map(|(n, c)| (n.name.as_str(), *c))
+            .collect();
+        assert!(
+            clients.contains(&("createEvent", EdgeConfidence::Exact)),
+            "inherited field resolved through the base class binding: {clients:?}"
+        );
+        assert!(
+            !trace
+                .server_handlers
+                .iter()
+                .any(|(n, _)| n.name.contains("createEventNode")
+                    || n.name.contains("CreateEventNode")),
+            "CreateEventNode's handler is not CreateEvent's: {:?}",
+            trace.server_handlers
+        );
+        assert!(
+            trace
+                .related_rpcs
+                .iter()
+                .any(|n| n.name.ends_with("CreateEventNode")),
+            "the neighbour is reported as left out: {:?}",
+            trace.related_rpcs
+        );
+        let node = graph.analyze_grpc("CreateEventNode");
+        assert!(
+            !node.server_handlers.is_empty() && node.related_rpcs.is_empty(),
+            "{node:?}"
+        );
+        assert!(graph
+            .all_edges()
+            .iter()
+            .all(|e| e.kind != EdgeKind::CallsRpc
+                || e.metadata
+                    .as_deref()
+                    .is_some_and(|m| !m.starts_with(['=', '~', '^', '#']))));
+    }
+
+    /// An inherited field whose base class binds nothing known falls back to
+    /// the field-name inference, heuristic; a field the class declares itself
+    /// is never looked up in the base.
+    #[test]
+    fn inherited_field_records_and_fallbacks() {
+        let code = r#"
+export class A extends Base {
+  private readonly userService: UserDomainService;
+  a() { return this.commandService.createEvent({}); }
+  b() { return this.userService.signUp({}); }
+  c() { return this.repo.save({}); }
+}
+export class Plain {
+  d() { return this.eventService.getEvent({}); }
+}
+"#;
+        let (nodes, rpc_calls) = extract_rpc_with(
+            "a.controller.ts",
+            code,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        );
+        let calls: Vec<(&str, &str)> = rpc_calls
+            .iter()
+            .map(|(i, t)| (nodes[*i].name.as_str(), t.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("a", "^Base#commandService.createEvent")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&("b", "~UserService.signUp")), "{calls:?}");
+        assert!(calls.contains(&("c", "^Base#repo.save")), "{calls:?}");
+        assert!(
+            calls.contains(&("d", "~EventService.getEvent")),
+            "{calls:?}"
+        );
     }
 
     #[test]

@@ -5,6 +5,31 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.7] — 2026-09-28
+
+`analyze_grpc` answers (Volontariapp 7.0.6 report, critical defects 1 and 2). Measured on the
+Volontariapp workspace against the report's `rg` ground truth, 6 RPCs: clients 8/8 (7.0.6: 6/8,
+plus 1 false positive), handlers 5/5 with no false positive (7.0.6: 5 right out of 9 listed).
+
+### Fixed
+- **RPCs whose name contains the target were traced as the target.** `CreateEvent` listed
+  `CreateEventNode`'s handler, `UpdateUser` listed `AdminUpdateUser`'s. Any `.proto` node matching
+  by substring was an anchor. Now, once a service or method matches by name (or by full
+  `package.Service/Method`), substring-only matches are dropped and named in a "Not traced" line;
+  substring matching remains the fallback when nothing matches by name. Same rule in
+  `analyze_impact`'s gRPC part.
+- **Calls through an inherited client field were invisible**: 75 gateway calls in 22 files use
+  `this.commandService` / `this.queryService` bound in `BaseEventGrpcController` (another file).
+  Each class's client fields are now recorded, and a call through a field the class does not
+  declare resolves through its base class's binding (`extends Base`), falling back to the field
+  name as before. Measured: 75/75 of those call sites now have an `exact` edge to their RPC.
+- **"Client Stubs (1 found)" with no caveat while another caller was unresolved.** The
+  "may call this method" list was only computed when no client at all resolved. It is now always
+  computed, and says the list may be incomplete. Files that hold the service's client in a typed
+  field are left out of it: every call through such a field is recorded method by method, so they
+  are known not to call the method (7.0.6 listed `relationship.query-controller.ts` for `SignUp`).
+- Index cache schema v8.
+
 ## [7.0.6] — 2026-09-28
 
 Release hygiene (Volontariapp report, point 15).

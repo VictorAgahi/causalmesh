@@ -73,8 +73,11 @@ confirmation — merging into `.cursor/mcp.json` and `.vscode/mcp.json` without 
 servers, and keeping an existing `.agents/mesh-mcp.toml` byte-for-byte — then checks the result
 with `mesh-mcp doctor --json` and fails loudly on any `error` check. It never downloads anything.
 
-During the pilot, `mesh-mcp stats --since all` reports per-tool latency p50/p95, the `isError`
-rate, the index cache hit rate and `meshd` restarts from the local audit database. The A/B
+During the pilot, `mesh-mcp stats --since all` reports calls per session (one per agent
+connection; `--session <id>` keeps one), per-tool latency p50/p95 (p95 from 20 timed calls on),
+the `isError` rate, the index cache hit rate and `meshd` restarts from the local audit database;
+`--json` prints the same summary on stdout. Point `MESH_AUDIT_DB` (or `stats --db`) at a
+dedicated file to keep pilot calls apart from any other use of MeshMCP on the machine. The A/B
 measurement protocol is in [`docs/pilot-scorecard.md`](docs/pilot-scorecard.md).
 
 ### Try it on the bundled demo
@@ -201,22 +204,25 @@ Abridged output (the exact lines depend on the platform and configuration):
 ```
 🔍 Running MeshMCP Diagnostic Healthcheck (v7.0.0, commit: ...)...
 
-✔ Config syntax: Valid (.agents/mesh-mcp.toml)
-✔ Jailed roots verified (6/6 allowed roots, 0 escapes detected)
+✔ Config syntax: valid (.agents/mesh-mcp.toml)
 ℹ Project skills: none configured ([engines.policy.skills])
+✔ Jailed roots: 6 allowed root(s) resolved
 ✔ Root overlap: 6 root(s), none overlapping
-✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)
-✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
-✔ Toolchain utilities: git & ripgrep detected
-⚠ Index health: ... files rejected (oversized, binary, guard, parse failure), first 10 listed
+✔ Symlink invariants: follow_links=false verified (crawler rejects symlink traversal)
+✔ Secret redaction engine: active (test secrets masked)
+✔ Tree-sitter parsers: initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
+✔ Toolchain utilities: git and ripgrep detected
+⚠ Index health: ... file(s) scanned, ... indexed, ... not indexed, first 10 listed
+    (... non-source file(s) skipped: images, fonts, archives, lockfiles, bundles)
     Searches cannot return these files; read them directly.
 
 ✔ Socket permissions: socket 0600, directory 0700 (owner-only)
 ✔ Audit trail: quick_check and hash chain: ok
 ```
 
-The last block (socket, daemon version, Linux sandbox, caches, audit chain) is what
-`mesh-mcp doctor --json` prints on stdout and what `mesh-mcp doctor --fix` repairs. Some lines are
+`mesh-mcp doctor --json` prints every one of these checks as a JSON array on stdout; the last
+block (socket, daemon version, Linux sandbox, caches, audit chain) is what `mesh-mcp doctor --fix`
+repairs. Some lines are
 informational only; see [docs/development.md](docs/development.md#6-mesh-mcp-doctor) for which.
 
 `doctor` validates syntax and roots — it does not tell you whether the *content* was understood.

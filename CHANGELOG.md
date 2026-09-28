@@ -5,6 +5,36 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.1] — 2026-09-28
+
+Fixes from the first field report on a NestJS / TypeScript / React Native workspace (Volontariapp,
+15 repositories), measured on 7.0.0.
+
+### Fixed
+- **`mesh-mcp stats --since 7é` panicked** slicing inside a multi-byte character; any non-ASCII
+  unit is now a plain error.
+- **Every tool call was audited as session `active-session`**, so agent sessions could not be told
+  apart. `meshd` now audits each client connection under its own session id (the standalone server
+  uses one per process), and `stats` lists sessions and filters one with `--session <id>`.
+- **Tests and benchmarks wrote into the real `~/.cache/mesh-mcp/audit.db`** (314 `test_slow_op`
+  calls and scale-bench files dominated `stats` on a developer machine). `meshd`'s tests use an
+  in-memory database, the benchmark scripts set `MESH_AUDIT_DB`, a new environment variable that
+  moves the default audit database; `stats --db <path>` reads another file.
+- **`stats` reported a p95 over a single sample.** p95 is now shown from 20 timed calls on
+  (`-` below, with a note). "Most-queried" is renamed to what it counts ("most-returned files"),
+  multi-root workspaces print relative to their common ancestor, session timestamps are
+  normalized to ISO 8601 whatever format the row was written in, and `--json` prints the summary.
+- **`doctor --json` only printed 4 of the checks.** Every section is now a structured check, so
+  `--json` prints all of them (index health included); volatile figures (RSS) stay in the text
+  report so two runs remain identical.
+- **`doctor` logged a "Sandbox escape attempt" for its own symlink probe on macOS**, and the probe
+  then passed without testing anything: the temp directory was not canonicalized before being
+  used as the jail root. The "JSON-RPC serialization baseline" line (timing one tiny
+  serialization) is removed, memory is measured before doctor's own index scan, and the last line
+  now counts errors and warnings instead of always reading "All systems operational".
+- **Index health listed `yarn.lock` and PNGs as "not indexed"**. Non-source files (images, fonts,
+  archives, lockfiles, minified bundles) are counted as skipped, never listed.
+
 ## [7.0.0] — 2026-09-27
 
 **Plan 4 (P3) complete: enterprise readiness, scale tiers, and field stabilization.** Major

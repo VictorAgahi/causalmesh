@@ -4,15 +4,13 @@ use mesh_parsers::AstGuard;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use notify::Watcher;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 pub struct DoctorCommand;
 
-/// One repairable-health finding (plan 4 step 4.7): socket permissions, a
-/// stale daemon version, a corrupt or legacy cache, an orphaned per-version
-/// workspace directory. Separate from sections 1-9's plain prose above, which
-/// stay exactly as they were — these are the checks `--fix` can act on and
-/// `--json` renders as structured output for install scripts.
+/// One doctor finding. Every section produces these, so `--json` renders the
+/// whole report (7.0.0 only rendered the repairable checks of plan 4 step 4.7:
+/// socket permissions, a stale daemon version, a corrupt or legacy cache, an
+/// orphaned per-version workspace directory — the ones `--fix` can act on).
 #[derive(Debug, Clone, serde::Serialize)]
 struct DoctorCheck {
     name: &'static str,
@@ -23,6 +21,10 @@ struct DoctorCheck {
     /// `Some(true/false)` for whether the attempted fix succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     fixed: Option<bool>,
+    /// A volatile measurement shown in the text report only: `--json` must be
+    /// identical between two runs on the same machine (`test_install_pilot.sh`).
+    #[serde(skip)]
+    detail: Option<String>,
 }
 
 impl DoctorCheck {
@@ -32,6 +34,7 @@ impl DoctorCheck {
             status: "ok",
             message: message.into(),
             fixed: None,
+            detail: None,
         }
     }
     fn warn(name: &'static str, message: impl Into<String>) -> Self {
@@ -40,6 +43,7 @@ impl DoctorCheck {
             status: "warn",
             message: message.into(),
             fixed: None,
+            detail: None,
         }
     }
     fn error(name: &'static str, message: impl Into<String>) -> Self {
@@ -48,6 +52,7 @@ impl DoctorCheck {
             status: "error",
             message: message.into(),
             fixed: None,
+            detail: None,
         }
     }
     fn info(name: &'static str, message: impl Into<String>) -> Self {
@@ -56,10 +61,17 @@ impl DoctorCheck {
             status: "info",
             message: message.into(),
             fixed: None,
+            detail: None,
         }
     }
     fn with_fixed(mut self, fixed: bool) -> Self {
         self.fixed = Some(fixed);
+        self
+    }
+    // Only the Unix memory check has a volatile figure to attach today.
+    #[cfg(unix)]
+    fn with_detail(mut self, detail: String) -> Self {
+        self.detail = Some(detail);
         self
     }
     fn icon(&self) -> &'static str {
@@ -74,25 +86,380 @@ impl DoctorCheck {
 
 impl DoctorCommand {
     /// Scans the workspace once (no persistent cache, nothing written) and
-    /// prints the rejected-file summary: counts per reason, first 10 paths.
-    /// Returns (errors, warnings) count.
-    fn report_index_health(config_path: Option<&Path>) -> (usize, usize) {
+    /// reports the rejected-file summary: counts per reason, first 10 paths.
+    fn index_health_check(config_path: Option<&Path>) -> DoctorCheck {
         let Ok((config, base_dir)) = WorkspaceIndexer::discover_config(config_path) else {
-            eprintln!("ℹ Index health: skipped (no config to scan)");
-            return (0, 0);
+            return DoctorCheck::info("Index health", "skipped (no config to scan)");
         };
         let roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
         let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
         let health = &snapshot.health;
         let summary = health.render_summary(10);
+        let summary = summary.trim_end();
         if health.rejected.is_empty() && health.rejected_overflow == 0 {
-            eprint!("✔ Index health: {summary}");
-            (0, 0)
+            DoctorCheck::ok("Index health", summary)
         } else {
-            eprintln!(
-                "⚠ Index health: {summary}    Searches cannot return these files; read them directly."
-            );
-            (0, 1)
+            DoctorCheck::warn(
+                "Index health",
+                format!("{summary}\n    Searches cannot return these files; read them directly."),
+            )
+        }
+    }
+
+    /// Config-derived checks (sections 1-1d): syntax, jailed roots, skill files,
+    /// dead path patterns, overlapping roots.
+    fn config_checks(cfg_path: Option<&Path>, checks: &mut Vec<DoctorCheck>) {
+        let Some(p) = cfg_path else {
+            checks.push(DoctorCheck::info(
+                "Config syntax",
+                "no local config file found (run 'mesh-mcp init --auto')",
+            ));
+            return;
+        };
+        let cfg = match Config::load_from_file(p) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                checks.push(DoctorCheck::error(
+                    "Config syntax",
+                    format!("INVALID ({}) - {e}", p.display()),
+                ));
+                return;
+            }
+        };
+        checks.push(DoctorCheck::ok(
+            "Config syntax",
+            format!("valid ({})", p.display()),
+        ));
+        let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
+
+        // 1b. Configured skill files must exist, or the recommendation silently never fires.
+        let mut skill_cfg = cfg.clone();
+        skill_cfg.resolve_skill_paths(base_dir);
+        let skills = skill_cfg
+            .engines
+            .policy
+            .as_ref()
+            .map(|pol| pol.skills.clone())
+            .unwrap_or_default();
+        if skills.is_empty() {
+            checks.push(DoctorCheck::info(
+                "Project skills",
+                "none configured ([engines.policy.skills])",
+            ));
+        } else {
+            let missing: Vec<String> = skills
+                .iter()
+                .filter(|(_, resolved)| !Path::new(resolved.as_str()).exists())
+                .map(|(key, resolved)| format!("{key} -> {resolved}"))
+                .collect();
+            if missing.is_empty() {
+                checks.push(DoctorCheck::ok(
+                    "Project skills",
+                    format!("{} configured, all files found", skills.len()),
+                ));
+            } else {
+                checks.push(DoctorCheck::error(
+                    "Project skills",
+                    format!(
+                        "{} of {} file(s) missing — these keys will never recommend anything: {}",
+                        missing.len(),
+                        skills.len(),
+                        missing.join("; ")
+                    ),
+                ));
+            }
+        }
+
+        let Ok(roots) = expand_roots(
+            &cfg.workspace.roots,
+            base_dir,
+            &cfg.workspace.workspace_root,
+        ) else {
+            checks.push(DoctorCheck::warn(
+                "Jailed roots",
+                "no roots resolved or syntax error",
+            ));
+            return;
+        };
+        checks.push(DoctorCheck::ok(
+            "Jailed roots",
+            format!("{} allowed root(s) resolved", roots.len()),
+        ));
+
+        // 1c. Dead configuration pattern inspection on positive selection fields.
+        let root_names: Vec<String> = roots
+            .iter()
+            .filter_map(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        for pat in &cfg.workspace.exclude_patterns {
+            for root_name in &root_names {
+                if pat.starts_with(root_name) || pat.contains(&format!("/{root_name}/")) {
+                    checks.push(DoctorCheck::info(
+                        "Exclude pattern",
+                        format!(
+                            "pattern '{pat}' includes root name '{root_name}'; MeshMCP automatically resolves root-prefixed patterns"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let crawl_root = |root: &PathBuf| -> Vec<PathBuf> {
+            mesh_core::ValidatedScope::resolve_with_aliases(
+                &root.to_string_lossy(),
+                &roots,
+                &cfg.workspace.mount_aliases,
+                None,
+            )
+            .map(|scope| mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(SCAN_DEPTH)))
+            .unwrap_or_default()
+        };
+
+        if let Some(docs) = &cfg.engines.docs {
+            if !docs.paths.is_empty() {
+                let docs_matcher = mesh_core::ExcludeMatcher::compile(&docs.paths);
+                for root in &roots {
+                    for f in crawl_root(root) {
+                        if let Ok(rel) = f.strip_prefix(root) {
+                            let _ = docs_matcher.is_excluded_with_root(rel, Some(root));
+                        }
+                    }
+                }
+                let dead_docs = docs_matcher.unmatched_patterns();
+                if dead_docs.is_empty() {
+                    checks.push(DoctorCheck::ok(
+                        "Docs path patterns",
+                        format!(
+                            "{} configured, all patterns matched scanned files",
+                            docs.paths.len()
+                        ),
+                    ));
+                } else {
+                    for dead in dead_docs {
+                        checks.push(DoctorCheck::warn(
+                            "Docs path patterns",
+                            format!("'{dead}' in [engines.docs.paths] matched 0 files — likely dead config"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(contracts) = &cfg.engines.contracts {
+            if let Some(grpc) = &contracts.grpc {
+                if !grpc.proto_dirs.is_empty() {
+                    // Reuse the real runtime matcher (ExtractConfig::allows_proto_path)
+                    // instead of reimplementing the substring/prefix logic here, so
+                    // this check can never drift from what extraction actually does.
+                    // Test one dir at a time (via a single-entry ExtractConfig clone)
+                    // to keep per-directory reporting.
+                    let base_extract_cfg = mesh_parsers::ExtractConfig::from_contracts(contracts);
+                    let mut matched_dirs = std::collections::HashSet::new();
+                    for root in &roots {
+                        for f in crawl_root(root) {
+                            if f.extension().is_some_and(|ext| ext == "proto") {
+                                let p_str = f.to_string_lossy();
+                                for dir in &grpc.proto_dirs {
+                                    let mut single_dir_cfg = base_extract_cfg.clone();
+                                    single_dir_cfg.proto_dirs = vec![dir.clone()];
+                                    if single_dir_cfg.allows_proto_path(&p_str) {
+                                        matched_dirs.insert(dir.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for dir in &grpc.proto_dirs {
+                        if !matched_dirs.contains(dir) {
+                            checks.push(DoctorCheck::warn(
+                                "Proto directories",
+                                format!("'{dir}' in [engines.contracts.grpc.proto_dirs] matched 0 files — likely dead config"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let Some(openapi) = &contracts.openapi {
+                if !openapi.spec_files.is_empty() {
+                    let extract_cfg = mesh_parsers::ExtractConfig::from_contracts(contracts);
+                    let any_spec = roots.iter().any(|root| {
+                        crawl_root(root)
+                            .iter()
+                            .any(|f| extract_cfg.allows_openapi_spec(&f.to_string_lossy()))
+                    });
+                    if !any_spec {
+                        for spec in &openapi.spec_files {
+                            checks.push(DoctorCheck::warn(
+                                "Spec files",
+                                format!("'{spec}' in [engines.contracts.openapi.spec_files] matched 0 files — likely dead config"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1d. Overlapping roots: `expand_roots` only dedupes identical
+        // canonical paths, so an enclosing root and one of its own
+        // subdirectories (e.g. `roots = [".", "./services/*"]`) can both
+        // be configured. The indexer now resolves this deterministically
+        // (the more specific root wins the overlapping files, see
+        // `WorkspaceIndexer::crawl_all`), but the config itself is still
+        // worth flagging: it means one of the roots is redundant.
+        let mut overlaps = 0usize;
+        for outer in &roots {
+            for inner in &roots {
+                if inner != outer && inner.starts_with(outer) {
+                    overlaps += 1;
+                    checks.push(DoctorCheck::warn(
+                        "Root overlap",
+                        format!(
+                            "'{}' is inside '{}' — files under it are indexed only once, attributed to the more specific root",
+                            inner.display(),
+                            outer.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        if overlaps == 0 {
+            checks.push(DoctorCheck::ok(
+                "Root overlap",
+                format!("{} root(s), none overlapping", roots.len()),
+            ));
+        }
+    }
+
+    /// Section 2: the crawler never follows a symlink. The probe directory is
+    /// canonicalized before it is used as the jail root: on macOS the temp dir
+    /// (`/var/folders/…`) canonicalizes to `/private/var/…`, so the uncanonicalized
+    /// root made `ValidatedScope::resolve` log a "Sandbox escape attempt" for
+    /// doctor's own probe and the check passed without testing anything.
+    fn symlink_check() -> DoctorCheck {
+        let probe_dir =
+            std::env::temp_dir().join(format!("mesh-symlink-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&probe_dir);
+        let outcome = (|| -> Result<bool, String> {
+            let probe_dir = dunce::canonicalize(&probe_dir).map_err(|e| e.to_string())?;
+            let target = probe_dir.join("target");
+            let link = probe_dir.join("link");
+            std::fs::write(&target, "content").map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&target, &link).map_err(|e| e.to_string())?;
+            #[cfg(not(any(unix, windows)))]
+            return Err("no symlink support on this platform".to_string());
+            let roots = vec![probe_dir.clone()];
+            let scope = mesh_core::ValidatedScope::resolve(&probe_dir.to_string_lossy(), &roots)
+                .map_err(|e| e.to_string())?;
+            let crawled = mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(2));
+            Ok(!crawled.contains(&link))
+        })();
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        match outcome {
+            Ok(true) => DoctorCheck::ok(
+                "Symlink invariants",
+                "follow_links=false verified (crawler rejects symlink traversal)",
+            ),
+            Ok(false) => DoctorCheck::error(
+                "Symlink invariants",
+                "symlink traversal detected in crawler",
+            ),
+            // Windows without developer mode cannot create symlinks: nothing to verify.
+            Err(e) => DoctorCheck::info("Symlink invariants", format!("probe not run: {e}")),
+        }
+    }
+
+    /// Section 4: the host's native file-event subsystem.
+    fn event_subsystem_check() -> DoctorCheck {
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches") {
+                Ok(content) => {
+                    let watches: u64 = content.trim().parse().unwrap_or(0);
+                    if watches >= 524_288 {
+                        DoctorCheck::ok(
+                            "Host OS event subsystem",
+                            format!("inotify: {watches} watches available"),
+                        )
+                    } else {
+                        DoctorCheck::warn(
+                            "Host OS event subsystem",
+                            format!("inotify: {watches} watches (low: recommend >= 524,288)"),
+                        )
+                    }
+                }
+                Err(e) => DoctorCheck::warn(
+                    "Host OS event subsystem",
+                    format!("inotify limit unreadable: {e}"),
+                ),
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let name = if cfg!(target_os = "macos") {
+                "FSEvents"
+            } else {
+                "ReadDirectoryChangesW"
+            };
+            match notify::RecommendedWatcher::new(|_| {}, notify::Config::default()) {
+                Ok(_) => DoctorCheck::ok("Host OS event subsystem", format!("native ({name})")),
+                Err(e) => DoctorCheck::warn("Host OS event subsystem", format!("{name}: {e}")),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            DoctorCheck::info(
+                "Host OS event subsystem",
+                "not checked on this platform (polling watcher)",
+            )
+        }
+    }
+
+    /// Section 9: peak resident memory of this process so far.
+    fn memory_check() -> DoctorCheck {
+        #[cfg(unix)]
+        {
+            let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) } == 0 {
+                let rusage = unsafe { rusage.assume_init() };
+                #[cfg(target_os = "macos")]
+                let mb = rusage.ru_maxrss as f64 / (1024.0 * 1024.0);
+                #[cfg(not(target_os = "macos"))]
+                let mb = rusage.ru_maxrss as f64 / 1024.0;
+                let detail = format!("{mb:.1} MiB RSS");
+                return if mb < 50.0 {
+                    DoctorCheck::ok("Memory baseline", "peak RSS under 50 MiB").with_detail(detail)
+                } else {
+                    DoctorCheck::warn(
+                        "Memory baseline",
+                        "peak RSS over 50 MiB (expected under 50 MiB)",
+                    )
+                    .with_detail(detail)
+                };
+            }
+        }
+        DoctorCheck::info("Memory baseline", "RSS not measurable on this platform")
+    }
+
+    /// Section 8: external tools MeshMCP shells out to.
+    fn toolchain_check() -> DoctorCheck {
+        let has = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        match (has("git"), has("rg")) {
+            (true, true) => DoctorCheck::ok("Toolchain utilities", "git and ripgrep detected"),
+            (true, false) => DoctorCheck::ok(
+                "Toolchain utilities",
+                "git detected (ripgrep recommended for large repos)",
+            ),
+            (false, _) => DoctorCheck::warn("Toolchain utilities", "git not found in PATH"),
         }
     }
 
@@ -101,16 +468,14 @@ impl DoctorCommand {
         fix: bool,
         json: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!(
-            "🔍 Running MeshMCP Diagnostic Healthcheck (v{}, commit: {})...\n",
-            env!("CARGO_PKG_VERSION"),
-            option_env!("GIT_HASH").unwrap_or("dev")
-        );
+        if !json {
+            eprintln!(
+                "🔍 Running MeshMCP Diagnostic Healthcheck (v{}, commit: {})...\n",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("GIT_HASH").unwrap_or("dev")
+            );
+        }
 
-        let mut total_errors: usize = 0;
-        let mut total_warnings: usize = 0;
-
-        // 1. Config syntax
         let default_paths = [
             PathBuf::from(".agents/mesh-mcp.toml"),
             PathBuf::from("mesh-mcp.toml"),
@@ -122,439 +487,56 @@ impl DoctorCommand {
                 .map(|p| p.as_path())
         });
 
-        if let Some(p) = cfg_path {
-            match Config::load_from_file(p) {
-                Ok(cfg) => {
-                    eprintln!("✔ Config syntax: Valid ({})", p.display());
-                    let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
-                    if let Ok(roots) = expand_roots(
-                        &cfg.workspace.roots,
-                        base_dir,
-                        &cfg.workspace.workspace_root,
-                    ) {
-                        let roots_count = roots.len();
-                        eprintln!("✔ Jailed roots verified ({roots_count}/{roots_count} allowed roots, 0 escapes detected)");
-                    } else {
-                        total_warnings += 1;
-                        eprintln!("⚠ Jailed roots warning: No roots resolved or syntax error");
-                    }
-                }
-                Err(e) => {
-                    total_errors += 1;
-                    eprintln!("✖ Config syntax: INVALID ({}) - {e}", p.display());
-                }
-            }
-        } else {
-            eprintln!("ℹ Config syntax: No local config file found (run 'mesh-mcp init --auto')");
-        }
+        let mut checks: Vec<DoctorCheck> = Vec::new();
+        // Measured before the index-health scan below, which builds a whole
+        // snapshot: the threshold is about the process at boot, not after that.
+        let memory = Self::memory_check();
 
-        // 1b. Configured skill files must exist, or the recommendation silently never fires.
-        if let Some(p) = cfg_path {
-            if let Ok(mut cfg) = Config::load_from_file(p) {
-                let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
-                cfg.resolve_skill_paths(base_dir);
-                let skills = cfg
-                    .engines
-                    .policy
-                    .as_ref()
-                    .map(|pol| pol.skills.clone())
-                    .unwrap_or_default();
+        // 1. Config syntax, roots, skills, dead patterns, overlaps.
+        Self::config_checks(cfg_path, &mut checks);
 
-                if skills.is_empty() {
-                    eprintln!("ℹ Project skills: none configured ([engines.policy.skills])");
-                } else {
-                    let mut missing = Vec::new();
-                    for (key, resolved) in &skills {
-                        if !Path::new(resolved).exists() {
-                            missing.push(format!("{key} -> {resolved}"));
-                        }
-                    }
-                    if missing.is_empty() {
-                        eprintln!(
-                            "✔ Project skills: {} configured, all files found",
-                            skills.len()
-                        );
-                    } else {
-                        total_errors += missing.len();
-                        eprintln!(
-                            "✖ Project skills: {} of {} file(s) missing — these keys will never recommend anything:",
-                            missing.len(),
-                            skills.len()
-                        );
-                        for m in missing {
-                            eprintln!("    {m}");
-                        }
-                    }
-                }
-            }
-        }
+        // 2. Symlink invariants.
+        checks.push(Self::symlink_check());
 
-        // 1c. Dead configuration pattern inspection on positive selection fields
-        if let Some(p) = cfg_path {
-            if let Ok(cfg) = Config::load_from_file(p) {
-                let base_dir = p.parent().unwrap_or_else(|| Path::new("."));
-                if let Ok(roots) = expand_roots(
-                    &cfg.workspace.roots,
-                    base_dir,
-                    &cfg.workspace.workspace_root,
-                ) {
-                    // Check exclude_patterns for root-name prefix pitfalls
-                    let root_names: Vec<String> = roots
-                        .iter()
-                        .filter_map(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
-                        .collect();
-                    for pat in &cfg.workspace.exclude_patterns {
-                        for root_name in &root_names {
-                            if pat.starts_with(root_name) || pat.contains(&format!("/{root_name}/"))
-                            {
-                                eprintln!(
-                                    "ℹ Exclude pattern note: Pattern '{pat}' includes root name '{root_name}'. MeshMCP automatically resolves root-prefixed patterns."
-                                );
-                            }
-                        }
-                    }
-
-                    // Check positive selection fields (docs.paths, proto_dirs, spec_files) for 0 matches
-                    if let Some(docs) = &cfg.engines.docs {
-                        if !docs.paths.is_empty() {
-                            let docs_matcher = mesh_core::ExcludeMatcher::compile(&docs.paths);
-                            for root in &roots {
-                                if let Ok(scope) = mesh_core::ValidatedScope::resolve_with_aliases(
-                                    &root.to_string_lossy(),
-                                    &roots,
-                                    &cfg.workspace.mount_aliases,
-                                    None,
-                                ) {
-                                    let files = mesh_core::FilesystemCrawler::crawl_scope(
-                                        &scope,
-                                        &[],
-                                        Some(SCAN_DEPTH),
-                                    );
-                                    for f in files {
-                                        if let Ok(rel) = f.strip_prefix(root) {
-                                            let _ =
-                                                docs_matcher.is_excluded_with_root(rel, Some(root));
-                                        }
-                                    }
-                                }
-                            }
-                            let dead_docs = docs_matcher.unmatched_patterns();
-                            if dead_docs.is_empty() {
-                                eprintln!(
-                                    "✔ Docs path patterns: {} configured, all patterns matched scanned files",
-                                    docs.paths.len()
-                                );
-                            } else {
-                                total_warnings += dead_docs.len();
-                                for dead in dead_docs {
-                                    eprintln!(
-                                        "⚠ Path pattern '{dead}' in [engines.docs.paths] matched 0 files — likely dead config"
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(contracts) = &cfg.engines.contracts {
-                        if let Some(grpc) = &contracts.grpc {
-                            if !grpc.proto_dirs.is_empty() {
-                                // Reuse the real runtime matcher (ExtractConfig::allows_proto_path)
-                                // instead of reimplementing the substring/prefix logic here, so
-                                // this check can never drift from what extraction actually does.
-                                // Test one dir at a time (via a single-entry ExtractConfig clone)
-                                // to keep per-directory reporting.
-                                let base_extract_cfg =
-                                    mesh_parsers::ExtractConfig::from_contracts(contracts);
-                                let mut matched_dirs = std::collections::HashSet::new();
-                                for root in &roots {
-                                    if let Ok(scope) =
-                                        mesh_core::ValidatedScope::resolve_with_aliases(
-                                            &root.to_string_lossy(),
-                                            &roots,
-                                            &cfg.workspace.mount_aliases,
-                                            None,
-                                        )
-                                    {
-                                        let files = mesh_core::FilesystemCrawler::crawl_scope(
-                                            &scope,
-                                            &[],
-                                            Some(SCAN_DEPTH),
-                                        );
-                                        for f in files {
-                                            if f.extension().is_some_and(|ext| ext == "proto") {
-                                                let p_str = f.to_string_lossy();
-                                                for dir in &grpc.proto_dirs {
-                                                    let mut single_dir_cfg =
-                                                        base_extract_cfg.clone();
-                                                    single_dir_cfg.proto_dirs = vec![dir.clone()];
-                                                    if single_dir_cfg.allows_proto_path(&p_str) {
-                                                        matched_dirs.insert(dir.clone());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                for dir in &grpc.proto_dirs {
-                                    if !matched_dirs.contains(dir) {
-                                        total_warnings += 1;
-                                        eprintln!(
-                                            "⚠ Proto directory '{dir}' in [engines.contracts.grpc.proto_dirs] matched 0 files — likely dead config"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(openapi) = &contracts.openapi {
-                            if !openapi.spec_files.is_empty() {
-                                let extract_cfg =
-                                    mesh_parsers::ExtractConfig::from_contracts(contracts);
-                                for spec in &openapi.spec_files {
-                                    let mut matched = false;
-                                    for root in &roots {
-                                        if let Ok(scope) =
-                                            mesh_core::ValidatedScope::resolve_with_aliases(
-                                                &root.to_string_lossy(),
-                                                &roots,
-                                                &cfg.workspace.mount_aliases,
-                                                None,
-                                            )
-                                        {
-                                            let files = mesh_core::FilesystemCrawler::crawl_scope(
-                                                &scope,
-                                                &[],
-                                                Some(SCAN_DEPTH),
-                                            );
-                                            for f in files {
-                                                if extract_cfg
-                                                    .allows_openapi_spec(&f.to_string_lossy())
-                                                {
-                                                    matched = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if matched {
-                                            break;
-                                        }
-                                    }
-                                    if !matched {
-                                        total_warnings += 1;
-                                        eprintln!(
-                                            "⚠ Spec file '{spec}' in [engines.contracts.openapi.spec_files] matched 0 files — likely dead config"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 1d. Overlapping roots: `expand_roots` only dedupes identical
-                    // canonical paths, so an enclosing root and one of its own
-                    // subdirectories (e.g. `roots = [".", "./services/*"]`) can both
-                    // be configured. The indexer now resolves this deterministically
-                    // (the more specific root wins the overlapping files, see
-                    // `WorkspaceIndexer::crawl_all`), but the config itself is still
-                    // worth flagging: it means one of the roots is redundant.
-                    let mut overlaps: Vec<(String, String)> = Vec::new();
-                    for outer in &roots {
-                        for inner in &roots {
-                            if inner != outer && inner.starts_with(outer) {
-                                overlaps.push((
-                                    outer.display().to_string(),
-                                    inner.display().to_string(),
-                                ));
-                            }
-                        }
-                    }
-                    if overlaps.is_empty() {
-                        eprintln!("✔ Root overlap: {} root(s), none overlapping", roots.len());
-                    } else {
-                        total_warnings += overlaps.len();
-                        for (outer, inner) in overlaps {
-                            eprintln!(
-                                "⚠ Root overlap: '{inner}' is inside '{outer}' — files under it are indexed only once, attributed to '{inner}' (the more specific root)."
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Symlink invariants
-        let symlink_ok = {
-            let probe_dir =
-                std::env::temp_dir().join(format!("mesh-symlink-probe-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&probe_dir);
-            let target = probe_dir.join("target");
-            let link = probe_dir.join("link");
-            let _ = std::fs::write(&target, "content");
-            #[cfg(unix)]
-            let created = std::os::unix::fs::symlink(&target, &link).is_ok();
-            #[cfg(windows)]
-            let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
-            #[cfg(not(any(unix, windows)))]
-            let created = false;
-
-            let res = if created {
-                let roots = vec![probe_dir.clone()];
-                if let Ok(scope) =
-                    mesh_core::ValidatedScope::resolve(&probe_dir.to_string_lossy(), &roots)
-                {
-                    let crawled = mesh_core::FilesystemCrawler::crawl_scope(&scope, &[], Some(2));
-                    !crawled.contains(&link)
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
-            let _ = std::fs::remove_dir_all(&probe_dir);
-            res
-        };
-        if symlink_ok {
-            eprintln!("✔ Symlink invariants: follow_links=false verified (crawler rejects symlink traversal)");
-        } else {
-            total_errors += 1;
-            eprintln!("✖ Symlink invariants: symlink traversal detected in crawler");
-        }
-
-        // 3. Secret redaction engine
+        // 3. Secret redaction engine.
         let mut reg = PropertyRegistry::new();
         reg.insert_sanitized("jwt.secret", "token123");
         reg.insert_sanitized("spring.datasource.password", "secret");
-        if reg.redacted_count() == 2 {
-            eprintln!("✔ Secret redaction engine: ACTIVE (Dev secrets masked with fallback hints)");
+        checks.push(if reg.redacted_count() == 2 {
+            DoctorCheck::ok("Secret redaction engine", "active (test secrets masked)")
         } else {
-            total_errors += 1;
-            eprintln!("✖ Secret redaction engine: FAILED to mask test secrets");
-        }
+            DoctorCheck::error("Secret redaction engine", "failed to mask test secrets")
+        });
 
-        // 4. Host OS event subsystem check
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(content) = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches") {
-                let watches: u64 = content.trim().parse().unwrap_or(0);
-                if watches >= 524_288 {
-                    eprintln!("✔ Linux inotify watchers check: {watches} available (Max: PASS)");
-                } else {
-                    total_warnings += 1;
-                    eprintln!(
-                        "⚠ Linux inotify watchers check: {watches} (LOW: recommend >= 524,288)"
-                    );
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            match notify::RecommendedWatcher::new(|_| {}, notify::Config::default()) {
-                Ok(_) => eprintln!("✔ Host OS event subsystem: Native (APFS FSEvents active)"),
-                Err(e) => {
-                    total_warnings += 1;
-                    eprintln!("⚠ Host OS event subsystem: FSEvents warning: {e}");
-                }
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            match notify::RecommendedWatcher::new(|_| {}, notify::Config::default()) {
-                Ok(_) => eprintln!(
-                    "✔ Host OS event subsystem: Native (Windows ReadDirectoryChangesW active)"
-                ),
-                Err(e) => {
-                    total_warnings += 1;
-                    eprintln!("⚠ Host OS event subsystem: ReadDirectoryChangesW warning: {e}");
-                }
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            eprintln!("✔ Host OS event subsystem: Native event queue active");
-        }
+        // 4. Host OS event subsystem.
+        checks.push(Self::event_subsystem_check());
 
-        // 5. JSON serialization baseline
-        let t0 = Instant::now();
-        let _ = serde_json::to_string(&serde_json::json!({"test": "latency"}))?;
-        let loopback_micros = t0.elapsed().as_micros();
-        eprintln!(
-            "✔ JSON-RPC serialization baseline: {:.2}ms",
-            loopback_micros as f64 / 1000.0
-        );
-
-        // 6. Tree-sitter parsers initialization
-        if AstGuard::verify_all_parsers() {
-            eprintln!(
-                "✔ Tree-sitter parsers initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)"
-            );
+        // 5. Tree-sitter parsers.
+        checks.push(if AstGuard::verify_all_parsers() {
+            DoctorCheck::ok(
+                "Tree-sitter parsers",
+                "initialized (Java, Go, Python, TypeScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)",
+            )
         } else {
-            total_errors += 1;
-            eprintln!("✖ Tree-sitter parsers: Initialization error");
-        }
+            DoctorCheck::error("Tree-sitter parsers", "initialization error")
+        });
 
-        // 7. Memory baseline (measured real RSS)
-        #[cfg(unix)]
-        let (rss_mb, rss_ok) = {
-            let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-            if unsafe { libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) } == 0 {
-                let rusage = unsafe { rusage.assume_init() };
-                #[cfg(target_os = "macos")]
-                let mb = rusage.ru_maxrss as f64 / (1024.0 * 1024.0);
-                #[cfg(not(target_os = "macos"))]
-                let mb = rusage.ru_maxrss as f64 / 1024.0;
-                (mb, mb < 50.0)
-            } else {
-                (0.0, true)
-            }
-        };
-        #[cfg(not(unix))]
-        let (rss_mb, rss_ok) = (0.0, true);
+        // 6. Toolchain utilities.
+        checks.push(Self::toolchain_check());
 
-        if rss_mb > 0.0 {
-            if rss_ok {
-                eprintln!("✔ Memory baseline: {rss_mb:.1} MiB RSS (mimalloc + compact_str)");
-            } else {
-                total_warnings += 1;
-                eprintln!(
-                    "⚠ Memory baseline: {rss_mb:.1} MiB RSS (elevated, expected < 50 MiB at boot)"
-                );
-            }
-        } else {
-            eprintln!("✔ Memory baseline: mimalloc + compact_str active");
-        }
-
-        // 8. Toolchain utilities check
-        let git_ok = std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let rg_ok = std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if git_ok && rg_ok {
-            eprintln!("✔ Toolchain utilities: git & ripgrep detected");
-        } else if git_ok {
-            eprintln!("✔ Toolchain utilities: git detected (ripgrep recommended for large repos)");
-        } else {
-            total_warnings += 1;
-            eprintln!("⚠ Toolchain utilities: git not found in PATH");
-        }
-
-        // 9. Index health (plan 4 step 4.1): the files a search can never
+        // 7. Index health (plan 4 step 4.1): the files a search can never
         // return, with the same reasons and sizes the tools' notes give.
-        let (_index_errors, index_warnings) = Self::report_index_health(config_path);
-        total_warnings += index_warnings;
+        checks.push(Self::index_health_check(config_path));
 
-        // 10. Repairable health (plan 4 step 4.7): socket permissions, daemon
+        // 8. Repairable health (plan 4 step 4.7): socket permissions, daemon
         // version drift, corrupt or legacy caches, orphaned per-version
-        // workspace directories. Structured separately from sections 1-9
-        // above so `--json` has something to render and `--fix` something
-        // to act on.
-        let checks = Self::run_repairable_checks(config_path, fix);
+        // workspace directories — the checks `--fix` can act on.
+        checks.extend(Self::run_repairable_checks(config_path, fix));
+
+        // 9. Memory at boot (measured above).
+        checks.push(memory);
+
+        let (mut total_errors, mut total_warnings) = (0usize, 0usize);
         for check in &checks {
             if check.fixed != Some(true) {
                 match check.status {
@@ -567,31 +549,36 @@ impl DoctorCommand {
 
         if json {
             println!("{}", serde_json::to_string_pretty(&checks)?);
-        } else {
-            eprintln!();
-            for check in &checks {
-                let suffix = match check.fixed {
-                    Some(true) => " (fixed)",
-                    Some(false) => " (fix attempted, still failing)",
-                    None => "",
-                };
-                eprintln!("{} {}: {}{suffix}", check.icon(), check.name, check.message);
-            }
+            return Ok(());
         }
 
-        if !json {
-            eprintln!();
-            if total_errors > 0 {
-                eprintln!(
-                    "✖ Diagnostic check failed: {total_errors} error(s), {total_warnings} warning(s)."
-                );
-            } else if total_warnings > 0 {
-                eprintln!(
-                    "⚠ All critical systems operational ({total_warnings} warning(s)). Ready for AI agents."
-                );
-            } else {
-                eprintln!("✔ All systems operational. Ready for AI agents.");
-            }
+        for check in &checks {
+            let suffix = match check.fixed {
+                Some(true) => " (fixed)",
+                Some(false) => " (fix attempted, still failing)",
+                None => "",
+            };
+            let detail = check
+                .detail
+                .as_deref()
+                .map_or(String::new(), |d| format!(" [{d}]"));
+            eprintln!(
+                "{} {}: {}{detail}{suffix}",
+                check.icon(),
+                check.name,
+                check.message
+            );
+        }
+
+        eprintln!();
+        if total_errors > 0 {
+            eprintln!(
+                "✖ Diagnostic check failed: {total_errors} error(s), {total_warnings} warning(s)."
+            );
+        } else if total_warnings > 0 {
+            eprintln!("⚠ No errors, {total_warnings} warning(s).");
+        } else {
+            eprintln!("✔ No errors, no warnings.");
         }
 
         Ok(())

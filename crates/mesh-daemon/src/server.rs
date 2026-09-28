@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 // ── JSON-RPC dispatcher (platform-independent) ───────────────────────────────
 
-async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
+async fn dispatch(line: &str, state: &Arc<AppState>, session_id: &str) -> Option<String> {
     use mesh_server::protocol::{classify, Incoming};
 
     let response = match classify(line) {
@@ -26,7 +26,7 @@ async fn dispatch(line: &str, state: &Arc<AppState>) -> Option<String> {
         // `initialize`/`ping` succeed) before ingestion finishes.
         Incoming::Request(req) => {
             let still_indexing = state.snapshot().generation == 0;
-            mesh_server::respond(req, state, still_indexing).await
+            mesh_server::respond(req, state, still_indexing, session_id).await
         }
         // JSON-RPC 2.0 §4.1: a notification never gets a reply.
         Incoming::Notification(_) => return None,
@@ -53,6 +53,9 @@ async fn handle_client<S>(
 {
     let (reader_half, mut writer_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader_half);
+    // One audit session per client connection: each `mesh-mcp run` proxy (one
+    // agent session) opens exactly one.
+    let session_id = mesh_server::new_session_id();
     let mut line = String::new();
 
     loop {
@@ -67,7 +70,7 @@ async fn handle_client<S>(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Some(resp) = dispatch(trimmed, &state).await {
+                        if let Some(resp) = dispatch(trimmed, &state, &session_id).await {
                             let mut out = resp;
                             out.push('\n');
                             if writer_half.write_all(out.as_bytes()).await.is_err() {
@@ -316,7 +319,7 @@ mod unix_tests {
             "[workspace]\nname = \"test\"\nversion = \"2.9.0\"\nroots = [\".\"]\n",
         )
         .unwrap();
-        let audit = Arc::new(AuditLogger::new(None).unwrap());
+        let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
         let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
         let state = Arc::new(AppState::new(config, vec![], audit, rescan));
         // Real meshd only starts serving `tools/call` once its initial ingestion
@@ -516,7 +519,7 @@ mod unix_tests {
             "[workspace]\nname = \"test\"\nversion = \"2.9.0\"\nroots = [\".\"]\n",
         )
         .unwrap();
-        let audit = Arc::new(AuditLogger::new(None).unwrap());
+        let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
         let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
         let state = Arc::new(AppState::new(config, vec![], audit, rescan));
         assert_eq!(state.snapshot().generation, 0, "test setup: not yet ready");
@@ -602,7 +605,7 @@ mod unix_tests {
                 "[workspace]\nname = \"{name}\"\nversion = \"2.9.0\"\nroots = [\".\"]\n"
             ))
             .unwrap();
-            let audit = Arc::new(AuditLogger::new(None).unwrap());
+            let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
             let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
             let state = Arc::new(AppState::new(config, vec![], audit, rescan));
             state.install_snapshot(mesh_core::MeshSnapshot::default());
@@ -805,9 +808,8 @@ mod unix_tests {
     /// check and `--fix`'s termination target would otherwise point at a
     /// process that never actually served this workspace's socket. Mutates
     /// `HOME` for its duration (`write_daemon_meta`/`read_daemon_meta` have no
-    /// override), like `make_state()` in this same file already touches the
-    /// real audit db path — same accepted, pre-existing risk under parallel
-    /// tests, on a `workspace_id` unique to this test.
+    /// override) — an accepted risk under parallel tests, on a `workspace_id`
+    /// unique to this test.
     #[tokio::test]
     async fn losing_a_bind_race_never_overwrites_the_winners_daemon_meta() {
         let home = tempdir().unwrap();
@@ -950,7 +952,7 @@ mod windows_tests {
             "[workspace]\nname = \"test\"\nversion = \"2.9.0\"\nroots = [\".\"]\n",
         )
         .unwrap();
-        let audit = Arc::new(AuditLogger::new(None).unwrap());
+        let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
         let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
         let state = Arc::new(AppState::new(config, vec![], audit, rescan));
         // Real meshd only starts serving `tools/call` once its initial ingestion

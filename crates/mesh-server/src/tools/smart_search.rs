@@ -1349,10 +1349,14 @@ mod tests {
             "scope": scope.to_string_lossy(),
             "limit": 100,
         });
-        crate::tools::ToolRegistry::invoke::<SmartSearchTool>(args, Arc::clone(state))
-            .await
-            .expect("no protocol fault")
-            .expect("tool ok")
+        crate::tools::ToolRegistry::invoke::<SmartSearchTool>(
+            args,
+            Arc::clone(state),
+            Arc::from("test"),
+        )
+        .await
+        .expect("no protocol fault")
+        .expect("tool ok")
     }
 
     /// Plan 4 step 4.1: a 450 KB file inside the scope is named in a note at the
@@ -1403,7 +1407,8 @@ mod tests {
     /// 4.13 review: the note names only source files a search would have
     /// covered. An image the indexer rejected — oversized or binary — stays out
     /// of it (it cost 1.8-1.9 KB on every golden-corpus page), next to an
-    /// oversized source file that is still named; `doctor`'s list keeps both.
+    /// oversized source file that is still named. Since 7.0.1 `doctor` no longer
+    /// lists the images either (pilot feedback: noise); it only counts them.
     #[tokio::test]
     async fn rejected_image_is_not_named_in_the_note() {
         let (_tmp, root) = py_workspace();
@@ -1429,12 +1434,14 @@ mod tests {
                     .into_owned()
             })
             .collect();
-        assert_eq!(
-            rejected,
-            ["big.py", "hero.png", "logo.png"],
-            "doctor keeps all"
+        assert_eq!(rejected, ["big.py"]);
+        assert_eq!(health.files_skipped_non_source, 2);
+        let summary = health.render_summary(10);
+        assert!(
+            summary.contains("2 non-source file(s) skipped"),
+            "{summary}"
         );
-        assert!(health.render_summary(10).contains("logo.png"));
+        assert!(!summary.contains("logo.png"), "{summary}");
 
         let text = invoke_search(&state, "Widget", &root).await;
         assert!(text.contains("class Widget"), "{text}");

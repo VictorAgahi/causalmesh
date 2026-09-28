@@ -4,11 +4,44 @@ use std::path::Path;
 pub struct InitCommand;
 
 impl InitCommand {
-    pub fn run(_auto: bool, write_ide_config: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// Writes `.agents/mesh-mcp.toml` from the directory layout — unless one
+    /// already exists and `force` is off: a hand-tuned config (roots, event
+    /// patterns, stop rules) is the user's, and 7.0.0 silently replaced it on
+    /// every `init`, including `init --write-ide-config`. With
+    /// `write_ide_config`, also merges a `mesh-mcp` server entry into Claude
+    /// Code's `.mcp.json`, `.cursor/mcp.json` and `.vscode/mcp.json`.
+    pub fn run(
+        _auto: bool,
+        write_ide_config: bool,
+        force: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cur_dir = std::env::current_dir()?;
+        let config_file = cur_dir.join(".agents").join("mesh-mcp.toml");
+        if config_file.exists() && !force {
+            eprintln!(
+                "ℹ Kept the existing .agents/mesh-mcp.toml (pass --force to regenerate it from the directory layout)."
+            );
+        } else {
+            Self::write_generated_config(&cur_dir)?;
+        }
+
+        if write_ide_config {
+            eprintln!("\n🔌 Auto-Configuring IDEs (--write-ide-config):");
+            Self::configure_claude_code(&cur_dir)?;
+            Self::configure_cursor(&cur_dir)?;
+            Self::configure_vscode(&cur_dir)?;
+        }
+
+        eprintln!(
+            "\nNext: run `mesh-mcp doctor`, then restart your agent so it loads the mesh-mcp tools."
+        );
+        Ok(())
+    }
+
+    fn write_generated_config(cur_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("🔍 Scanning workspace tree for polyglot services and schemas...");
 
         let mut roots = Vec::new();
-        let cur_dir = std::env::current_dir()?;
 
         if cur_dir.join("proto-registry").exists()
             || cur_dir.join("proto").exists()
@@ -174,7 +207,7 @@ impl InitCommand {
         }
         // If no explicit docs folder exists, check for markdown files in root
         if doc_paths.is_empty() {
-            if let Ok(entries) = fs::read_dir(&cur_dir) {
+            if let Ok(entries) = fs::read_dir(cur_dir) {
                 let has_md = entries
                     .flatten()
                     .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("md"));
@@ -257,16 +290,20 @@ cryptographic_audit_trail = true
 
         fs::write(&config_file, toml_content)?;
         eprintln!("\n✨ Generated .agents/mesh-mcp.toml with dynamic root expansion.");
-
-        if write_ide_config {
-            eprintln!("\n🔌 Auto-Configuring IDEs (--write-ide-config):");
-            Self::configure_cursor(&cur_dir)?;
-            Self::configure_vscode(&cur_dir)?;
-            eprintln!("  ✔ Registered Claude Code CLI guidance");
-        }
-
-        eprintln!("\n🚀 Zero setup left. Ready for AI agents!");
         Ok(())
+    }
+
+    /// Claude Code's project-scope config: `.mcp.json` at the workspace root,
+    /// servers under `mcpServers` (same file `claude mcp add -s project` writes).
+    fn configure_claude_code(cur_dir: &Path) -> Result<(), std::io::Error> {
+        let entry = serde_json::json!({ "type": "stdio", "command": "mesh-mcp", "args": [] });
+        Self::upsert_mcp_server(&cur_dir.join(".mcp.json"), "mcpServers", entry, None).map(
+            |written| {
+                if written {
+                    eprintln!("  ✔ Claude Code: Added 'mesh-mcp' entry to .mcp.json");
+                }
+            },
+        )
     }
 
     /// True if `dir` looks like the root of a single project in some
@@ -461,6 +498,47 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).expect("read"), broken);
     }
 
+    /// Claude Code's project config gets the same merge (7.0.0 printed
+    /// "Registered Claude Code CLI guidance" and wrote nothing).
+    #[test]
+    fn claude_code_project_config_is_merged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"github":{"command":"gh-mcp"}}}"#).expect("write");
+        InitCommand::configure_claude_code(tmp.path()).expect("configure");
+        let doc = read_json(&path);
+        assert_eq!(doc["mcpServers"]["github"]["command"], "gh-mcp");
+        assert_eq!(doc["mcpServers"]["mesh-mcp"]["command"], "mesh-mcp");
+        assert_eq!(doc["mcpServers"]["mesh-mcp"]["type"], "stdio");
+    }
+
+    /// An existing config is the user's: kept byte-for-byte unless `--force`.
+    #[test]
+    fn existing_config_is_kept_unless_forced() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original_cwd = std::env::current_dir().expect("cwd");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join(".agents/mesh-mcp.toml");
+        fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+        let tuned = "[workspace]\nname = \"tuned\"\nversion = \"0\"\nroots = [\"../a\"]\n";
+        fs::write(&config, tuned).expect("write");
+
+        std::env::set_current_dir(temp.path()).expect("chdir");
+        let kept = InitCommand::run(true, false, false);
+        let kept_text = fs::read_to_string(&config).expect("read");
+        let forced = InitCommand::run(true, false, true);
+        let forced_text = fs::read_to_string(&config).expect("read");
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        kept.expect("init without --force");
+        forced.expect("init --force");
+        assert_eq!(kept_text, tuned);
+        assert!(
+            forced_text.contains("Generated by 'mesh-mcp init --auto'"),
+            "{forced_text}"
+        );
+    }
+
     /// No config yet: one is created with just our entry.
     #[test]
     fn missing_ide_config_is_created() {
@@ -470,7 +548,7 @@ mod tests {
         assert_eq!(doc["mcpServers"]["mesh-mcp"]["command"], "mesh-mcp");
     }
 
-    /// Runs `InitCommand::run(true, false)` inside a fresh temp dir containing
+    /// Runs `InitCommand::run(true, false, false)` inside a fresh temp dir containing
     /// `marker_files`, restores the original cwd afterward, and returns the
     /// generated `roots` list from `.agents/mesh-mcp.toml`.
     fn roots_for(marker_files: &[&str]) -> Vec<String> {
@@ -487,7 +565,7 @@ mod tests {
         }
 
         std::env::set_current_dir(temp.path()).expect("chdir into tempdir");
-        let result = InitCommand::run(true, false);
+        let result = InitCommand::run(true, false, false);
         std::env::set_current_dir(&original_cwd).expect("restore cwd");
         result.expect("InitCommand::run should succeed");
 

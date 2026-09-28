@@ -14,9 +14,33 @@ use framing::StdioFramingActor;
 use mesh_core::AppState;
 use protocol::{Incoming, JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tools::ToolRegistry;
+
+/// A fresh audit session id: `<unix-ms>-p<pid>-c<n>`, unique per process and
+/// per call. `meshd` takes one per accepted client connection (one connection
+/// = one agent session, since each `mesh-mcp run` proxy opens exactly one);
+/// the standalone stdio server uses [`process_session_id`].
+pub fn new_session_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    format!(
+        "{millis}-p{}-c{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// This process's own session id, created on first use.
+pub fn process_session_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(new_session_id)
+}
 
 /// Main MCP JSON-RPC stdio event loop per RFC-001 Rev. 2.9.0
 pub async fn run_server(
@@ -29,7 +53,7 @@ pub async fn run_server(
 
     while let Some(line) = rx_in.recv().await {
         let response = match protocol::classify(&line) {
-            Incoming::Request(req) => respond(req, &state, false).await,
+            Incoming::Request(req) => respond(req, &state, false, process_session_id()).await,
             Incoming::Notification(note) => {
                 // JSON-RPC 2.0 §4.1: never answer a notification, not even
                 // with an error (`notifications/initialized`, cancellations, ...).
@@ -59,10 +83,12 @@ pub async fn run_server(
 ///
 /// `still_indexing` (meshd before its first snapshot) turns `tools/call` into a
 /// tool error the agent can retry on, instead of answering from an empty graph.
+/// `session_id` is what the call is audited under (see [`new_session_id`]).
 pub async fn respond(
     req: JsonRpcRequest,
     state: &Arc<AppState>,
     still_indexing: bool,
+    session_id: &str,
 ) -> JsonRpcResponse {
     let req_id = req.id;
     match req.method.as_str() {
@@ -113,7 +139,14 @@ pub async fn respond(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match ToolRegistry::call_tool(tool_name, arguments, state.clone()).await {
+            match ToolRegistry::call_tool_in_session(
+                tool_name,
+                arguments,
+                state.clone(),
+                session_id,
+            )
+            .await
+            {
                 Ok(call_result) => JsonRpcResponse::success(req_id, call_result),
                 Err((code, msg)) => JsonRpcResponse::error(req_id, code, msg, None),
             }
@@ -154,7 +187,7 @@ mod tests {
     /// name is now checked before the `still_indexing` gate.
     #[tokio::test]
     async fn unknown_tool_is_rejected_even_while_still_indexing() {
-        let resp = respond(tools_call("not_a_real_tool"), &test_state(), true).await;
+        let resp = respond(tools_call("not_a_real_tool"), &test_state(), true, "s").await;
         let err = resp.error.expect("unknown tool must be a protocol error");
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("not_a_real_tool"), "{err:?}");
@@ -164,13 +197,22 @@ mod tests {
     /// "still indexing" behavior (not a regression of the reordering above).
     #[tokio::test]
     async fn known_tool_still_gets_the_still_indexing_retry_while_indexing() {
-        let resp = respond(tools_call("smart_search"), &test_state(), true).await;
+        let resp = respond(tools_call("smart_search"), &test_state(), true, "s").await;
         let result = resp
             .result
             .expect("known tool while indexing is a tool result, not an error");
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("still indexing"), "{text}");
         assert_eq!(result["isError"], json!(true));
+    }
+
+    #[test]
+    fn session_ids_are_unique_and_the_process_id_is_stable() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_ne!(a, b);
+        assert!(a.contains(&format!("-p{}-c", std::process::id())), "{a}");
+        assert_eq!(process_session_id(), process_session_id());
     }
 
     /// Plan 4 step 4.8: every audited tool call (success, tool error, refused
@@ -188,10 +230,10 @@ mod tests {
         let state = Arc::new(AppState::new(cfg, vec![], audit, rescan));
 
         // Refused arguments (unknown field) and a regular call.
-        let _ = respond(tools_call("smart_search"), &state, false).await;
+        let _ = respond(tools_call("smart_search"), &state, false, "session-a").await;
         let mut ok = tools_call("smart_search");
         ok.params = Some(json!({ "name": "smart_search", "arguments": { "query": "x" } }));
-        let _ = respond(ok, &state, false).await;
+        let _ = respond(ok, &state, false, "session-b").await;
 
         let entries = AuditLogger::read_entries(&db, None).expect("entries");
         let metrics = AuditLogger::read_metrics(&db, None).expect("metrics");
@@ -199,6 +241,9 @@ mod tests {
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert_eq!(latencies.len(), 2, "{latencies:?}");
         assert!(latencies.iter().all(|(tool, _)| tool == "smart_search"));
+        // Each call is audited under the session it came from, not a constant.
+        let sessions: Vec<&str> = entries.iter().map(|e| e.session_id.as_str()).collect();
+        assert_eq!(sessions, ["session-a", "session-b"]);
         assert_eq!(metrics.process_starts.map(|s| s.len()), Some(1));
     }
 }

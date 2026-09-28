@@ -252,6 +252,19 @@ Comprehensive end-to-end tracing for gRPC service architectures. Correlates Prot
 It then checks the `.proto` that defines the target for **wire-format breaking changes** against a
 Git base (see [Wire-format check](#wire-format-check) below).
 
+**Target matching.** When a service or method matches the target by name (exact, case-folded,
+bare `SIGN_UP` ↔ `SignUp`, or its full `package.Service/Method`), only those are traced — plus a
+matched service's own methods. RPCs whose name merely *contains* the target (`CreateEventNode` for
+`CreateEvent`) are left out and named in a "Not traced" line. Substring matches are traced (with
+`heuristic` confidence) only when nothing matches by name.
+
+**Completeness.** A TypeScript call through a field the class inherits
+(`class C extends BaseGrpcController` calling `this.commandService.createEvent(…)`) resolves
+through the base class's own binding of that field, in any file. Callers that construct a client
+for the method's service in a file where no call to this method was resolved — and where the
+client is not held in a typed field, whose calls are all recorded — are listed as "may call", even
+when other clients were found: the client list is never presented as complete when it may not be.
+
 **Negative Constraints**: DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema

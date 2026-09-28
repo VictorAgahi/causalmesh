@@ -4,7 +4,7 @@ use crate::types::{
 };
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Query results borrow from the graph: the snapshot guard held by the caller
@@ -55,6 +55,29 @@ pub const RPC_EXACT_METHOD_PREFIX: char = '=';
 /// Same as [`RPC_EXACT_METHOD_PREFIX`], but the service was inferred from a
 /// field name rather than read from a client binding: heuristic confidence.
 pub const RPC_INFERRED_METHOD_PREFIX: char = '~';
+/// A method-level call through a field the calling class does not bind itself
+/// but inherits (`^BaseEventGrpcController#commandService.createEvent`):
+/// resolved against the base class's [`CLIENT_FIELD_BINDING_PREFIX`] records,
+/// falling back to the field-name inference of [`RPC_INFERRED_METHOD_PREFIX`].
+pub const RPC_INHERITED_METHOD_PREFIX: char = '^';
+/// Not a call: records that the class it is attached to binds a client field
+/// (`#commandService=EventCommandService`), so subclasses in other files can
+/// resolve calls through it. Never becomes an edge by itself.
+pub const CLIENT_FIELD_BINDING_PREFIX: char = '#';
+
+/// `userService` / `userClient` -> `UserService`; anything else -> `None`.
+/// The service a client field is assumed to talk to when nothing binds it.
+pub fn service_from_client_field_name(field: &str) -> Option<String> {
+    let stem = field
+        .strip_suffix("Client")
+        .or_else(|| field.strip_suffix("Service"))?;
+    if stem.is_empty() || !stem.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut chars = stem.chars();
+    let first = chars.next()?.to_ascii_uppercase();
+    Some(format!("{first}{}Service", chars.as_str()))
+}
 
 /// How [`ContractGraph::find_dependents_matched`] found its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,12 +104,16 @@ pub struct GrpcTrace<'g> {
     /// Each handler paired with the confidence of the match that linked it
     /// to the proto definition (bare-name scan vs. an exact `Implements` edge).
     pub server_handlers: Vec<(&'g ContractNode, EdgeConfidence)>,
-    /// Filled only when `client_stubs` is empty and the target is a method:
-    /// callers linked to the method's *service* (a client constructed for it,
-    /// `getService<UserServiceClient>(…)`) without the called method being
-    /// resolved. They may or may not call this method; the formatter says so
-    /// instead of answering "0 clients".
+    /// When the target is a method: callers linked to the method's *service*
+    /// (a client constructed for it, `getService<UserServiceClient>(…)`)
+    /// without the called method being resolved, in files with no resolved
+    /// call. They may or may not call this method; the formatter says so
+    /// instead of presenting `client_stubs` as complete.
     pub service_level_clients: Vec<(&'g ContractNode, EdgeConfidence)>,
+    /// `.proto` services/methods whose name merely contains the target
+    /// (`CreateEventNode` for `CreateEvent`), left out because a symbol
+    /// matched exactly. Listed so the answer says what it did not trace.
+    pub related_rpcs: Vec<&'g ContractNode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -955,18 +982,53 @@ impl ContractGraph {
         let proto_by_fqcn = self.group_by_package(proto_by_fqcn);
         let proto_by_bare = self.group_by_package(proto_by_bare);
 
+        // Client fields each class binds (`#field=Service` records), keyed by
+        // (class name, field), so a subclass in another file resolves
+        // `this.<inherited field>.<method>()`. 7.0.6 missed all 75 Volontariapp
+        // gateway calls made through `BaseEventGrpcController`'s fields.
+        let mut class_fields: HashMap<(&str, &str), Vec<(RepoId, &str)>> = HashMap::new();
+        for (class_id, recorded) in &self.rpc_calls {
+            let Some(binding) = recorded.strip_prefix(CLIENT_FIELD_BINDING_PREFIX) else {
+                continue;
+            };
+            let (Some(class), Some((field, service))) =
+                (self.nodes.get(class_id), binding.split_once('='))
+            else {
+                continue;
+            };
+            class_fields
+                .entry((class.name.as_str(), field))
+                .or_default()
+                .push((class.repo_id, service));
+        }
+
         let mut rpc_edges = Vec::new();
         for (caller_id, recorded) in &self.rpc_calls {
+            if recorded.starts_with(CLIENT_FIELD_BINDING_PREFIX) {
+                continue;
+            }
             // Method-level call sites (`this.users.signUp(…)`) are recorded with
             // a prefix: `=` resolves by exact `Service.Method` only — never by
             // bare method name, which would link `this.users.findAll()` to any
             // other service's `FindAll` — and `~` does the same with heuristic
             // confidence (the service was inferred from the field's name).
+            // `^` (inherited field) becomes one of the two once the base
+            // class's binding is looked up.
+            let inherited: String;
             let (target_str, method_level, inferred) =
                 if let Some(t) = recorded.strip_prefix(RPC_EXACT_METHOD_PREFIX) {
                     (t, true, false)
                 } else if let Some(t) = recorded.strip_prefix(RPC_INFERRED_METHOD_PREFIX) {
                     (t, true, true)
+                } else if let Some(t) = recorded.strip_prefix(RPC_INHERITED_METHOD_PREFIX) {
+                    let caller_repo = self.nodes.get(caller_id).map(|n| n.repo_id);
+                    let Some((resolved, inferred)) =
+                        Self::resolve_inherited_call(t, caller_repo, &class_fields)
+                    else {
+                        continue;
+                    };
+                    inherited = resolved;
+                    (inherited.as_str(), true, inferred)
                 } else {
                     (recorded.as_str(), false, false)
                 };
@@ -1324,12 +1386,8 @@ impl ContractGraph {
         let mut client_stubs: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
         let mut server_handlers: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
 
-        for node in self.nodes.values() {
-            let Some((confidence, is_symbol_match)) = Self::grpc_target_match(node, norm_target)
-            else {
-                continue;
-            };
-
+        let (matches, related_rpcs) = self.grpc_anchor_matches(norm_target);
+        for (node, confidence, is_symbol_match) in matches {
             if Self::is_proto_file(&node.file_path) {
                 if confidence == EdgeConfidence::Exact || proto_definition.is_none() {
                     proto_definition = Some(node);
@@ -1372,14 +1430,45 @@ impl ContractGraph {
             }
         }
 
+        // Always computed, not only when no method-level call resolved: 7.0.6
+        // said "Client Stubs (1 found)" for CreateEvent while a second caller,
+        // whose call went through an inherited field, sat unresolved. A file
+        // that already has a resolved call is not repeated here.
         let mut service_level_clients: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
-        if client_stubs.is_empty() {
+        {
+            let mut resolved_files: HashSet<&FilePath> =
+                client_stubs.iter().map(|(c, _)| &c.file_path).collect();
             let services: HashSet<NodeId> = anchors
                 .iter()
                 .filter_map(|id| self.nodes.get(id))
                 .filter(|m| m.kind == NodeKind::GrpcMethod)
                 .filter_map(|m| self.enclosing_grpc_service(m))
                 .collect();
+            // A file that binds the service's client to a typed field has every
+            // call through that field recorded method by method (`=S.m`, or `#`
+            // for a base class whose subclasses call through it): if none of
+            // them is this method, the file does not call it. Only clients
+            // held some other way stay "may call".
+            let service_names: Vec<&str> = services
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .map(|s| s.name.as_str())
+                .collect();
+            for (caller_id, recorded) in &self.rpc_calls {
+                let service = if let Some(t) = recorded.strip_prefix(RPC_EXACT_METHOD_PREFIX) {
+                    t.rsplit_once('.').map(|(s, _)| s)
+                } else if let Some(b) = recorded.strip_prefix(CLIENT_FIELD_BINDING_PREFIX) {
+                    b.split_once('=').map(|(_, s)| s)
+                } else {
+                    None
+                };
+                if service.is_some_and(|s| service_names.iter().any(|n| n.eq_ignore_ascii_case(s)))
+                {
+                    if let Some(caller) = self.nodes.get(caller_id) {
+                        resolved_files.insert(&caller.file_path);
+                    }
+                }
+            }
             let mut edges: Vec<&ContractEdge> = self
                 .edges
                 .iter()
@@ -1388,7 +1477,9 @@ impl ContractGraph {
             edges.sort_by_key(|e| e.from);
             for edge in edges {
                 if let Some(client) = self.nodes.get(&edge.from) {
-                    if !service_level_clients.iter().any(|(c, _)| c.id == client.id) {
+                    if !resolved_files.contains(&client.file_path)
+                        && !service_level_clients.iter().any(|(c, _)| c.id == client.id)
+                    {
                         service_level_clients.push((client, edge.confidence));
                     }
                 }
@@ -1401,6 +1492,7 @@ impl ContractGraph {
             client_stubs,
             server_handlers,
             service_level_clients,
+            related_rpcs,
         }
     }
 
@@ -1429,7 +1521,8 @@ impl ContractGraph {
         }
         // Case-sensitive exact-name equality is unambiguous; case-folding
         // or a substring FQCN hit is a name heuristic.
-        let exact_name = node.name.as_str() == norm_target;
+        let exact_name = node.name.as_str() == norm_target
+            || Self::fqcn_equals(&node.package, &node.name, norm_target);
         let matches_name = exact_name
             || node.name.eq_ignore_ascii_case(norm_target)
             || Self::bare_names_match(&node.name, norm_target);
@@ -1443,8 +1536,101 @@ impl ContractGraph {
         } else {
             EdgeConfidence::Heuristic
         };
-        let is_symbol_match = exact_name || Self::bare_names_match(&node.name, norm_target);
+        let is_symbol_match = exact_name
+            || node.name.eq_ignore_ascii_case(norm_target)
+            || Self::bare_names_match(&node.name, norm_target);
         Some((confidence, is_symbol_match))
+    }
+
+    /// `Base#field.method` (an [`RPC_INHERITED_METHOD_PREFIX`] record) ->
+    /// (`Service.method`, inferred?). The base class's binding of `field` wins
+    /// when it names exactly one service — base classes in the caller's own
+    /// repository first, the whole mesh otherwise. Unbound or ambiguous, the
+    /// field's name is the only clue left: [`service_from_client_field_name`],
+    /// flagged inferred.
+    fn resolve_inherited_call(
+        recorded: &str,
+        caller_repo: Option<RepoId>,
+        class_fields: &HashMap<(&str, &str), Vec<(RepoId, &str)>>,
+    ) -> Option<(String, bool)> {
+        let (base, rest) = recorded.split_once('#')?;
+        let (field, method) = rest.split_once('.')?;
+        if let Some(bindings) = class_fields.get(&(base, field)) {
+            let same_repo: BTreeSet<&str> = bindings
+                .iter()
+                .filter(|(repo, _)| Some(*repo) == caller_repo)
+                .map(|(_, service)| *service)
+                .collect();
+            let services = if same_repo.is_empty() {
+                bindings.iter().map(|(_, service)| *service).collect()
+            } else {
+                same_repo
+            };
+            if let [service] = services.into_iter().collect::<Vec<_>>()[..] {
+                return Some((format!("{service}.{method}"), false));
+            }
+        }
+        service_from_client_field_name(field).map(|service| (format!("{service}.{method}"), true))
+    }
+
+    /// Every gRPC node matching `norm_target`, then the proto ones left out.
+    /// As soon as one node matches as a symbol (exact name, bare name or
+    /// FQCN), substring-only matches are dropped: `CreateEvent` must not
+    /// anchor on `CreateEventNode`, whose handlers and clients 7.0.6 listed as
+    /// `CreateEvent`'s. They come back as "related" so the answer can say what
+    /// was left out. With no symbol match at all (a package or partial name),
+    /// every substring match stays an anchor, with heuristic confidence.
+    fn grpc_anchor_matches(
+        &self,
+        norm_target: &str,
+    ) -> (
+        Vec<(&ContractNode, EdgeConfidence, bool)>,
+        Vec<&ContractNode>,
+    ) {
+        let matches: Vec<(&ContractNode, EdgeConfidence, bool)> = self
+            .nodes
+            .values()
+            .filter_map(|node| {
+                Self::grpc_target_match(node, norm_target).map(|(c, symbol)| (node, c, symbol))
+            })
+            .collect();
+        if !matches.iter().any(|(_, _, symbol)| *symbol) {
+            return (matches, Vec::new());
+        }
+        // A matched service keeps its own methods (`UserService` covers
+        // `UserService.SignUp`): they are the target, not a neighbour.
+        let services: Vec<&ContractNode> = matches
+            .iter()
+            .filter(|(n, _, symbol)| *symbol && n.kind == NodeKind::GrpcService)
+            .map(|(n, _, _)| *n)
+            .collect();
+        let (kept, dropped): (Vec<_>, Vec<_>) =
+            matches.into_iter().partition(|(node, _, symbol)| {
+                *symbol
+                    || (node.kind == NodeKind::GrpcMethod
+                        && services.iter().any(|s| {
+                            s.file_path == node.file_path
+                                && node
+                                    .name
+                                    .strip_prefix(s.name.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                        }))
+            });
+        let related = dropped
+            .into_iter()
+            .map(|(node, _, _)| node)
+            .filter(|node| Self::is_proto_file(&node.file_path))
+            .collect();
+        (kept, related)
+    }
+
+    /// `target` spells `package` + `.` or `/` + `name`.
+    fn fqcn_equals(package: &str, name: &str, target: &str) -> bool {
+        !package.is_empty()
+            && target
+                .strip_prefix(package)
+                .and_then(|rest| rest.strip_prefix(['.', '/']))
+                == Some(name)
     }
 
     /// `format!("{package}/{name}").contains(needle)` without the allocation.
@@ -1693,11 +1879,7 @@ impl ContractGraph {
             EdgeConfidence,
             Option<&ContractNode>,
         )> = Vec::new();
-        for node in self.nodes.values() {
-            let Some((confidence, is_symbol_match)) = Self::grpc_target_match(node, norm_target)
-            else {
-                continue;
-            };
+        for (node, confidence, is_symbol_match) in self.grpc_anchor_matches(norm_target).0 {
             if Self::is_proto_file(&node.file_path) {
                 anchors.push(node);
             } else if is_symbol_match {

@@ -84,7 +84,7 @@ and stop rules, is in [SETUP.md](SETUP.md). A five-language example workspace is
 | `mesh-mcp agent-guide` | Print the setup guide for an AI agent installing MeshMCP for you (Markdown). |
 | `mesh-mcp doctor [--fix] [--json]` | Diagnose configuration, index health, socket, daemon version, cache and sandbox; `--fix` repairs what is safe to repair (never the audit log). |
 | `mesh-mcp graph [--format html\|mermaid\|json\|fingerprint] [--open]` | Render the full topology, or print a content fingerprint of the index. |
-| `mesh-mcp stats [--since 7d\|24h\|all]` | Local audit summary: calls, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. |
+| `mesh-mcp stats [--since 7d\|24h\|all] [--session ID] [--db PATH] [--json]` | Local audit summary: calls per tool and per agent session, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. `MESH_AUDIT_DB` moves the audit database. |
 | `mesh-mcp install-hooks` | Install the Git pre-commit hook. |
 
 Logs go to stderr. Under `mesh-mcp run`, stdout carries only JSON-RPC frames.

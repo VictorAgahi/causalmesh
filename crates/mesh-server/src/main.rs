@@ -46,8 +46,8 @@ enum Commands {
         #[arg(long, default_value = "false")]
         fix: bool,
 
-        /// Emit the repairable-health checks (section 10) as JSON on stdout,
-        /// for install scripts. Sections 1-9's prose still goes to stderr.
+        /// Emit every check as a JSON array on stdout (for install scripts and
+        /// pilot sheets) instead of the text report on stderr.
         #[arg(long, default_value = "false")]
         json: bool,
     },
@@ -78,13 +78,27 @@ enum Commands {
     /// Install OS-level Git pre-commit hooks for active governance
     InstallHooks,
 
-    /// Summarize local audit-log usage: calls per tool, error rate, and
-    /// most-queried scopes/targets. Reads `audit.db` read-only; nothing leaves
-    /// the machine.
+    /// Summarize local audit-log usage: calls per tool and per session, error
+    /// rate, latency, most-returned files. Reads `audit.db` read-only; nothing
+    /// leaves the machine.
     Stats {
         /// Time window to include: `<N>s`, `<N>m`, `<N>h`, `<N>d`, or `all`.
         #[arg(long, default_value = "7d")]
         since: String,
+
+        /// Audit database to read (default: `$MESH_AUDIT_DB`, else
+        /// `~/.cache/mesh-mcp/audit.db`).
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Only count calls audited under this session id (see the
+        /// "Sessions" section of the default output).
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Print the summary as JSON on stdout instead of text on stderr.
+        #[arg(long, default_value = "false")]
+        json: bool,
     },
 
     /// Generate and view an interactive architecture graph of services, contracts, and topics
@@ -140,8 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Commands::Stats { since } => {
-            StatsCommand::run(None, Some(&since))?;
+        Commands::Stats {
+            since,
+            db,
+            session,
+            json,
+        } => {
+            StatsCommand::run(db.as_deref(), Some(&since), session.as_deref(), json)?;
         }
         Commands::Graph {
             format,

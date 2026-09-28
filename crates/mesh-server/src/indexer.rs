@@ -432,7 +432,13 @@ impl WorkspaceIndexer {
 
     /// Counts a rejection and remembers the file by path (plan 4 step 4.1), so a
     /// tool can name it instead of silently returning nothing for it.
+    /// A rejected non-source file (image, lockfile, bundle: see
+    /// `mesh_core::health::is_non_source`) is only counted as skipped.
     fn record_rejection(health: &mut IndexHealth, reason: RejectKind, path: PathBuf) {
+        if mesh_core::health::is_non_source(&path) {
+            health.record_skipped_non_source();
+            return;
+        }
         let reason = match reason {
             RejectKind::Oversized => {
                 health.record_oversized();

@@ -98,6 +98,56 @@ pub struct IndexHealth {
     /// Rejected paths dropped from `rejected` by the [`MAX_REJECTED_FILES`] cap.
     #[serde(default)]
     pub rejected_overflow: usize,
+    /// Files a guard rejected that are not source at all ([`is_non_source`]:
+    /// images, fonts, archives, lockfiles, minified bundles). Counted apart from
+    /// the rejections above and never listed by path: no search could ever
+    /// return them anyway, so listing them was pure noise in `doctor` and in
+    /// every tool note (7.0.0 pilot feedback: `yarn.lock` and PNGs as "not indexed").
+    #[serde(default)]
+    pub files_skipped_non_source: usize,
+}
+
+/// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
+/// binary assets, archives, lockfiles and generated bundles. Conservative: an
+/// unknown extension is *not* non-source.
+pub fn is_non_source(path: &Path) -> bool {
+    const LOCKFILES: &[&str] = &[
+        "yarn.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "npm-shrinkwrap.json",
+        "bun.lockb",
+        "Cargo.lock",
+        "poetry.lock",
+        "Pipfile.lock",
+        "uv.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "gradle.lockfile",
+        "Podfile.lock",
+    ];
+    const EXTENSIONS: &[&str] = &[
+        // images
+        "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tif", "tiff", "icns", "heic",
+        // fonts
+        "ttf", "otf", "woff", "woff2", "eot", // archives and packages
+        "zip", "gz", "tgz", "bz2", "xz", "7z", "tar", "jar", "war", "aar", "apk", "ipa",
+        // media and documents
+        "mp3", "mp4", "mov", "wav", "ogg", "webm", "pdf", // compiled artifacts
+        "so", "dylib", "dll", "exe", "wasm", "class", "pyc", "o", "a", "lockb",
+        // generated
+        "map",
+    ];
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if LOCKFILES.contains(&name) || name.ends_with(".min.js") || name.ends_with(".min.css") {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(ext)))
 }
 
 impl IndexHealth {
@@ -129,6 +179,11 @@ impl IndexHealth {
     #[inline]
     pub fn record_parse_failed(&mut self) {
         self.files_parse_failed += 1;
+    }
+
+    #[inline]
+    pub fn record_skipped_non_source(&mut self) {
+        self.files_skipped_non_source += 1;
     }
 
     /// Remembers one rejected file. Call [`Self::normalize_rejected`] once the
@@ -246,6 +301,13 @@ impl IndexHealth {
             "{} file(s) scanned, {} indexed, {total} not indexed",
             self.files_scanned, self.files_indexed
         );
+        if self.files_skipped_non_source > 0 {
+            let _ = writeln!(
+                out,
+                "    ({} non-source file(s) skipped: images, fonts, archives, lockfiles, bundles)",
+                self.files_skipped_non_source
+            );
+        }
         for reason in RejectReason::ALL {
             let n = self.rejected.iter().filter(|r| r.reason == reason).count();
             if n > 0 {
@@ -287,6 +349,7 @@ impl IndexHealth {
         self.files_rejected_guard += other.files_rejected_guard;
         self.files_read_error += other.files_read_error;
         self.files_parse_failed += other.files_parse_failed;
+        self.files_skipped_non_source += other.files_skipped_non_source;
     }
 
     #[inline]
@@ -326,6 +389,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn non_source_covers_assets_and_lockfiles_only() {
+        for p in [
+            "a/yarn.lock",
+            "a/logo.PNG",
+            "a/font.woff2",
+            "a/app.min.js",
+            "a/bundle.js.map",
+            "go.sum",
+        ] {
+            assert!(is_non_source(Path::new(p)), "{p}");
+        }
+        for p in [
+            "a/main.ts",
+            "a/App.tsx",
+            "README.md",
+            "a/data.json",
+            "a/notes",
+            "a/x.lock.ts",
+        ] {
+            assert!(!is_non_source(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
     fn merge_adds_every_field() {
         let mut a = IndexHealth {
             files_scanned: 10,
@@ -343,9 +430,11 @@ mod tests {
             files_rejected_guard: 0,
             files_read_error: 1,
             files_parse_failed: 1,
+            files_skipped_non_source: 2,
             ..Default::default()
         };
         a.merge(&b);
+        assert_eq!(a.files_skipped_non_source, 2);
         assert_eq!(a.files_scanned, 13);
         assert_eq!(a.files_indexed, 9);
         assert_eq!(a.files_rejected_oversized, 1);

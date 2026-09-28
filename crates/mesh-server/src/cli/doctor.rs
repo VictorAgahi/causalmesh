@@ -68,6 +68,8 @@ impl DoctorCheck {
         self.fixed = Some(fixed);
         self
     }
+    // Only the Unix memory check has a volatile figure to attach today.
+    #[cfg(unix)]
     fn with_detail(mut self, detail: String) -> Self {
         self.detail = Some(detail);
         self

@@ -5,6 +5,24 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.18] — 2026-09-28
+
+Imperative tool activation in `initialize.instructions`.
+
+### Changed
+- **`initialize.instructions` (`crates/mesh-server/src/lib.rs`)**: the conditional "if your client
+  defers…" activation paragraph is replaced by a `MANDATORY FIRST STEP (Turn 1)`: for questions about
+  imports, packages, gRPC or events, load `find_dependents`, `analyze_impact` and `analyze_grpc`
+  (`ToolSearch select:…` in deferred-loading clients such as Claude Code) before any grep. Measured on
+  7.0.17 with Claude Code's deferred loading (8 single runs, T1–T7 + a T6 repeat): ToolSearch in 6/8,
+  MeshMCP called in 4/8; a T6 run that never loaded it cost 2.7M tokens against ~1.0M without MeshMCP,
+  and T2 ("who imports a package") was answered by grepping import statements.
+- Rule 3 maps "who imports X" / package usages to `find_dependents`; a new rule forbids grepping
+  event publish/consume sites or import statements before querying the graph. `find_dependents`'s
+  description says it answers who imports or uses a package, module or symbol.
+- The instructions constant had been inserted inside `respond`'s doc comment (7.0.15); each now has
+  its own.
+
 ## [7.0.17] — 2026-09-28
 
 Makes the 7.0.15–7.0.16 agent guidance actually reach agents and agree with itself.

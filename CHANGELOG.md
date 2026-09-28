@@ -5,6 +5,24 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.10] — 2026-09-28
+
+`analyze_impact` (Volontariapp 7.0.6 report, defects 5, 6 and 13). Measured on the Volontariapp
+workspace: `EVENT_CREATED` with `depth: 2` now reaches the second hop the report's ground truth
+has (both post-processors emit onto `WS_EVENT_CREATED_FEEDBACK`, consumed by `ws-service`); 7.0.6
+returned the depth-1 answer.
+
+### Fixed
+- **`depth ≥ 2` did not follow re-emissions**: a post-processor's re-emission is a separate
+  producer node in its file, while the walk only followed the consumer node's own `Produces`
+  edges. Each hop now also follows producers declared in a reached consumer's file; those rows are
+  `heuristic` and the output says the walk used them.
+- **A topic with no resolved producer (or consumer) was shown without comment** (`USER_CREATED`,
+  emitted by a SQL trigger; `EVENT_SOCIAL_CREATED`, consumed through another name). The matrix
+  now says "No producer resolved" / "No consumer resolved" (outside tests) and why that may be.
+- **`event.created` matched nothing**, although the tool description cites it: a target matching
+  no topic key as written is tried with `.`, `:`, `-`, `/` as `_` (`event_created`).
+
 ## [7.0.9] — 2026-09-28
 
 `smart_search` secret masking (Volontariapp 7.0.6 report, defects 4 and 8). The report's six

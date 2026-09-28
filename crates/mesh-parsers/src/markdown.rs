@@ -516,6 +516,21 @@ impl MarkdownFormatter {
             }
         ));
 
+        if matrix.file_linked_hops {
+            header.push_str(
+                "*Past the first hop, the walk follows producers declared in the same file as a consumer (a handler that re-emits): those rows are `heuristic`.*\n",
+            );
+        }
+        if matrix.no_producer_resolved {
+            header.push_str(
+                "\n**No producer resolved** for this event outside tests. Producers the index does not see — a SQL trigger, a topic name built at runtime, a config-driven publisher — may exist: search for them before concluding nothing emits it.\n",
+            );
+        }
+        if matrix.no_consumer_resolved {
+            header.push_str(
+                "\n**No consumer resolved** for this event outside tests. A consumer subscribing through a runtime-built name or configuration is not indexed: search before concluding nothing handles it.\n",
+            );
+        }
         if total == 0 {
             header.push_str(
                 "\n*No gRPC handler/client or async producer/topic/consumer matched this target. Pass a proto method (`ProcessPayment`, `PaymentService.ProcessPayment`), a service, or an event/topic name.*\n",
@@ -724,6 +739,9 @@ mod tests {
             target: "Ping".into(),
             contracts: Vec::new(),
             owner_roots: vec![0],
+            no_producer_resolved: false,
+            no_consumer_resolved: false,
+            file_linked_hops: false,
             rows: nodes
                 .iter()
                 .map(|n| mesh_core::ImpactRow {

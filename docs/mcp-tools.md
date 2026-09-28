@@ -413,8 +413,22 @@ starts with an uppercase letter and whose last is CONSTANT_CASE) — keys on the
 (`event_created`), so producers and consumers that spell it differently meet on one topic. A
 broker literal (`orders.created`) is kept whole. The target is normalized the same way; when a
 topic key equals it, only exact keys match (`EVENT_CREATED` does not pull in
-`WS_EVENT_CREATED_FEEDBACK`), otherwise keys containing it do. Rows in test files are left out and
+`WS_EVENT_CREATED_FEEDBACK`), otherwise keys containing it do. When no key matches the target as
+written, it is tried once more with `.`, `:`, `-`, `/` turned into `_`, so the value a constant holds
+(`event.created`) finds the member-keyed topic (`event_created`). Rows in test files are left out and
 counted unless `include_tests: true`.
+
+#### Depth
+Each hop past the first follows the `Produces` edges of the consumers reached on the previous hop
+**and of the producers declared in the same file as one of them** — a handler usually re-emits
+from a separate call site (a `produce:` pattern, a `client.emit` in another method), not from the
+node that consumes. Those rows are `heuristic` (linked by file, not by a call edge), and the output
+says the walk used them.
+
+#### Gaps said explicitly
+When an event matches but no producer outside tests was resolved, the output says so (**No
+producer resolved**): producers the index does not see — a SQL trigger, a runtime-built topic name,
+a config-driven publisher — may exist. Same for **No consumer resolved**.
 
 #### Classification rule
 The graph has no "service" field, so a service is a workspace **root** (`repo_id`).

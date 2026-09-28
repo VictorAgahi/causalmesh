@@ -429,13 +429,45 @@ impl ProtoWireMessage {
     }
 }
 
-/// Every message of one `.proto` file, plus the enum names it declares (so a
-/// field typed with a file-local enum is known to be a varint, not a message).
+/// One enum constant: `EVENT_STATE_CANCELLED = 3;`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtoWireEnumValue {
+    pub name: CompactStr,
+    pub number: i64,
+    pub line: usize,
+}
+
+/// One enum (nested enums are named `Outer.Inner`, like messages).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtoWireEnum {
+    /// Dotted path inside the file (`Outer.State`), without the package.
+    pub path: String,
+    pub line: usize,
+    pub values: Vec<ProtoWireEnumValue>,
+    pub reserved_ranges: Vec<(u32, u32)>,
+    pub reserved_names: Vec<CompactStr>,
+}
+
+impl ProtoWireEnum {
+    pub fn is_number_reserved(&self, number: i64) -> bool {
+        self.reserved_ranges
+            .iter()
+            .any(|&(lo, hi)| i64::from(lo) <= number && number <= i64::from(hi))
+    }
+
+    pub fn is_name_reserved(&self, name: &str) -> bool {
+        self.reserved_names.iter().any(|n| n.as_str() == name)
+    }
+}
+
+/// Every message and enum of one `.proto` file. `enum_names` (bare names) is
+/// what tells a field typed with a file-local enum is a varint, not a message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProtoWireSchema {
     pub messages: Vec<ProtoWireMessage>,
     /// Bare names of every enum declared in the file, at any nesting level.
     pub enum_names: Vec<CompactStr>,
+    pub enums: Vec<ProtoWireEnum>,
 }
 
 /// Why a `.proto` source could not be turned into a [`ProtoWireSchema`].
@@ -464,6 +496,12 @@ pub enum WireRule {
     IncompatibleType,
     /// A field disappeared and neither its number nor its name is `reserved`.
     DeletedWithoutReserved,
+    /// An enum number now names a different constant (values renumbered or
+    /// swapped), or a `reserved` number is used again: a peer on the other
+    /// version reads the integer as another constant.
+    EnumNumberReused,
+    /// An enum constant disappeared and its number is not `reserved`.
+    EnumValueDeletedWithoutReserved,
 }
 
 impl WireRule {
@@ -472,6 +510,8 @@ impl WireRule {
             Self::FieldNumberReused => "field number reused",
             Self::IncompatibleType => "incompatible type change",
             Self::DeletedWithoutReserved => "field deleted without `reserved`",
+            Self::EnumNumberReused => "enum number reused",
+            Self::EnumValueDeletedWithoutReserved => "enum value deleted without `reserved`",
         }
     }
 }
@@ -480,9 +520,10 @@ impl WireRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBreakingChange {
     pub rule: WireRule,
-    /// Message path (`Outer.Inner`).
+    /// Message or enum path (`Outer.Inner`).
     pub message: String,
-    pub number: u32,
+    /// Field number, or enum value number.
+    pub number: i64,
     /// Human-readable specifics (old/new name and type).
     pub detail: String,
     /// Line in the new version when the field still exists there, else in the base.
@@ -494,9 +535,9 @@ pub struct WireBreakingChange {
 /// names), or a type change that depends on a type declared in another file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireWarning {
-    /// Message path (`Outer.Inner`).
+    /// Message or enum path (`Outer.Inner`).
     pub message: String,
-    pub number: u32,
+    pub number: i64,
     pub detail: String,
     /// Line in the new version.
     pub line: usize,
@@ -512,6 +553,9 @@ pub struct WireDiff {
     /// renamed). Not a wire break by itself — a field still typed with it is
     /// caught as an incompatible type — but listed so the agent can check.
     pub removed_messages: Vec<String>,
+    /// Enums present in the base but not in the new version (removed, moved
+    /// or renamed). A field still typed with one is caught as a type change.
+    pub removed_enums: Vec<String>,
 }
 
 /// Verdict on whether two declarations decode each other's bytes.
@@ -793,7 +837,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                             diff.breaking.push(WireBreakingChange {
                                 rule: WireRule::FieldNumberReused,
                                 message: old_msg.path.clone(),
-                                number,
+                                number: i64::from(number),
                                 detail: format!(
                                     "was `{}` (`{}`), now `{}` (`{}`): data written by either side is read as the other field",
                                     of.name,
@@ -811,7 +855,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                             };
                             diff.warnings.push(WireWarning {
                                 message: old_msg.path.clone(),
-                                number,
+                                number: i64::from(number),
                                 detail: format!(
                                     "renamed `{}` -> `{}` (`{}` -> `{}`): binary-compatible, but JSON and text-format payloads use the old name{caveat}",
                                     of.name,
@@ -828,7 +872,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                         WireCompat::Compatible => {}
                         WireCompat::Unknown => diff.warnings.push(WireWarning {
                             message: old_msg.path.clone(),
-                            number,
+                            number: i64::from(number),
                             detail: format!(
                                 "`{}`: `{}` -> `{}` involves a type declared in another file (imported enum or message); compatibility not checked",
                                 of.name,
@@ -850,7 +894,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                             diff.breaking.push(WireBreakingChange {
                                 rule: WireRule::IncompatibleType,
                                 message: old_msg.path.clone(),
-                                number,
+                                number: i64::from(number),
                                 detail: format!(
                                     "`{}`: `{}` -> `{}` ({why})",
                                     of.name,
@@ -867,7 +911,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                         diff.breaking.push(WireBreakingChange {
                             rule: WireRule::DeletedWithoutReserved,
                             message: old_msg.path.clone(),
-                            number,
+                            number: i64::from(number),
                             detail: format!(
                                 "`{}` (`{}`) was removed; add `reserved {number};` and `reserved \"{}\";` so the number is never reused",
                                 of.name,
@@ -886,7 +930,7 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                 diff.breaking.push(WireBreakingChange {
                     rule: WireRule::FieldNumberReused,
                     message: old_msg.path.clone(),
-                    number,
+                    number: i64::from(number),
                     detail: format!(
                         "number {number} was `reserved` in the base and is now `{}` (`{}`): old data for the deleted field is read as this one",
                         nf.name,
@@ -900,7 +944,155 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
         diff.warnings[warn_start..].sort_by_key(|w| w.number);
     }
 
+    diff_wire_enums(old, new, &mut diff);
     diff
+}
+
+/// Enum constants go on the wire as their number only, so a renumbering
+/// decodes without error into the wrong constant (`EVENT_STATE_CANCELLED`
+/// 3 -> 5 with `EVENT_STATE_IN_PROGRESS` taking 3: an old peer reads every
+/// in-progress event as cancelled). 7.0.6 compared messages only and answered
+/// "no wire-format breaking change" on exactly that. Same shape as the field
+/// rules: a number whose constant changed is a break when a name really moved
+/// (the old name now has another number, or the new name had another one),
+/// a warning for a plain in-place rename (JSON carries the name); a constant
+/// removed without its number `reserved` is a break; a `reserved` number
+/// reused is a break. `allow_alias` numbers compare as sets of names.
+fn diff_wire_enums(old: &ProtoWireSchema, new: &ProtoWireSchema, diff: &mut WireDiff) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let new_enums: BTreeMap<&str, &ProtoWireEnum> = new
+        .enums
+        .iter()
+        .rev()
+        .map(|e| (e.path.as_str(), e))
+        .collect();
+    for old_enum in &old.enums {
+        let Some(new_enum) = new_enums.get(old_enum.path.as_str()) else {
+            diff.removed_enums.push(old_enum.path.clone());
+            continue;
+        };
+        let start = diff.breaking.len();
+        let warn_start = diff.warnings.len();
+        fn by_number(e: &ProtoWireEnum) -> BTreeMap<i64, BTreeSet<&str>> {
+            let mut map: BTreeMap<i64, BTreeSet<&str>> = BTreeMap::new();
+            for v in &e.values {
+                map.entry(v.number).or_default().insert(v.name.as_str());
+            }
+            map
+        }
+        let number_of = |e: &ProtoWireEnum, name: &str| {
+            e.values
+                .iter()
+                .find(|v| v.name.as_str() == name)
+                .map(|v| v.number)
+        };
+        let line_of = |e: &ProtoWireEnum, number: i64| {
+            e.values
+                .iter()
+                .find(|v| v.number == number)
+                .map_or(e.line, |v| v.line)
+        };
+        let old_by_num = by_number(old_enum);
+        let new_by_num = by_number(new_enum);
+        let join = |names: &BTreeSet<&str>| {
+            names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+
+        for (&number, old_names) in &old_by_num {
+            match new_by_num.get(&number) {
+                Some(new_names) if new_names == old_names => {}
+                Some(new_names) => {
+                    let moved: Vec<String> = old_names
+                        .iter()
+                        .filter_map(|n| {
+                            number_of(new_enum, n)
+                                .filter(|&m| m != number)
+                                .map(|m| format!("`{n}` is now {m}"))
+                        })
+                        .chain(new_names.iter().filter_map(|n| {
+                            number_of(old_enum, n)
+                                .filter(|&m| m != number)
+                                .map(|m| format!("`{n}` was {m}"))
+                        }))
+                        .collect();
+                    if moved.is_empty() {
+                        diff.warnings.push(WireWarning {
+                            message: old_enum.path.clone(),
+                            number,
+                            detail: format!(
+                                "enum value renamed {} -> {}: binary-compatible, but JSON and text-format payloads use the old name",
+                                join(old_names),
+                                join(new_names)
+                            ),
+                            line: line_of(new_enum, number),
+                        });
+                    } else {
+                        diff.breaking.push(WireBreakingChange {
+                            rule: WireRule::EnumNumberReused,
+                            message: old_enum.path.clone(),
+                            number,
+                            detail: format!(
+                                "{number} was {}, now {} ({}): a peer on the other version reads {number} as the other constant",
+                                join(old_names),
+                                join(new_names),
+                                moved.join(", ")
+                            ),
+                            line: line_of(new_enum, number),
+                        });
+                    }
+                }
+                None => {
+                    if !new_enum.is_number_reserved(number) {
+                        let moved: Vec<String> = old_names
+                            .iter()
+                            .filter_map(|n| {
+                                number_of(new_enum, n).map(|m| format!("`{n}` is now {m}"))
+                            })
+                            .collect();
+                        let detail = if moved.is_empty() {
+                            format!(
+                                "{} ({number}) was removed; add `reserved {number};` so the number is never reused",
+                                join(old_names)
+                            )
+                        } else {
+                            format!(
+                                "{number} no longer exists ({}): data written with {number} by the other version is an unknown value; add `reserved {number};`",
+                                moved.join(", ")
+                            )
+                        };
+                        diff.breaking.push(WireBreakingChange {
+                            rule: WireRule::EnumValueDeletedWithoutReserved,
+                            message: old_enum.path.clone(),
+                            number,
+                            detail,
+                            line: line_of(old_enum, number),
+                        });
+                    }
+                }
+            }
+        }
+        for (&number, new_names) in &new_by_num {
+            if !old_by_num.contains_key(&number) && old_enum.is_number_reserved(number) {
+                diff.breaking.push(WireBreakingChange {
+                    rule: WireRule::EnumNumberReused,
+                    message: old_enum.path.clone(),
+                    number,
+                    detail: format!(
+                        "{number} was `reserved` in the base and is now {}: old data with the deleted constant is read as this one",
+                        join(new_names)
+                    ),
+                    line: line_of(new_enum, number),
+                });
+            }
+        }
+        diff.breaking[start..].sort_by_key(|c| (c.number, c.rule));
+        diff.warnings[warn_start..].sort_by_key(|w| w.number);
+    }
 }
 
 impl ProtoExtractor {
@@ -968,6 +1160,20 @@ impl ProtoExtractor {
             match child.kind() {
                 "enum" => {
                     if let Some(name) = Self::find_child_text(child, "enum_name", source) {
+                        let path = if prefix.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{prefix}.{name}")
+                        };
+                        let mut wire_enum = ProtoWireEnum {
+                            path,
+                            line: child.start_position().row + 1,
+                            ..ProtoWireEnum::default()
+                        };
+                        if let Some(body) = Self::find_child_by_kind(child, "enum_body") {
+                            Self::collect_enum_members(body, source, &mut wire_enum);
+                        }
+                        schema.enums.push(wire_enum);
                         schema.enum_names.push(name);
                     }
                 }
@@ -993,6 +1199,48 @@ impl ProtoExtractor {
                     if let Some(body) = body {
                         Self::collect_wire_scope(body, source, &path, schema);
                     }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `NAME = 3;` / `NAME = -1 [deprecated = true];` and `reserved` lines.
+    fn collect_enum_members(body: Node, source: &[u8], wire_enum: &mut ProtoWireEnum) {
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            match member.kind() {
+                "enum_field" => {
+                    let (Some(name), Some(int_node)) = (
+                        Self::find_child_text(member, "identifier", source),
+                        Self::find_child_by_kind(member, "int_lit"),
+                    ) else {
+                        continue;
+                    };
+                    let Some(magnitude) = int_node
+                        .utf8_text(source)
+                        .ok()
+                        .and_then(Self::parse_int_lit)
+                    else {
+                        continue;
+                    };
+                    let number = if Self::has_token(member, "-") {
+                        -i64::from(magnitude)
+                    } else {
+                        i64::from(magnitude)
+                    };
+                    wire_enum.values.push(ProtoWireEnumValue {
+                        name,
+                        number,
+                        line: member.start_position().row + 1,
+                    });
+                }
+                "reserved" => {
+                    // Same `reserved` grammar as a message's.
+                    let mut reserved = ProtoWireMessage::default();
+                    Self::collect_reserved(member, source, &mut reserved);
+                    wire_enum.reserved_ranges.extend(reserved.reserved_ranges);
+                    wire_enum.reserved_names.extend(reserved.reserved_names);
                 }
                 _ => {}
             }
@@ -1475,7 +1723,7 @@ message Outer {
             "syntax = \"proto3\";\nmessage Tag { string v = 1; }\nmessage Entry { string key = 1; int64 value = 2; }\nmessage M {\n  repeated string s = 1;\n  repeated bytes b = 2;\n  repeated Tag t = 3;\n  repeated int32 n = 4;\n  repeated Entry counts = 5;\n  int32 m2 = 6;\n  repeated imp.Thing u = 7;\n}\n",
         );
         let diff = diff_wire_schemas(&old, &new);
-        let found: Vec<(WireRule, u32)> =
+        let found: Vec<(WireRule, i64)> =
             diff.breaking.iter().map(|c| (c.rule, c.number)).collect();
         assert_eq!(
             found,
@@ -1486,11 +1734,11 @@ message Outer {
             "{diff:#?}"
         );
         // `imp.Thing` may be an imported enum (packed) or message: a warning.
-        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        let warned: Vec<i64> = diff.warnings.iter().map(|w| w.number).collect();
         assert_eq!(warned, vec![7], "{diff:#?}");
         // And back: repeated -> singular for the same types.
         let back = diff_wire_schemas(&new, &old);
-        let found: Vec<u32> = back.breaking.iter().map(|c| c.number).collect();
+        let found: Vec<i64> = back.breaking.iter().map(|c| c.number).collect();
         assert_eq!(found, vec![4, 6], "{back:#?}");
     }
 
@@ -1507,7 +1755,7 @@ message Outer {
             "syntax = \"proto3\";\nmessage M {\n  string contact_email = 1;\n  int32 b = 2;\n  int32 a = 3;\n  int64 cc = 4;\n  int64 d_renamed = 5;\n}\n",
         );
         let diff = diff_wire_schemas(&old, &new);
-        let found: Vec<(WireRule, u32)> =
+        let found: Vec<(WireRule, i64)> =
             diff.breaking.iter().map(|c| (c.rule, c.number)).collect();
         assert_eq!(
             found,
@@ -1518,7 +1766,7 @@ message Outer {
             ],
             "{diff:#?}"
         );
-        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        let warned: Vec<i64> = diff.warnings.iter().map(|w| w.number).collect();
         assert_eq!(warned, vec![1, 5], "{diff:#?}");
         assert!(diff.warnings[0].detail.contains("JSON"), "{diff:#?}");
     }
@@ -1536,11 +1784,54 @@ message Outer {
         );
         let diff = diff_wire_schemas(&old, &new);
         assert!(diff.breaking.is_empty(), "{diff:#?}");
-        let warned: Vec<u32> = diff.warnings.iter().map(|w| w.number).collect();
+        let warned: Vec<i64> = diff.warnings.iter().map(|w| w.number).collect();
         assert_eq!(warned, vec![1], "{diff:#?}");
         // Identical versions: nothing at all.
         let same = diff_wire_schemas(&old, &old);
         assert_eq!(same, WireDiff::default());
+    }
+
+    /// Volontariapp 7.0.6 report, critical defect 3: a real renumbering
+    /// (`EVENT_STATE_CANCELLED` 3 -> 5, 3 reused) was "no wire-format
+    /// breaking change" because enums were not compared at all.
+    #[test]
+    fn wire_diff_compares_enum_values() {
+        let old = schema(
+            "syntax = \"proto3\";\nenum EventState {\n  EVENT_STATE_UNSPECIFIED = 0;\n  EVENT_STATE_OPEN = 1;\n  EVENT_STATE_CLOSED = 2;\n  EVENT_STATE_CANCELLED = 3;\n  EVENT_STATE_DRAFT = 4;\n  reserved 9;\n}\nmessage M { enum Kind { K_A = 0; K_B = 1; NEG = -1; } int32 x = 1; }\nenum Gone { G = 0; }\n",
+        );
+        let new = schema(
+            "syntax = \"proto3\";\nenum EventState {\n  EVENT_STATE_UNSPECIFIED = 0;\n  EVENT_STATE_OPENED = 1;\n  EVENT_STATE_IN_PROGRESS = 3;\n  EVENT_STATE_CANCELLED = 5;\n  reserved 2;\n  EVENT_STATE_ARCHIVED = 9;\n}\nmessage M { enum Kind { K_A = 0; K_C = 1; } int32 x = 1; }\n",
+        );
+        assert_eq!(new.enums[0].values[3].number, 5, "{new:#?}");
+        assert_eq!(old.enums[1].path, "M.Kind");
+        assert_eq!(old.enums[1].values[2].number, -1, "{old:#?}");
+        let diff = diff_wire_schemas(&old, &new);
+        let found: Vec<(WireRule, &str, i64)> = diff
+            .breaking
+            .iter()
+            .map(|c| (c.rule, c.message.as_str(), c.number))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                // CANCELLED moved to 5 and IN_PROGRESS took 3.
+                (WireRule::EnumNumberReused, "EventState", 3),
+                // DRAFT removed, 4 not reserved.
+                (WireRule::EnumValueDeletedWithoutReserved, "EventState", 4),
+                // 9 was reserved and is used again.
+                (WireRule::EnumNumberReused, "EventState", 9),
+                (WireRule::EnumValueDeletedWithoutReserved, "M.Kind", -1),
+            ],
+            "{diff:#?}"
+        );
+        // OPEN -> OPENED and K_B -> K_C in place: JSON-only renames. 2 is reserved.
+        let warned: Vec<(&str, i64)> = diff
+            .warnings
+            .iter()
+            .map(|w| (w.message.as_str(), w.number))
+            .collect();
+        assert_eq!(warned, vec![("EventState", 1), ("M.Kind", 1)], "{diff:#?}");
+        assert_eq!(diff.removed_enums, vec!["Gone".to_string()]);
     }
 
     #[test]
@@ -1552,7 +1843,7 @@ message Outer {
             "syntax = \"proto3\";\nmessage M {\n  reserved 4;\n  reserved \"f\";\n  int64 a = 1;\n  int32 renamed = 2;\n  sint32 c = 3;\n  int32 e = 5;\n  int32 g = 7;\n}\n",
         );
         let diff = diff_wire_schemas(&old, &new);
-        let found: Vec<(WireRule, u32)> =
+        let found: Vec<(WireRule, i64)> =
             diff.breaking.iter().map(|c| (c.rule, c.number)).collect();
         assert_eq!(
             found,

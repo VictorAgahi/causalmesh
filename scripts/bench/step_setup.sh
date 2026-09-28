@@ -7,7 +7,7 @@ if [[ ! -d "$dest" ]]; then
   exit 0
 fi
 cd "$dest"
-"$MESH_MCP_BIN" init --auto > "$RESULTS_DIR/$name.init.log" 2>&1 || echo "[$name] init failed"
+"$MESH_MCP_BIN" init --auto --force > "$RESULTS_DIR/$name.init.log" 2>&1 || echo "[$name] init failed"
 if "$MESH_MCP_BIN" doctor --config .agents/mesh-mcp.toml > "$RESULTS_DIR/$name.doctor.log" 2>&1; then
   echo "[$name] doctor OK"
 else

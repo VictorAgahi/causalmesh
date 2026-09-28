@@ -5,6 +5,27 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.2] — 2026-09-28
+
+Most installs are done by the user's own AI agent: this release gives that agent an accurate guide
+and fixes two `init` defects found while writing it.
+
+### Added
+- **`mesh-mcp agent-guide`** prints `docs/agent-setup.md`, a setup guide written for the AI agent
+  that installs MeshMCP on the user's behalf: what to ask first (global config, `install-hooks`,
+  `doctor --fix`), choosing the workspace root for sibling repositories, reviewing `roots`,
+  excludes, gRPC and event patterns, registering the server, and verifying the result against
+  `grep` before reporting success. Embedded in the binary, so it always matches the version.
+- **`install.sh` ends with a plain-text note for AI agents** pointing at `mesh-mcp agent-guide`.
+
+### Fixed
+- **`mesh-mcp init` overwrote an existing `.agents/mesh-mcp.toml`**, including on
+  `init --write-ide-config`, silently discarding a tuned config. It is now kept; `--force`
+  regenerates it.
+- **`init --write-ide-config` printed "Registered Claude Code CLI guidance" and wrote nothing.** It
+  now merges a `mesh-mcp` entry into Claude Code's project-scope `.mcp.json`, like it does for
+  `.cursor/mcp.json` and `.vscode/mcp.json`.
+
 ## [7.0.1] — 2026-09-28
 
 Fixes from the first field report on a NestJS / TypeScript / React Native workspace (Volontariapp,

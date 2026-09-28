@@ -67,8 +67,8 @@ cd /path/to/your/workspace
 ```
 
 It copies `mesh-mcp` and `meshd` into `~/.local/bin`, runs
-`mesh-mcp init --auto --write-ide-config` (keeps an existing config, merges `.cursor/mcp.json` and
-`.vscode/mcp.json` without removing other servers) and checks the result with
+`mesh-mcp init --auto --write-ide-config` (keeps an existing config, merges `.mcp.json`,
+`.cursor/mcp.json` and `.vscode/mcp.json` without removing other servers) and checks the result with
 `mesh-mcp doctor --json`. Building needs a stable Rust toolchain and a C compiler.
 
 The full walkthrough, including configuration of roots, docs vocabulary, custom patterns, skills
@@ -80,7 +80,8 @@ and stop rules, is in [SETUP.md](SETUP.md). A five-language example workspace is
 | Command | Purpose |
 | :--- | :--- |
 | `mesh-mcp run [--standalone]` | MCP server on stdio (daemon-backed by default). |
-| `mesh-mcp init --auto [--write-ide-config]` | Generate `.agents/mesh-mcp.toml` from the directory layout; optionally write Cursor / VS Code MCP entries. |
+| `mesh-mcp init --auto [--write-ide-config] [--force]` | Generate `.agents/mesh-mcp.toml` from the directory layout (an existing one is kept unless `--force`); optionally write Claude Code / Cursor / VS Code MCP entries. |
+| `mesh-mcp agent-guide` | Print the setup guide for an AI agent installing MeshMCP for you (Markdown). |
 | `mesh-mcp doctor [--fix] [--json]` | Diagnose configuration, index health, socket, daemon version, cache and sandbox; `--fix` repairs what is safe to repair (never the audit log). |
 | `mesh-mcp graph [--format html\|mermaid\|json\|fingerprint] [--open]` | Render the full topology, or print a content fingerprint of the index. |
 | `mesh-mcp stats [--since 7d\|24h\|all] [--session ID] [--db PATH] [--json]` | Local audit summary: calls per tool and per agent session, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. `MESH_AUDIT_DB` moves the audit database. |

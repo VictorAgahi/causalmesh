@@ -102,7 +102,12 @@ mesh-mcp init --auto
 ```
 
 This writes `.agents/mesh-mcp.toml`, guessing your roots from directory names it recognises
-(`services/`, `packages/`, `crates/`, `proto*/`, `docs/`, `k8s*/`, …).
+(`services/`, `packages/`, `crates/`, `proto*/`, `docs/`, `k8s*/`, …). An existing
+`.agents/mesh-mcp.toml` is kept as is; `--force` regenerates it.
+
+**Installing with an AI agent?** Have it run `mesh-mcp agent-guide` first: it prints a setup
+guide written for agents (what to ask the user, how to write `roots` for sibling repositories,
+how to verify the result against `grep`).
 
 **Treat the result as a draft.** It cannot know that your contracts live in `schemas/v2`, or
 that `legacy/` should be ignored. Step 3 is where the real work happens.
@@ -266,7 +271,8 @@ claude mcp add mesh-mcp -- mesh-mcp run
 { "servers": { "mesh-mcp": { "type": "stdio", "command": "mesh-mcp", "args": ["run"] } } }
 ```
 
-`mesh-mcp init --auto --write-ide-config` writes both files for you. It only adds or replaces the
+`mesh-mcp init --auto --write-ide-config` writes these files for you, plus Claude Code's
+project-scope `.mcp.json`. It only adds or replaces the
 `mesh-mcp` entry: other servers are kept, and a file that is not valid JSON is left untouched.
 
 ### Verify by hand

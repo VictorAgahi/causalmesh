@@ -61,10 +61,19 @@ enum Commands {
         auto: bool,
         #[arg(
             long,
-            help = "Generate IDE configurations for Cursor, VS Code, and Claude Code"
+            help = "Merge a mesh-mcp server entry into Claude Code's .mcp.json, .cursor/mcp.json and .vscode/mcp.json"
         )]
         write_ide_config: bool,
+        #[arg(
+            long,
+            help = "Regenerate .agents/mesh-mcp.toml even if it exists (it is kept by default)"
+        )]
+        force: bool,
     },
+
+    /// Print the setup guide for AI agents installing MeshMCP for a user
+    /// (Markdown, on stdout). Matches this binary's version.
+    AgentGuide,
 
     /// Install OS-level Git pre-commit hooks for active governance
     InstallHooks,
@@ -127,8 +136,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Init {
             auto,
             write_ide_config,
+            force,
         } => {
-            InitCommand::run(auto, write_ide_config)?;
+            InitCommand::run(auto, write_ide_config, force)?;
+        }
+        Commands::AgentGuide => {
+            // A CLI subcommand, never the MCP server: stdout is free here.
+            print!("{}", mesh_server::cli::AGENT_SETUP_GUIDE);
         }
         Commands::InstallHooks => {
             let (config, _base) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;

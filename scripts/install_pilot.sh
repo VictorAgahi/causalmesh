@@ -127,11 +127,12 @@ confirm() {
   esac
 }
 
-if confirm "Run 'mesh-mcp init --auto --write-ide-config' in $WORKSPACE (merges into .cursor/mcp.json and .vscode/mcp.json)?"; then
+if confirm "Run 'mesh-mcp init --auto --write-ide-config' in $WORKSPACE (merges into .mcp.json, .cursor/mcp.json and .vscode/mcp.json)?"; then
   CONFIG="$WORKSPACE/.agents/mesh-mcp.toml"
   SAVED=""
   if [ -f "$CONFIG" ]; then
-    # `init` regenerates .agents/mesh-mcp.toml; a pilot's hand-tuned config wins.
+    # Redundant since 7.0.1 (`init` keeps an existing config), kept as a cheap
+    # guard: a pilot's hand-tuned config must survive this script byte-for-byte.
     SAVED="$(mktemp)"
     cp "$CONFIG" "$SAVED" || die "cannot back up $CONFIG"
   fi

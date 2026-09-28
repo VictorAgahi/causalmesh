@@ -22,7 +22,10 @@ pub mod watcher;
 pub mod yaml_stream;
 
 // Re-export common types
-pub use audit::{AuditEntry, AuditError, AuditLogger, AuditMetrics, IndexCacheTotals};
+pub use audit::{
+    normalize_audit_timestamp, parse_timestamp_to_epoch_secs, AuditEntry, AuditError, AuditLogger,
+    AuditMetrics, IndexCacheTotals,
+};
 pub use config::{
     expand_roots, strip_workspace_root_prefix, AsyncApiConfig, Config, ConfigError,
     ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternKind,

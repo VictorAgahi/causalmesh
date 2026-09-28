@@ -79,7 +79,7 @@ def prepare_synthetic(args):
         home = tempfile.mkdtemp(prefix="mtb-init-")
         try:
             env = dict(os.environ, HOME=home)
-            subprocess.run([mesh_bin(), "init", "--auto"], cwd=corpus, env=env, check=True,
+            subprocess.run([mesh_bin(), "init", "--auto", "--force"], cwd=corpus, env=env, check=True,
                            stdout=sys.stderr, stderr=sys.stderr)
         finally:
             shutil.rmtree(home, ignore_errors=True)

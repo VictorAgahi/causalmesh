@@ -81,8 +81,18 @@ impl AuditLogger {
     /// every historical entry rejected as tampered the moment this binary is upgraded.
     pub const CHAIN_VERSION: i64 = 2;
 
+    /// Environment variable overriding [`Self::default_db_path`]: benchmarks, test
+    /// harnesses and pilot runs point it at their own file so they never mix their
+    /// calls into the user's real audit trail (7.0.0 pilot feedback: 314 test calls
+    /// and scale-bench files dominated `mesh-mcp stats` on a developer machine).
+    pub const DB_PATH_ENV: &'static str = "MESH_AUDIT_DB";
+
+    /// `$MESH_AUDIT_DB` when set and non-empty, else `~/.cache/mesh-mcp/audit.db`.
     pub fn default_db_path() -> PathBuf {
-        crate::paths::mesh_cache_dir().join("audit.db")
+        match std::env::var_os(Self::DB_PATH_ENV) {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => crate::paths::mesh_cache_dir().join("audit.db"),
+        }
     }
 
     pub fn default_log_path() -> PathBuf {
@@ -546,6 +556,17 @@ impl AuditLogger {
         path: &Path,
         since_epoch_secs: Option<f64>,
     ) -> Result<AuditMetrics, AuditError> {
+        Self::read_metrics_for_session(path, since_epoch_secs, None)
+    }
+
+    /// [`Self::read_metrics`], with tool latencies restricted to calls audited
+    /// under `session` when given. Index cache passes and process starts are not
+    /// tied to a session and are returned unfiltered.
+    pub fn read_metrics_for_session(
+        path: &Path,
+        since_epoch_secs: Option<f64>,
+        session: Option<&str>,
+    ) -> Result<AuditMetrics, AuditError> {
         let mut metrics = AuditMetrics::default();
         if !path.exists() {
             return Ok(metrics);
@@ -567,7 +588,7 @@ impl AuditLogger {
 
         if has_table("tool_call_metrics")? {
             let mut stmt = conn.prepare(
-                "SELECT e.tool, m.duration_us, e.timestamp
+                "SELECT e.tool, m.duration_us, e.timestamp, e.session_id
                  FROM tool_call_metrics m JOIN audit_entries e ON e.entry_seq = m.entry_seq
                  ORDER BY m.entry_seq ASC",
             )?;
@@ -576,12 +597,13 @@ impl AuditLogger {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (tool, duration_us, ts) = row?;
-                if in_window(&ts) {
+                let (tool, duration_us, ts, row_session) = row?;
+                if in_window(&ts) && session.is_none_or(|s| s == row_session) {
                     out.push((tool, duration_us.max(0) as u64));
                 }
             }
@@ -699,7 +721,19 @@ mod hex {
 fn chrono_fallback_utc_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now();
-    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    format_epoch_iso(now.duration_since(UNIX_EPOCH).unwrap_or_default())
+}
+
+/// An audit row's timestamp as ISO 8601 UTC, whichever of the two formats it was
+/// written in (early rows hold `<epoch-secs>.<millis>Z`, later ones ISO 8601).
+pub fn normalize_audit_timestamp(ts: &str) -> String {
+    // Rounded to the millisecond both formats store: `from_secs_f64` alone
+    // truncated `…21.564` to `…21.563`.
+    let millis = (parse_timestamp_to_epoch_secs(ts).max(0.0) * 1000.0).round() as u64;
+    format_epoch_iso(std::time::Duration::from_millis(millis))
+}
+
+fn format_epoch_iso(duration: std::time::Duration) -> String {
     let total_secs = duration.as_secs();
     let millis = duration.subsec_millis();
 
@@ -726,7 +760,9 @@ fn chrono_fallback_utc_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
-fn parse_timestamp_to_epoch_secs(ts: &str) -> f64 {
+/// Seconds since the Unix epoch of an audit timestamp in either stored format
+/// (see [`normalize_audit_timestamp`]); 0 when unparseable.
+pub fn parse_timestamp_to_epoch_secs(ts: &str) -> f64 {
     let trimmed = ts.trim_end_matches('Z');
     if let Ok(v) = trimmed.parse::<f64>() {
         return v;
@@ -1056,5 +1092,34 @@ mod tests {
         let missing = temp_dir.path().join("does-not-exist.db");
         let entries = AuditLogger::read_entries(&missing, None).expect("read missing db");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn normalize_audit_timestamp_handles_both_stored_formats() {
+        assert_eq!(
+            normalize_audit_timestamp("1700000000.000Z"),
+            "2023-11-14T22:13:20.000Z"
+        );
+        assert_eq!(
+            normalize_audit_timestamp("2026-09-28T08:32:21.564Z"),
+            "2026-09-28T08:32:21.564Z"
+        );
+    }
+
+    /// `MESH_AUDIT_DB` redirects the default database (benches, pilots, tests).
+    #[test]
+    fn default_db_path_honors_the_env_override() {
+        let prev = std::env::var_os(AuditLogger::DB_PATH_ENV);
+        std::env::set_var(AuditLogger::DB_PATH_ENV, "/tmp/pilot-run-1.db");
+        assert_eq!(
+            AuditLogger::default_db_path(),
+            PathBuf::from("/tmp/pilot-run-1.db")
+        );
+        std::env::set_var(AuditLogger::DB_PATH_ENV, "");
+        assert!(AuditLogger::default_db_path().ends_with("audit.db"));
+        match prev {
+            Some(v) => std::env::set_var(AuditLogger::DB_PATH_ENV, v),
+            None => std::env::remove_var(AuditLogger::DB_PATH_ENV),
+        }
     }
 }

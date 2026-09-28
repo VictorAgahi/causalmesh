@@ -1,7 +1,7 @@
 # Pilot scorecard — A/B measurement protocol (template)
 
 > Plan 4 step 4.8. This is an **empty template**: it holds the protocol and the grids to fill in
-> during the pilot (run by a human, after the 6.1.0 release). Every cell is filled from a
+> during the pilot (run by a human, on 7.0.1 or later). Every cell is filled from a
 > measurement taken during the pilot; nothing is pre-filled, estimated or extrapolated. A value
 > that could not be measured is written `not measured`, never guessed.
 
@@ -103,15 +103,18 @@ Run after the last condition-B run of the pilot, and attach the raw output unedi
 
 ```bash
 mesh-mcp --version
-mesh-mcp stats --since all      # whole pilot
-mesh-mcp stats --since 7d       # last week of the pilot
+mesh-mcp stats --since all      # whole pilot, with one line per agent session
+mesh-mcp stats --since all --json
 mesh-mcp doctor --json          # health at the end of the pilot
 ```
 
-`stats` reports, from the local audit database only: calls, isError count and rate per tool,
-latency p50/p95 per tool (nearest-rank over timed calls), index cache hit rate (hits / lookups
-recorded per indexing pass), and `meshd` restarts. A line saying "not recorded" means the audit
-database predates 6.1.0 for that metric; it is not a zero.
+`stats` reports, from the local audit database only: calls, isError count and rate per tool and
+per session, latency p50/p95 per tool (nearest-rank over timed calls; p95 only from 20 timed
+calls on), index cache hit rate (hits / lookups recorded per indexing pass), and `meshd` restarts.
+Each agent session is audited under its own id, so `mesh-mcp stats --session <id>` gives one
+run's figures. Before the first run, export `MESH_AUDIT_DB=<pilot file>` in the environment that
+starts the agent (and `meshd`), so the pilot database holds pilot calls only. A line saying "not
+recorded" means the audit database predates 7.0.0 for that metric; it is not a zero.
 
 ## 9. Conclusion (fill in after the runs)
 

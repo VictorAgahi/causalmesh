@@ -161,17 +161,43 @@ impl ToolRegistry {
         arguments: Value,
         state: Arc<AppState>,
     ) -> Result<Value, ToolError> {
+        Self::call_tool_in_session(name, arguments, state, crate::process_session_id()).await
+    }
+
+    /// [`Self::call_tool`], audited under `session_id`: one id per MCP client
+    /// connection (`meshd`) or per process (`mesh-mcp run --standalone`), so
+    /// `mesh-mcp stats` can separate agent sessions. Every call used to be
+    /// audited as the literal `"active-session"`.
+    pub async fn call_tool_in_session(
+        name: &str,
+        arguments: Value,
+        state: Arc<AppState>,
+        session_id: &str,
+    ) -> Result<Value, ToolError> {
+        let session: Arc<str> = Arc::from(session_id);
         let outcome = match name {
-            SmartSearchTool::NAME => Self::invoke::<SmartSearchTool>(arguments, state).await?,
-            FindDependentsTool::NAME => {
-                Self::invoke::<FindDependentsTool>(arguments, state).await?
+            SmartSearchTool::NAME => {
+                Self::invoke::<SmartSearchTool>(arguments, state, session).await?
             }
-            AnalyzeGrpcTool::NAME => Self::invoke::<AnalyzeGrpcTool>(arguments, state).await?,
-            AnalyzeImpactTool::NAME => Self::invoke::<AnalyzeImpactTool>(arguments, state).await?,
-            SearchDocsTool::NAME => Self::invoke::<SearchDocsTool>(arguments, state).await?,
-            VisualizeMeshTool::NAME => Self::invoke::<VisualizeMeshTool>(arguments, state).await?,
+            FindDependentsTool::NAME => {
+                Self::invoke::<FindDependentsTool>(arguments, state, session).await?
+            }
+            AnalyzeGrpcTool::NAME => {
+                Self::invoke::<AnalyzeGrpcTool>(arguments, state, session).await?
+            }
+            AnalyzeImpactTool::NAME => {
+                Self::invoke::<AnalyzeImpactTool>(arguments, state, session).await?
+            }
+            SearchDocsTool::NAME => {
+                Self::invoke::<SearchDocsTool>(arguments, state, session).await?
+            }
+            VisualizeMeshTool::NAME => {
+                Self::invoke::<VisualizeMeshTool>(arguments, state, session).await?
+            }
             #[cfg(feature = "test-util")]
-            TestSlowOpTool::NAME => Self::invoke::<TestSlowOpTool>(arguments, state).await?,
+            TestSlowOpTool::NAME => {
+                Self::invoke::<TestSlowOpTool>(arguments, state, session).await?
+            }
             unknown => return Err((-32602, format!("Unknown tool: {unknown}"))),
         };
 
@@ -250,6 +276,7 @@ impl ToolRegistry {
     /// semantics as the normal path, and off the executor for the same reason.
     async fn record_refusal(
         state: &Arc<AppState>,
+        session: Arc<str>,
         tool: &'static str,
         trace_id: Option<String>,
         args_json: &str,
@@ -263,7 +290,7 @@ impl ToolRegistry {
         let duration_us = micros_since(started);
         let _ = tokio::task::spawn_blocking(move || {
             match state.audit.record_entry(
-                "active-session",
+                &session,
                 trace_id.as_deref(),
                 tool,
                 &args_json,
@@ -288,6 +315,7 @@ impl ToolRegistry {
     async fn invoke<T: McpTool>(
         arguments: Value,
         state: Arc<AppState>,
+        session: Arc<str>,
     ) -> Result<Result<String, ToolError>, ToolError> {
         // Plan 4 step 4.8: wall-clock latency of the whole call (argument parsing,
         // governance, tool body, output capping), persisted next to its audit row.
@@ -295,7 +323,15 @@ impl ToolRegistry {
         let args: T::Args = match serde_json::from_value(arguments.clone()) {
             Ok(args) => args,
             Err(e) => {
-                Self::record_refusal(&state, T::NAME, None, &arguments.to_string(), started).await;
+                Self::record_refusal(
+                    &state,
+                    session,
+                    T::NAME,
+                    None,
+                    &arguments.to_string(),
+                    started,
+                )
+                .await;
                 return Ok(Err((
                     -32602,
                     format!("Invalid arguments for {}: {e}", T::NAME),
@@ -321,7 +357,15 @@ impl ToolRegistry {
                         });
                         let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
                         let args_json = serde_json::to_string(&args).unwrap_or_default();
-                        Self::record_refusal(&state, T::NAME, trace_id, &args_json, started).await;
+                        Self::record_refusal(
+                            &state,
+                            Arc::clone(&session),
+                            T::NAME,
+                            trace_id,
+                            &args_json,
+                            started,
+                        )
+                        .await;
                         return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
                     } else if mode == mesh_core::ReadGovernanceMode::AuditWarn {
                         tracing::warn!(
@@ -388,7 +432,7 @@ impl ToolRegistry {
                 let duration_us = micros_since(started);
                 let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
                 match state.audit.record_entry(
-                    "active-session",
+                    &session,
                     trace_id.as_deref(),
                     T::NAME,
                     &serde_json::to_string(&args).unwrap_or_default(),
@@ -663,6 +707,7 @@ mod tests {
         let result = ToolRegistry::invoke::<MutatingTestTool>(
             json!({ "target": 12345 }), // `target` is a String
             Arc::clone(&state),
+            Arc::from("test"),
         )
         .await
         .expect("invalid args is a tool outcome, not a protocol fault");
@@ -672,6 +717,7 @@ mod tests {
         let result = ToolRegistry::invoke::<MutatingTestTool>(
             json!({ "target": "services/proto-registry/auth.proto" }),
             Arc::clone(&state),
+            Arc::from("test"),
         )
         .await
         .expect("a governance refusal is a tool outcome, not a protocol fault");
@@ -743,7 +789,7 @@ roots = ["."]
         let state = governed_state();
         let args = json!({ "target": "services/proto-registry/auth.proto" });
 
-        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state)
+        let result = ToolRegistry::invoke::<MutatingTestTool>(args, state, Arc::from("test"))
             .await
             .expect("a governance refusal is a tool outcome, not a protocol fault");
         let (code, message) = result.expect_err("guarded mutation must be refused");
@@ -785,7 +831,7 @@ roots = ["."]
             }
         }
 
-        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state)
+        let result = ToolRegistry::invoke::<ReadOnlyTestTool>(args, state, Arc::from("test"))
             .await
             .expect("no protocol fault");
         let text = result.expect("read-only call on a guarded subject stays allowed");
@@ -831,10 +877,14 @@ roots = ["."]
         let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
         let state = Arc::new(AppState::new(config, vec![], audit, rescan));
 
-        let text = ToolRegistry::invoke::<NotedTestTool>(json!({ "target": "x" }), state)
-            .await
-            .expect("no protocol fault")
-            .expect("tool ok");
+        let text = ToolRegistry::invoke::<NotedTestTool>(
+            json!({ "target": "x" }),
+            state,
+            Arc::from("test"),
+        )
+        .await
+        .expect("no protocol fault")
+        .expect("tool ok");
         assert!(
             text.trim_end().ends_with("TRAILING_NOTE_MARKER"),
             "the tool's own note must stay last, skill hint included: {text:?}"
@@ -865,7 +915,7 @@ roots = ["."]
             }
         }
         let args = json!({ "target": "x".repeat(200_000) });
-        let text = ToolRegistry::invoke::<HugeTool>(args, governed_state())
+        let text = ToolRegistry::invoke::<HugeTool>(args, governed_state(), Arc::from("test"))
             .await
             .expect("no protocol fault")
             .expect("tool ok");

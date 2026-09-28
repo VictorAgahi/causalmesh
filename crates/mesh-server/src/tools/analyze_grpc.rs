@@ -47,7 +47,7 @@ pub struct AnalyzeGrpcTool;
 
 impl McpTool for AnalyzeGrpcTool {
     const NAME: &'static str = "analyze_grpc";
-    const DESCRIPTION: &'static str = "Authoritative compiler-grade gRPC index. Traces end-to-end gRPC RPC definitions from .proto to polyglot generated stubs and controllers, and checks .proto for wire-format breaking changes. If a client stub or handler is reported as 0/none, IT DOES NOT EXIST in the codebase: DO NOT run secondary ripgrep/grep searches to double-check negative results. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
+    const DESCRIPTION: &'static str = "Authoritative compiler-grade gRPC index. Traces end-to-end gRPC RPC definitions from .proto to polyglot generated stubs, server handlers/controllers and client call sites, and checks .proto for wire-format breaking changes. A 0 labeled 'Authoritative AST Scan' is exhaustive over the indexed workspace roots: DO NOT re-check it with ripgrep/grep. Rows marked heuristic or ambiguous may be verified with a targeted read. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
     type Args = AnalyzeGrpcArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {

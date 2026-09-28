@@ -5,6 +5,33 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.17] — 2026-09-28
+
+Makes the 7.0.15–7.0.16 agent guidance actually reach agents and agree with itself.
+
+### Fixed
+- **Stale sibling `meshd` no longer serves a newer `mesh-mcp` (`crates/mesh-server/src/main.rs`)**:
+  the socket name is keyed by `mesh-mcp`'s version, so when only `mesh-mcp` was reinstalled it
+  auto-spawned the older sibling `meshd` on a fresh socket, and that daemon answered every
+  request — `initialize` included — with its own behavior. Measured twice (7.0.15 and 7.0.16
+  installs): `serverInfo.version` and `instructions` came from the previous release. Before
+  spawning, `mesh-mcp` now runs `meshd --version` and, on a mismatch, logs both versions and
+  serves the session in-process instead.
+- **Tool descriptions contradicted the 7.0.16 negative-assertion rule**: `analyze_grpc`,
+  `analyze_impact` and `find_dependents` still said any 0 means "does not exist, never grep",
+  while `initialize.instructions` limits that to results labeled `Authoritative AST Scan` and
+  allows targeted checks of heuristic/ambiguous rows. The descriptions (and
+  `docs/mcp-tools.md`) now state the same rule.
+- **CI red since 7.0.15**: `test_tools_call_reports_still_indexing_before_first_snapshot` read
+  the `initialize` reply into a fixed 1 KiB buffer; with the routing `instructions` it is larger,
+  so the JSON was cut. The test now reads one line-delimited frame per reply.
+
+### Changed
+- `analyze_impact` and `analyze_grpc` descriptions name what agents ask for in generic terms
+  (who publishes / consumes or subscribes, outbox writes, message broker and event bus
+  listeners, client call sites), so deferred-tool search can match them. The 7.0.16 entry
+  announced refined tool descriptions, but only one argument description had changed.
+
 ## [7.0.16] — 2026-09-28
 
 Conditional deferred tool activation instructions, heuristic-aware negative assertion rules, and generic architectural taxonomy.

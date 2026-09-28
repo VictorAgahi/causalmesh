@@ -166,7 +166,8 @@ mesh-mcp doctor          # human-readable; --json for the same checks as JSON
   resolves to nothing, or a scanned count far below expectations, means `roots` or
   `exclude_patterns` is wrong. Files listed as not indexed are oversized or binary: an agent must
   read those directly.
-- `⚠ Root overlap` or `matched 0 files — likely dead config` lines point at config mistakes.
+- `⚠ Root overlap`, `⚠ Duplicated submodule` (the same git submodule checked out in several roots,
+  indexed once per copy) or `matched 0 files — likely dead config` lines point at config mistakes.
 
 ### 5.2 Answers against ground truth
 
@@ -193,8 +194,12 @@ did not, and anything you left for them to decide (stop rules, git hook, global 
 
 - `smart_search` matches **declared symbol names**, not free text; use `fuzzy: true` for a text
   scan. Follow the `offset` in a page footer instead of raising `limit`.
-- Every result that comes from a name heuristic rather than a structural link is marked as such:
-  treat it as a lead to confirm by reading the code, not as a fact.
+- `analyze_grpc`, `analyze_impact` and `visualize_mesh` label each link `exact`, `heuristic` or
+  `ambiguous`, and say when a list may be incomplete ("may call", "No producer resolved").
+  `smart_search` is a substring search: it lists exact declarations first and says how many other
+  results only contain the query. `find_dependents` warns when its answer is a substring fallback.
+  Treat anything `heuristic`, `ambiguous` or merely name-matched as a lead to confirm by reading
+  the code, not as a fact.
 - A tool answer that says a file is not indexed means: read that file directly.
 
 ---

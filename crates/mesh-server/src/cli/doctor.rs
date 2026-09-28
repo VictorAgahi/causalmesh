@@ -329,6 +329,68 @@ impl DoctorCommand {
                 format!("{} root(s), none overlapping", roots.len()),
             ));
         }
+
+        // 1e. The same git submodule checked out in several roots is indexed
+        // once per copy — nothing overlaps, so the check above cannot see it.
+        // On Volontariapp, 14 copies of `ci-tools` were ~17% of the index and
+        // surfaced in scoped searches.
+        let exclude = mesh_core::ExcludeMatcher::compile(&cfg.workspace.exclude_patterns);
+        let mut by_url: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for root in &roots {
+            let Ok(text) = std::fs::read_to_string(root.join(".gitmodules")) else {
+                continue;
+            };
+            for (path, url) in Self::parse_gitmodules(&text) {
+                let probe = Path::new(&path).join("probe.ts");
+                if exclude.is_excluded_with_root(&probe, Some(root)) {
+                    continue;
+                }
+                by_url
+                    .entry(url)
+                    .or_default()
+                    .push(root.join(&path).display().to_string());
+            }
+        }
+        for (url, copies) in by_url.iter().filter(|(_, c)| c.len() > 1) {
+            let name = Path::new(url.trim_end_matches(".git"))
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| url.clone());
+            checks.push(DoctorCheck::warn(
+                "Duplicated submodule",
+                format!(
+                    "'{url}' is checked out {} times ({}{}): its files are indexed once per copy and show up in every search. Exclude it (e.g. \"**/{name}/**\") or keep one copy as a root.",
+                    copies.len(),
+                    copies.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
+                    if copies.len() > 3 { ", …" } else { "" }
+                ),
+            ));
+        }
+    }
+
+    /// `(path, url)` of each `[submodule …]` section of a `.gitmodules` file.
+    fn parse_gitmodules(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let (mut path, mut url): (Option<String>, Option<String>) = (None, None);
+        let mut flush = |path: &mut Option<String>, url: &mut Option<String>| {
+            if let (Some(p), Some(u)) = (path.take(), url.take()) {
+                out.push((p, u));
+            }
+        };
+        for line in text.lines().map(str::trim) {
+            if line.starts_with("[submodule") {
+                flush(&mut path, &mut url);
+            } else if let Some((key, value)) = line.split_once('=') {
+                match key.trim() {
+                    "path" => path = Some(value.trim().to_string()),
+                    "url" => url = Some(value.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        flush(&mut path, &mut url);
+        out
     }
 
     /// Section 2: the crawler never follows a symlink. The probe directory is
@@ -1012,5 +1074,22 @@ mod sandbox_check_tests {
         // Pre-5.9 kernel: no filter count, the mode is all there is.
         assert_eq!(seccomp_confined("Seccomp:\t2\n", ""), Some(true));
         assert_eq!(seccomp_confined("Name:\tmeshd\n", own_bare), None);
+    }
+}
+
+#[cfg(test)]
+mod gitmodules_tests {
+    use super::DoctorCommand;
+
+    #[test]
+    fn parse_gitmodules_reads_each_section() {
+        let text = "[submodule \"ci-tools\"]\n\tpath = ci-tools\n\turl = ../ci-tools.git\n[submodule \"x\"]\n  url = git@h:o/x.git\n  path = vendor/x\n[submodule \"broken\"]\n  path = only-path\n";
+        assert_eq!(
+            DoctorCommand::parse_gitmodules(text),
+            vec![
+                ("ci-tools".to_string(), "../ci-tools.git".to_string()),
+                ("vendor/x".to_string(), "git@h:o/x.git".to_string()),
+            ]
+        );
     }
 }

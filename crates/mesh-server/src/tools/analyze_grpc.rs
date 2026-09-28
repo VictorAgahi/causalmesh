@@ -671,6 +671,24 @@ fn render_report(report: &WireReport) -> String {
                     }
                 ));
             }
+            if !diff.removed_enums.is_empty() {
+                let listed: Vec<String> = diff
+                    .removed_enums
+                    .iter()
+                    .take(20)
+                    .map(|m| format!("`{m}`"))
+                    .collect();
+                let more = diff.removed_enums.len().saturating_sub(20);
+                out.push_str(&format!(
+                    "- **Enums removed or renamed** (values not compared): {}{}\n",
+                    listed.join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
         }
     }
     out
@@ -797,7 +815,7 @@ message User {
         .unwrap_or_else(|| unreachable!("expected a comparison, got {report:?}"))
     }
 
-    fn rules(diff: &WireDiff) -> Vec<(WireRule, String, u32)> {
+    fn rules(diff: &WireDiff) -> Vec<(WireRule, String, i64)> {
         diff.breaking
             .iter()
             .map(|c| (c.rule, c.message.clone(), c.number))

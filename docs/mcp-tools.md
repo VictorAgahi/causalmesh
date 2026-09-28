@@ -336,6 +336,12 @@ path in the file (`Outer.Inner`); `oneof` members belong to the enclosing messag
 | Field number reused | Number N now names a different field: the old name still exists at another number, the new name existed at another number in the base (swap/move), or the name changed together with an incompatible type; or a number `reserved` in the base is used again |
 | Incompatible type | Same number and name, but the value types are not in the same group below, or the cardinality changed in a way the other side cannot parse (see below) |
 | Deleted without `reserved` | A field of the base is gone and neither its number (single, `N to M`, `N to max`) nor its name is `reserved` |
+| Enum number reused | Enum value N now names a different constant and a name really moved (the old constant now has another number, or the new one had another number in the base — a renumbering or swap), or a number `reserved` in the base is used again. Constants go on the wire as numbers only: the other version reads N as the other constant |
+| Enum value deleted without `reserved` | A constant's number is gone from the enum and not `reserved` |
+
+Enums are matched by path like messages (`Outer.State`); `allow_alias` numbers compare as sets of
+names. An enum present in the base and missing in the new version is listed under "Enums removed or
+renamed".
 
 **Compatibility table** (value types, and map keys/values):
 
@@ -359,8 +365,9 @@ is always reported.
 
 **Warnings** (listed under `**Warnings**`, never counted as `WIRE_FORMAT_BREAKING_CHANGE`):
 
-- *In-place rename* — same number, compatible type, and neither name used elsewhere in the message:
-  names never go on the wire, but JSON and text-format payloads carry them.
+- *In-place rename* — same number, compatible type, and neither name used elsewhere in the message
+  (or, for an enum constant, in the enum): names never go on the wire, but JSON and text-format
+  payloads carry them.
 - *Type declared in another file* — a type the `.proto` does not declare may be an imported enum
   (varint) or message (length-delimited). Against a varint, `bytes` or another undeclared type the
   change cannot be decided from this file and is a warning; against `string`, `sint*`, fixed or

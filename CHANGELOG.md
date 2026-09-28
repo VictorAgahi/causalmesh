@@ -5,6 +5,21 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.8] — 2026-09-28
+
+Wire-format check covers enums (Volontariapp 7.0.6 report, critical defect 3). Measured on the
+Volontariapp `event.proto` against base `610b2ac`: the `EVENT_STATE_CANCELLED` 3 → 5 renumbering is
+now one `WIRE_FORMAT_BREAKING_CHANGE` (7.0.6: "no wire-format breaking change"); the `Tag.color` →
+`balise` warning and the silence on `optional organizer_id` are unchanged.
+
+### Fixed
+- **Enums were not compared at all**: only their names were collected, so a renumbering, a swap, a
+  deleted constant or a reused `reserved` number passed as "no wire-format breaking change". Two
+  new rules: *enum number reused* (a number now names another constant because a name moved, or a
+  `reserved` number is used again) and *enum value deleted without `reserved`*. An in-place rename
+  of a constant is a JSON warning, like a field rename. Nested enums, negative values,
+  `allow_alias` and removed enums are handled.
+
 ## [7.0.7] — 2026-09-28
 
 `analyze_grpc` answers (Volontariapp 7.0.6 report, critical defects 1 and 2). Measured on the

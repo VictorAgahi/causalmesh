@@ -23,7 +23,7 @@ pub enum SecurityError {
 }
 
 impl SecurityError {
-    /// JSON-RPC error code per RFC-001 Commandment 4
+    /// JSON-RPC error code per CLAUDE.md Commandment 4
     pub fn jsonrpc_code(&self) -> i32 {
         -32602
     }
@@ -37,7 +37,7 @@ pub fn to_nfc_path(path: &Path) -> PathBuf {
     PathBuf::from(nfc)
 }
 
-/// A validated, canonicalized, and sandboxed path jail per RFC-001 Commandment 4.
+/// A validated, canonicalized, and sandboxed path jail per CLAUDE.md Commandment 4.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValidatedScope(PathBuf);
 

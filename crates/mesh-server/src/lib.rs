@@ -42,7 +42,7 @@ pub fn process_session_id() -> &'static str {
     ID.get_or_init(new_session_id)
 }
 
-/// Main MCP JSON-RPC stdio event loop per RFC-001 Rev. 2.9.0
+/// Main MCP JSON-RPC stdio event loop
 pub async fn run_server(
     state: Arc<AppState>,
     cancel_token: CancellationToken,

@@ -5,6 +5,19 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.6] — 2026-09-28
+
+Release hygiene (Volontariapp report, point 15).
+
+### Fixed
+- **No declared minimum Rust version, and `SETUP.md` claimed 1.80+.** The real minimum is 1.90
+  (set by `tree-sitter-language`), now pinned as `rust-version` for every crate and verified with
+  `cargo +1.90 check --workspace --all-targets`.
+- **21 code comments cited "RFC-001"**, a document that is not in the repository. They now point
+  at the commandments in `CLAUDE.md` or drop the reference.
+- Every release since 7.0.1 is tagged on its merge commit on `main` (7.0.0's tag points at a
+  pre-amend commit that is not on `main`, so a 7.0.0 binary cannot be traced back to `main`).
+
 ## [7.0.5] — 2026-09-28
 
 Asynchronous flows in TypeScript (Volontariapp report, points 3 and 6). Measured on the Volontariapp

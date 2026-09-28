@@ -113,7 +113,7 @@ exit 0
 
         format!(
             r#"#!/usr/bin/env bash
-# MeshMCP Pre-Commit Governance Hook (RFC-001 Commandment 6)
+# MeshMCP Pre-Commit Governance Hook (active governance, RSAH)
 set -e
 
 STAGED_FILES=$(git diff --cached --name-only)

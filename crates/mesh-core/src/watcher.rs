@@ -214,7 +214,7 @@ fn is_relevant_dir_path(path: &Path) -> bool {
 }
 
 /// In-kernel filesystem watcher service providing debounced change notifications
-/// and atomic snapshot reloading per RFC-001 Commandment 7.
+/// and atomic snapshot reloading per CLAUDE.md Commandment 7.
 pub struct FileWatcherService;
 
 impl FileWatcherService {

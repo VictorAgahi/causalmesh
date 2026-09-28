@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const MPSC_BUFFER_CAPACITY: usize = 64;
 
-/// Dedicated Stdio Actor managing non-blocking JSON-RPC stdio framing per RFC-001 Commandment 3.
+/// Dedicated Stdio Actor managing non-blocking JSON-RPC stdio framing per CLAUDE.md Commandment 3.
 pub struct StdioFramingActor;
 
 impl StdioFramingActor {

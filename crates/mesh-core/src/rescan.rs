@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 /// Applies OS-level background priority/QoS to the calling thread. Invoked once
 /// per rescan worker thread at startup so background rescans stay out of the
-/// editor's way (RFC-001 Commandment 7). No-op on platforms without a
+/// editor's way (CLAUDE.md Commandment 7). No-op on platforms without a
 /// background priority primitive.
 fn apply_background_priority() {
     // macOS: Assign Background Quality of Service (Zero UI impact)
@@ -36,7 +36,7 @@ fn apply_background_priority() {
 }
 
 /// BackgroundRescanEngine providing dedicated thread pool with OS-level QoS throttling
-/// guaranteeing zero IDE keystroke stuttering (< 150ms invariant) per RFC-001 Commandment 7.
+/// guaranteeing zero IDE keystroke stuttering (< 150ms invariant) per CLAUDE.md Commandment 7.
 pub struct BackgroundRescanEngine {
     thread_pool: Arc<ThreadPool>,
 }

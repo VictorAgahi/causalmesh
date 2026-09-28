@@ -58,7 +58,7 @@ impl<R> ParseOutcome<R> {
     }
 }
 
-/// Hardened Tree-sitter C-FFI bounded guards and lexical pre-checks per RFC-001 Commandment 2
+/// Hardened Tree-sitter C-FFI bounded guards and lexical pre-checks per CLAUDE.md Commandment 2
 pub struct AstGuard;
 
 impl AstGuard {

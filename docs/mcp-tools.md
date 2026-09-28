@@ -386,6 +386,16 @@ Impact matrix of a change. For a proto/gRPC method or service: its server handle
 
 **Negative Constraints**: DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
 
+#### Topic matching
+Topic keys are lowercase. A code reference to an enum or constant member — `Streams.EVENT_CREATED`,
+`EventMessagingType.EVENT_CREATED`, `typeof Topics.EVENT_CREATED` (a dotted path whose first segment
+starts with an uppercase letter and whose last is CONSTANT_CASE) — keys on the member alone
+(`event_created`), so producers and consumers that spell it differently meet on one topic. A
+broker literal (`orders.created`) is kept whole. The target is normalized the same way; when a
+topic key equals it, only exact keys match (`EVENT_CREATED` does not pull in
+`WS_EVENT_CREATED_FEEDBACK`), otherwise keys containing it do. Rows in test files are left out and
+counted unless `include_tests: true`.
+
 #### Classification rule
 The graph has no "service" field, so a service is a workspace **root** (`repo_id`).
 - **Owner of a proto contract**: the roots of the handlers that implement it; with no handler, the root of the `.proto` itself. **Owner of an event**: the roots of its producers, else of its topic nodes.

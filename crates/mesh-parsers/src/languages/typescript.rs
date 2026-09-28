@@ -642,6 +642,34 @@ impl TypeScriptExtractor {
                                         });
                                     }
                                 }
+                                // NestJS `ClientProxy.emit('pattern', data)` /
+                                // `.send('pattern', data)`: the first argument is
+                                // the pattern (string literal only).
+                                if matches!(prop_name, "emit" | "send") {
+                                    if let Some(pattern) = node
+                                        .child_by_field_name("arguments")
+                                        .and_then(|a| Self::extract_first_arg_value(a, source))
+                                    {
+                                        nodes.push(ContractNode {
+                                            id: 0,
+                                            name: CompactStr::new(pattern),
+                                            kind: NodeKind::KafkaTopic,
+                                            file_path: file_path.clone(),
+                                            line_start: node.start_position().row + 1,
+                                            line_end: node.end_position().row + 1,
+                                            package: package_name.clone(),
+                                            repo_id,
+                                            signature: Some(CompactStr::new(
+                                                if prop_name == "emit" {
+                                                    "nestjs client.emit"
+                                                } else {
+                                                    "nestjs client.send"
+                                                },
+                                            )),
+                                            docstring: None,
+                                        });
+                                    }
+                                }
                                 let signature = match prop_name {
                                     "subscribe" => Some("kafkajs consumer.subscribe"),
                                     "send" => Some("kafkajs producer.send"),
@@ -689,7 +717,27 @@ impl TypeScriptExtractor {
                         });
                     }
                     if ctor.kind() == "identifier" {
-                        if let Ok("Queue") = ctor.utf8_text(source) {
+                        let ctor_name = ctor.utf8_text(source).unwrap_or_default();
+                        if ctor_name == "Worker" {
+                            if let Some(queue_name) = node
+                                .child_by_field_name("arguments")
+                                .and_then(|a| Self::extract_first_arg_value(a, source))
+                            {
+                                nodes.push(ContractNode {
+                                    id: 0,
+                                    name: CompactStr::new(queue_name),
+                                    kind: NodeKind::Queue,
+                                    file_path: file_path.clone(),
+                                    line_start: node.start_position().row + 1,
+                                    line_end: node.end_position().row + 1,
+                                    package: package_name.clone(),
+                                    repo_id,
+                                    signature: Some(CompactStr::new("bullmq new Worker()")),
+                                    docstring: None,
+                                });
+                            }
+                        }
+                        if ctor_name == "Queue" {
                             if let Some(args) = node.child_by_field_name("arguments") {
                                 if let Some(queue_name) =
                                     Self::extract_first_arg_value(args, source)

@@ -5,6 +5,27 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.5] — 2026-09-28
+
+Asynchronous flows in TypeScript (Volontariapp report, points 3 and 6). Measured on the Volontariapp
+workspace, `analyze_impact EVENT_CREATED`: one topic linking the two producers to the consumers
+(7.0.0: four unrelated topics, test files counted as producers, a sibling
+`WS_EVENT_CREATED_FEEDBACK` stream mixed in). With one pattern for the `streamName:
+getEventStreamName(Streams.X)` options convention, the result is exactly the three consumers `grep`
+finds.
+
+### Fixed
+- **TypeScript event facts were never registered as producers or consumers** (the nodes existed,
+  `analyze_impact` could not link them). `@EventPattern` / `@MessagePattern` handlers consume their
+  pattern; kafkajs `subscribe` / `send`, NestJS `client.emit` / `client.send('pattern')` and BullMQ
+  `new Queue` / `new Worker` (new) are attributed to the method that publishes or subscribes.
+- **Topic keys had no normalization**: `Streams.EVENT_CREATED`, `EventMessagingType.EVENT_CREATED`
+  and `typeof EventMessagingType.EVENT_CREATED` were three topics. A code reference to an enum or
+  constant member now keys on the member; broker literals (`orders.created`) are kept whole.
+- **`analyze_impact` matched topics by substring only**: a topic whose key equals the target now
+  wins, so `EVENT_CREATED` no longer pulls in `WS_EVENT_CREATED_FEEDBACK`.
+- Index cache schema v7.
+
 ## [7.0.4] — 2026-09-28
 
 TypeScript depth (Volontariapp report, points 1, 4, 5 and 7). Measured on the Volontariapp

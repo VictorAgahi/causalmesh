@@ -67,8 +67,8 @@ cd /path/to/your/workspace
 ```
 
 It copies `mesh-mcp` and `meshd` into `~/.local/bin`, runs
-`mesh-mcp init --auto --write-ide-config` (keeps an existing config, merges `.cursor/mcp.json` and
-`.vscode/mcp.json` without removing other servers) and checks the result with
+`mesh-mcp init --auto --write-ide-config` (keeps an existing config, merges `.mcp.json`,
+`.cursor/mcp.json` and `.vscode/mcp.json` without removing other servers) and checks the result with
 `mesh-mcp doctor --json`. Building needs a stable Rust toolchain and a C compiler.
 
 The full walkthrough, including configuration of roots, docs vocabulary, custom patterns, skills
@@ -80,10 +80,11 @@ and stop rules, is in [SETUP.md](SETUP.md). A five-language example workspace is
 | Command | Purpose |
 | :--- | :--- |
 | `mesh-mcp run [--standalone]` | MCP server on stdio (daemon-backed by default). |
-| `mesh-mcp init --auto [--write-ide-config]` | Generate `.agents/mesh-mcp.toml` from the directory layout; optionally write Cursor / VS Code MCP entries. |
+| `mesh-mcp init --auto [--write-ide-config] [--force]` | Generate `.agents/mesh-mcp.toml` from the directory layout (an existing one is kept unless `--force`); optionally write Claude Code / Cursor / VS Code MCP entries. |
+| `mesh-mcp agent-guide` | Print the setup guide for an AI agent installing MeshMCP for you (Markdown). |
 | `mesh-mcp doctor [--fix] [--json]` | Diagnose configuration, index health, socket, daemon version, cache and sandbox; `--fix` repairs what is safe to repair (never the audit log). |
 | `mesh-mcp graph [--format html\|mermaid\|json\|fingerprint] [--open]` | Render the full topology, or print a content fingerprint of the index. |
-| `mesh-mcp stats [--since 7d\|24h\|all]` | Local audit summary: calls, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. |
+| `mesh-mcp stats [--since 7d\|24h\|all] [--session ID] [--db PATH] [--json]` | Local audit summary: calls per tool and per agent session, `isError` rate, p50/p95 latency per tool, cache hit rate, `meshd` restarts. `MESH_AUDIT_DB` moves the audit database. |
 | `mesh-mcp install-hooks` | Install the Git pre-commit hook. |
 
 Logs go to stderr. Under `mesh-mcp run`, stdout carries only JSON-RPC frames.
@@ -152,7 +153,7 @@ classes, interfaces, functions/methods and similar symbols usable by `smart_sear
 | Java | yes | yes | `*ImplBase` servers, `@GrpcService`, `newBlockingStub/newStub/newFutureStub` clients | `@KafkaListener`, `KafkaTemplate` | Spring MVC / JAX-RS annotations |
 | Go | yes | yes | `Register*Server`, `New*Client` | kafka-go, sarama, confluent-kafka-go | — |
 | Python | yes | yes | `*Servicer` servers, `*_pb2_grpc.*Stub(...)` clients | confluent_kafka, aiokafka, Celery | Flask / FastAPI routes (path and method) |
-| TypeScript / JavaScript (`.ts`, `.tsx`, `.js`) | yes | yes | NestJS `@GrpcMethod`, `getService<...>()`, imported `new XClient(...)` (ts-proto, `@grpc/grpc-js`) | kafkajs `subscribe`/`send`, NestJS `@EventPattern`/`@MessagePattern` and `client.emit`/`client.send`, BullMQ `Queue`/`Worker` | — |
+| TypeScript / JavaScript (`.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) | yes | yes | NestJS `@GrpcMethod`, `getService<...>()` and the method calls on the client it returns (`this.users.signUp(…)`), imported `new XClient(...)` (ts-proto, `@grpc/grpc-js`) | kafkajs `subscribe`/`send`, NestJS `@EventPattern`/`@MessagePattern` and `client.emit`/`client.send`, BullMQ `Queue`/`Worker` | — |
 | Rust | yes | yes | tonic service implementations | rdkafka | — |
 | C++ | yes | yes (`#include`) | — | — | — |
 | Kotlin | yes | — | — | `@KafkaListener`, kafka-clients `subscribe`/`send` | Spring annotations |

@@ -69,7 +69,8 @@ Measurement harnesses (scale, memory, cache, payload) are described in
 
 ## 4. Adding a tree-sitter language
 
-Supported today: Java, Go, Python, TypeScript (`.ts`, `.tsx`, `.js`), Rust, C++, Kotlin, C#,
+Supported today: Java, Go, Python, TypeScript (`.ts`, `.mts`, `.cts`; `.tsx`, `.js`, `.jsx`,
+`.mjs`, `.cjs` through the TSX grammar), Rust, C++, Kotlin, C#,
 Ruby, PHP, Swift, Scala and Protobuf, all through tree-sitter; YAML (OpenAPI, AsyncAPI, Spring
 properties), `.properties` and Markdown are parsed without it. The full walkthrough is
 [`.agents/skills/mesh-parser-engineering/SKILL.md`](../.agents/skills/mesh-parser-engineering/SKILL.md).
@@ -146,8 +147,10 @@ written to stdout.
 
 ## 6. `mesh-mcp doctor`
 
-`crates/mesh-server/src/cli/doctor.rs`. Output goes to stderr, except `--json`, which prints the
-repairable checks as JSON on stdout.
+`crates/mesh-server/src/cli/doctor.rs`. Output goes to stderr, except `--json`, which prints every
+check below as one JSON array on stdout (`name`, `status`, `message`, and `fixed` after `--fix`).
+The JSON is identical between two runs on the same machine: volatile figures (the measured RSS)
+appear in the text report only.
 
 What it actually checks:
 
@@ -159,15 +162,17 @@ What it actually checks:
 - **Linux**: the `fs.inotify.max_user_watches` limit (warns below 524,288).
 - **Parsers**: every tree-sitter grammar initialises (`AstGuard::verify_all_parsers`).
 - **Tools on `PATH`**: `git`, and whether `ripgrep` is present.
+- **Symlink invariants**: a symlink is created in a canonicalized temp directory and the crawler
+  must not follow it (the probe reports `info` where symlinks cannot be created).
+- **Host event subsystem**: an FSEvents / ReadDirectoryChangesW watcher can be created.
 - **Index health**: a full scan of the workspace, then the count of files rejected per reason and
-  the first 10 paths.
+  the first 10 paths. Non-source files (images, fonts, archives, lockfiles, minified bundles:
+  `mesh_core::health::is_non_source`) are only counted as skipped, never listed.
+- **Memory**: peak RSS before the index-health scan, `warn` above 50 MiB.
 - **Repairable checks** (also in `--json`, acted on by `--fix`): socket and socket-directory
   permissions, orphaned socket, daemon version drift, daemon seccomp confinement (Linux),
   legacy machine-wide cache, corrupt workspace cache, orphaned per-version cache directories, and
   audit-chain verification (reported, never repaired).
 
-Some lines are informational rather than measured: the symlink line, the host event-subsystem
-line on macOS/Windows, the "memory baseline" line and the "stdio loopback latency" line (which
-times one small JSON serialisation) print fixed or trivial results, and the final "All systems
-operational" line is printed regardless of earlier warnings. Read the individual `⚠`/`✖` lines,
-or the `--json` output, rather than the last line.
+The last line counts the `error` and `warn` checks above it (a check repaired by `--fix` is not
+counted).

@@ -36,6 +36,8 @@ BENCH_JOBS="${BENCH_JOBS:-2}"
 MESH_MCP_BIN="$REPO_ROOT/target/release/mesh-mcp"
 
 export CLONE_DIR RESULTS_DIR MESH_MCP_BIN SCRIPT_DIR
+# Keep benchmark calls out of the user's real audit trail (`mesh-mcp stats`).
+export MESH_AUDIT_DB="${MESH_AUDIT_DB:-$RESULTS_DIR/audit.db}"
 
 mkdir -p "$CLONE_DIR" "$RESULTS_DIR"
 

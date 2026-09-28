@@ -114,6 +114,8 @@ pub struct GrpcTrace<'g> {
     /// (`CreateEventNode` for `CreateEvent`), left out because a symbol
     /// matched exactly. Listed so the answer says what it did not trace.
     pub related_rpcs: Vec<&'g ContractNode>,
+    /// Number of source files in the index searched during this trace.
+    pub files_scanned: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +132,8 @@ pub struct ImpactFlow<'g> {
     /// reached on the previous hop (a handler that re-emits), through which
     /// the walk continued. Linked by file, not by a call edge.
     pub downstream_producers: Vec<&'g ContractNode>,
+    /// Number of source files in the index searched during this flow trace.
+    pub files_scanned: usize,
 }
 
 /// Whether an impacted element lives in the service that owns the changed
@@ -269,6 +273,11 @@ impl ContractGraph {
     #[inline]
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    #[inline]
+    pub fn file_count(&self) -> usize {
+        self.file_to_nodes.len()
     }
 
     pub fn get_node(&self, id: NodeId) -> Option<&ContractNode> {
@@ -1582,6 +1591,7 @@ impl ContractGraph {
             server_handlers,
             service_level_clients,
             related_rpcs,
+            files_scanned: self.file_to_nodes.len(),
         }
     }
 
@@ -1845,6 +1855,7 @@ impl ContractGraph {
             downstream_consumers,
             related_sagas,
             downstream_producers: Vec::new(),
+            files_scanned: self.file_to_nodes.len(),
         }
     }
 

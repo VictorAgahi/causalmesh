@@ -246,12 +246,23 @@ impl MarkdownFormatter {
     /// instance) — flattening those into one undifferentiated list is how a
     /// caller ends up scanning dozens of irrelevant file paths by hand to
     /// N services" up front instead.
-    pub fn format_dependents(target: &str, dependents: &[(&ContractNode, String)]) -> String {
+    pub fn format_dependents(
+        target: &str,
+        dependents: &[(&ContractNode, String)],
+        files_scanned: usize,
+    ) -> String {
         // Totals (all pages) are the caller's to print: this renders one page.
         let mut out = format!("## Reverse dependencies of `{target}`\n\n");
 
         if dependents.is_empty() {
-            out.push_str("No dependents found importing this symbol or package across any indexed workspace root (0 dependents).\n*Exhaustive index check: verified by AST import graph. Do NOT perform redundant fallback text/grep searches.*\n");
+            let files_note = if files_scanned > 0 {
+                format!("({files_scanned} indexed source files scanned across all workspace roots)")
+            } else {
+                "across any indexed workspace root".to_string()
+            };
+            out.push_str(&format!(
+                "No dependents found importing this symbol or package {files_note} (0 dependents).\n*Exhaustive index check: verified by AST import graph. Do NOT perform redundant fallback text/grep searches.*\n"
+            ));
             return out;
         }
 
@@ -335,7 +346,17 @@ impl MarkdownFormatter {
 
         if trace.client_stubs.is_empty() && trace.service_level_clients.is_empty() {
             out.push_str("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)\n");
-            out.push_str("*Exhaustive AST scan across all workspace roots confirmed NO client stubs or invocation sites exist. Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic.*\n\n");
+            let files_note = if trace.files_scanned > 0 {
+                format!(
+                    "({} indexed source files scanned across all workspace roots)",
+                    trace.files_scanned
+                )
+            } else {
+                "across all workspace roots".to_string()
+            };
+            out.push_str(&format!(
+                "*Exhaustive AST scan {files_note} confirmed NO client stubs or invocation sites exist. Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic.*\n\n"
+            ));
         } else {
             out.push_str(&format!(
                 "### 2. Client Stubs ({} found)\n",
@@ -378,8 +399,17 @@ impl MarkdownFormatter {
         }
 
         if trace.server_handlers.is_empty() {
-            out.push_str("### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)\n");
-            out.push_str("*Exhaustive AST scan confirmed NO server handlers implement this method in any indexed workspace root.*\n\n");
+            out.push_str(
+                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)\n",
+            );
+            let files_note = if trace.files_scanned > 0 {
+                format!("({} indexed source files checked)", trace.files_scanned)
+            } else {
+                "in any indexed workspace root".to_string()
+            };
+            out.push_str(&format!(
+                "*Exhaustive AST scan confirmed NO server handlers implement this method {files_note}.*\n\n"
+            ));
         } else {
             out.push_str(&format!(
                 "### 3. Server Handlers / Controllers ({} found)\n",
@@ -406,7 +436,17 @@ impl MarkdownFormatter {
         );
 
         if flow.upstream_producers.is_empty() {
-            out.push_str("### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)\n*No upstream producers resolved across indexed workspace roots.*\n\n");
+            let files_note = if flow.files_scanned > 0 {
+                format!(
+                    "across {} indexed source files in all workspace roots",
+                    flow.files_scanned
+                )
+            } else {
+                "across indexed workspace roots".to_string()
+            };
+            out.push_str(&format!(
+                "### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)\n*No upstream producers resolved {files_note}.*\n\n"
+            ));
         } else {
             out.push_str(&format!(
                 "### 1. Upstream Event Producers ({} found)\n",
@@ -442,7 +482,17 @@ impl MarkdownFormatter {
         }
 
         if flow.downstream_consumers.is_empty() {
-            out.push_str("### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)\n*No downstream consumers resolved across indexed workspace roots.*\n\n");
+            let files_note = if flow.files_scanned > 0 {
+                format!(
+                    "across {} indexed source files in all workspace roots",
+                    flow.files_scanned
+                )
+            } else {
+                "across indexed workspace roots".to_string()
+            };
+            out.push_str(&format!(
+                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)\n*No downstream consumers resolved {files_note}.*\n\n"
+            ));
         } else {
             out.push_str(&format!(
                 "### 3. Downstream Consumers / Handlers ({} found)\n",
@@ -545,19 +595,22 @@ impl MarkdownFormatter {
             );
         }
         if matrix.no_producer_resolved {
-            header.push_str(
-                "\n**No producer resolved** for this event outside tests (0 AST producers found across workspace roots). If not emitted via an unindexed runtime-dynamic topic string or raw SQL trigger, this negative result is authoritative: nothing in static application code emits it.\n",
-            );
+            header.push_str(&format!(
+                "\n**No producer resolved** for this event outside tests (0 AST producers found across {} workspace roots). If not emitted via an unindexed runtime-dynamic topic string or raw SQL trigger, this negative result is authoritative: nothing in static application code emits it.\n",
+                roots.len()
+            ));
         }
         if matrix.no_consumer_resolved {
-            header.push_str(
-                "\n**No consumer resolved** for this event outside tests (0 AST consumers found across workspace roots). This negative result is authoritative for static code.\n",
-            );
+            header.push_str(&format!(
+                "\n**No consumer resolved** for this event outside tests (0 AST consumers found across {} workspace roots). This negative result is authoritative for static code.\n",
+                roots.len()
+            ));
         }
         if total == 0 {
-            header.push_str(
-                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name.*\n",
-            );
+            header.push_str(&format!(
+                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across {} indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name.*\n",
+                roots.len()
+            ));
             return header;
         }
         if offset >= total {
@@ -965,18 +1018,34 @@ mod tests {
             client_stubs: Vec::new(),
             service_level_clients: Vec::new(),
             server_handlers: Vec::new(),
+            files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_grpc_trace(&empty_trace);
-        assert!(out.contains("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)"), "{out}");
+        assert!(
+            out.contains("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1248 indexed source files scanned across all workspace roots"),
+            "{out}"
+        );
         assert!(out.contains("Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic."), "{out}");
-        assert!(out.contains("### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)"), "{out}");
-        assert!(out.contains("Exhaustive AST scan confirmed NO server handlers implement this method"), "{out}");
+        assert!(
+            out.contains(
+                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("1248 indexed source files checked"), "{out}");
     }
 
     #[test]
     fn test_format_dependents_authoritative_negative_assertions() {
-        let out = MarkdownFormatter::format_dependents("NonExistentService", &[]);
-        assert!(out.contains("No dependents found importing this symbol or package across any indexed workspace root (0 dependents)."), "{out}");
+        let out = MarkdownFormatter::format_dependents("NonExistentService", &[], 1248);
+        assert!(
+            out.contains("1248 indexed source files scanned across all workspace roots"),
+            "{out}"
+        );
         assert!(out.contains("Exhaustive index check: verified by AST import graph. Do NOT perform redundant fallback text/grep searches."), "{out}");
     }
 
@@ -990,9 +1059,22 @@ mod tests {
             downstream_consumers: Vec::new(),
             related_sagas: Vec::new(),
             downstream_producers: Vec::new(),
+            files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_impact_flow(&empty_flow);
-        assert!(out.contains("### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)"), "{out}");
-        assert!(out.contains("### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)"), "{out}");
+        assert!(
+            out.contains("### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("across 1248 indexed source files in all workspace roots"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)"
+            ),
+            "{out}"
+        );
     }
 }

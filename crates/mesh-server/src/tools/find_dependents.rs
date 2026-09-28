@@ -211,9 +211,11 @@ impl McpTool for FindDependentsTool {
             // (7.0.6 said "No dependents found" at `offset: 180` of 167).
             text.push_str(&format!("## Reverse dependencies of `{}`\n\n", args.target));
         } else {
+            let files_scanned = snapshot.contract_graph.file_count();
             text.push_str(&MarkdownFormatter::format_dependents(
                 args.target.as_str(),
                 &labeled,
+                files_scanned,
             ));
         }
         drop(labeled);

@@ -5,6 +5,22 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.13] — 2026-09-28
+
+Honesty and setup checks (Volontariapp 7.0.6 report, minor defects 15 and 17).
+
+### Fixed
+- **`doctor` did not see duplicated git submodules**: 14 copies of `ci-tools` (one per root) were
+  ~17% of the Volontariapp index and showed up in scoped searches, while "Root overlap: none".
+  A new `Duplicated submodule` warning names a submodule URL checked out in several roots and not
+  excluded, with the pattern to exclude it.
+- **`smart_search` listed names that merely contain the query as equals** of exact declarations
+  (`SocialEventCreatedPostProcessor` among three `EventCreatedPostProcessor`s). A page mixing both
+  now says how many files declare the query exactly (listed first) and how many only contain it.
+- **The agent guide claimed every heuristic result is marked**, which was false. It now says which
+  tools label confidence and completeness, and how `smart_search` / `find_dependents` flag
+  name-only matches.
+
 ## [7.0.12] — 2026-09-28
 
 `find_dependents` completeness (Volontariapp 7.0.6 report, defects 9 and 10). Measured on the

@@ -314,11 +314,25 @@ impl McpTool for SmartSearchTool {
             (Vec::new(), SearchPage::single(0), Vec::new())
         };
         let indexed = !ranked.is_empty();
+        // `smart_search` is a substring search, but a page mixing exact
+        // declarations of the query with names that merely contain it read as
+        // one list of equals (7.0.6: `SocialEventCreatedPostProcessor` among
+        // the three `EventCreatedPostProcessor`s, unlabeled).
+        let exact_files = ranked.iter().filter(|f| f.rank.0 == 0).count();
+        let partial_note = (exact_files > 0 && exact_files < ranked.len()).then(|| {
+            format!(
+                "*{exact_files} file(s) declare `{query}` exactly (listed first); the other {} only declare a name containing it.*\n",
+                ranked.len() - exact_files
+            )
+        });
         drop(ranked);
         drop(snapshot);
 
         let files_accessed: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
         let mut text = MarkdownFormatter::format_search_page(query, scope_label, &matches, &page);
+        if let Some(note) = &partial_note {
+            text.push_str(note);
+        }
         if let Some(note) = &gap_note {
             text.push_str(note);
         }

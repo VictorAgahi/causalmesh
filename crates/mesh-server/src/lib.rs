@@ -79,22 +79,25 @@ pub async fn run_server(
 
 /// `initialize.instructions`: the routing guidance MCP clients put in the agent's system prompt.
 ///
-/// The first step is imperative (7.0.18): with the 7.0.17 conditional wording, Claude Code agents
-/// with deferred tool loading loaded MeshMCP in only 6 of 8 bench runs and called it in 4.
+/// Framed as a verifiable starting point, not an authority (7.0.19): agents weigh MCP server
+/// instructions as third-party text, and the imperative "MANDATORY / do NOT verify" wording of
+/// 7.0.18 was rejected outright in the bench ("I want fully verifiable output rather than trusting
+/// an opaque tool's claim"). The routing agents did follow lives in the project's `CLAUDE.md` /
+/// `AGENTS.md`, written by `mesh-mcp init --write-ide-config`.
 pub const MCP_SERVER_INSTRUCTIONS: &str = "\
-MeshMCP provides compiler-grade, deterministic AST graph analysis for polyglot microservices architectures across 14 languages.
+MeshMCP indexes this polyglot workspace (14 languages) into a graph of packages, gRPC contracts and event flows.
 
-MANDATORY FIRST STEP (Turn 1): If the question is about imports, packages, gRPC, or events, you MUST load the architecture tools before executing any grep. In clients that defer MCP tool schemas (such as Claude Code), run:
+WHEN TO USE IT: for a question that spans several repositories, start from the graph, then verify what matters with your usual tools.
+1. Who imports or uses a package, module or symbol (\"who imports X\", package usages, reverse dependencies, blast radius of a change): `find_dependents`.
+2. Events and messaging (who publishes an event, outbox writes, topics, queues, streams, consumers): `analyze_impact`.
+3. gRPC (server handlers, client call sites, .proto wire-format checks): `analyze_grpc`.
+4. Symbol declarations across roots: `smart_search`.
+For an exact identifier (an enum value, a class name), plain grep is fine.
+
+LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:
   ToolSearch select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc
-Clients that already expose MeshMCP tools can call them directly.
 
-ROUTING INSTRUCTIONS FOR CODING AGENTS:
-1. Event & Messaging inquiries: For questions regarding outbox events, message brokers, queues, topics, streams, event producers, or consumer handlers: ALWAYS use `analyze_impact` before grep.
-2. gRPC inquiries: For questions regarding gRPC services, RPC methods, client stubs, server controllers, or .proto wire-format checks: ALWAYS use `analyze_grpc` before grep.
-3. Symbol & Service dependencies: For questions regarding reverse dependencies, callers, or the blast radius of modifying a shared symbol or package: ALWAYS use `find_dependents` before grep. For questions asking \"who imports X\", package usages, or reverse dependencies: ALWAYS use `find_dependents` instead of grepping for import statements.
-4. Cross-service search: Use `smart_search` for semantic and symbol declaration search across polyglot workspace roots.
-5. Graph first: Do NOT grep for event publish/consume sites or import statements before querying the graph (`analyze_impact`, `find_dependents`). Grep is for follow-up checks, not the first move.
-6. Negative assertions & Heuristics: When MeshMCP reports an authoritative 0 (labeled 'Authoritative AST Scan'), the negative result is compiler-verified across all workspace roots; do NOT run redundant fallback ripgrep/grep searches. If a result is explicitly marked 'heuristic', ambiguous, or notes potential unindexed runtime/dynamic strings, targeted verification is appropriate.";
+READING RESULTS: every row carries a path:line you can open to check it. A 0 labeled 'Authoritative AST Scan' covers every indexed root, so a broad grep re-scan rarely adds anything; rows marked 'heuristic' or 'ambiguous', and notes about unindexed dynamic strings or SQL, are worth a targeted check.";
 
 /// Answers one JSON-RPC request (never a notification — see [`protocol::classify`]).
 /// Shared by the stdio server and `meshd`'s IPC dispatcher so both speak exactly
@@ -282,15 +285,25 @@ mod tests {
         let instructions = res["instructions"]
             .as_str()
             .expect("instructions must be present");
-        assert!(instructions.contains("analyze_grpc"));
-        assert!(instructions.contains("analyze_impact"));
-        assert!(instructions.contains("find_dependents"));
-        assert!(instructions.contains("smart_search"));
-        assert!(instructions.contains("ToolSearch select:"));
-        assert!(instructions.contains("MANDATORY FIRST STEP"));
-        assert!(instructions.contains("\"who imports X\""));
-        assert!(instructions
-            .contains("Do NOT grep for event publish/consume sites or import statements"));
-        assert!(instructions.contains("do NOT run redundant fallback ripgrep/grep searches"));
+        for needle in [
+            "analyze_grpc",
+            "analyze_impact",
+            "find_dependents",
+            "smart_search",
+            "ToolSearch select:",
+            "\"who imports X\"",
+            "path:line",
+        ] {
+            assert!(instructions.contains(needle), "missing {needle}");
+        }
+        // 7.0.19: no wording that tells the agent not to verify.
+        for banned in [
+            "MANDATORY",
+            "do NOT run",
+            "Do NOT grep",
+            "compiler-verified",
+        ] {
+            assert!(!instructions.contains(banned), "still says {banned}");
+        }
     }
 }

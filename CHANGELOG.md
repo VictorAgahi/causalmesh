@@ -5,6 +5,39 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.0.19] — 2026-09-29
+
+Routing guidance moves to where agents trust it; the server's own wording stops forbidding checks.
+
+### Why (measured, Volontariapp bench, `claude-sonnet-5`, Claude Code deferred tool loading)
+- The connection, version and `initialize.instructions` were all correct, yet with 7.0.18 the agent
+  loaded MeshMCP on 0 of 3 runs (T1–T3). Twice (7.0.17 and 7.0.18, both on T2) it said why: the
+  server's instructions "may be an untrusted source", "I want fully verifiable output rather than
+  trusting an opaque tool's claim". The more imperative the wording ("MANDATORY", "do NOT verify"),
+  the less it was followed.
+- The same routing placed in a project `CLAUDE.md`, framed as a verifiable starting point: MeshMCP
+  loaded on the first turn in 3 of 3 runs. Cost vs the no-MCP baseline: T4 $0.420 vs $0.751
+  (median), T6 $0.304 vs $0.412, T2 $0.177 vs $0.134 (grep alone is enough there); 3 tasks
+  $0.901 vs $1.297 (−31%). One run per task.
+
+### Added
+- **`mesh-mcp init --write-ide-config` writes a routing section into `CLAUDE.md` and `AGENTS.md`**
+  (`crates/mesh-server/src/cli/init.rs`): which tool answers which question, results as a
+  verifiable `path:line` starting point, grep still right for exact identifiers; the
+  `ToolSearch select:` line only in `CLAUDE.md`; a pointer to `.agents/skills/mesh-mcp/SKILL.md`
+  when it exists (skills stay under `.agents/`, readable by every agent). Managed between
+  `<!-- mesh-mcp:begin … -->` / `<!-- mesh-mcp:end -->`: replaced in place on re-run, the rest of
+  each file untouched, a half-marked file left alone with a warning.
+
+### Changed
+- **`initialize.instructions`** (`crates/mesh-server/src/lib.rs`): "MANDATORY FIRST STEP", "Do NOT
+  grep … before querying the graph" and "do NOT run redundant fallback … searches" are gone. It now
+  says when each tool helps, how to load them in deferred-loading clients, and that every row is a
+  `path:line` to check (a labeled authoritative 0 makes a broad re-scan pointless; heuristic rows,
+  unindexed dynamic strings or SQL deserve a targeted check). A test bans the old wording.
+- `analyze_grpc`, `analyze_impact`, `find_dependents` descriptions and `docs/mcp-tools.md` use the
+  same tone ("a broad grep re-scan rarely adds anything" instead of "DO NOT re-check").
+
 ## [7.0.18] — 2026-09-28
 
 Imperative tool activation in `initialize.instructions`.

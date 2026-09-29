@@ -146,6 +146,16 @@ finds `.agents/mesh-mcp.toml` in its working directory and starts or reuses a ba
   without touching other servers (a file that is not valid JSON is left untouched, with a
   warning), and generates `.agents/mesh-mcp.toml` only if none exists.
 
+  It also writes a short routing section into `CLAUDE.md` and `AGENTS.md` at the workspace root
+  (which tool answers which question, results as a verifiable `path:line` starting point, and the
+  `ToolSearch select:` line in `CLAUDE.md` only). The section sits between
+  `<!-- mesh-mcp:begin … -->` and `<!-- mesh-mcp:end -->`; re-running `init` replaces it in place and
+  never touches the rest of either file. If `.agents/skills/mesh-mcp/SKILL.md` exists, the section
+  points to it: the team skill stays where every agent can read it, no copy under `.claude/`.
+  Agents weigh a project file like this far more than the MCP server's own instructions: in the
+  Volontariapp bench, the same routing was ignored when it only came from the server and followed
+  on every run once it was in `CLAUDE.md`.
+
 The client must be **restarted** (a new Claude Code session) before the tools appear. Tools:
 `smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`,
 `visualize_mesh`.

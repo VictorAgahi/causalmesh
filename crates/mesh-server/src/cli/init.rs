@@ -9,7 +9,9 @@ impl InitCommand {
     /// patterns, stop rules) is the user's, and 7.0.0 silently replaced it on
     /// every `init`, including `init --write-ide-config`. With
     /// `write_ide_config`, also merges a `mesh-mcp` server entry into Claude
-    /// Code's `.mcp.json`, `.cursor/mcp.json` and `.vscode/mcp.json`.
+    /// Code's `.mcp.json`, `.cursor/mcp.json` and `.vscode/mcp.json`, and the
+    /// routing guidance into `CLAUDE.md` and `AGENTS.md` (see
+    /// [`Self::write_agent_guidance`]).
     pub fn run(
         _auto: bool,
         write_ide_config: bool,
@@ -30,6 +32,7 @@ impl InitCommand {
             Self::configure_claude_code(&cur_dir)?;
             Self::configure_cursor(&cur_dir)?;
             Self::configure_vscode(&cur_dir)?;
+            Self::write_agent_guidance(&cur_dir)?;
         }
 
         eprintln!(
@@ -293,6 +296,32 @@ cryptographic_audit_trail = true
         Ok(())
     }
 
+    /// Upserts the MeshMCP routing section into the workspace's `CLAUDE.md`
+    /// (Claude Code) and `AGENTS.md` (Codex, Cursor, Antigravity and other
+    /// agents that read it), between [`GUIDANCE_BEGIN`] and [`GUIDANCE_END`]:
+    /// the rest of each file is the user's and is left as is.
+    ///
+    /// Why a project file and not only `initialize.instructions` (7.0.19):
+    /// agents weigh MCP server instructions as third-party text. In the
+    /// Volontariapp bench, Sonnet ignored the server's routing on 3 of 3
+    /// runs and twice said why ("untrusted source", "opaque tool's claim");
+    /// the same routing in a project `CLAUDE.md` was followed on 3 of 3.
+    fn write_agent_guidance(cur_dir: &Path) -> Result<(), std::io::Error> {
+        let team_skill = cur_dir
+            .join(".agents")
+            .join("skills")
+            .join("mesh-mcp")
+            .join("SKILL.md")
+            .is_file();
+        for (file, for_claude_code) in [("CLAUDE.md", true), ("AGENTS.md", false)] {
+            let block = agent_guidance(for_claude_code, team_skill);
+            if upsert_guidance(&cur_dir.join(file), &block)? {
+                eprintln!("  ✔ Agent guidance: MeshMCP routing section written to {file}");
+            }
+        }
+        Ok(())
+    }
+
     /// Claude Code's project-scope config: `.mcp.json` at the workspace root,
     /// servers under `mcpServers` (same file `claude mcp add -s project` writes).
     fn configure_claude_code(cur_dir: &Path) -> Result<(), std::io::Error> {
@@ -422,6 +451,91 @@ cryptographic_audit_trail = true
         fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")?;
         Ok(true)
     }
+}
+
+/// Opening marker of the section `init --write-ide-config` manages in
+/// `CLAUDE.md` / `AGENTS.md`; everything outside the markers is the user's.
+const GUIDANCE_BEGIN: &str =
+    "<!-- mesh-mcp:begin (managed by `mesh-mcp init --write-ide-config`) -->";
+const GUIDANCE_END: &str = "<!-- mesh-mcp:end -->";
+
+/// The routing section, framed as a verifiable starting point rather than an
+/// authority: the imperative, "do not verify" wording of 7.0.18 was what the
+/// bench agents rejected.
+fn agent_guidance(for_claude_code: bool, team_skill: bool) -> String {
+    let mut text = format!(
+        "{GUIDANCE_BEGIN}
+## Cross-repository navigation: MeshMCP
+
+This workspace is indexed by MeshMCP (MCP server `mesh-mcp`). For a question that spans several
+repositories, start from the graph, then check what matters with your usual read and search tools:
+
+- who imports or uses a package, module or symbol → `find_dependents`
+- events: who publishes, which topics, queues or streams, which consumers → `analyze_impact`
+- gRPC: server handlers, client call sites, `.proto` changes → `analyze_grpc`
+
+Every row carries a `path:line`: a verifiable starting point, not an answer to take on trust. Rows
+marked `heuristic` or `ambiguous` deserve a check.
+
+For an exact identifier (an enum value, a class name), plain text search is still the right tool.
+"
+    );
+    if for_claude_code {
+        text.push_str(
+            "
+In Claude Code these tools load on demand: `ToolSearch` with
+`select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc`.
+",
+        );
+    }
+    if team_skill {
+        text.push_str("\nTeam guide: `.agents/skills/mesh-mcp/SKILL.md`.\n");
+    }
+    text.push_str(GUIDANCE_END);
+    text.push('\n');
+    text
+}
+
+/// Replaces the marked section of `path` with `block`, or appends it (after a
+/// blank line) when the file has none; creates the file if missing. A file
+/// with only one of the two markers is left untouched with a warning — its
+/// section cannot be located safely. Returns whether the file was written.
+fn upsert_guidance(path: &Path, block: &str) -> Result<bool, std::io::Error> {
+    let current = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let updated = match (current.find(GUIDANCE_BEGIN), current.find(GUIDANCE_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let mut after = end + GUIDANCE_END.len();
+            if current[after..].starts_with('\n') {
+                after += 1;
+            }
+            format!("{}{block}{}", &current[..begin], &current[after..])
+        }
+        (None, None) if current.trim().is_empty() => block.to_string(),
+        (None, None) => {
+            let separator = if current.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            format!("{current}{separator}{block}")
+        }
+        _ => {
+            eprintln!(
+                "  ⚠ {} has an incomplete mesh-mcp section; left unchanged.",
+                path.display()
+            );
+            return Ok(false);
+        }
+    };
+    if updated == current {
+        return Ok(false);
+    }
+    fs::write(path, updated)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -753,5 +867,70 @@ mod tests {
             roots.contains(&"../packages/*".to_string()),
             "a monorepo with packages/ must also root '../packages/*', got: {roots:?}"
         );
+    }
+
+    /// 7.0.19: the routing section lands in both files, is idempotent, and
+    /// never touches what the user wrote around it.
+    #[test]
+    fn agent_guidance_is_upserted_between_markers_and_keeps_user_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let claude = tmp.path().join("CLAUDE.md");
+        fs::write(&claude, "# Team notes\n\nKeep this.\n").expect("seed");
+
+        InitCommand::write_agent_guidance(tmp.path()).expect("first write");
+        let first = fs::read_to_string(&claude).expect("read");
+        assert!(
+            first.starts_with("# Team notes\n\nKeep this.\n\n"),
+            "{first}"
+        );
+        assert!(
+            first.contains("ToolSearch"),
+            "Claude Code gets the loading line"
+        );
+        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).expect("AGENTS.md created");
+        assert!(agents.contains("find_dependents") && !agents.contains("ToolSearch"));
+
+        fs::write(&claude, first.clone() + "\nAfter the section.\n").expect("user edit");
+        InitCommand::write_agent_guidance(tmp.path()).expect("second write");
+        let second = fs::read_to_string(&claude).expect("read");
+        assert_eq!(
+            second,
+            first.clone() + "\nAfter the section.\n",
+            "idempotent"
+        );
+        assert_eq!(second.matches(GUIDANCE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn agent_guidance_replaces_an_older_section_and_names_the_team_skill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill = tmp.path().join(".agents").join("skills").join("mesh-mcp");
+        fs::create_dir_all(&skill).expect("mkdir");
+        fs::write(skill.join("SKILL.md"), "---\nname: mesh-mcp\n---\n").expect("skill");
+        let agents = tmp.path().join("AGENTS.md");
+        fs::write(
+            &agents,
+            format!("intro\n{GUIDANCE_BEGIN}\nold text\n{GUIDANCE_END}\noutro\n"),
+        )
+        .expect("seed");
+
+        InitCommand::write_agent_guidance(tmp.path()).expect("write");
+        let text = fs::read_to_string(&agents).expect("read");
+        assert!(
+            text.starts_with("intro\n") && text.ends_with("outro\n"),
+            "{text}"
+        );
+        assert!(!text.contains("old text"));
+        assert!(text.contains(".agents/skills/mesh-mcp/SKILL.md"));
+    }
+
+    #[test]
+    fn half_marked_guidance_file_is_left_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("CLAUDE.md");
+        let text = format!("{GUIDANCE_BEGIN}\nno end marker\n");
+        fs::write(&path, &text).expect("seed");
+        assert!(!upsert_guidance(&path, "new\n").expect("upsert"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), text);
     }
 }

@@ -14,7 +14,7 @@ pub mod swift;
 pub mod ts_config;
 pub mod typescript;
 
-pub use ts_config::TsConfigResolver;
+pub use ts_config::TsAliasIndex;
 
 use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
@@ -53,6 +53,9 @@ pub struct ExtractConfig {
     /// When true (default), AsyncAPI extraction also infers topics from a
     /// non-standard top-level `topics:` string list, not just `channels`.
     pub infer_string_topics: bool,
+    /// `tsconfig.json` / `jsconfig.json` `paths` and `package.json` `imports`
+    /// aliases of the workspace; disabled (rewrites nothing) by default.
+    pub ts_aliases: TsAliasIndex,
 }
 
 impl Default for ExtractConfig {
@@ -64,6 +67,7 @@ impl Default for ExtractConfig {
             openapi_spec_files: Vec::new(),
             asyncapi_spec_files: Vec::new(),
             infer_string_topics: true,
+            ts_aliases: TsAliasIndex::default(),
         }
     }
 }
@@ -110,6 +114,7 @@ impl ExtractConfig {
             openapi_spec_files,
             asyncapi_spec_files,
             infer_string_topics,
+            ts_aliases: default.ts_aliases,
         }
     }
 
@@ -482,7 +487,7 @@ impl PolyglotIndexer {
                         other => other,
                     };
                 }
-                let (nodes, imports, rpc_calls) = match outcome {
+                let (nodes, mut imports, rpc_calls) = match outcome {
                     ParseOutcome::Parsed(Some(extracted)) => extracted,
                     ParseOutcome::Parsed(None) | ParseOutcome::NoGrammar => Default::default(),
                     ParseOutcome::ParseFailed => {
@@ -490,6 +495,15 @@ impl PolyglotIndexer {
                         Default::default()
                     }
                 };
+                // An aliased module (`@/services/User`, `#utils/log`) is the
+                // relative path this file would have written for it.
+                for (symbol, module) in &mut imports {
+                    if symbol.is_empty() {
+                        if let Some(relative) = cfg.ts_aliases.rewrite(file_path, module) {
+                            *module = relative;
+                        }
+                    }
+                }
                 out.rpc_calls = rpc_calls;
                 Self::wire_ts_events(&nodes, &mut out);
                 let mut nodes = nodes;

@@ -14,6 +14,7 @@ use mesh_core::{
 };
 use mesh_parsers::{
     AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
+    TsAliasIndex,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -260,7 +261,7 @@ impl WorkspaceIndexer {
         let patterns = Self::compiled_patterns(config);
         let doc_template = Self::doc_index_for(config);
         let spring = SpringSettings::from_config(config);
-        let extract_cfg = Self::extract_config(config);
+        let extract_cfg = Self::extract_config(config, roots);
         let toggles = Self::engine_toggles(config);
         let config_fingerprint = Self::config_fingerprint(&extract_cfg);
         let scan_cfg = ScanConfig {
@@ -694,7 +695,7 @@ impl WorkspaceIndexer {
         let roots = &state.allowed_roots;
         let patterns = Self::compiled_patterns(config);
         let spring = SpringSettings::from_config(config);
-        let extract_cfg = Self::extract_config(config);
+        let extract_cfg = Self::extract_config(config, roots);
         let toggles = Self::engine_toggles(config);
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
@@ -874,13 +875,15 @@ impl WorkspaceIndexer {
     /// `.openapi` / `.asyncapi` so `proto_dirs`, `controller_annotations`,
     /// `canonical_fqcn_projection`, `spec_files` and `infer_string_topics`
     /// actually apply instead of being parsed and ignored.
-    fn extract_config(config: &Config) -> ExtractConfig {
-        config
+    fn extract_config(config: &Config, roots: &[PathBuf]) -> ExtractConfig {
+        let mut extract_cfg = config
             .engines
             .contracts
             .as_ref()
             .map(ExtractConfig::from_contracts)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        extract_cfg.ts_aliases = TsAliasIndex::new(roots);
+        extract_cfg
     }
 
     /// Reads `[engines.docs] enabled`, `[engines.contracts] enabled` and
@@ -1119,8 +1122,17 @@ impl WorkspaceIndexer {
                 None,
             );
         };
-        let key =
-            PersistentIndexCache::key_for(path, content_hash, repo_id, &cfg.config_fingerprint);
+        // A script governed by `tsconfig` / `package.json` aliases is keyed by
+        // them too: editing such a config re-extracts the files it governs.
+        let file_fingerprint = match extract_cfg.ts_aliases.fingerprint_input(path) {
+            Some(aliases) => {
+                let mut input = cfg.config_fingerprint.to_vec();
+                input.extend_from_slice(aliases.as_bytes());
+                sha256(&input)
+            }
+            None => cfg.config_fingerprint,
+        };
+        let key = PersistentIndexCache::key_for(path, content_hash, repo_id, &file_fingerprint);
         if let Some(bytes) = cache.get(&key) {
             if let Ok(cached) = serde_json::from_slice::<FileIndex>(&bytes) {
                 return (cached, None);
@@ -1843,5 +1855,59 @@ resolve_placeholders = true
         // The most specific root has no descendants to exclude among its siblings.
         let nested = WorkspaceIndexer::exclude_patterns_for_root(&[], &roots, &roots[1]);
         assert!(nested.is_empty());
+    }
+
+    #[test]
+    fn tsconfig_aliases_reach_the_snapshot_and_key_the_index_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(base.join("src/services")).expect("mkdir");
+        std::fs::create_dir_all(base.join("src/app")).expect("mkdir");
+        std::fs::write(
+            base.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .expect("write");
+        std::fs::write(
+            base.join("src/services/User.ts"),
+            "export default class User {}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            base.join("src/app/main.ts"),
+            "import User from '@/services/User';\nexport class Main { u: User }\n",
+        )
+        .expect("write");
+
+        let cfg =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![base.clone()];
+        let snapshot = WorkspaceIndexer::build_snapshot(&cfg, &roots, None, None, None);
+        let graph = &snapshot.contract_graph;
+        let linked = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == mesh_core::EdgeKind::Imports)
+            .any(|e| {
+                graph.get_node(e.from).map(|n| n.name.as_str()) == Some("Main")
+                    && graph.get_node(e.to).map(|n| n.name.as_str()) == Some("User")
+            });
+        assert!(linked, "Main -> User through the `@/` alias");
+
+        // The alias map is part of a script's cache key; a config that governs
+        // nothing is not.
+        let extract_cfg = WorkspaceIndexer::extract_config(&cfg, &roots);
+        let main_ts = base.join("src/app/main.ts");
+        assert!(extract_cfg.ts_aliases.fingerprint_input(&main_ts).is_some());
+        assert!(extract_cfg
+            .ts_aliases
+            .fingerprint_input(&base.join("tsconfig.json"))
+            .is_none());
+        // Deterministic across rebuilds of the config.
+        assert_eq!(
+            WorkspaceIndexer::config_fingerprint(&extract_cfg),
+            WorkspaceIndexer::config_fingerprint(&WorkspaceIndexer::extract_config(&cfg, &roots))
+        );
     }
 }

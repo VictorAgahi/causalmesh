@@ -236,6 +236,35 @@ fn remix_route(stem: &str) -> String {
     }
 }
 
+/// The route of a single-file component page by location alone: SvelteKit's
+/// `+page.svelte` and Astro's `src/pages/**/*.astro` (both unambiguous conventions).
+pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
+    let segs = segments(path);
+    let (file, dirs) = segs.split_last()?;
+    let (stem, ext) = split_ext(file);
+    let route = match (ext, stem) {
+        // `+page.svelte`, and `+page@.svelte` / `+page@(group).svelte` (layout resets).
+        ("svelte", s) if s == "+page" || s.starts_with("+page@") => {
+            // SvelteKit's routes live in `src/routes` (the first such pair names the root).
+            let i = (1..dirs.len()).find(|&i| dirs[i] == "routes" && dirs[i - 1] == "src")?;
+            route_of(&dirs[i + 1..], None)
+        }
+        ("astro", _) if !stem.starts_with('_') => {
+            let i = (1..dirs.len()).find(|&i| dirs[i] == "pages" && dirs[i - 1] == "src")?;
+            // Astro ignores files and folders whose name starts with `_`.
+            if dirs[i + 1..].iter().any(|d| d.starts_with('_')) {
+                return None;
+            }
+            route_of(&dirs[i + 1..], (stem != "index").then_some(stem))
+        }
+        _ => return None,
+    };
+    Some(RouteFact {
+        method: "PAGE".to_string(),
+        path: route,
+    })
+}
+
 /// The routes the location and exports of one file declare, with the lines each is anchored to.
 pub(crate) fn file_routes(
     path: &Path,

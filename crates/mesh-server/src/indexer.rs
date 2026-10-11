@@ -930,6 +930,9 @@ impl WorkspaceIndexer {
             matches!(
                 LanguageKind::from_path(&p.to_string_lossy()),
                 LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript
+            ) || matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("vue" | "svelte" | "astro")
             )
         };
         vfs.tracked_paths()

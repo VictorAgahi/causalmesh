@@ -700,6 +700,7 @@ impl ContractGraph {
                                     .entry(*id)
                                     .or_insert_with(|| module_key(&node.file_path));
                                 module_key_matches(key, &target)
+                                    && extension_compatible(&node.file_path, target_str)
                             })
                             .collect();
                         &in_target_file
@@ -2500,14 +2501,25 @@ type ResolvedKey<'g> = (&'g CompactStr, RepoId, Option<&'g Path>);
 /// (`./user.js` for `user.ts`), longest first.
 const MODULE_EXTENSIONS: &[&str] = &[
     ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs",
-    ".json",
+    ".json", ".vue", ".svelte", ".astro",
 ];
 
 /// Whether `path` is a JavaScript / TypeScript source file.
 fn is_script_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+        Some(
+            "ts" | "tsx"
+                | "mts"
+                | "cts"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "vue"
+                | "svelte"
+                | "astro"
+        )
     )
 }
 
@@ -2524,6 +2536,22 @@ fn module_key(path: &Path) -> PathBuf {
         }
     }
     cleaned
+}
+
+/// Whether the file's extension is one the specifier can mean: an explicit `.vue` / `.svelte` /
+/// `.astro` names only such a file, and an explicit `.js` / `.ts` / … never names a component
+/// (`Foo.vue` and `Foo.ts` side by side are two modules).
+fn extension_compatible(file: &Path, specifier: &str) -> bool {
+    let component = |e: &str| matches!(e, "vue" | "svelte" | "astro");
+    let spec_ext = Path::new(specifier).extension().and_then(|e| e.to_str());
+    let file_ext = file.extension().and_then(|e| e.to_str());
+    match spec_ext {
+        Some(e) if component(e) => file_ext == Some(e),
+        Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts" | "json") => {
+            !file_ext.is_some_and(component)
+        }
+        _ => true,
+    }
 }
 
 /// Whether a declaration in the file keyed `file` is what the relative import

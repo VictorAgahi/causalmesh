@@ -16,6 +16,7 @@ mod http;
 mod messaging;
 pub(crate) mod scope;
 
+pub(crate) use file_routes::sfc_route;
 pub(crate) use http::{decorator_route, detect_routes, DecoratorRoute, RouteFact};
 use mesh_core::NodeKind;
 use scope::{is_shadowed, receiver_key, BlockCache, ConstTable, ModuleBindings, Names, Receivers};

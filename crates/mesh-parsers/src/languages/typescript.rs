@@ -995,7 +995,7 @@ impl TypeScriptExtractor {
     /// Name of the anonymous declaration a file exports: its stem
     /// (`users.controller.ts` -> `users.controller`), or its directory for an
     /// `index` file (`routes/index.ts` -> `routes`).
-    fn file_symbol_name(file_path: &FilePath) -> String {
+    pub(crate) fn file_symbol_name(file_path: &FilePath) -> String {
         let stem = file_path
             .file_stem()
             .and_then(|s| s.to_str())

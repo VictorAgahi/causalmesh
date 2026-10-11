@@ -10,6 +10,7 @@ pub mod python;
 pub mod ruby;
 pub mod rust_lang;
 pub mod scala;
+mod sfc;
 mod spec_shape;
 pub mod swift;
 pub mod ts_config;
@@ -374,8 +375,105 @@ impl PolyglotIndexer {
         repo_id: RepoId,
         cfg: &ExtractConfig,
     ) -> FileIndex {
+        // A single-file component is its script blocks, read with the JS / TS grammar;
+        // the component itself is a declaration named after its file.
+        if sfc::is_sfc(file_path) {
+            return Self::extract_component(file_path, content, repo_id, cfg);
+        }
+        let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
+        Self::extract_as(file_path, content, repo_id, cfg, lang_kind)
+    }
+
+    /// `.vue` / `.svelte` / `.astro`: the script is extracted (line numbers are the file's),
+    /// then the component is declared, so that an import of it names a symbol.
+    fn extract_component(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        cfg: &ExtractConfig,
+    ) -> FileIndex {
+        let mut out = match sfc::script_view(file_path, content) {
+            // Same lexical guard as any parsed source, on the script alone.
+            Some(view)
+                if AstGuard::max_nesting_depth(view.script.as_bytes())
+                    <= AstGuard::MAX_NESTING_DEPTH
+                    && view
+                        .script
+                        .lines()
+                        // Blanked template / style lines are runs of spaces: only the
+                        // script's own width counts.
+                        .all(|l| l.trim_end().len() <= AstGuard::MAX_LINE_LEN_BYTES) =>
+            {
+                Self::extract_as(file_path, &view.script, repo_id, cfg, view.kind)
+            }
+            _ => FileIndex::default(),
+        };
+        let name =
+            typescript::TypeScriptExtractor::file_symbol_name(&std::sync::Arc::from(file_path));
+        // SvelteKit's `+page` / `+layout` / `+error` are route files, not named components.
+        let special = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('+'));
+        if !special && !out.nodes.iter().any(|n| n.name == name.as_str()) {
+            // The component spans its file; its imports are its dependencies.
+            let lines = content.lines().count().max(1);
+            let component = ContractNode {
+                id: 0,
+                name: CompactStr::new(&name),
+                kind: NodeKind::ServiceClass,
+                file_path: std::sync::Arc::from(file_path),
+                line_start: 1,
+                line_end: lines,
+                package: mesh_core::detect_service_package(file_path, None),
+                repo_id,
+                signature: Some(CompactStr::new(format!("component {name}"))),
+                docstring: None,
+            };
+            let imports: std::collections::BTreeSet<CompactStr> =
+                out.dependencies.iter().map(|(_, d)| d.clone()).collect();
+            if out.nodes.len() == 1 && out.nodes[0].kind == NodeKind::Module {
+                // Only the imports-only Module node exists: the component replaces it.
+                out.nodes.clear();
+                out.dependencies.clear();
+            }
+            let idx = out.nodes.len();
+            out.nodes.push(component);
+            for d in imports {
+                if !out.dependencies.iter().any(|(i, t)| *i == idx && *t == d) {
+                    out.dependencies.push((idx, d));
+                }
+            }
+        }
+        // SvelteKit's `+page.svelte` and Astro's `src/pages/**/*.astro` are pages by location.
+        if let Some(page) = Self::routing_path(cfg, file_path)
+            .and_then(|routing_path| js_frameworks::sfc_route(&routing_path))
+        {
+            let label = page.label();
+            out.nodes.push(ContractNode {
+                id: 0,
+                name: CompactStr::new(&label),
+                kind: NodeKind::HttpEndpoint,
+                file_path: std::sync::Arc::from(file_path),
+                line_start: 1,
+                line_end: content.lines().count().max(1),
+                package: mesh_core::detect_service_package(file_path, None),
+                repo_id,
+                signature: Some(CompactStr::new(label)),
+                docstring: None,
+            });
+        }
+        out
+    }
+
+    fn extract_as(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        cfg: &ExtractConfig,
+        lang_kind: LanguageKind,
+    ) -> FileIndex {
         let path_str = file_path.to_string_lossy();
-        let lang_kind = LanguageKind::from_path(&path_str);
         let mut out = FileIndex::default();
 
         // Parses `content` once for `lang_kind` at the indexing budget

@@ -5,7 +5,7 @@ use crate::types::{
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
@@ -595,6 +595,7 @@ impl ContractGraph {
     fn resolve_import_targets<'g>(
         &'g self,
         importer_repo: Option<RepoId>,
+        importer_dir: Option<&Path>,
         target_str: &str,
         memo: &mut ImportMemo<'g>,
     ) -> Vec<(NodeId, EdgeConfidence)> {
@@ -680,9 +681,28 @@ impl ContractGraph {
                             .filter(|id| self.nodes.get(id).map(|n| n.repo_id) == importer_repo)
                             .collect()
                     });
-                if !same_repo.is_empty() {
+                // From a script, the symbol must live in the file the specifier
+                // names: `import x from '@/lib/utils'` (rewritten to a relative
+                // path) is not a reference to any other `utils` in the repo.
+                let in_target_file: Vec<NodeId>;
+                let candidates: &[NodeId] = match importer_dir {
+                    Some(dir) => {
+                        in_target_file = same_repo
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                self.nodes.get(id).is_some_and(|n| {
+                                    module_path_matches(&n.file_path, dir, target_str)
+                                })
+                            })
+                            .collect();
+                        &in_target_file
+                    }
+                    None => same_repo,
+                };
+                if !candidates.is_empty() {
                     return self.pick_or_ambiguous(
-                        same_repo,
+                        candidates,
                         importer_repo,
                         EdgeConfidence::Heuristic,
                     );
@@ -796,16 +816,29 @@ impl ContractGraph {
         // `name_to_nodes` bucket — which for a hot name is O(N). Memoized per
         // (target, importer repo), N importers of one hot name cost one scan
         // instead of N (was O(importers × bucket)).
-        let mut resolved: HashMap<(&CompactStr, RepoId), Vec<(NodeId, EdgeConfidence)>> =
-            HashMap::new();
+        // A relative import from a JavaScript/TypeScript file also depends on the
+        // importer's directory (see `module_path_matches`), so that directory joins
+        // the memo key for those, and only those.
+        let mut resolved: HashMap<ResolvedKey, Vec<(NodeId, EdgeConfidence)>> = HashMap::new();
         let mut memo = ImportMemo::default();
         for (importer_id, target) in import_facts {
-            let Some(importer_repo) = self.nodes.get(&importer_id).map(|n| n.repo_id) else {
+            let Some(importer) = self.nodes.get(&importer_id) else {
                 continue;
             };
-            let targets = resolved.entry((target, importer_repo)).or_insert_with(|| {
-                self.resolve_import_targets(Some(importer_repo), target.as_str(), &mut memo)
-            });
+            let importer_repo = importer.repo_id;
+            let importer_dir = (target.starts_with('.') && is_script_path(&importer.file_path))
+                .then(|| importer.file_path.parent())
+                .flatten();
+            let targets = resolved
+                .entry((target, importer_repo, importer_dir))
+                .or_insert_with(|| {
+                    self.resolve_import_targets(
+                        Some(importer_repo),
+                        importer_dir,
+                        target.as_str(),
+                        &mut memo,
+                    )
+                });
             for &(to_id, confidence) in targets.iter() {
                 if edge_set.insert((importer_id, to_id, EdgeKind::Imports)) {
                     import_edges.push(ContractEdge {
@@ -2451,6 +2484,49 @@ impl PackageBucket<'_> {
                 .collect(),
         }
     }
+}
+
+/// `(import target, importer repo, importer directory)`: the key of a resolved
+/// import fact; the directory is `Some` only for a relative import from a script.
+type ResolvedKey<'g> = (&'g CompactStr, RepoId, Option<&'g Path>);
+
+/// Source extensions that name a module without being part of its import path
+/// (`./user.js` for `user.ts`), longest first.
+const MODULE_EXTENSIONS: &[&str] = &[
+    ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs",
+    ".json",
+];
+
+/// Whether `path` is a JavaScript / TypeScript source file.
+fn is_script_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
+/// `path` without a module extension, lexically normalised: the identity a
+/// relative import path and a declaration's file are compared by.
+fn module_key(path: &Path) -> PathBuf {
+    let cleaned = path_clean::clean(path);
+    let text = cleaned.to_string_lossy();
+    for ext in MODULE_EXTENSIONS {
+        if let Some(stem) = text.strip_suffix(ext) {
+            if !stem.is_empty() && !stem.ends_with(std::path::MAIN_SEPARATOR) {
+                return PathBuf::from(stem);
+            }
+        }
+    }
+    cleaned
+}
+
+/// Whether a declaration in `file` is what the relative import `specifier`,
+/// written in a file of directory `importer_dir`, names: the same module path,
+/// or that path's `index` (`./services` -> `services/index.ts`).
+fn module_path_matches(file: &Path, importer_dir: &Path, specifier: &str) -> bool {
+    let target = module_key(&importer_dir.join(specifier));
+    let file = module_key(file);
+    file == target || file == target.join("index")
 }
 
 /// Per-`reconcile_edges` memo for [`ContractGraph::resolve_import_targets`],

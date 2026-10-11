@@ -9,7 +9,9 @@
 //! Resolution is lazy and per directory: the nearest config above a file is read once
 //! per [`TsAliasIndex`] and memoised, so the same code serves a full scan and a
 //! one-file incremental reload with no workspace-wide discovery pass, and nothing is
-//! cached across `ExtractConfig`s (a rebuilt config re-reads the files). The cache key
+//! cached across `ExtractConfig`s (a rebuilt config re-reads the files). Every file read
+//! is confined to the workspace root the importing file belongs to (symlinks and `..`
+//! are resolved first), and a file outside every root is never looked up. The cache key
 //! of a file's `FileIndex` folds in [`TsAliasIndex::fingerprint_input`], so editing a
 //! `tsconfig.json` re-extracts exactly the files that config governs.
 
@@ -22,8 +24,6 @@ use std::sync::{Arc, Mutex};
 const MAX_EXTENDS_DEPTH: usize = 8;
 /// A config larger than this is ignored: it is not a hand-written tsconfig.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-/// Directories climbed from a file that sits under no known root.
-const MAX_CLIMB: usize = 16;
 
 /// One alias: `pattern` (`@/*`, `@app`, `#utils/*`) mapped to `target`, an absolute
 /// path that holds a `*` where the pattern does.
@@ -73,6 +73,9 @@ impl AliasRule {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RuleSet {
     rules: Vec<AliasRule>,
+    /// Canonical text of `rules`, built once (it keys the cache of every file
+    /// the rules govern).
+    canonical: String,
 }
 
 impl RuleSet {
@@ -85,23 +88,18 @@ impl RuleSet {
                 .then_with(|| a.suffix.cmp(&b.suffix))
         });
         rules.dedup();
-        Self { rules }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
-    /// A canonical text of the rules, for cache keys.
-    fn canonical(&self) -> String {
-        let mut out = String::new();
-        for r in &self.rules {
-            out.push_str(&format!(
+        let mut canonical = String::new();
+        for r in &rules {
+            canonical.push_str(&format!(
                 "{}|{}|{}|{}\n",
                 r.prefix, r.suffix, r.wildcard, r.target
             ));
         }
-        out
+        Self { rules, canonical }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 }
 
@@ -129,21 +127,28 @@ pub struct TsAliasIndex {
 }
 
 impl std::fmt::Debug for TsAliasIndex {
-    /// Roots only: this value is part of the extraction-config fingerprint, which
-    /// must not move with the memo's contents.
+    /// A constant per state: this value is part of the extraction-config
+    /// fingerprint, which must move with neither the memo's contents nor the
+    /// set of roots (a root is already part of every file's path, hence its key;
+    /// the aliases that govern a file are part of that file's key).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.inner {
             None => f.write_str("TsAliasIndex(disabled)"),
-            Some(inner) => write!(f, "TsAliasIndex(roots={:?})", inner.roots),
+            Some(_) => f.write_str("TsAliasIndex(enabled)"),
         }
     }
 }
 
 impl TsAliasIndex {
-    /// Enabled for files under `roots`; a config is never looked for above the
-    /// root a file belongs to.
+    /// Enabled for files under `roots`; a config is never looked for, nor read,
+    /// outside the root a file belongs to.
     pub fn new(roots: &[PathBuf]) -> Self {
-        let mut roots = roots.to_vec();
+        // Canonical, so `dir.starts_with(root)` and the jail check agree with the
+        // (canonical) paths the crawler yields.
+        let mut roots: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| dunce::canonicalize(r).unwrap_or_else(|_| r.clone()))
+            .collect();
         roots.sort();
         roots.dedup();
         Self {
@@ -180,13 +185,13 @@ impl TsAliasIndex {
         let mut out = String::new();
         if let Some(ts) = ts {
             out.push_str("ts\n");
-            out.push_str(&ts.canonical());
+            out.push_str(&ts.canonical);
         }
         if let Some(pkg) = pkg {
             out.push_str("pkg\n");
-            out.push_str(&pkg.canonical());
+            out.push_str(&pkg.canonical);
         }
-        (!out.is_empty()).then_some(out)
+        Some(out)
     }
 
     fn rule_sets(&self, file: &Path) -> Option<GoverningRules> {
@@ -195,8 +200,12 @@ impl TsAliasIndex {
             return None;
         }
         let dir = file.parent()?;
-        let ts = inner.nearest(&inner.ts, dir, load_ts_rules);
-        let pkg = inner.nearest(&inner.pkg, dir, load_package_imports);
+        let ts = inner
+            .nearest(&inner.ts, dir, load_ts_rules)
+            .filter(|s| !s.is_empty());
+        let pkg = inner
+            .nearest(&inner.pkg, dir, load_package_imports)
+            .filter(|s| !s.is_empty());
         (ts.is_some() || pkg.is_some()).then_some((ts, pkg))
     }
 }
@@ -204,62 +213,47 @@ impl TsAliasIndex {
 fn is_script_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some(
-            "ts" | "tsx"
-                | "mts"
-                | "cts"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "vue"
-                | "svelte"
-                | "astro"
-        )
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
     )
 }
 
 impl Inner {
-    /// The rule set of the nearest directory at or above `dir` (never above the
-    /// file's root) for which `load` finds one, memoised for every directory
-    /// climbed so a sibling file costs a lookup.
+    /// The rule set of the nearest directory at or above `dir` that holds a config
+    /// (`load` returns `Some`, possibly empty: a config with no aliases still
+    /// ends the climb, as in TypeScript and Node, so a package never inherits a
+    /// parent project's aliases). Never above the file's root, and `None` for a
+    /// directory under no root. Every directory climbed is memoised, so a
+    /// sibling file costs a lookup.
     fn nearest(
         &self,
         memo: &Memo,
         dir: &Path,
-        load: fn(&Path) -> Option<RuleSet>,
+        load: fn(&Path, &Path) -> Option<RuleSet>,
     ) -> Option<Arc<RuleSet>> {
-        let boundary = self
+        let jail = self
             .roots
             .iter()
             .filter(|r| dir.starts_with(r))
-            .max_by_key(|r| r.components().count());
+            .max_by_key(|r| r.components().count())?;
         let mut climbed: Vec<PathBuf> = Vec::new();
         let mut found: Option<Arc<RuleSet>> = None;
         let mut current = Some(dir);
         while let Some(d) = current {
-            if climbed.len() >= MAX_CLIMB && boundary.is_none() {
-                break;
-            }
             let cached = memo
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(d)
                 .cloned();
-            match cached {
-                Some(hit) => {
-                    found = hit;
-                    break;
-                }
-                None => {
-                    climbed.push(d.to_path_buf());
-                    if let Some(set) = load(d).filter(|s| !s.is_empty()) {
-                        found = Some(Arc::new(set));
-                        break;
-                    }
-                }
+            if let Some(hit) = cached {
+                found = hit;
+                break;
             }
-            if boundary.is_some_and(|b| b.as_path() == d) {
+            climbed.push(d.to_path_buf());
+            if let Some(set) = load(d, jail) {
+                found = Some(Arc::new(set));
+                break;
+            }
+            if d == jail.as_path() {
                 break;
             }
             current = d.parent();
@@ -272,55 +266,62 @@ impl Inner {
     }
 }
 
-/// `compilerOptions.paths` of the `tsconfig.json` / `jsconfig.json` in `dir`.
-fn load_ts_rules(dir: &Path) -> Option<RuleSet> {
+/// `compilerOptions.paths` of the `tsconfig.json` (else `jsconfig.json`) in `dir`.
+/// `Some` as soon as such a config exists, even with no `paths`.
+fn load_ts_rules(dir: &Path, jail: &Path) -> Option<RuleSet> {
     for name in ["tsconfig.json", "jsconfig.json"] {
         let path = dir.join(name);
-        if !path.is_file() {
+        if !path.exists() {
             continue;
         }
-        let Some(layer) = load_layer(&path, 0) else {
-            continue;
+        let layer = load_layer(&path, jail, 0).unwrap_or_default();
+        let rules = match layer.paths {
+            Some((origin, paths)) => {
+                let base = layer.base_url.unwrap_or(origin);
+                paths
+                    .iter()
+                    .filter_map(|(pattern, targets)| {
+                        let target = targets.first()?;
+                        AliasRule::new(
+                            pattern,
+                            clean(&base.join(target)).to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
         };
-        let Some((origin, paths)) = layer.paths else {
-            continue;
-        };
-        let base = layer.base_url.unwrap_or(origin);
-        let rules = paths
-            .iter()
-            .filter_map(|(pattern, targets)| {
-                let target = targets.first()?;
-                AliasRule::new(
-                    pattern,
-                    clean(&base.join(target)).to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        let set = RuleSet::from_rules(rules);
-        if !set.is_empty() {
-            return Some(set);
-        }
+        return Some(RuleSet::from_rules(rules));
     }
     None
 }
 
-/// `imports` (`"#internal/*": "./src/internal/*.js"`) of the `package.json` in `dir`.
-fn load_package_imports(dir: &Path) -> Option<RuleSet> {
+/// `imports` (`"#internal/*": "./src/internal/*.js"`) of the `package.json` in
+/// `dir`. `Some` as soon as a `package.json` exists, even with no `imports`.
+fn load_package_imports(dir: &Path, jail: &Path) -> Option<RuleSet> {
     let path = dir.join("package.json");
-    let value = read_json(&path)?;
-    let imports = value.get("imports")?.as_object()?;
-    let rules = imports
-        .iter()
-        .filter(|(key, _)| key.starts_with('#'))
-        .filter_map(|(key, target)| {
-            let target = condition_target(target, 0)?;
-            // A bare target (`"#ext": "some-package"`) points at a package, not a file.
-            if !target.starts_with("./") {
-                return None;
-            }
-            AliasRule::new(key, clean(&dir.join(target)).to_string_lossy().into_owned())
+    if !path.exists() {
+        return None;
+    }
+    let value = read_json(&path, jail).unwrap_or(Value::Null);
+    let rules = value
+        .get("imports")
+        .and_then(Value::as_object)
+        .map(|imports| {
+            imports
+                .iter()
+                .filter(|(key, _)| key.starts_with('#'))
+                .filter_map(|(key, target)| {
+                    let target = condition_target(target, 0)?;
+                    // A bare target (`"#ext": "some-package"`) points at a package.
+                    if !target.starts_with("./") {
+                        return None;
+                    }
+                    AliasRule::new(key, clean(&dir.join(target)).to_string_lossy().into_owned())
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     Some(RuleSet::from_rules(rules))
 }
 
@@ -356,11 +357,11 @@ struct ConfigLayer {
     paths: Option<(PathBuf, PathEntries)>,
 }
 
-fn load_layer(path: &Path, depth: usize) -> Option<ConfigLayer> {
+fn load_layer(path: &Path, jail: &Path, depth: usize) -> Option<ConfigLayer> {
     if depth > MAX_EXTENDS_DEPTH {
         return None;
     }
-    let value = read_json(path)?;
+    let value = read_json(path, jail)?;
     let dir = path.parent()?;
     let mut layer = ConfigLayer::default();
 
@@ -374,11 +375,19 @@ fn load_layer(path: &Path, depth: usize) -> Option<ConfigLayer> {
         if !(spec.starts_with('.') || spec.starts_with('/')) {
             continue;
         }
-        let mut parent = clean(&dir.join(spec));
-        if !parent.is_file() {
-            parent.as_mut_os_string().push(".json");
-        }
-        if let Some(inherited) = load_layer(&parent, depth + 1) {
+        // `./base`, `./base.json` or a directory holding a `tsconfig.json`.
+        let named = clean(&dir.join(spec));
+        let mut with_json = named.clone().into_os_string();
+        with_json.push(".json");
+        let parent = [
+            named.clone(),
+            PathBuf::from(with_json),
+            named.join("tsconfig.json"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(named);
+        if let Some(inherited) = load_layer(&parent, jail, depth + 1) {
             if inherited.base_url.is_some() {
                 layer.base_url = inherited.base_url;
             }
@@ -415,17 +424,31 @@ fn load_layer(path: &Path, depth: usize) -> Option<ConfigLayer> {
     Some(layer)
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+/// Reads a config that lies inside `jail` (a canonical workspace root): the path
+/// is resolved first (symlinks, `..`), so a symlinked or `extends`-ed file outside
+/// the root is refused. The size cap is enforced on the bytes actually read.
+fn read_json(path: &Path, jail: &Path) -> Option<Value> {
+    use std::io::Read;
+    let canonical = dunce::canonicalize(path).ok()?;
+    if !canonical.starts_with(jail) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let file = std::fs::File::open(&canonical).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return None;
+    }
     parse_jsonc(&text)
 }
 
 /// Parses JSON with comments and trailing commas (what `tsc` accepts in a tsconfig).
-pub fn parse_jsonc(input: &str) -> Option<Value> {
+pub(crate) fn parse_jsonc(input: &str) -> Option<Value> {
     serde_json::from_str(&strip_jsonc(input)).ok()
 }
 
@@ -745,5 +768,144 @@ mod tests {
         assert_eq!(r("/a/b/c", "/a/x").as_deref(), Some("../../x"));
         assert_eq!(r("/a", "/a").as_deref(), Some("."));
         assert_eq!(r("/a", "b"), None);
+    }
+
+    #[test]
+    fn extends_outside_the_root_is_refused() {
+        let (_t, root) = setup();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let outside_dir = std::fs::canonicalize(outside.path()).expect("canon");
+        write(
+            &outside_dir,
+            "evil.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["secret/*"] } } }"#,
+        );
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        // Absolute and relative `extends` pointing outside the workspace root.
+        write(
+            &ws,
+            "abs/tsconfig.json",
+            &format!(
+                r#"{{ "extends": "{}" }}"#,
+                outside_dir.join("evil.json").display()
+            ),
+        );
+        let rel_up = {
+            let mut up = PathBuf::new();
+            for _ in 0..ws.join("rel").components().count() {
+                up.push("..");
+            }
+            up.join(outside_dir.strip_prefix("/").unwrap_or(&outside_dir))
+        };
+        write(
+            &ws,
+            "rel/tsconfig.json",
+            &format!(r#"{{ "extends": "{}/evil.json" }}"#, rel_up.display()),
+        );
+        let idx = TsAliasIndex::new(std::slice::from_ref(&ws));
+        assert_eq!(idx.rewrite(&ws.join("abs/a.ts"), "@/x"), None);
+        assert_eq!(idx.rewrite(&ws.join("rel/a.ts"), "@/x"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_leaving_the_root_is_refused() {
+        let (_t, root) = setup();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let outside_dir = std::fs::canonicalize(outside.path()).expect("canon");
+        write(
+            &outside_dir,
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["secret/*"] } } }"#,
+        );
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::os::unix::fs::symlink(outside_dir.join("tsconfig.json"), ws.join("tsconfig.json"))
+            .expect("symlink");
+        write(
+            &ws,
+            "inside.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        );
+        std::fs::create_dir_all(ws.join("pkg")).expect("mkdir");
+        std::os::unix::fs::symlink(ws.join("inside.json"), ws.join("pkg/tsconfig.json"))
+            .expect("symlink");
+        let idx = TsAliasIndex::new(std::slice::from_ref(&ws));
+        assert_eq!(idx.rewrite(&ws.join("a.ts"), "@/x"), None);
+        // A symlink that stays inside the root is fine.
+        assert_eq!(
+            idx.rewrite(&ws.join("pkg/a.ts"), "@/x").as_deref(),
+            Some("./src/x")
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_root_is_canonicalised_and_a_file_outside_every_root_is_ignored() {
+        let (_t, root) = setup();
+        write(
+            &root,
+            "ws/tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        );
+        write(
+            &root,
+            "other/tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        );
+        write(&root, "ws/src/a.ts", "");
+        let dotted = root.join("ws/src/..");
+        let idx = TsAliasIndex::new(std::slice::from_ref(&dotted));
+        assert!(idx.rewrite(&root.join("ws/src/a.ts"), "@/b").is_some());
+        assert_eq!(idx.rewrite(&root.join("other/a.ts"), "@/b"), None);
+    }
+
+    #[test]
+    fn a_nested_config_without_aliases_ends_the_climb() {
+        let (_t, root) = setup();
+        write(
+            &root,
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        );
+        write(
+            &root,
+            "package.json",
+            r##"{ "imports": { "#u/*": "./u/*.js" } }"##,
+        );
+        write(
+            &root,
+            "packages/b/tsconfig.json",
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        );
+        write(&root, "packages/b/package.json", r#"{ "name": "b" }"#);
+        write(&root, "packages/c/src/a.ts", "");
+        let idx = TsAliasIndex::new(std::slice::from_ref(&root));
+        let b = root.join("packages/b/src/a.ts");
+        assert_eq!(idx.rewrite(&b, "@/y"), None);
+        assert_eq!(idx.rewrite(&b, "#u/y"), None);
+        assert_eq!(idx.fingerprint_input(&b), None);
+        // A package with no config of its own is still governed by the root's.
+        assert!(idx
+            .rewrite(&root.join("packages/c/src/a.ts"), "@/y")
+            .is_some());
+    }
+
+    #[test]
+    fn extends_may_name_a_directory_and_the_debug_form_ignores_the_roots() {
+        let (_t, root) = setup();
+        write(
+            &root,
+            "base/tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@b/*": ["lib/*"] } } }"#,
+        );
+        write(&root, "app/tsconfig.json", r#"{ "extends": "../base" }"#);
+        let idx = TsAliasIndex::new(std::slice::from_ref(&root));
+        assert_eq!(
+            idx.rewrite(&root.join("app/src/a.ts"), "@b/x").as_deref(),
+            Some("../../base/lib/x")
+        );
+        let other = TsAliasIndex::new(&[root.join("app"), root.join("base")]);
+        assert_eq!(format!("{idx:?}"), format!("{other:?}"));
     }
 }

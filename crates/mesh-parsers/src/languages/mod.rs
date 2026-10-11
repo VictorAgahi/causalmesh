@@ -459,7 +459,7 @@ impl PolyglotIndexer {
                             }
                             let mut imports = Vec::new();
                             let mut rpc_calls = Vec::new();
-                            let nodes = typescript::TypeScriptExtractor::extract_with_config(
+                            let mut nodes = typescript::TypeScriptExtractor::extract_with_config(
                                 file_path,
                                 content,
                                 repo_id,
@@ -468,6 +468,19 @@ impl PolyglotIndexer {
                                 &mut rpc_calls,
                                 &cfg.controller_annotations,
                             );
+                            // The path a file-system router is read from is the one below
+                            // the workspace root, not the whole checkout path.
+                            let routing_path = cfg
+                                .ts_aliases
+                                .relative_to_root(file_path)
+                                .unwrap_or_else(|| file_path.to_path_buf());
+                            nodes.extend(typescript::TypeScriptExtractor::file_route_nodes(
+                                &routing_path,
+                                file_path,
+                                content,
+                                repo_id,
+                                tree,
+                            ));
                             Some((nodes, imports, rpc_calls))
                         },
                     )

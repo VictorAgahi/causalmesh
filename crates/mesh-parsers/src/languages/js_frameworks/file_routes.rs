@@ -31,6 +31,15 @@ pub(super) fn exported_names(root: Node, source: &[u8]) -> Exports {
             .any(|c| c.kind() == "default")
         {
             out.insert("default".to_string(), lines);
+            // `export default defineEventHandler(…)`: remember what is called.
+            let callee = stmt
+                .child_by_field_name("value")
+                .filter(|v| v.kind() == "call_expression")
+                .and_then(|v| v.child_by_field_name("function"))
+                .and_then(|f| f.utf8_text(source).ok());
+            if let Some(callee) = callee {
+                out.insert(format!("default@{callee}"), lines);
+            }
             continue;
         }
         if let Some(decl) = stmt.child_by_field_name("declaration") {
@@ -48,12 +57,33 @@ pub(super) fn exported_names(root: Node, source: &[u8]) -> Exports {
                         .named_children(&mut decl.walk())
                         .filter(|d| d.kind() == "variable_declarator")
                     {
-                        if let Some(name) = d
-                            .child_by_field_name("name")
-                            .filter(|n| n.kind() == "identifier")
-                            .and_then(|n| n.utf8_text(source).ok())
-                        {
-                            out.insert(name.to_string(), lines);
+                        let Some(binding) = d.child_by_field_name("name") else {
+                            continue;
+                        };
+                        match binding.kind() {
+                            "identifier" => {
+                                if let Ok(name) = binding.utf8_text(source) {
+                                    out.insert(name.to_string(), lines);
+                                }
+                            }
+                            // `export const { GET, POST } = handlers;` (Auth.js)
+                            "object_pattern" => {
+                                for member in binding.named_children(&mut binding.walk()) {
+                                    let local = match member.kind() {
+                                        "shorthand_property_identifier_pattern" => Some(member),
+                                        "pair_pattern" => member.child_by_field_name("value"),
+                                        "object_assignment_pattern" => {
+                                            member.child_by_field_name("left")
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(name) = local.and_then(|n| n.utf8_text(source).ok())
+                                    {
+                                        out.insert(name.to_string(), lines);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -120,8 +150,18 @@ fn is_script_ext(ext: &str) -> bool {
 /// `*rest`, `[[...rest]]` / `[[id]]` -> optional, `[id=int]` -> `:id`, a `(group)` or
 /// `@slot` -> nothing.
 fn dynamic_segment(seg: &str) -> Option<String> {
+    // `(group)`, `@slot` and the intercepting markers `(.)x` / `(..)x` / `(...)x` are no
+    // path segments (an intercepting route is served at the path it intercepts).
     if (seg.starts_with('(') && seg.ends_with(')')) || seg.starts_with('@') {
         return None;
+    }
+    if let Some(rest) = seg
+        .strip_prefix("(...)")
+        .or_else(|| seg.strip_prefix("(..)(..)"))
+        .or_else(|| seg.strip_prefix("(..)"))
+        .or_else(|| seg.strip_prefix("(.)"))
+    {
+        return Some(rest.to_string());
     }
     if let Some(inner) = seg.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
         let name = inner.trim_start_matches("...");
@@ -158,11 +198,14 @@ fn route_of(dirs: &[String], leaf: Option<&str>) -> String {
 }
 
 /// The route segments of a Remix / React Router flat-route file stem
-/// (`users.$id.edit` -> `/users/:id/edit`, `_index` -> `/`, `_auth.login` -> `/login`).
+/// (`users.$id.edit` -> `/users/:id/edit`, `_index` -> `/`, `_auth.login` -> `/login`,
+/// `sitemap[.]xml` -> `/sitemap.xml`, `($lang).about` -> `/:lang?/about`).
 fn remix_route(stem: &str) -> String {
+    // `[.]` is an escaped dot, not a separator.
+    let escaped = stem.replace("[.]", "\u{1}");
     let mut out = String::new();
-    for part in stem.split('.') {
-        let part = part.trim_end_matches('_');
+    for part in escaped.split('.') {
+        let part = part.trim_end_matches('_').replace('\u{1}', ".");
         if part.is_empty() || part == "_index" || part == "index" || part.starts_with('_') {
             continue;
         }
@@ -172,8 +215,14 @@ fn remix_route(stem: &str) -> String {
         } else if let Some(name) = part.strip_prefix('$') {
             out.push(':');
             out.push_str(name);
+        } else if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+            // `($lang)` is an optional parameter, `(en)` an optional static segment.
+            match inner.strip_prefix('$') {
+                Some(name) => out.push_str(&format!(":{name}?")),
+                None => out.push_str(&format!("{inner}?")),
+            }
         } else {
-            out.push_str(part);
+            out.push_str(&part);
         }
     }
     if out.is_empty() {
@@ -234,13 +283,11 @@ pub(crate) fn file_routes(
             let route = route_of(rest, None);
             return match stem {
                 "+server" => verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect(),
-                "+page" | "+page.server" => {
-                    let mut out = vec![page(&route)];
-                    if let Some(l) = exports.get("actions") {
-                        out.push(fact("POST", &route, *l));
-                    }
-                    out
-                }
+                // The page itself is `+page.svelte`; its load / actions module adds the form actions.
+                "+page" | "+page.server" => match exports.get("actions") {
+                    Some(l) => vec![fact("POST", &route, *l)],
+                    None => Vec::new(),
+                },
                 _ => Vec::new(),
             };
         }
@@ -249,6 +296,10 @@ pub(crate) fn file_routes(
     // Next.js App Router: `app/**/route.ts` (verbs) and `app/**/page.tsx`.
     if (stem == "route" || stem == "page") && dirs.iter().any(|d| d == "app") {
         let rest = after("app").unwrap_or(&[]);
+        // A folder prefixed with `_` is private to the app router: nothing under it is routed.
+        if rest.iter().any(|d| d.starts_with('_')) {
+            return Vec::new();
+        }
         let route = route_of(rest, None);
         if stem == "route" && !verbs.is_empty() {
             return verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect();
@@ -276,7 +327,13 @@ pub(crate) fn file_routes(
         let remix_import =
             bindings.references_any(&["@remix-run/", "react-router", "@react-router/"]);
         if remix_import && dirs.iter().any(|d| d == "app") {
+            // A pathless layout (`_auth.tsx`, `_layout.tsx`) wraps routes, it is not one.
+            let layout = stem
+                .rsplit('.')
+                .next()
+                .is_some_and(|last| last.starts_with('_') && last != "_index");
             let route = match rest.last() {
+                None if layout => None,
                 None => Some(remix_route(stem)),
                 Some(folder) if stem == "route" || stem == "index" => Some(remix_route(folder)),
                 Some(_) => None,
@@ -337,11 +394,18 @@ fn nitro_route(
 ) -> Option<Vec<(RouteFact, (usize, usize))>> {
     // The file must define a handler: `export default defineEventHandler(…)`.
     let lines = exports.get("default").copied()?;
-    if !(mentions("defineEventHandler")
-        || mentions("eventHandler")
-        || mentions("defineNuxtRouteHandler")
-        || mentions("defineCachedEventHandler"))
-    {
+    let _ = mentions;
+    let handler = [
+        "defineEventHandler",
+        "eventHandler",
+        "defineNuxtRouteHandler",
+        "defineCachedEventHandler",
+        "defineWebSocketHandler",
+        "defineLazyEventHandler",
+    ]
+    .iter()
+    .any(|h| exports.contains_key(&format!("default@{h}")));
+    if !handler {
         return None;
     }
     let (name, method) = match stem.rsplit_once('.') {

@@ -178,6 +178,19 @@ impl TsAliasIndex {
         relative_specifier(file.parent()?, Path::new(&target))
     }
 
+    /// `file` relative to the workspace root it belongs to, when roots are known: the path a
+    /// file-system router is read from, free of whatever directories hold the checkout
+    /// (`/app/...` in a container, `~/api/...`).
+    pub fn relative_to_root(&self, file: &Path) -> Option<PathBuf> {
+        let inner = self.inner.as_ref()?;
+        let root = inner
+            .roots
+            .iter()
+            .filter(|r| file.starts_with(r))
+            .max_by_key(|r| r.components().count())?;
+        file.strip_prefix(root).ok().map(Path::to_path_buf)
+    }
+
     /// What the aliases governing `file` add to its `FileIndex` cache key; `None`
     /// when none do, so files outside any aliased project keep their key.
     pub fn fingerprint_input(&self, file: &Path) -> Option<String> {

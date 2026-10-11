@@ -135,11 +135,17 @@ fn sveltekit_server_endpoints_and_page_modules() {
         routes(&server),
         r(&["DELETE /api/items/:id", "GET /api/items/:id"])
     );
+    // The page itself is `+page.svelte`; its server module only adds the form actions.
     let page = index(
         "web/src/routes/(app)/dashboard/+page.server.ts",
         "export const load = () => ({});\nexport const actions = { default: async () => {} };\n",
     );
-    assert_eq!(routes(&page), r(&["PAGE /dashboard", "POST /dashboard"]));
+    assert_eq!(routes(&page), r(&["POST /dashboard"]));
+    let load_only = index(
+        "web/src/routes/x/+page.ts",
+        "export const load = () => ({});\n",
+    );
+    assert!(routes(&load_only).is_empty());
     let layout = index(
         "web/src/routes/+layout.ts",
         "export const prerender = true;\n",
@@ -217,4 +223,94 @@ fn ordinary_modules_in_look_alike_folders_are_not_routes() {
     ] {
         assert!(routes(&index(path, code)).is_empty(), "{path}");
     }
+}
+
+#[test]
+fn authjs_style_destructured_exports_and_reexports_are_routes() {
+    let destructured = index(
+        "web/app/api/auth/[...nextauth]/route.ts",
+        "import { handlers } from '@/auth';\nexport const { GET, POST } = handlers;\n",
+    );
+    assert_eq!(
+        routes(&destructured),
+        r(&["GET /api/auth/*nextauth", "POST /api/auth/*nextauth"])
+    );
+    let reexport = index(
+        "web/app/api/x/route.ts",
+        "export { GET, POST } from './handlers';\n",
+    );
+    assert_eq!(routes(&reexport), r(&["GET /api/x", "POST /api/x"]));
+}
+
+#[test]
+fn remix_pathless_layouts_and_escapes() {
+    let remix = "import { json } from '@remix-run/node';\nexport const loader = () => json({});\nexport default function C() { return null; }\n";
+    for layout in ["web/app/routes/_auth.tsx", "web/app/routes/_layout.tsx"] {
+        assert!(routes(&index(layout, remix)).is_empty(), "{layout}");
+    }
+    assert_eq!(
+        routes(&index("web/app/routes/sitemap[.]xml.tsx", remix)),
+        r(&["GET /sitemap.xml", "PAGE /sitemap.xml"])
+    );
+    assert_eq!(
+        routes(&index("web/app/routes/($lang).about.tsx", remix)),
+        r(&["GET /:lang?/about", "PAGE /:lang?/about"])
+    );
+}
+
+#[test]
+fn next_intercepting_and_private_folders() {
+    let page = "import Link from 'next/link';\nexport default function P() { return null; }\n";
+    assert_eq!(
+        routes(&index("web/app/(shop)/@modal/(.)photo/[id]/page.tsx", page)),
+        r(&["PAGE /photo/:id"])
+    );
+    assert!(routes(&index("web/app/_components/page.tsx", page)).is_empty());
+    assert!(routes(&index("web/app/dashboard/_private/page.tsx", page)).is_empty());
+}
+
+#[test]
+fn nitro_handlers_are_recognised_by_what_the_default_export_calls() {
+    let commented = index(
+        "web/server/api/x.ts",
+        "// TODO use defineEventHandler later\nconst note = 'eventHandler';\nexport default function h() {}\n",
+    );
+    assert!(routes(&commented).is_empty());
+    let real = index(
+        "web/server/api/y.ts",
+        "export default defineEventHandler(() => 'ok');\n",
+    );
+    assert_eq!(routes(&real), r(&["ALL /api/y"]));
+}
+
+#[test]
+fn directories_above_the_workspace_root_are_not_framework_folders() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A checkout under a directory named `app` (a container's /app): its `src/server` is no router.
+    let root = dunce::canonicalize(tmp.path()).expect("canon").join("app");
+    std::fs::create_dir_all(root.join("src/server")).expect("mkdir");
+    let file = root.join("src/server/route.ts");
+    let code = "export function GET() {}\n";
+    std::fs::write(&file, code).expect("write");
+    let cfg = mesh_parsers::ExtractConfig {
+        ts_aliases: mesh_parsers::TsAliasIndex::new(std::slice::from_ref(&root)),
+        ..mesh_parsers::ExtractConfig::default()
+    };
+    let with_roots = PolyglotIndexer::extract_with_config(&file, code, 0, &cfg);
+    assert!(routes(&with_roots).is_empty(), "{:?}", routes(&with_roots));
+    // The same file where the checkout directory is the app router really is one.
+    let router = tmp.path().join("web");
+    std::fs::create_dir_all(router.join("app/api/x")).expect("mkdir");
+    let file = dunce::canonicalize(&router)
+        .expect("canon")
+        .join("app/api/x/route.ts");
+    std::fs::write(&file, code).expect("write");
+    let cfg = mesh_parsers::ExtractConfig {
+        ts_aliases: mesh_parsers::TsAliasIndex::new(
+            &[dunce::canonicalize(&router).expect("canon")],
+        ),
+        ..mesh_parsers::ExtractConfig::default()
+    };
+    let ok = PolyglotIndexer::extract_with_config(&file, code, 0, &cfg);
+    assert_eq!(routes(&ok), r(&["GET /api/x"]));
 }

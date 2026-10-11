@@ -175,7 +175,14 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
   the default export *calls* (`defineEventHandler(…)`), not by a mention; SvelteKit's `+page.ts` /
   `+page.server.ts` only add their form `actions` (the page itself is `+page.svelte`). Paths are read from
   the workspace root down, so a checkout under `/app` or `~/api` does not make `app` / `api` framework folders.
-- **Known limits**: React Router v7 `app/routes.ts` config routing (the file name is not the route there),
+- **Anchoring**: the first router marker of the root-relative path names the router root, so a route folder
+  called `app` / `api` / `pages` / `routes` is part of the route (`app/app/dashboard` is `/app/dashboard`).
+  Next intercepting routes are served at the path they intercept (`(.)` same level, `(..)` one route segment
+  up, `(..)(..)` two, `(...)` from the root). Remix's folder form works under `_`-prefixed folders
+  (`routes/_index/route.tsx`); deeper nested folders are not read. Nitro also recognises `h3.defineEventHandler`
+  and `cachedEventHandler`.
+- **Known limits**: a workspace root that is itself the router folder (`web/app` registered as a root) has no
+  marker left: register the project root; plain `export default async function (event)` Nitro handlers; React Router v7 `app/routes.ts` config routing (the file name is not the route there),
   Next UI pages that import nothing from `next`, `export * from` re-exports, `pageExtensions`.
 - **Not in this PR**: `.vue` / `.svelte` / `.astro` pages (next PR), TanStack Router / Expo Router / Qwik City /
   SolidStart conventions, `middleware`, parallel/intercepting route details beyond ignoring `@slot`.
@@ -193,7 +200,7 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
 - **Pages by location**: SvelteKit `+page.svelte` and Astro `src/pages/**/*.astro` are `PAGE` routes, even
   with no script.
 - The script gets the lexical guard of any parsed source (nesting depth, line length) measured on the script alone: long template / style lines (inline SVG, data URIs, Tailwind lists) do not hide it.
-- The block scanner skips `<script>` mentioned in comments and `<style>`, self-closing external scripts, reads quoted attributes containing `>` (`generic="T extends Array<string>"`) and ignores non-JS blocks (`lang="coffee"`, `type="application/ld+json"`, import maps); the Astro frontmatter may follow a BOM or blank lines.
+- The block scanner is one linear pass over the markup: it skips comments and `<style>`, every other tag with its quoted attribute values (`<div :title="'<script>'">` holds no script), and reads attributes case-insensitively. It skips `<script>` mentioned in comments and `<style>`, self-closing external scripts, reads quoted attributes containing `>` (`generic="T extends Array<string>"`) and ignores non-JS blocks (`lang="coffee"`, `type="application/ld+json"`, import maps); the Astro frontmatter may follow a BOM or blank lines.
 - An explicit `.vue` / `.svelte` / `.astro` import names only such a file, and an explicit `.js` / `.ts` never names a component (`Foo.vue` beside `Foo.ts`).
 - `+page` / `+layout` files are routes, not named components; SvelteKit pages need `src/routes`, Astro skips `_`-prefixed files and folders.
 - The script gets the same lexical guard as any parsed source (nesting depth, line length). The watcher
@@ -203,21 +210,30 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
   decapitation and `smart_search` snippets of components (the file is shown as written).
 
 #### Typed API layers
-- **tRPC procedures** (`router({ get: publicProcedure.input(…).query(…) })`, nested routers composing the
-  dotted path, `t.procedure…`) and **GraphQL operations** (`@Query()` / `@Mutation()` / `@Subscription()` of
-  `@nestjs/graphql` and `type-graphql`, honouring the `name` option; the `Query` / `Mutation` /
-  `Subscription` maps of an Apollo-style `resolvers` object in a GraphQL file) are recorded as
-  `HttpEndpoint` nodes signed `TRPC query user.get` / `GRAPHQL Query users`. The REST `@Query()` parameter
-  decorator of `@nestjs/common` is not one.
+- **tRPC procedures** (`router({ get: publicProcedure.input(…).query(…) })`, `t.procedure…`), in a file that
+  is tRPC's, and **GraphQL operations** (`@Query()` / `@Mutation()` / `@Subscription()` of `@nestjs/graphql`
+  and `type-graphql`, also aliased, with the `name` option or a schema-first `@Query('author')`; the
+  `Query` / `Mutation` / `Subscription` maps of a `resolvers` object in a file that loads a GraphQL library)
+  are recorded as `HttpEndpoint` nodes signed `TRPC query user.get` / `GRAPHQL Query users`. Routers nested
+  inline or through a router variable of the same file (`post: postRouter`) compose the dotted path.
+  The REST `@Query()` parameter decorator of `@nestjs/common`, Apollo Client `typePolicies` and data keyed
+  `Query` are not operations. At most 5000 route nodes are recorded per file.
+- **Not covered**: routers mounted from another file, procedures defined as variables and referenced by
+  name, `@ResolveField`, resolver maps for custom types, schema (`typeDefs`) parsing, Pothos / Nexus builders.
 
 ### Index cache
-Schema v10: unchanged JavaScript / TypeScript files are re-extracted once.
+Schema v10, and the workspace id folds in the version: unchanged JavaScript / TypeScript files are
+re-extracted once.
 
 ### Measured
-- `Imports` edges after the path-aware resolution, release builds, vs 7.0.19: otel-demo 2,008 -> 1,406
-  (659 removed, 57 added), react 194,325 -> 137,196 (57,129 removed), vscode/src 5,796,592 -> 1,170,703
-  (4,625,889 removed). Removed edges were classified by resolving each specifier on disk: false positives,
-  except the component-folder case (fixed before release).
+- `Imports` edges after the path-aware resolution, release builds, vs 7.0.19: otel-demo 2,008 -> 1,509
+  (562 removed, 63 added), react 194,325 -> 137,558 (56,767 removed, 0 added); vscode/src 5,796,592 ->
+  1,170,703 (measured before the component-folder fix, which restores a few thousand real edges). Removed
+  edges were classified by resolving each specifier on disk: false positives (an import of `../types/Cart`
+  linking a Go file, `./ReactSharedInternals` linking another package's file), except the
+  component-folder case (`./Button` -> `Button/Button.tsx`), fixed before release.
+- Pathological inputs are linear: a router mounted 3,000 times, 16,000-link `await` chains, a 380 KB
+  component of unclosed tags, a 300 KB factory called 3,000 times, a 20,000-field resolver map.
 
 ## [7.0.19] — 2026-09-29
 

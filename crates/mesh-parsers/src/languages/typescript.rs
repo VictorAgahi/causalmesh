@@ -884,8 +884,11 @@ impl TypeScriptExtractor {
             // tRPC procedures (`router({ get: publicProcedure.query(…) })`) and Apollo-style
             // resolver maps (`Query: { users() {} }`): the API surface of the file.
             "pair" => {
-                if ctx.route_nodes.get() < MAX_ROUTE_NODES_PER_FILE {
-                    if let Some(label) = js_frameworks::trpc_procedure(node, source) {
+                let budget = MAX_ROUTE_NODES_PER_FILE.saturating_sub(ctx.route_nodes.get());
+                if budget > 0 {
+                    if let Some(label) =
+                        js_frameworks::trpc_procedure(node, source, &ctx.frameworks)
+                    {
                         ctx.route_nodes.set(ctx.route_nodes.get() + 1);
                         nodes.push(Self::api_node(
                             ctx,
@@ -893,9 +896,12 @@ impl TypeScriptExtractor {
                             (node.start_position().row + 1, node.end_position().row + 1),
                         ));
                     }
-                    for (label, lines) in
-                        js_frameworks::graphql_map_fields(node, source, &ctx.frameworks)
-                    {
+                    for (label, lines) in js_frameworks::graphql_map_fields(
+                        node,
+                        source,
+                        &ctx.frameworks,
+                        budget.saturating_sub(1),
+                    ) {
                         ctx.route_nodes.set(ctx.route_nodes.get() + 1);
                         nodes.push(Self::api_node(ctx, format!("GRAPHQL {label}"), lines));
                     }

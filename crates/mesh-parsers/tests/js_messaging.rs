@@ -902,3 +902,60 @@ fn a_for_loop_variable_hides_a_module_constant() {
     );
     assert_eq!(events(&fi), vec![ev('P', "module-level")]);
 }
+
+// ---- review round 3 (PR #82) ------------------------------------------------------------
+
+#[test]
+fn long_expression_chains_in_a_broker_file_stay_linear() {
+    // With a broker mention the detectors run; each link used to climb the whole chain.
+    let awaits = format!("const T = {}x;", "await ".repeat(16_000));
+    let assigns = format!("let T; T = {}'q';", "T = ".repeat(8_000));
+    for body in [awaits, assigns] {
+        let code = format!("import {{ Kafka }} from 'kafkajs';\n{body}\n");
+        let start = std::time::Instant::now();
+        let fi = on_small_stack(move || index("svc/chain.ts", &code));
+        assert!(events(&fi).is_empty());
+        assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    }
+}
+
+#[test]
+fn upper_case_receiver_names_are_still_kafka_shaped() {
+    let fi = index(
+        "svc/caps.ts",
+        "const PRODUCER = make();\nconst CONSUMER = make();\nconst KAFKA = make();\n\
+         export async function f() {\n\
+           await PRODUCER.send({ topic: 'caps-out' });\n\
+           await CONSUMER.subscribe({ topic: 'caps-in' });\n\
+           await KAFKA.send({ topic: 'caps-kafka' });\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('C', "caps-in"),
+            ev('P', "caps-kafka"),
+            ev('P', "caps-out")
+        ]
+    );
+}
+
+#[test]
+fn a_local_factory_that_never_touches_the_library_cannot_return_its_client() {
+    let fi = index(
+        "svc/bus.ts",
+        "import Redis from 'ioredis';\n\
+         const redis = new Redis();\n\
+         function createBus() { return new EventBus(); }\n\
+         export class S {\n\
+           eventBus = createBus();\n\
+           constructor() { this.other = createBus(); }\n\
+           f() {\n\
+             this.eventBus.publish('app-event', 1);\n\
+             this.other.publish('app-event-2', 1);\n\
+             redis.publish('real', 'x');\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "real")]);
+}

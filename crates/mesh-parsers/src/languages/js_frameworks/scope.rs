@@ -296,6 +296,15 @@ impl ModuleBindings {
         self.declared.contains(name)
     }
 
+    /// The local names bound to a module matching one of `libs`.
+    pub(crate) fn local_names_from(&self, libs: &[&str]) -> Vec<&str> {
+        self.locals
+            .iter()
+            .filter(|(_, b)| Self::module_in(&b.module, libs))
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+
     /// Whether `module` is `lib` or under it (see [`module_matches`]).
     pub(crate) fn module_in(module: &str, libs: &[&str]) -> bool {
         libs.iter().any(|lib| module_matches(module, lib))
@@ -669,7 +678,14 @@ fn local_declaration<'t>(
     cache: &BlockCache,
 ) -> Option<Local<'t>> {
     let mut ancestor = at.parent();
+    let mut hops = 0;
     while let Some(a) = ancestor {
+        // Bounded like every walk of this module: a hostile expression chain must not
+        // make each of its links climb the whole chain (quadratic).
+        hops += 1;
+        if hops > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return None;
+        }
         match a.kind() {
             "function_declaration"
             | "function_expression"
@@ -944,6 +960,42 @@ impl Receivers {
             }
         }
 
+        // The text of each function this file declares at module level, by name.
+        let mut factories: HashMap<String, &str> = HashMap::new();
+        for stmt in root.named_children(&mut root.walk()) {
+            let decl = if stmt.kind() == "export_statement" {
+                stmt.child_by_field_name("declaration").unwrap_or(stmt)
+            } else {
+                stmt
+            };
+            let mut add = |name: Option<Node>, body: Node| {
+                if let (Some(name), Ok(text)) = (
+                    name.and_then(|n| n.utf8_text(source).ok()),
+                    body.utf8_text(source),
+                ) {
+                    factories.insert(name.to_string(), text);
+                }
+            };
+            match decl.kind() {
+                "function_declaration" | "generator_function_declaration" => {
+                    add(decl.child_by_field_name("name"), decl);
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    for d in decl
+                        .named_children(&mut decl.walk())
+                        .filter(|d| d.kind() == "variable_declarator")
+                    {
+                        if d.child_by_field_name("value").is_some_and(|v| {
+                            matches!(v.kind(), "arrow_function" | "function_expression")
+                        }) {
+                            add(d.child_by_field_name("name"), d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut by_family: HashMap<&'static str, HashSet<String>> = HashMap::new();
         let mut unknown: HashMap<&'static str, HashSet<String>> = HashMap::new();
         for libs in families {
@@ -989,13 +1041,18 @@ impl Receivers {
                     }
                 }
             }
+            // A function this file declares whose body names something imported from the
+            // library may well return a client of it; one that does not (an application
+            // bus factory) cannot.
+            let library_names = bindings.local_names_from(libs);
             let factory_built: HashSet<String> = decls
                 .iter()
                 .filter(|d| !bound.contains(&d.key))
                 .filter(|d| {
                     d.value
                         .and_then(|v| root_key(v, source))
-                        .is_some_and(|root| bindings.declares(&root))
+                        .and_then(|root| factories.get(&root))
+                        .is_some_and(|body| library_names.iter().any(|n| body.contains(n)))
                 })
                 .map(|d| d.key.clone())
                 .collect();

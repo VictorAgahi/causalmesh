@@ -925,7 +925,10 @@ pub(super) const DECORATOR_RULES: &[DecoratorRule] = &[
 /// of their libraries or decorators, or the historical import-free shapes (a `Queue` /
 /// `Worker`, a `producer` / `consumer` / `kafka` receiver).
 pub(super) fn mentions_broker(source: &str) -> bool {
-    const SHAPES: &[&str] = &["Queue", "Worker", "roducer", "onsumer", "afka", "edpanda"];
+    const SHAPES: &[&str] = &[
+        "Queue", "Worker", "roducer", "onsumer", "afka", "edpanda", "PRODUCER", "CONSUMER",
+        "KAFKA", "REDPANDA",
+    ];
     if SHAPES.iter().any(|n| source.contains(n)) {
         return true;
     }

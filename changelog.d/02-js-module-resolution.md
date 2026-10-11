@@ -32,7 +32,8 @@
   digest of what each config last held (the whole file for a tsconfig, the `imports` map for a
   `package.json`): an edit that cannot move an alias (a version bump, a dependency) re-extracts
   nothing, while a config appearing, vanishing or edited for the first time since the daemon started
-  does, once.
+  does, once. An `extends` base whose file name does not start with `tsconfig` / `jsconfig` (`base.json`) is
+  not watched: a restart picks up its edits.
 - The extraction-config fingerprint no longer depends on the workspace roots (adding a root does not
   invalidate the whole cache).
 - A FIFO or special file named like a config is skipped (it used to block the scan forever).

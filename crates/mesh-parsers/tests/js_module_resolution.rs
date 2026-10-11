@@ -45,7 +45,7 @@ fn import_edges(root: &Path, files: &[(&str, &str)], aliases: bool) -> Vec<(Stri
 
 fn root() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+    let root = dunce::canonicalize(tmp.path()).expect("canonicalize");
     (tmp, root)
 }
 
@@ -209,4 +209,27 @@ fn a_nested_package_does_not_inherit_the_root_aliases() {
         ),
     ];
     assert!(import_edges(&root, &files, true).is_empty());
+}
+
+#[test]
+fn a_component_folder_import_reaches_the_component_not_the_barrel() {
+    let (_t, root) = root();
+    let files = [
+        ("ui/Button/Button.tsx", "export default function Button() {}\n"),
+        ("ui/Button/index.ts", "export { default } from './Button';\n"),
+        ("ui/Panel/Panel.tsx", "export default function Panel() {}\n"),
+        (
+            "pages/home.tsx",
+            "import Button from '../ui/Button';\nimport Panel from '../ui/Panel';\nexport function Home() {}\n",
+        ),
+    ];
+    let edges = import_edges(&root, &files, false);
+    assert!(
+        edges.contains(&("Home".to_string(), "Button".to_string())),
+        "{edges:?}"
+    );
+    assert!(
+        edges.contains(&("Home".to_string(), "Panel".to_string())),
+        "{edges:?}"
+    );
 }

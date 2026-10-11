@@ -730,6 +730,17 @@ impl WorkspaceIndexer {
             }
         }
 
+        // A `tsconfig.json` / `jsconfig.json` / `package.json` edit changes what the
+        // scripts under it import (their aliases) without touching those files: they
+        // are re-extracted, and folded in even though their own bytes are unchanged.
+        let forced = Self::alias_governed_scripts(&vfs, roots, &candidates, &deleted);
+        let forced_paths: HashSet<PathBuf> = forced.iter().map(|(_, p)| p.clone()).collect();
+        for (repo_id, path) in forced {
+            if !candidates.iter().any(|(_, p)| *p == path) {
+                candidates.push((repo_id, path));
+            }
+        }
+
         if candidates.is_empty() && deleted.is_empty() {
             tracing::debug!(target: "mesh::watcher", "{label}: 0 files changed, skipping reload.");
             return;
@@ -775,7 +786,10 @@ impl WorkspaceIndexer {
         // Bare `touch`es hash identical and are dropped here.
         let changed: Vec<FileFragment> = fragments
             .into_iter()
-            .filter(|f| vfs.upsert(&f.path, f.signature.clone()))
+            .filter(|f| {
+                let content_changed = vfs.upsert(&f.path, f.signature.clone());
+                content_changed || forced_paths.contains(&f.path)
+            })
             .collect();
         for path in &deleted {
             vfs.remove(path);
@@ -842,6 +856,55 @@ impl WorkspaceIndexer {
             "{label} reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
             deleted.len()
         );
+    }
+
+    /// Whether `path` is a file that defines import aliases for the scripts under it.
+    fn is_alias_config(path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("tsconfig.json" | "jsconfig.json" | "package.json")
+        )
+    }
+
+    /// The tracked scripts under the directory of every alias config among `changed`
+    /// and `deleted`. A `package.json` counts only when it holds an `imports` map (a
+    /// dependency edit changes no alias), or is gone.
+    fn alias_governed_scripts(
+        vfs: &DifferentialVfs,
+        roots: &[PathBuf],
+        changed: &[(RepoId, PathBuf)],
+        deleted: &[PathBuf],
+    ) -> Vec<(RepoId, PathBuf)> {
+        let is_script = |p: &Path| {
+            matches!(
+                LanguageKind::from_path(&p.to_string_lossy()),
+                LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript
+            )
+        };
+        let mut dirs: Vec<&Path> = Vec::new();
+        for path in changed
+            .iter()
+            .map(|(_, p)| p.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+        {
+            if !Self::is_alias_config(path) {
+                continue;
+            }
+            let is_package_json = path.file_name().is_some_and(|n| n == "package.json");
+            let defines_aliases = !is_package_json
+                || !path.exists()
+                || std::fs::read_to_string(path).is_ok_and(|text| text.contains("\"imports\""));
+            if let (true, Some(dir)) = (defines_aliases, path.parent()) {
+                dirs.push(dir);
+            }
+        }
+        if dirs.is_empty() {
+            return Vec::new();
+        }
+        vfs.tracked_paths()
+            .filter(|p| is_script(p) && dirs.iter().any(|d| p.starts_with(d)))
+            .filter_map(|p| Self::most_specific_root(p, roots).map(|(r, _)| (r, p.to_path_buf())))
+            .collect()
     }
 
     // ── Internals ───────────────────────────────────────────────────────────
@@ -1909,5 +1972,76 @@ resolve_placeholders = true
             WorkspaceIndexer::config_fingerprint(&extract_cfg),
             WorkspaceIndexer::config_fingerprint(&WorkspaceIndexer::extract_config(&cfg, &roots))
         );
+    }
+
+    /// A `tsconfig.json` edit reaches the scripts it governs without their bytes
+    /// changing: an incremental reload equals a full rebuild (invariant I2).
+    #[test]
+    fn a_tsconfig_edit_re_resolves_unchanged_scripts_incrementally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        for dir in ["src/services", "lib/services", "src/app"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        let tsconfig = |target: &str| {
+            format!(
+                r#"{{ "compilerOptions": {{ "baseUrl": ".", "paths": {{ "@/*": ["{target}/*"] }} }} }}"#
+            )
+        };
+        std::fs::write(root.join("tsconfig.json"), tsconfig("src")).expect("write");
+        std::fs::write(
+            root.join("src/services/User.ts"),
+            "export default class User {}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("lib/services/User.ts"),
+            "export default class User {}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("src/app/main.ts"),
+            "import User from '@/services/User';\nexport class Main { u: User }\n",
+        )
+        .expect("write");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        let import_target = |state: &AppState| -> Vec<String> {
+            let snapshot = state.snapshot();
+            let graph = &snapshot.contract_graph;
+            let mut out: Vec<String> = graph
+                .all_edges()
+                .iter()
+                .filter(|e| e.kind == mesh_core::EdgeKind::Imports)
+                .filter(|e| graph.get_node(e.from).map(|n| n.name.as_str()) == Some("Main"))
+                .filter_map(|e| graph.get_node(e.to))
+                .map(|n| {
+                    n.file_path
+                        .strip_prefix(&root)
+                        .unwrap_or(&n.file_path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(import_target(&state), vec!["src/services/User.ts"]);
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(root.join("tsconfig.json"), tsconfig("lib")).expect("rewrite");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("tsconfig.json")]);
+        assert_eq!(import_target(&state), vec!["lib/services/User.ts"]);
     }
 }

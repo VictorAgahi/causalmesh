@@ -433,6 +433,10 @@ fn read_json(path: &Path, jail: &Path) -> Option<Value> {
     if !canonical.starts_with(jail) {
         return None;
     }
+    // Checked before opening: opening a FIFO for reading blocks until a writer appears.
+    if !std::fs::metadata(&canonical).ok()?.is_file() {
+        return None;
+    }
     let file = std::fs::File::open(&canonical).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
@@ -578,7 +582,7 @@ mod tests {
     }
 
     fn dunce_canonical(p: &Path) -> PathBuf {
-        std::fs::canonicalize(p).expect("canonicalize")
+        dunce::canonicalize(p).expect("canonicalize")
     }
 
     #[test]
@@ -774,7 +778,7 @@ mod tests {
     fn extends_outside_the_root_is_refused() {
         let (_t, root) = setup();
         let outside = tempfile::tempdir().expect("tempdir");
-        let outside_dir = std::fs::canonicalize(outside.path()).expect("canon");
+        let outside_dir = dunce::canonicalize(outside.path()).expect("canon");
         write(
             &outside_dir,
             "evil.json",
@@ -783,25 +787,28 @@ mod tests {
         let ws = root.join("ws");
         std::fs::create_dir_all(&ws).expect("mkdir");
         // Absolute and relative `extends` pointing outside the workspace root.
-        write(
-            &ws,
-            "abs/tsconfig.json",
-            &format!(
-                r#"{{ "extends": "{}" }}"#,
-                outside_dir.join("evil.json").display()
-            ),
-        );
-        let rel_up = {
-            let mut up = PathBuf::new();
-            for _ in 0..ws.join("rel").components().count() {
-                up.push("..");
-            }
-            up.join(outside_dir.strip_prefix("/").unwrap_or(&outside_dir))
+        let config = |extends: &Path| {
+            serde_json::json!({ "extends": extends.to_string_lossy() }).to_string()
         };
         write(
             &ws,
+            "abs/tsconfig.json",
+            &config(&outside_dir.join("evil.json")),
+        );
+        let mut up = PathBuf::new();
+        for _ in 0..ws.join("rel").components().count() {
+            up.push("..");
+        }
+        let relative = up.join(
+            outside_dir
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .collect::<PathBuf>(),
+        );
+        write(
+            &ws,
             "rel/tsconfig.json",
-            &format!(r#"{{ "extends": "{}/evil.json" }}"#, rel_up.display()),
+            &config(&relative.join("evil.json")),
         );
         let idx = TsAliasIndex::new(std::slice::from_ref(&ws));
         assert_eq!(idx.rewrite(&ws.join("abs/a.ts"), "@/x"), None);
@@ -813,7 +820,7 @@ mod tests {
     fn a_symlinked_config_leaving_the_root_is_refused() {
         let (_t, root) = setup();
         let outside = tempfile::tempdir().expect("tempdir");
-        let outside_dir = std::fs::canonicalize(outside.path()).expect("canon");
+        let outside_dir = dunce::canonicalize(outside.path()).expect("canon");
         write(
             &outside_dir,
             "tsconfig.json",
@@ -907,5 +914,30 @@ mod tests {
         );
         let other = TsAliasIndex::new(&[root.join("app"), root.join("base")]);
         assert_eq!(format!("{idx:?}"), format!("{other:?}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_a_config_does_not_hang_the_indexer() {
+        let (_t, root) = setup();
+        for name in ["tsconfig.json", "package.json"] {
+            let dir = root.join(name.trim_end_matches(".json"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let status = std::process::Command::new("mkfifo")
+                .arg(dir.join(name))
+                .status()
+                .expect("mkfifo");
+            assert!(status.success());
+            let idx = TsAliasIndex::new(std::slice::from_ref(&root));
+            let file = dir.join("a.ts");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(idx.rewrite(&file, "@/x"));
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a FIFO config must be skipped, not opened");
+            assert_eq!(result, None);
+        }
     }
 }

@@ -687,13 +687,19 @@ impl ContractGraph {
                 let in_target_file: Vec<NodeId>;
                 let candidates: &[NodeId] = match importer_dir {
                     Some(dir) => {
+                        let target = module_key(&dir.join(target_str));
+                        let node_keys = &mut memo.node_keys;
                         in_target_file = same_repo
                             .iter()
                             .copied()
                             .filter(|id| {
-                                self.nodes.get(id).is_some_and(|n| {
-                                    module_path_matches(&n.file_path, dir, target_str)
-                                })
+                                let Some(node) = self.nodes.get(id) else {
+                                    return false;
+                                };
+                                let key = node_keys
+                                    .entry(*id)
+                                    .or_insert_with(|| module_key(&node.file_path));
+                                module_key_matches(key, &target)
                             })
                             .collect();
                         &in_target_file
@@ -2520,13 +2526,17 @@ fn module_key(path: &Path) -> PathBuf {
     cleaned
 }
 
-/// Whether a declaration in `file` is what the relative import `specifier`,
-/// written in a file of directory `importer_dir`, names: the same module path,
-/// or that path's `index` (`./services` -> `services/index.ts`).
-fn module_path_matches(file: &Path, importer_dir: &Path, specifier: &str) -> bool {
-    let target = module_key(&importer_dir.join(specifier));
-    let file = module_key(file);
-    file == target || file == target.join("index")
+/// Whether a declaration in the file keyed `file` is what the relative import
+/// keyed `target` names: the same module path; that directory's `index`
+/// (`./services` -> `services/index.ts`); or the directory's file of its own name
+/// (`./Button` -> `Button/Button.tsx`, the component-folder convention whose
+/// `index.ts` only re-exports it).
+fn module_key_matches(file: &Path, target: &Path) -> bool {
+    file == target
+        || file == target.join("index")
+        || target
+            .file_name()
+            .is_some_and(|name| file == target.join(name))
 }
 
 /// Per-`reconcile_edges` memo for [`ContractGraph::resolve_import_targets`],
@@ -2544,6 +2554,8 @@ fn module_path_matches(file: &Path, importer_dir: &Path, specifier: &str) -> boo
 struct ImportMemo<'g> {
     first_by_package: HashMap<&'g str, HashMap<&'g str, NodeId>>,
     same_repo_by_stem: HashMap<(&'g str, Option<RepoId>), Vec<NodeId>>,
+    /// `module_key` of each declaration's file, computed once per node.
+    node_keys: HashMap<NodeId, PathBuf>,
 }
 
 /// Lookup index over gRPC handler candidates for `reconcile_edges`' `Implements`

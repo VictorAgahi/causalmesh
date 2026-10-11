@@ -1,3 +1,4 @@
+use super::js_frameworks;
 use mesh_core::{
     service_from_client_field_name, CompactStr, ContractNode, FilePath, NodeKind, RepoId,
     CLIENT_FIELD_BINDING_PREFIX, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
@@ -73,6 +74,8 @@ struct VisitCtx<'a> {
     /// already declared (`cjs:name`, `fn:name`), so a repeated assignment or
     /// an overload set is one node, in O(1) per statement.
     declared: RefCell<HashSet<String>>,
+    /// Modules and constants the broker detectors read.
+    frameworks: js_frameworks::FrameworkCtx,
 }
 
 impl TypeScriptExtractor {
@@ -133,6 +136,7 @@ impl TypeScriptExtractor {
             grpc_annotations,
             import_bindings: &import_bindings,
             declared: RefCell::new(HashSet::new()),
+            frameworks: js_frameworks::FrameworkCtx::new(root, source_bytes),
         };
 
         let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
@@ -771,7 +775,6 @@ impl TypeScriptExtractor {
                     docstring: None,
                 });
             }
-            // kafkajs: `consumer.subscribe({ topic: 'x' })` / `producer.send({ topic: 'x' })`.
             // NestJS: `this.client.getService<FooServiceClient>('FooService')`
             // (or the string-literal argument alone, when no generic type
             // argument is present) — the standard `ClientGrpc` client
@@ -789,80 +792,27 @@ impl TypeScriptExtractor {
                     imports.push((String::new(), module));
                 }
                 if let Some(callee) = node.child_by_field_name("function") {
-                    if callee.kind() == "member_expression" {
-                        if let Some(prop) = callee.child_by_field_name("property") {
-                            if let Ok(prop_name) = prop.utf8_text(source) {
-                                if prop_name == "getService" {
-                                    if let Some(service_name) =
-                                        Self::extract_get_service_target(node, source)
-                                    {
-                                        raw_rpc_calls.push(RawRpcCall {
-                                            line_start: node.start_position().row + 1,
-                                            line_end: node.end_position().row + 1,
-                                            service_name: CompactStr::new(service_name),
-                                            binding: None,
-                                        });
-                                    }
-                                }
-                                // NestJS `ClientProxy.emit('pattern', data)` /
-                                // `.send('pattern', data)`: the first argument is
-                                // the pattern (string literal only).
-                                if matches!(prop_name, "emit" | "send") {
-                                    if let Some(pattern) = node
-                                        .child_by_field_name("arguments")
-                                        .and_then(|a| Self::extract_first_arg_value(a, source))
-                                    {
-                                        nodes.push(ContractNode {
-                                            id: 0,
-                                            name: CompactStr::new(pattern),
-                                            kind: NodeKind::KafkaTopic,
-                                            file_path: file_path.clone(),
-                                            line_start: node.start_position().row + 1,
-                                            line_end: node.end_position().row + 1,
-                                            package: package_name.clone(),
-                                            repo_id,
-                                            signature: Some(CompactStr::new(
-                                                if prop_name == "emit" {
-                                                    "nestjs client.emit"
-                                                } else {
-                                                    "nestjs client.send"
-                                                },
-                                            )),
-                                            docstring: None,
-                                        });
-                                    }
-                                }
-                                let signature = match prop_name {
-                                    "subscribe" => Some("kafkajs consumer.subscribe"),
-                                    "send" => Some("kafkajs producer.send"),
-                                    _ => None,
-                                };
-                                if let Some(signature) = signature {
-                                    if let Some(args) = node.child_by_field_name("arguments") {
-                                        if let Some(topic) =
-                                            Self::extract_object_value(args, source, "topic")
-                                        {
-                                            nodes.push(ContractNode {
-                                                id: 0,
-                                                name: CompactStr::new(topic),
-                                                kind: NodeKind::KafkaTopic,
-                                                file_path: file_path.clone(),
-                                                line_start: node.start_position().row + 1,
-                                                line_end: node.end_position().row + 1,
-                                                package: package_name.clone(),
-                                                repo_id,
-                                                signature: Some(CompactStr::new(signature)),
-                                                docstring: None,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
+                    if callee.kind() == "member_expression"
+                        && callee
+                            .child_by_field_name("property")
+                            .and_then(|p| p.utf8_text(source).ok())
+                            == Some("getService")
+                    {
+                        if let Some(service_name) = Self::extract_get_service_target(node, source) {
+                            raw_rpc_calls.push(RawRpcCall {
+                                line_start: node.start_position().row + 1,
+                                line_end: node.end_position().row + 1,
+                                service_name: CompactStr::new(service_name),
+                                binding: None,
+                            });
                         }
                     }
                 }
+                // Brokers and queues (Kafka, Redis, NATS, RabbitMQ, …): see `js_frameworks`.
+                for fact in js_frameworks::detect_call(node, source, &ctx.frameworks) {
+                    nodes.push(Self::event_node(ctx, node, fact));
+                }
             }
-            // BullMQ: `new Queue('name')` is a producer-side topic/queue declaration.
             // ts-proto / grpc-js generated clients: `new AdServiceClient(addr, creds)`
             // with `AdServiceClient` imported is a client-construction call
             // site, recorded like `getService<...>` above (Plan 4 step 4.5).
@@ -878,48 +828,11 @@ impl TypeScriptExtractor {
                             binding: Self::client_binding(node, source),
                         });
                     }
-                    if ctor.kind() == "identifier" {
-                        let ctor_name = ctor.utf8_text(source).unwrap_or_default();
-                        if ctor_name == "Worker" {
-                            if let Some(queue_name) = node
-                                .child_by_field_name("arguments")
-                                .and_then(|a| Self::extract_first_arg_value(a, source))
-                            {
-                                nodes.push(ContractNode {
-                                    id: 0,
-                                    name: CompactStr::new(queue_name),
-                                    kind: NodeKind::Queue,
-                                    file_path: file_path.clone(),
-                                    line_start: node.start_position().row + 1,
-                                    line_end: node.end_position().row + 1,
-                                    package: package_name.clone(),
-                                    repo_id,
-                                    signature: Some(CompactStr::new("bullmq new Worker()")),
-                                    docstring: None,
-                                });
-                            }
-                        }
-                        if ctor_name == "Queue" {
-                            if let Some(args) = node.child_by_field_name("arguments") {
-                                if let Some(queue_name) =
-                                    Self::extract_first_arg_value(args, source)
-                                {
-                                    nodes.push(ContractNode {
-                                        id: 0,
-                                        name: CompactStr::new(queue_name),
-                                        kind: NodeKind::Queue,
-                                        file_path: file_path.clone(),
-                                        line_start: node.start_position().row + 1,
-                                        line_end: node.end_position().row + 1,
-                                        package: package_name.clone(),
-                                        repo_id,
-                                        signature: Some(CompactStr::new("bullmq new Queue()")),
-                                        docstring: None,
-                                    });
-                                }
-                            }
-                        }
-                    }
+                }
+                // Queues and clients that name a topic in their constructor
+                // (BullMQ `new Queue('q')`, SQS commands, …): see `js_frameworks`.
+                for fact in js_frameworks::detect_new(node, source, &ctx.frameworks) {
+                    nodes.push(Self::event_node(ctx, node, fact));
                 }
             }
             _ => {}
@@ -992,7 +905,7 @@ impl TypeScriptExtractor {
 
     /// Strips wrappers that do not change what is declared:
     /// `{ … } satisfies T`, `(…)`, `… as T`, `await …`.
-    fn peel_wrappers(mut node: Node) -> Node {
+    pub(crate) fn peel_wrappers(mut node: Node) -> Node {
         while matches!(
             node.kind(),
             "parenthesized_expression"
@@ -1090,7 +1003,7 @@ impl TypeScriptExtractor {
     /// The module a call loads — `require('x')` or `import('x')` with a string
     /// literal argument. A computed specifier (`require(name)`) is not a
     /// statically known dependency and returns `None`.
-    fn module_call_specifier(call: Node, source: &[u8]) -> Option<String> {
+    pub(crate) fn module_call_specifier(call: Node, source: &[u8]) -> Option<String> {
         let callee = call.child_by_field_name("function")?;
         let is_load = match callee.kind() {
             "import" => true,
@@ -1175,7 +1088,7 @@ impl TypeScriptExtractor {
     /// The module a declarator's initializer loads, looking through `await`
     /// and a trailing property access (`require('x').default`,
     /// `(await import('x')).foo`).
-    fn module_load_specifier(value: Node, source: &[u8]) -> Option<String> {
+    pub(crate) fn module_load_specifier(value: Node, source: &[u8]) -> Option<String> {
         let mut node = Self::peel_wrappers(value);
         while node.kind() == "member_expression" {
             node = Self::peel_wrappers(node.child_by_field_name("object")?);
@@ -1184,6 +1097,22 @@ impl TypeScriptExtractor {
             return None;
         }
         Self::module_call_specifier(node, source)
+    }
+
+    /// The node of a broker interaction found at `node`.
+    fn event_node(ctx: &VisitCtx, node: Node, fact: js_frameworks::EventFact) -> ContractNode {
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(fact.name),
+            kind: fact.kind,
+            file_path: ctx.file_path.clone(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            package: ctx.package_name.clone(),
+            repo_id: ctx.repo_id,
+            signature: Some(CompactStr::new(fact.signature)),
+            docstring: None,
+        }
     }
 
     /// A declaration node spanning `node`, named `name`, with the first
@@ -1670,37 +1599,6 @@ impl TypeScriptExtractor {
                 .trim_matches('`')
                 .to_string(),
         )
-    }
-
-    /// Looks for an object literal among `args` (a call's `arguments` node) and
-    /// returns the value of its `key` property, e.g. `topic` in
-    /// `{ topic: 'orders' }`. Falls through non-object arguments untouched.
-    fn extract_object_value(args: Node, source: &[u8], key: &str) -> Option<String> {
-        let mut cursor = args.walk();
-        for arg in args.children(&mut cursor) {
-            if arg.kind() != "object" {
-                continue;
-            }
-            let mut pair_cursor = arg.walk();
-            for pair in arg.children(&mut pair_cursor) {
-                if pair.kind() != "pair" {
-                    continue;
-                }
-                let Some(key_node) = pair.child_by_field_name("key") else {
-                    continue;
-                };
-                let Ok(key_text) = key_node.utf8_text(source) else {
-                    continue;
-                };
-                if key_text.trim_matches('\'').trim_matches('"') != key {
-                    continue;
-                }
-                if let Some(value_node) = pair.child_by_field_name("value") {
-                    return Self::extract_value_text(value_node, source);
-                }
-            }
-        }
-        None
     }
 
     /// Returns the first named argument of a call's `arguments` node, e.g. the

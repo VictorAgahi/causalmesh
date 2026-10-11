@@ -1057,3 +1057,22 @@ fn kinesis_eventbridge_stomp_and_redis_lists() {
     );
     assert!(events(&bare).is_empty());
 }
+
+#[test]
+fn redis_blocking_pop_timeouts_and_stomp_generic_names() {
+    let redis = index(
+        "svc/r2.ts",
+        "import Redis from 'ioredis';\nconst redis = new Redis();\nexport const f = () => redis.brpop('q', '5');\n",
+    );
+    assert_eq!(events(&redis), vec![ev('C', "q")]);
+    let ws = index(
+        "svc/w.ts",
+        "import { Client } from '@stomp/stompjs';\nexport const f = (ws: WebSocket) => ws.send('ping');\n",
+    );
+    assert!(events(&ws).is_empty());
+    let none = index(
+        "svc/n2.ts",
+        "export const f = (c: any) => c.send(new PutRecordCommand({ StreamName: 'x' }));\n",
+    );
+    assert!(events(&none).is_empty());
+}

@@ -10,8 +10,10 @@ at 3.0.0 — there is no reconstructed history before it.
 ### Added
 - React Router v7 config routing: `app/routes.ts` (gated on `@react-router/dev/routes`) now
   yields one `PAGE` route per `index` / `route` / `layout` / `prefix` call, with nesting and
-  spread `prefix(...)` resolved. Modules importing their generated `./+types/...` are no longer
-  read as Remix flat routes.
+  spread `prefix(...)` resolved, pathless `route(null, ..)` wrappers and
+  `const routes = [..]; export default routes` followed. Files routed by `routes.ts` are still
+  read by file name when they are also Remix-style (cross-file config routing stays a known
+  limit; `flatRoutes()` apps keep their 7.1.0 behaviour).
 - Brokers: AWS Kinesis (`PutRecord(s)Command`, `GetShardIteratorCommand`), EventBridge
   (`PutEventsCommand`, by `DetailType` then `EventBusName`), STOMP (`@stomp/stompjs` and
   relatives: `publish`, `send`, `subscribe`, `watch`), and Redis lists used as queues

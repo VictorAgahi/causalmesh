@@ -458,7 +458,12 @@ fn react_router_v7_routes_config_declares_the_routes() {
 }
 
 #[test]
-fn a_module_with_generated_route_types_is_not_a_flat_route() {
-    let code = "import type { Route } from './+types/users';\nimport { json } from 'react-router';\nexport const loader = () => json({});\nexport default function C() { return null; }\n";
-    assert!(routes(&index("web/app/routes/users.tsx", code)).is_empty());
+fn react_router_v7_config_forms() {
+    let wrapper = "import { route } from '@react-router/dev/routes';\nexport default [ route(null, 'routes/shell.tsx', [ route('a', 'routes/a.tsx') ]) ];\n";
+    assert_eq!(
+        routes(&index("web/app/routes.ts", wrapper)),
+        r(&["PAGE /a"])
+    );
+    let named = "import { route, type RouteConfig } from '@react-router/dev/routes';\nconst routes: RouteConfig = [ route('b', 'routes/b.tsx') ];\nexport default routes;\n";
+    assert_eq!(routes(&index("web/app/routes.ts", named)), r(&["PAGE /b"]));
 }

@@ -43,6 +43,14 @@ fn all_string_args(s: &Site) -> Vec<String> {
         .collect()
 }
 
+/// Every string argument but a numeric one: `brpop('q', '5')` has a timeout, not a key.
+fn key_args(s: &Site) -> Vec<String> {
+    all_string_args(s)
+        .into_iter()
+        .filter(|n| !n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .collect()
+}
+
 /// Names under `keys` of the object at argument `index`.
 fn object_keys(s: &Site, index: usize, keys: &[&str]) -> Vec<String> {
     let Some(object) = s.args.get(index) else {
@@ -793,38 +801,10 @@ pub(super) const CALL_RULES: &[CallRule] = &[
     call!(REDIS, "lPush", Produce, Queue, "redis lPush", first_arg),
     call!(REDIS, "rpush", Produce, Queue, "redis rpush", first_arg),
     call!(REDIS, "rPush", Produce, Queue, "redis rPush", first_arg),
-    call!(
-        REDIS,
-        "brpop",
-        Consume,
-        Queue,
-        "redis brpop",
-        all_string_args
-    ),
-    call!(
-        REDIS,
-        "bRPop",
-        Consume,
-        Queue,
-        "redis bRPop",
-        all_string_args
-    ),
-    call!(
-        REDIS,
-        "blpop",
-        Consume,
-        Queue,
-        "redis blpop",
-        all_string_args
-    ),
-    call!(
-        REDIS,
-        "bLPop",
-        Consume,
-        Queue,
-        "redis bLPop",
-        all_string_args
-    ),
+    call!(REDIS, "brpop", Consume, Queue, "redis brpop", key_args),
+    call!(REDIS, "bRPop", Consume, Queue, "redis bRPop", key_args),
+    call!(REDIS, "blpop", Consume, Queue, "redis blpop", key_args),
+    call!(REDIS, "bLPop", Consume, Queue, "redis bLPop", key_args),
     call!(REDIS, "rpop", Consume, Queue, "redis rpop", first_arg),
     call!(REDIS, "rPop", Consume, Queue, "redis rPop", first_arg),
     call!(REDIS, "lpop", Consume, Queue, "redis lpop", first_arg),
@@ -838,21 +818,12 @@ pub(super) const CALL_RULES: &[CallRule] = &[
         "stomp publish",
         stomp_destination
     ),
-    call!(STOMP, "send", Produce, EventStream, "stomp send", first_arg),
     call!(
         STOMP,
         "subscribe",
         Consume,
         EventStream,
         "stomp subscribe",
-        first_arg
-    ),
-    call!(
-        STOMP,
-        "watch",
-        Consume,
-        EventStream,
-        "stomp watch",
         first_arg
     ),
 ];

@@ -270,13 +270,40 @@ pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
 /// `layout` and `prefix` (`export default [ route('users/:id', 'routes/user.tsx') ] satisfies
 /// RouteConfig`), as `PAGE` routes anchored at each call.
 pub(crate) fn react_router_config(root: Node, source: &[u8]) -> Vec<(RouteFact, (usize, usize))> {
-    let array = root
+    let exported = root
         .named_children(&mut root.walk())
         .filter(|s| s.kind() == "export_statement")
         .filter(|s| s.children(&mut s.walk()).any(|c| c.kind() == "default"))
         .find_map(|s| s.child_by_field_name("value"))
-        .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers)
-        .filter(|v| v.kind() == "array");
+        .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers);
+    // `const routes = [..]; export default routes;`: follow the identifier to its array.
+    let array = exported.and_then(|v| {
+        if v.kind() != "identifier" {
+            return Some(v);
+        }
+        let name = v.utf8_text(source).ok()?;
+        root.named_children(&mut root.walk())
+            .flat_map(|s| {
+                let decl = if s.kind() == "export_statement" {
+                    s.child_by_field_name("declaration")
+                } else {
+                    Some(s)
+                };
+                decl.into_iter().flat_map(|d| {
+                    d.named_children(&mut d.walk())
+                        .filter(|c| c.kind() == "variable_declarator")
+                        .collect::<Vec<_>>()
+                })
+            })
+            .find(|d| {
+                d.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    == Some(name)
+            })
+            .and_then(|d| d.child_by_field_name("value"))
+            .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers)
+    });
+    let array = array.filter(|v| v.kind() == "array");
     let mut out = Vec::new();
     if let Some(array) = array {
         walk_route_config(array, "", source, &mut out, 0);
@@ -335,6 +362,13 @@ fn walk_route_config(
         match name {
             "index" => page(&join(prefix, "")),
             "route" => {
+                // `route(null, file, [..])` is a pathless wrapper: its children keep the prefix.
+                if args.first().is_some_and(|a| a.kind() == "null") {
+                    if let Some(children) = children_of(2) {
+                        walk_route_config(children, prefix, source, out, depth + 1);
+                    }
+                    continue;
+                }
                 let Some(path) = text_of(0) else { continue };
                 let full = join(prefix, &path);
                 page(&full);
@@ -460,9 +494,7 @@ pub(crate) fn file_routes(
     if let Some(rest) = after_pair("app", "routes") {
         let remix_import =
             bindings.references_any(&["@remix-run/", "react-router", "@react-router/"]);
-        // A module importing its generated `./+types/<name>` is routed by `app/routes.ts`
-        // (React Router v7 config routing): its file name is not its route.
-        if remix_import && !bindings.references_containing("+types/") {
+        if remix_import {
             // A pathless layout (`_auth.tsx`, `_layout.tsx`) wraps routes, it is not one.
             let layout = stem
                 .rsplit('.')

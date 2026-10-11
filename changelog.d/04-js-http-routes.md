@@ -30,3 +30,4 @@
   (Next, Remix, SvelteKit, Nuxt, Astro: next PR), a Fastify plugin passed as a named function, an inherited
   controller base class's `@Get` (it lacks the child's `@Controller` prefix), `@Get(['a', 'b'])` (first path only) and HTTP client calls are not linked to the routes.
 - Long method chains (more than ~30 links in one expression) are read up to a depth bound and silently stop; at most 5000 route nodes are recorded per file.
+- Type-only framework imports (`import type { FastifyInstance } from 'fastify'`) identify typed routers. Mount chains deeper than 64 are cut. Mount prefixes are independent of the order routes are registered in.

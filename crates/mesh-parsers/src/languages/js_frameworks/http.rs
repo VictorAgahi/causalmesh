@@ -136,12 +136,15 @@ pub(super) fn mentions_http(source: &str) -> bool {
 fn looks_like_router(key: &str) -> bool {
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut prev_upper = false;
     for c in key.chars() {
+        let upper_before = prev_upper;
+        prev_upper = c.is_ascii_uppercase();
         if c == '_' || c == '-' || c == '$' {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
             }
-        } else if c.is_ascii_uppercase() && !current.is_empty() {
+        } else if c.is_ascii_uppercase() && !current.is_empty() && !upper_before {
             words.push(std::mem::take(&mut current));
             current.push(c.to_ascii_lowercase());
         } else {
@@ -506,22 +509,27 @@ fn mounted_prefixes(
     router: &str,
     scope: (usize, usize),
 ) -> Rc<Vec<String>> {
+    /// `(prefixes, cut)`: `cut` when a depth limit or a mount cycle shortened the result, which
+    /// then depends on the path that led here and is not memoised.
     fn go(
         mounts: &Mounts,
         cache: &PrefixCache,
         router: &str,
         scope: Option<(usize, usize)>,
         path: &mut Vec<String>,
-    ) -> Rc<Vec<String>> {
+    ) -> (Rc<Vec<String>>, bool) {
         let key = (router.to_string(), scope);
         if let Some(hit) = cache.borrow().get(&key) {
-            return Rc::clone(hit);
+            return (Rc::clone(hit), false);
         }
-        let Some(entries) = mounts.get(router).filter(|_| path.len() < 8) else {
-            return Rc::new(vec![String::new()]);
+        let Some(entries) = mounts.get(router) else {
+            return (Rc::new(vec![String::new()]), false);
         };
-        if path.iter().any(|r| r == router) {
-            return Rc::new(vec![String::new()]);
+        // Mount chains deeper than the nesting guard are cut (and not memoised).
+        if path.len() >= crate::guard::AstGuard::MAX_NESTING_DEPTH
+            || path.iter().any(|r| r == router)
+        {
+            return (Rc::new(vec![String::new()]), true);
         }
         let local: Vec<&Mount> = entries
             .iter()
@@ -534,11 +542,13 @@ fn mounted_prefixes(
         };
         path.push(router.to_string());
         let mut out: Vec<String> = Vec::new();
+        let mut cut = false;
         'mounts: for mount in chosen {
-            let parents = match &mount.parent {
+            let (parents, parent_cut) = match &mount.parent {
                 Some(parent) => go(mounts, cache, parent, None, path),
-                None => Rc::new(vec![String::new()]),
+                None => (Rc::new(vec![String::new()]), false),
             };
+            cut |= parent_cut;
             for parent_prefix in parents.iter() {
                 let prefix = join(parent_prefix, &mount.prefix);
                 if !out.contains(&prefix) {
@@ -552,10 +562,12 @@ fn mounted_prefixes(
         }
         path.pop();
         let out = Rc::new(out);
-        cache.borrow_mut().insert(key, Rc::clone(&out));
-        out
+        if !cut {
+            cache.borrow_mut().insert(key, Rc::clone(&out));
+        }
+        (out, cut)
     }
-    go(mounts, cache, router, Some(scope), &mut Vec::new())
+    go(mounts, cache, router, Some(scope), &mut Vec::new()).0
 }
 
 /// The `route('/p')` call at the base of a `route('/p').get(h).post(h)` chain.
@@ -598,7 +610,10 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
         return Vec::new();
     }
     let built = fx.built();
-    if !FAMILIES.iter().any(|libs| built.bindings.imports_any(libs)) {
+    if !FAMILIES
+        .iter()
+        .any(|libs| built.bindings.references_any(libs))
+    {
         return Vec::new();
     }
     let names = Names {
@@ -625,7 +640,7 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
         .is_some_and(|k| scopes.iter().any(|s| s.router_param.as_deref() == Some(k)));
     let imported: Vec<&&[&str]> = FAMILIES
         .iter()
-        .filter(|libs| built.bindings.imports_any(libs))
+        .filter(|libs| built.bindings.references_any(libs))
         .collect();
     // `axios.get('/users', config)` is a client call even in a file that also serves.
     let is_http_client = key.as_deref().is_some_and(|k| {

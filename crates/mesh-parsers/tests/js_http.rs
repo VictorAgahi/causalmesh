@@ -538,3 +538,52 @@ fn router_looking_names_are_judged_by_their_last_word() {
     );
     assert_eq!(routes(&fi), r(&["GET /f", "GET /g"]));
 }
+
+#[test]
+fn type_only_framework_imports_still_identify_typed_routers() {
+    let fi = index(
+        "api/plugin.ts",
+        "import type { FastifyInstance } from 'fastify';
+export default async function plugin(app: FastifyInstance) {
+  app.get('/ping', async () => 'pong');
+}
+",
+    );
+    assert_eq!(routes(&fi), r(&["GET /ping"]));
+    let hono = index(
+        "edge/types.ts",
+        "import type { Hono } from 'hono';
+export const mount = (app: Hono) => app.get('/x', (c) => c.text('x'));
+",
+    );
+    assert_eq!(routes(&hono), r(&["GET /x"]));
+}
+
+#[test]
+fn all_caps_router_names_and_deep_chains_do_not_depend_on_registration_order() {
+    let caps = index(
+        "api/caps.ts",
+        "import express from 'express';
+export function f(ROUTER, APP) { ROUTER.get('/a', h); APP.get('/b', h); }
+",
+    );
+    assert_eq!(routes(&caps), r(&["GET /a", "GET /b"]));
+    // An 11-level mount chain: the answer must not depend on which route is registered first.
+    let build = |order: &[usize]| {
+        let mut code = String::from("import express from 'express';\nconst app = express();\n");
+        for i in 0..11 {
+            code.push_str(&format!("const r{i} = express.Router();\n"));
+        }
+        for i in 0..10 {
+            code.push_str(&format!("r{}.use('/l{i}', r{i});\n", i + 1));
+        }
+        code.push_str("app.use('/root', r10);\n");
+        for i in order {
+            code.push_str(&format!("r{i}.get('/route{i}', h);\n"));
+        }
+        routes(&index("api/order.ts", &code))
+    };
+    let forward = build(&[0, 3, 9]);
+    let backward = build(&[9, 3, 0]);
+    assert_eq!(forward, backward);
+}

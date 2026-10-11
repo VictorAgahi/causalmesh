@@ -2,6 +2,7 @@ pub mod cpp;
 pub mod csharp;
 pub mod go;
 pub mod java;
+mod js_frameworks;
 pub mod kotlin;
 pub mod php;
 pub mod proto;
@@ -295,19 +296,15 @@ impl PolyglotIndexer {
     fn wire_ts_events(nodes: &[ContractNode], out: &mut FileIndex) {
         for (i, node) in nodes.iter().enumerate() {
             let signature = node.signature.as_deref().unwrap_or("");
-            let produces = match (node.kind, signature) {
-                (NodeKind::KafkaTopic, "kafkajs producer.send")
-                | (NodeKind::KafkaTopic, "nestjs client.emit")
-                | (NodeKind::KafkaTopic, "nestjs client.send")
-                | (NodeKind::Queue, "bullmq new Queue()") => true,
-                (NodeKind::KafkaTopic, "kafkajs consumer.subscribe")
-                | (NodeKind::Queue, "bullmq new Worker()") => false,
+            let produces = match js_frameworks::signature_role(signature) {
+                Some(js_frameworks::Role::Produce) => true,
+                Some(js_frameworks::Role::Consume) => false,
                 // `@EventPattern('x')` / `@MessagePattern('x')` handler method.
-                (NodeKind::KafkaTopic, _) => {
+                None if node.kind == NodeKind::KafkaTopic => {
                     out.consumers.push((i, node.name.clone()));
                     continue;
                 }
-                _ => continue,
+                None => continue,
             };
             let owner = nodes
                 .iter()
@@ -316,7 +313,10 @@ impl PolyglotIndexer {
                     *j != i
                         && n.line_start <= node.line_start
                         && n.line_end >= node.line_end
-                        && !matches!(n.kind, NodeKind::KafkaTopic | NodeKind::Queue)
+                        && !matches!(
+                            n.kind,
+                            NodeKind::KafkaTopic | NodeKind::Queue | NodeKind::EventStream
+                        )
                 })
                 .min_by_key(|(_, n)| n.line_end - n.line_start)
                 .map_or(i, |(j, _)| j);
@@ -1073,6 +1073,7 @@ export class JobOutboxFailedPostProcessor {
         PolyglotIndexer::index_file(
             Path::new("orders/src/orders.service.ts"),
             r#"
+import { ClientProxy } from '@nestjs/microservices';
 export class OrdersService {
   place() { return this.client.emit('order.placed', {}); }
   async publish() { await producer.send({ topic: 'order.shipped', messages: [] }); }

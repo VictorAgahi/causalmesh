@@ -441,20 +441,51 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
-                let mut imports = Vec::new();
-                let mut rpc_calls = Vec::new();
-                let nodes = parsed!(|tree| {
-                    typescript::TypeScriptExtractor::extract_with_config(
-                        file_path,
+                // One parse + extraction under `kind`; the flag says the tree
+                // holds syntax errors.
+                let run = |kind: LanguageKind| {
+                    AstGuard::parse_with(
+                        kind,
                         content,
-                        repo_id,
-                        tree,
-                        &mut imports,
-                        &mut rpc_calls,
-                        &cfg.controller_annotations,
+                        AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
+                        |tree| {
+                            let mut imports = Vec::new();
+                            let mut rpc_calls = Vec::new();
+                            let nodes = typescript::TypeScriptExtractor::extract_with_config(
+                                file_path,
+                                content,
+                                repo_id,
+                                tree,
+                                &mut imports,
+                                &mut rpc_calls,
+                                &cfg.controller_annotations,
+                            );
+                            (nodes, imports, rpc_calls, tree.root_node().has_error())
+                        },
                     )
-                })
-                .unwrap_or_default();
+                };
+                let mut outcome = run(lang_kind);
+                // Plain JavaScript is parsed by its own grammar. A `.js` file
+                // that carries Flow / Babel annotations does not parse
+                // cleanly there (its classes and types become error nodes),
+                // but does under TSX: take the TSX result when it is clean.
+                if lang_kind == LanguageKind::JavaScript {
+                    if let ParseOutcome::Parsed((.., true)) = &outcome {
+                        if let ParseOutcome::Parsed(tsx @ (.., false)) = run(LanguageKind::Tsx) {
+                            outcome = ParseOutcome::Parsed(tsx);
+                        }
+                    }
+                }
+                let (nodes, imports, rpc_calls) = match outcome {
+                    ParseOutcome::Parsed((nodes, imports, rpc_calls, _)) => {
+                        (nodes, imports, rpc_calls)
+                    }
+                    ParseOutcome::ParseFailed => {
+                        out.parse_failed = true;
+                        Default::default()
+                    }
+                    ParseOutcome::NoGrammar => Default::default(),
+                };
                 out.rpc_calls = rpc_calls;
                 Self::wire_ts_events(&nodes, &mut out);
                 let mut nodes = nodes;

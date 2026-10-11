@@ -217,11 +217,36 @@ impl AstDecapitator {
     pub const BOUNDED_ERROR_STUB: &'static str =
         "// [MeshMCP Warning: AST decapitation bounded or parser timeout (>15ms). Body stripped to protect context window.]\n";
 
+    /// A `.js` file that the JavaScript grammar cannot parse cleanly but the
+    /// TSX grammar can (Flow / Babel type annotations, `interface`, `enum`) is
+    /// decapitated as TSX: JavaScript's grammar would drop its classes and types
+    /// into error nodes. Any other language is returned unchanged.
+    fn resolve_dialect(content: &str, lang_kind: LanguageKind) -> LanguageKind {
+        if lang_kind != LanguageKind::JavaScript {
+            return lang_kind;
+        }
+        let has_error = |kind: LanguageKind| {
+            crate::guard::AstGuard::with_parser(kind, |parser| {
+                parser
+                    .parse(content, None)
+                    .is_some_and(|t| t.root_node().has_error())
+            })
+        };
+        if has_error(LanguageKind::JavaScript) == Some(true)
+            && has_error(LanguageKind::Tsx) == Some(false)
+        {
+            LanguageKind::Tsx
+        } else {
+            lang_kind
+        }
+    }
+
     /// Decapitates imperative method bodies using the appropriate language parser automatically
     pub fn decapitate_auto(content: &str, lang_kind: LanguageKind, include_body: bool) -> String {
         if include_body {
             return content.to_string();
         }
+        let lang_kind = Self::resolve_dialect(content, lang_kind);
 
         match lang_kind {
             LanguageKind::Protobuf | LanguageKind::Yaml => return content.to_string(),
@@ -293,6 +318,7 @@ impl AstDecapitator {
         if include_body {
             return identity();
         }
+        let lang_kind = Self::resolve_dialect(content, lang_kind);
         match lang_kind {
             LanguageKind::Protobuf | LanguageKind::Yaml => return identity(),
             LanguageKind::Unknown => {
@@ -463,6 +489,7 @@ impl AstDecapitator {
                     || kind == "function_declaration"
                     || kind == "function_item"
                     || kind == "function_expression"
+                    || kind == "class_static_block"
                     || kind == "generator_function"
                     || kind == "generator_function_declaration"
                     || kind == "arrow_function" =>

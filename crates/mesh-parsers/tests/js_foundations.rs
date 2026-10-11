@@ -219,3 +219,190 @@ fn function_expressions_are_decapitated() {
     assert!(out.contains("/* stripped */"), "{out}");
     assert!(!out.contains("doWork"), "{out}");
 }
+
+// ---- review round 1 (PR #80) ----------------------------------------------
+
+fn rpc_targets(fi: &FileIndex) -> Vec<String> {
+    let mut v: Vec<String> = fi.rpc_calls.iter().map(|(_, t)| t.to_string()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn module_keyword_blocks_are_indexed_but_string_modules_are_not() {
+    let fi = index(
+        "types/m.d.ts",
+        "module M { export const x = 1; }\n\
+         declare module Foo.Bar { function f(): void; }\n\
+         declare module 'pkg' { export function hidden(): void; }\n\
+         namespace N {}\n",
+    );
+    let names = node_names(&fi);
+    for expected in ["M", "x", "Foo.Bar", "f", "N"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} in {names:?}"
+        );
+    }
+    assert!(!names.contains(&"hidden".to_string()), "{names:?}");
+    assert!(!names.contains(&"pkg".to_string()), "{names:?}");
+}
+
+#[test]
+fn namespace_members_are_top_level_declarations() {
+    let fi = index(
+        "svc/ns.ts",
+        "namespace A { const x = 1; function helper() {} export class B {} }\n\
+         function outer() { const local = 1; }\n",
+    );
+    let names = node_names(&fi);
+    for expected in ["A", "x", "helper", "B", "outer"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} in {names:?}"
+        );
+    }
+    assert!(!names.contains(&"local".to_string()), "{names:?}");
+}
+
+#[test]
+fn inherited_grpc_client_fields_resolve_in_javascript() {
+    let src = "class Child extends Base {\n  run() { return this.users.GetUser({}); }\n}\n";
+    let js = index("svc/child.js", src);
+    let tsx = index("svc/child.tsx", src);
+    assert_eq!(rpc_targets(&js), rpc_targets(&tsx), "JS must match TSX");
+    assert!(
+        rpc_targets(&js)
+            .iter()
+            .any(|t| t.starts_with("^Base#users.GetUser")),
+        "{:?}",
+        rpc_targets(&js)
+    );
+}
+
+#[test]
+fn javascript_own_client_field_is_not_mistaken_for_an_inherited_one() {
+    let fi = index(
+        "svc/own.js",
+        "class Child extends Base {\n  users = makeClient();\n  run() { return this.users.GetUser({}); }\n}\n",
+    );
+    assert!(
+        !rpc_targets(&fi).iter().any(|t| t.starts_with("^Base#")),
+        "{:?}",
+        rpc_targets(&fi)
+    );
+}
+
+#[test]
+fn annotated_javascript_falls_back_to_the_tsx_grammar() {
+    let code = "// @flow\ntype A = { a: number };\nexport type B = string;\n\
+                interface I { x: number }\n\
+                export class C<T> implements I { private x: number = 1; run(): string { return ''; } }\n";
+    let fi = index("rn/flow.js", code);
+    let names = node_names(&fi);
+    for expected in ["A", "B", "I", "C", "run"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} in {names:?}"
+        );
+    }
+    let out = AstDecapitator::decapitate_auto(
+        "export class C<T> { run(x: number): string { return secret(x); } }\n",
+        LanguageKind::JavaScript,
+        false,
+    );
+    assert!(
+        out.contains("/* stripped */") && !out.contains("secret"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_shadowed_require_is_not_a_dependency() {
+    let fi = index(
+        "web/shadow.js",
+        "export function f(require) { return require('x'); }\n\
+         export const g = (require) => require('y');\n\
+         export function h() { return require('real'); }\n",
+    );
+    let deps = dep_targets(&fi);
+    assert!(!deps.contains(&"x".to_string()), "{deps:?}");
+    assert!(!deps.contains(&"y".to_string()), "{deps:?}");
+    assert!(deps.contains(&"real".to_string()), "{deps:?}");
+}
+
+#[test]
+fn create_require_binding_still_loads_modules() {
+    let fi = index(
+        "web/esm.mjs",
+        "import { createRequire } from 'node:module';\nconst require = createRequire(import.meta.url);\n\
+         export function load() { return require('legacy'); }\n",
+    );
+    assert!(dep_targets(&fi).contains(&"legacy".to_string()));
+}
+
+#[test]
+fn repeated_and_chained_commonjs_exports_are_single_nodes() {
+    let fi = index(
+        "svc/y.js",
+        "module.exports = {};\n\
+         module.exports = function () {};\n\
+         exports.a = function () {};\n\
+         exports.a = function () {};\n\
+         exports.default = class {};\n\
+         module.exports.default = () => 1;\n\
+         exports = module.exports = function chained() {};\n\
+         exports.p = module.exports.q = () => 2;\n",
+    );
+    let names = node_names(&fi);
+    assert_eq!(names.iter().filter(|n| *n == "y").count(), 1, "{names:?}");
+    assert_eq!(names.iter().filter(|n| *n == "a").count(), 1, "{names:?}");
+    assert!(!names.contains(&"default".to_string()), "{names:?}");
+    for expected in ["p", "q"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} in {names:?}"
+        );
+    }
+}
+
+#[test]
+fn destructured_require_with_default_value_is_a_named_import() {
+    let fi = index(
+        "svc/d.js",
+        "const { y = 1 } = require('e');\nexport function use() { return y; }\n",
+    );
+    let deps = dep_targets(&fi);
+    assert!(
+        deps.contains(&"e".to_string()) && deps.contains(&"y".to_string()),
+        "{deps:?}"
+    );
+}
+
+#[test]
+fn many_ambient_overloads_stay_linear() {
+    let code: String = (0..4000)
+        .map(|i| {
+            format!("declare function g{i}(): void;\ndeclare function g{i}(a: number): void;\n")
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    let fi = index("types/big.d.ts", &code);
+    assert_eq!(fi.nodes.len(), 4000);
+    assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn decapitation_strips_generators_static_blocks_and_keeps_jsx_files_intact() {
+    let code = "export function* gen() { yield compute(); }\n\
+                export class K { static { initialize(); } m() { return work(); } }\n\
+                export const V = () => <div>{render()}</div>;\n";
+    let out = AstDecapitator::decapitate_auto(code, LanguageKind::JavaScript, false);
+    for secret in ["compute", "initialize", "work(", "render"] {
+        assert!(!out.contains(secret), "{secret} survived: {out}");
+    }
+    assert!(
+        out.contains("gen") && out.contains("class K") && out.contains("V"),
+        "{out}"
+    );
+}

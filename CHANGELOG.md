@@ -5,6 +5,16 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.3] — 2026-10-12
+
+### Changed
+- A wildcard-looking key read only by Kafka-topic or queue consumers (a Kafka regex, a Redis
+  glob) is a literal key, not a NATS / MQTT subject. A subscription truncated at the
+  256-producer cap is now logged at debug level.
+
+### Tests
+- Wildcard edges are idempotent across reconciles and leave no stale edge when the producer goes.
+
 ## [7.1.2] — 2026-10-12
 
 ### Added

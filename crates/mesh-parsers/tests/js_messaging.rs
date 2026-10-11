@@ -467,14 +467,18 @@ fn google_pubsub_pulsar_and_azure() {
 fn nestjs_clients_need_a_client_shaped_receiver() {
     let fi = index(
         "svc/nest.ts",
-        "export class S {\n\
+        "import { ClientProxy } from '@nestjs/microservices';\n\
+         export class S {\n\
            notify() { this.client.emit('user.created', {}); }\n\
            ask() { return this.kafkaProxy.send('user.get', {}); }\n\
            reply(res) { res.send('ok'); }\n\
          }\n",
     );
-    // `kafkaProxy` is client-shaped but nothing says it is a microservice client here.
-    assert_eq!(events(&fi), vec![ev('P', "user.created")]);
+    // The file loads the microservices package: client-shaped receivers count, `res` does not.
+    assert_eq!(
+        events(&fi),
+        vec![ev('P', "user.created"), ev('P', "user.get")]
+    );
     let typed = index(
         "svc/nest2.ts",
         "import { ClientProxy } from '@nestjs/microservices';\n\
@@ -787,4 +791,114 @@ fn a_bull_queue_is_consumed_where_process_is_called() {
          function start() { emails.process(async (job) => {}); }\n",
     );
     assert_eq!(events(&fi), vec![ev('C', "emails"), ev('P', "emails")]);
+}
+
+// ---- review round 2 (PR #82) ------------------------------------------------------------
+
+/// Runs `f` on a thread with the default 2 MB stack (the indexer's pools use no larger one): an unbounded recursion on a
+/// hostile file would abort the process (SIGABRT), not fail an assertion.
+fn on_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("must not overflow the stack")
+}
+
+#[test]
+fn hostile_chains_neither_overflow_the_stack_nor_record_anything() {
+    let chain_call = format!("a{}", ".p()".repeat(3000));
+    let chain_member = format!("a{}", ".b".repeat(3000));
+    let parens = format!("{}x{}", "(".repeat(900), ")".repeat(900));
+    let awaits = "await ".repeat(3000);
+    for expr in [chain_call, chain_member, parens, awaits] {
+        let code = format!(
+            "import Redis from 'ioredis';\nasync function f() {{ const r = new Redis(); const v = {expr}; r.publish({expr}); }}\n"
+        );
+        let fi = on_small_stack(move || index("svc/hostile.ts", &code));
+        // The receiver `r` is a real client, the channel is no name.
+        assert!(events(&fi).is_empty(), "{:?}", events(&fi));
+    }
+}
+
+#[test]
+fn a_huge_function_of_new_expressions_and_sends_stays_fast() {
+    let mut code = String::from("export function big(producer) {\n  const T = 'topic-a';\n");
+    for i in 0..4000 {
+        code.push_str(&format!(
+            "  const v{i} = compute({i});\n  const o{i} = new Foo(v{i});\n  producer.send({{ topic: T, messages: [] }});\n"
+        ));
+    }
+    code.push_str("}\n");
+    let start = std::time::Instant::now();
+    let fi = index("svc/big.ts", &code);
+    assert_eq!(events(&fi), vec![ev('P', "topic-a")]);
+    // Linear: a block is scanned once however many names are looked up in it.
+    assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn a_bare_client_receiver_needs_the_microservices_package() {
+    let none = index(
+        "svc/gateway.ts",
+        "import { Socket } from 'socket.io';\n\
+         export class G {\n\
+           handle(client: Socket) { client.emit('joined', {}); client.send('hello'); }\n\
+         }\n",
+    );
+    assert!(events(&none).is_empty(), "{:?}", events(&none));
+    let axios = index(
+        "svc/http.ts",
+        "import axios from 'axios';\nexport class H { constructor() { this.client = axios.create(); } go() { this.client.send('hello'); } }\n",
+    );
+    assert!(events(&axios).is_empty());
+    let nest = index(
+        "svc/real.ts",
+        "import { ClientProxy } from '@nestjs/microservices';\nexport class R { constructor(private client: ClientProxy) {} go() { this.client.emit('user.created', {}); } }\n",
+    );
+    assert_eq!(events(&nest), vec![ev('P', "user.created")]);
+}
+
+#[test]
+fn a_client_built_by_a_local_factory_is_not_ruled_out() {
+    let fi = index(
+        "svc/factory.ts",
+        "import Redis from 'ioredis';\n\
+         import { Kafka } from 'kafkajs';\n\
+         function createRedis() { return new Redis(); }\n\
+         function makeProducer() { return new Kafka({ brokers: [] }).producer(); }\n\
+         export class S {\n\
+           private readonly sub: Redis = new Redis();\n\
+           private readonly producer = makeProducer();\n\
+           constructor() { this.pub = createRedis(); }\n\
+           go() {\n\
+             this.pub.publish('via-factory', 'x');\n\
+             this.sub.subscribe('typed');\n\
+             this.producer.send({ topic: 'kafka-factory', messages: [] });\n\
+             this.bus.publish('not-redis');\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('C', "typed"),
+            ev('P', "kafka-factory"),
+            ev('P', "via-factory")
+        ]
+    );
+}
+
+#[test]
+fn a_for_loop_variable_hides_a_module_constant() {
+    let fi = index(
+        "svc/loop.ts",
+        "const T = 'module-level';\n\
+         export function f(producer, topics) {\n\
+           for (let T = 0; T < 2; T++) { producer.send({ topic: T }); }\n\
+         }\n\
+         export function g(producer) { producer.send({ topic: T }); }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "module-level")]);
 }

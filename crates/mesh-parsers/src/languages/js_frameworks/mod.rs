@@ -15,7 +15,7 @@ mod messaging;
 pub(crate) mod scope;
 
 use mesh_core::NodeKind;
-use scope::{is_shadowed, receiver_key, ConstTable, ModuleBindings, Names, Receivers};
+use scope::{is_shadowed, receiver_key, BlockCache, ConstTable, ModuleBindings, Names, Receivers};
 use std::cell::OnceCell;
 use tree_sitter::Node;
 
@@ -43,6 +43,7 @@ pub(crate) struct Built {
     pub bindings: ModuleBindings,
     pub consts: ConstTable,
     pub receivers: Receivers,
+    pub scopes: BlockCache,
 }
 
 /// Lazily built per-file context.
@@ -50,6 +51,7 @@ pub(crate) struct FrameworkCtx<'t> {
     root: Node<'t>,
     source: &'t [u8],
     built: OnceCell<Built>,
+    relevant: OnceCell<bool>,
 }
 
 impl<'t> FrameworkCtx<'t> {
@@ -58,7 +60,17 @@ impl<'t> FrameworkCtx<'t> {
             root,
             source,
             built: OnceCell::new(),
+            relevant: OnceCell::new(),
         }
+    }
+
+    /// Whether the file could contain a broker interaction at all: it names a
+    /// library, a decorator or a client-shaped receiver some rule knows. A file
+    /// that does not is never analysed further, so ordinary code pays one text scan.
+    fn relevant(&self) -> bool {
+        *self
+            .relevant
+            .get_or_init(|| std::str::from_utf8(self.source).is_ok_and(messaging::mentions_broker))
     }
 
     fn built(&self) -> &Built {
@@ -76,6 +88,7 @@ impl<'t> FrameworkCtx<'t> {
                 bindings,
                 consts,
                 receivers,
+                scopes: BlockCache::default(),
             }
         })
     }
@@ -191,7 +204,7 @@ pub(crate) fn detect_call(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<E
     else {
         return Vec::new();
     };
-    if !messaging::CALL_RULES.iter().any(|r| r.method == method) {
+    if !messaging::CALL_RULES.iter().any(|r| r.method == method) || !fx.relevant() {
         return Vec::new();
     }
     let built = fx.built();
@@ -199,6 +212,7 @@ pub(crate) fn detect_call(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<E
         source,
         consts: &built.consts,
         bindings: &built.bindings,
+        scopes: &built.scopes,
     };
     let site = Site {
         callee,
@@ -244,10 +258,16 @@ fn constructor_origin(
     match ctor.kind() {
         "identifier" => {
             let local = ctor.utf8_text(source).ok()?;
-            if is_shadowed(ctor, local, source) {
+            let binding = built.bindings.value_binding(local);
+            // Only an imported name or one of the historical bare constructors can
+            // match a rule: any other `new Foo()` is left alone, unscanned.
+            if binding.is_none() && !matches!(local, "Queue" | "Worker") {
                 return None;
             }
-            Some(match built.bindings.value_binding(local) {
+            if is_shadowed(ctor, local, source, &built.scopes) {
+                return None;
+            }
+            Some(match binding {
                 Some(b) => (Some(b.module.clone()), b.imported.clone()),
                 None => (None, local.to_string()),
             })
@@ -262,10 +282,10 @@ fn constructor_origin(
                 return None;
             }
             let local = object.utf8_text(source).ok()?;
-            if is_shadowed(ctor, local, source) {
+            let b = built.bindings.value_binding(local)?;
+            if is_shadowed(ctor, local, source, &built.scopes) {
                 return None;
             }
-            let b = built.bindings.value_binding(local)?;
             Some((Some(b.module.clone()), property.to_string()))
         }
         _ => None,
@@ -279,7 +299,7 @@ pub(crate) fn detect_new(node: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<Ev
     };
     // A constructor no rule could name is skipped before the file context is built:
     // an identifier (any imported default may be a queue class) or `ns.Name`.
-    if !matches!(ctor.kind(), "identifier" | "member_expression") {
+    if !matches!(ctor.kind(), "identifier" | "member_expression") || !fx.relevant() {
         return Vec::new();
     }
     let built = fx.built();
@@ -290,6 +310,7 @@ pub(crate) fn detect_new(node: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<Ev
         source,
         consts: &built.consts,
         bindings: &built.bindings,
+        scopes: &built.scopes,
     };
     let site = Site {
         callee: ctor,
@@ -353,6 +374,7 @@ pub(crate) fn detect_decorator(
     if !messaging::DECORATOR_RULES
         .iter()
         .any(|r| local.ends_with(r.name))
+        || !fx.relevant()
     {
         return Vec::new();
     }
@@ -364,6 +386,7 @@ pub(crate) fn detect_decorator(
         source,
         consts: &built.consts,
         bindings: &built.bindings,
+        scopes: &built.scopes,
     };
     let site = Site {
         callee: function,

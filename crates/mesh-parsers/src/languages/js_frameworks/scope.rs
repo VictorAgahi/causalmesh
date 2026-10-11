@@ -10,7 +10,9 @@
 //! never means a broker call in a file that merely also uses Redis for caching.
 
 use super::super::typescript::TypeScriptExtractor;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use tree_sitter::Node;
 
 /// Expression depth beyond which a name is not resolved (`'a' + 'b' + …` chains).
@@ -315,27 +317,34 @@ pub(crate) fn unquote(node: Node, source: &[u8]) -> Option<String> {
 }
 
 /// Dotted text of an identifier / member chain (`Topics.ORDERS`, `Topics['q-z']`,
-/// `this.topic`); `None` for anything else (calls, computed access).
+/// `this.topic`); `None` for anything else (calls, computed access). Iterative and
+/// bounded: a hostile chain cannot overflow the stack.
 fn dotted(node: Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" | "shorthand_property_identifier" | "this" => {
-            node.utf8_text(source).ok().map(str::to_string)
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = node;
+    for _ in 0..=crate::guard::AstGuard::MAX_NESTING_DEPTH {
+        match current.kind() {
+            "identifier" | "shorthand_property_identifier" | "this" => {
+                segments.push(current.utf8_text(source).ok()?.to_string());
+                segments.reverse();
+                return Some(segments.join("."));
+            }
+            "member_expression" => {
+                let property = current.child_by_field_name("property")?;
+                if property.kind() != "property_identifier" {
+                    return None;
+                }
+                segments.push(property.utf8_text(source).ok()?.to_string());
+                current = current.child_by_field_name("object")?;
+            }
+            "subscript_expression" => {
+                segments.push(unquote(current.child_by_field_name("index")?, source)?);
+                current = current.child_by_field_name("object")?;
+            }
+            _ => return None,
         }
-        "member_expression" => {
-            let object = dotted(node.child_by_field_name("object")?, source)?;
-            let property = node.child_by_field_name("property")?;
-            (property.kind() == "property_identifier")
-                .then(|| property.utf8_text(source).ok())
-                .flatten()
-                .map(|p| format!("{object}.{p}"))
-        }
-        "subscript_expression" => {
-            let object = dotted(node.child_by_field_name("object")?, source)?;
-            let key = unquote(node.child_by_field_name("index")?, source)?;
-            Some(format!("{object}.{key}"))
-        }
-        _ => None,
     }
+    None
 }
 
 fn is_constant_case(s: &str) -> bool {
@@ -530,10 +539,13 @@ impl ConstTable {
         source: &[u8],
         bindings: &ModuleBindings,
     ) -> Option<String> {
+        // Module-level constants have no enclosing block to scan.
+        let scopes = BlockCache::default();
         Names {
             source,
             consts: self,
             bindings,
+            scopes: &scopes,
         }
         .resolve_inner(node, 0, false)
     }
@@ -549,6 +561,100 @@ enum Local<'t> {
     Const(Node<'t>),
 }
 
+/// What one block declares under a name (see [`BlockCache`]).
+#[derive(Debug, Clone, Copy)]
+enum BlockDecl {
+    Shadowed,
+    /// `const name = <value>` with the value at this byte range.
+    Const(usize, usize),
+}
+
+/// The declarations of each `{ … }` block already scanned, by block id: a block is
+/// scanned once, however many names are looked up in it (a 10,000-statement function
+/// with 5,000 `producer.send(…)` calls would otherwise be quadratic).
+#[derive(Debug, Default)]
+pub(crate) struct BlockCache {
+    blocks: RefCell<HashMap<usize, Rc<HashMap<String, BlockDecl>>>>,
+}
+
+impl BlockCache {
+    fn declarations(&self, block: Node, source: &[u8]) -> Rc<HashMap<String, BlockDecl>> {
+        if let Some(hit) = self.blocks.borrow().get(&block.id()) {
+            return Rc::clone(hit);
+        }
+        let mut decls: HashMap<String, BlockDecl> = HashMap::new();
+        for stmt in block.named_children(&mut block.walk()) {
+            match stmt.kind() {
+                "lexical_declaration" | "variable_declaration" => {
+                    for d in stmt
+                        .named_children(&mut stmt.walk())
+                        .filter(|d| d.kind() == "variable_declarator")
+                    {
+                        let Some(n) = d.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let decl = match d.child_by_field_name("value") {
+                            Some(v) if is_const_declaration(stmt) && n.kind() == "identifier" => {
+                                BlockDecl::Const(v.start_byte(), v.end_byte())
+                            }
+                            _ => BlockDecl::Shadowed,
+                        };
+                        let mut names = Vec::new();
+                        pattern_names(n, source, &mut names, 0);
+                        for name in names {
+                            decls.entry(name).or_insert(decl);
+                        }
+                    }
+                }
+                "function_declaration" | "class_declaration" => {
+                    if let Some(name) = stmt
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                    {
+                        decls.entry(name.to_string()).or_insert(BlockDecl::Shadowed);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let decls = Rc::new(decls);
+        self.blocks
+            .borrow_mut()
+            .insert(block.id(), Rc::clone(&decls));
+        decls
+    }
+}
+
+/// Every name a binding pattern introduces.
+fn pattern_names(pattern: Node, source: &[u8], out: &mut Vec<String>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            if let Ok(t) = pattern.utf8_text(source) {
+                out.push(t.to_string());
+            }
+        }
+        "pair_pattern" => {
+            if let Some(v) = pattern.child_by_field_name("value") {
+                pattern_names(v, source, out, depth + 1);
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(l) = pattern.child_by_field_name("left") {
+                pattern_names(l, source, out, depth + 1);
+            }
+        }
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
+            for child in pattern.named_children(&mut pattern.walk()) {
+                pattern_names(child, source, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn pattern_binds(pattern: Node, name: &str, source: &[u8]) -> bool {
     TypeScriptExtractor::binds_name(pattern, name, source, 0)
 }
@@ -556,7 +662,12 @@ fn pattern_binds(pattern: Node, name: &str, source: &[u8]) -> bool {
 /// The innermost declaration of `name` visible at `at` inside a function or block
 /// (module level is [`ConstTable`]'s). A function parameter or a block-level
 /// declaration of the same name hides the module-level constant.
-fn local_declaration<'t>(at: Node<'t>, name: &str, source: &[u8]) -> Option<Local<'t>> {
+fn local_declaration<'t>(
+    at: Node<'t>,
+    name: &str,
+    source: &[u8],
+    cache: &BlockCache,
+) -> Option<Local<'t>> {
     let mut ancestor = at.parent();
     while let Some(a) = ancestor {
         match a.kind() {
@@ -589,43 +700,35 @@ fn local_declaration<'t>(at: Node<'t>, name: &str, source: &[u8]) -> Option<Loca
                     return Some(Local::Shadowed);
                 }
             }
-            "statement_block" => {
-                for stmt in a.named_children(&mut a.walk()) {
-                    match stmt.kind() {
-                        "lexical_declaration" | "variable_declaration" => {
-                            for d in stmt
-                                .named_children(&mut stmt.walk())
-                                .filter(|d| d.kind() == "variable_declarator")
-                            {
-                                let Some(n) = d.child_by_field_name("name") else {
-                                    continue;
-                                };
-                                if !pattern_binds(n, name, source) {
-                                    continue;
-                                }
-                                return Some(match d.child_by_field_name("value") {
-                                    Some(v)
-                                        if is_const_declaration(stmt)
-                                            && n.kind() == "identifier" =>
-                                    {
-                                        Local::Const(v)
-                                    }
-                                    _ => Local::Shadowed,
-                                });
-                            }
-                        }
-                        "function_declaration" | "class_declaration"
-                            if stmt
-                                .child_by_field_name("name")
-                                .and_then(|n| n.utf8_text(source).ok())
-                                == Some(name) =>
-                        {
-                            return Some(Local::Shadowed);
-                        }
-                        _ => {}
-                    }
+            // `for (let i = 0, T = …; …; …)`
+            "for_statement" => {
+                let declares = a
+                    .child_by_field_name("initializer")
+                    .into_iter()
+                    .flat_map(|init| init.named_children(&mut init.walk()).collect::<Vec<_>>())
+                    .filter(|d| d.kind() == "variable_declarator")
+                    .filter_map(|d| d.child_by_field_name("name"))
+                    .any(|n| pattern_binds(n, name, source));
+                if declares {
+                    return Some(Local::Shadowed);
                 }
             }
+            "statement_block" => match cache.declarations(a, source).get(name) {
+                Some(BlockDecl::Const(start, end)) => {
+                    // The value is the outermost node spanning exactly that range.
+                    let mut value = a.descendant_for_byte_range(*start, *end)?;
+                    while let Some(parent) = value.parent() {
+                        if parent.start_byte() == *start && parent.end_byte() == *end {
+                            value = parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    return Some(Local::Const(value));
+                }
+                Some(BlockDecl::Shadowed) => return Some(Local::Shadowed),
+                None => {}
+            },
             _ => {}
         }
         ancestor = a.parent();
@@ -635,8 +738,8 @@ fn local_declaration<'t>(at: Node<'t>, name: &str, source: &[u8]) -> Option<Loca
 
 /// Whether `name` at `at` is hidden by a parameter or local declaration of the
 /// same name (so an import or module-level constant of that name is not what it denotes).
-pub(crate) fn is_shadowed(at: Node, name: &str, source: &[u8]) -> bool {
-    local_declaration(at, name, source).is_some()
+pub(crate) fn is_shadowed(at: Node, name: &str, source: &[u8], cache: &BlockCache) -> bool {
+    local_declaration(at, name, source, cache).is_some()
 }
 
 /// The initializer of `this.<field>` in the class enclosing `at`.
@@ -668,30 +771,35 @@ fn this_field<'t>(at: Node<'t>, field: &str, source: &[u8]) -> Option<Node<'t>> 
 // ---- broker clients -------------------------------------------------------------------
 
 /// The identifier a receiver / initializer chain starts from: `redis` in
-/// `redis.duplicate()`, `redis` (the property) in `this.redis.pipeline()`.
+/// `redis.duplicate()`, `redis` (the property) in `this.redis.pipeline()`. Iterative and
+/// bounded: a hostile chain cannot overflow the stack.
 pub(crate) fn root_key(node: Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "await_expression"
-        | "parenthesized_expression"
-        | "as_expression"
-        | "satisfies_expression"
-        | "non_null_expression" => root_key(node.named_child(0)?, source),
-        "call_expression" => root_key(node.child_by_field_name("function")?, source),
-        "new_expression" => root_key(node.child_by_field_name("constructor")?, source),
-        "member_expression" => {
-            let object = node.child_by_field_name("object")?;
-            if object.kind() == "this" {
-                node.child_by_field_name("property")?
-                    .utf8_text(source)
-                    .ok()
-                    .map(str::to_string)
-            } else {
-                root_key(object, source)
+    let mut current = node;
+    for _ in 0..=crate::guard::AstGuard::MAX_NESTING_DEPTH {
+        match current.kind() {
+            "await_expression"
+            | "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => current = current.named_child(0)?,
+            "call_expression" => current = current.child_by_field_name("function")?,
+            "new_expression" => current = current.child_by_field_name("constructor")?,
+            "member_expression" => {
+                let object = current.child_by_field_name("object")?;
+                if object.kind() == "this" {
+                    return current
+                        .child_by_field_name("property")?
+                        .utf8_text(source)
+                        .ok()
+                        .map(str::to_string);
+                }
+                current = object;
             }
+            "identifier" => return current.utf8_text(source).ok().map(str::to_string),
+            _ => return None,
         }
-        "identifier" => node.utf8_text(source).ok().map(str::to_string),
-        _ => None,
     }
+    None
 }
 
 /// The name a call's receiver is known by: `pub` in `pub.publish()`, `redis` in
@@ -732,6 +840,9 @@ struct Declaration<'t> {
 pub(crate) struct Receivers {
     /// Per family (its first library name), the names bound to a client of it.
     by_family: HashMap<&'static str, HashSet<String>>,
+    /// Names initialised from a function this file declares (`makeProducer()`): they
+    /// may hold a client, which the file does not say, so they are not ruled out.
+    unknown: HashMap<&'static str, HashSet<String>>,
     /// `const q = new Bull('emails')` -> `q => emails`.
     queue_names: HashMap<String, String>,
 }
@@ -834,6 +945,7 @@ impl Receivers {
         }
 
         let mut by_family: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut unknown: HashMap<&'static str, HashSet<String>> = HashMap::new();
         for libs in families {
             let Some(family) = libs.first().copied() else {
                 continue;
@@ -877,6 +989,19 @@ impl Receivers {
                     }
                 }
             }
+            let factory_built: HashSet<String> = decls
+                .iter()
+                .filter(|d| !bound.contains(&d.key))
+                .filter(|d| {
+                    d.value
+                        .and_then(|v| root_key(v, source))
+                        .is_some_and(|root| bindings.declares(&root))
+                })
+                .map(|d| d.key.clone())
+                .collect();
+            if !factory_built.is_empty() {
+                unknown.insert(family, factory_built);
+            }
             if !bound.is_empty() {
                 by_family.insert(family, bound);
             }
@@ -884,10 +1009,12 @@ impl Receivers {
 
         // `const q = new Bull('emails')`: the queue a variable stands for.
         let mut queue_names = HashMap::new();
+        let scopes = BlockCache::default();
         let names = Names {
             source,
             consts,
             bindings,
+            scopes: &scopes,
         };
         for d in &decls {
             let Some(value) = d.value.map(|v| TypeScriptExtractor::peel_wrappers(v)) else {
@@ -916,6 +1043,7 @@ impl Receivers {
         }
         Self {
             by_family,
+            unknown,
             queue_names,
         }
     }
@@ -924,7 +1052,13 @@ impl Receivers {
     /// file builds no such client at all (a client received as an untyped
     /// parameter): the caller then falls back to the file importing the library.
     pub(crate) fn is_client(&self, family: &str, key: &str) -> Option<bool> {
-        self.by_family.get(family).map(|set| set.contains(key))
+        self.by_family.get(family).map(|set| {
+            set.contains(key)
+                || self
+                    .unknown
+                    .get(family)
+                    .is_some_and(|factory| factory.contains(key))
+        })
     }
 
     pub(crate) fn queue_name(&self, key: &str) -> Option<&str> {
@@ -939,6 +1073,7 @@ pub(crate) struct Names<'a> {
     pub source: &'a [u8],
     pub consts: &'a ConstTable,
     pub bindings: &'a ModuleBindings,
+    pub scopes: &'a BlockCache,
 }
 
 impl Names<'_> {
@@ -998,7 +1133,7 @@ impl Names<'_> {
                     let value = this_field(node, field, self.source)?;
                     return self.resolve_inner(value, depth + 1, false);
                 }
-                match local_declaration(node, first, self.source) {
+                match local_declaration(node, first, self.source, self.scopes) {
                     Some(Local::Shadowed) => return None,
                     Some(Local::Const(value)) if !path.contains('.') => {
                         return self.resolve_inner(value, depth + 1, false);

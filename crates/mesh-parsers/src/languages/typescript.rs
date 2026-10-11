@@ -377,10 +377,10 @@ impl TypeScriptExtractor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn visit_node(
-        node: Node,
+    fn visit_node<'a>(
+        node: Node<'a>,
         source: &[u8],
-        ctx: &VisitCtx,
+        ctx: &VisitCtx<'a>,
         nodes: &mut Vec<ContractNode>,
         imports: &mut Vec<(String, String)>,
         raw_rpc_calls: &mut Vec<RawRpcCall>,

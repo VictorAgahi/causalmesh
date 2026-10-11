@@ -237,8 +237,9 @@ fn event_hub_name(s: &Site) -> Vec<String> {
 
 /// A NestJS microservice client: a property or parameter typed `ClientProxy` /
 /// `ClientKafka` / …, injected with `@Inject(…)`, or, in a file that loads
-/// `@nestjs/microservices`, named like a client (`kafkaClient`, `orderProxy`), or
-/// named exactly `client`. An event bus, a socket or a response object is none of these.
+/// `@nestjs/microservices`, named like a client (`this.client`, `orderProxy`). An
+/// event bus, a socket, a response object or a `client` in a file that does not load
+/// the microservices package is none of these.
 fn nest_client(s: &Site) -> bool {
     let Some(key) = s.receiver_key() else {
         return false;
@@ -246,12 +247,8 @@ fn nest_client(s: &Site) -> bool {
     if s.fx.receivers.is_client(NEST[0], &key) == Some(true) {
         return true;
     }
-    // `this.client` is the conventional name of an injected microservice client; any
-    // other client-shaped name needs the file to load `@nestjs/microservices`.
     let lower = key.to_ascii_lowercase();
-    key == "client"
-        || (s.fx.bindings.imports_any(NEST)
-            && (lower.contains("client") || lower.contains("proxy")))
+    s.fx.bindings.imports_any(NEST) && (lower.contains("client") || lower.contains("proxy"))
 }
 
 /// Whether the receiver chain of the call contains a call (`http.post(url).send(…)`).
@@ -923,3 +920,22 @@ pub(super) const DECORATOR_RULES: &[DecoratorRule] = &[
         extract: first_arg,
     },
 ];
+
+/// Whether `source` could hold a broker interaction any rule recognises: it names one
+/// of their libraries or decorators, or the historical import-free shapes (a `Queue` /
+/// `Worker`, a `producer` / `consumer` / `kafka` receiver).
+pub(super) fn mentions_broker(source: &str) -> bool {
+    const SHAPES: &[&str] = &["Queue", "Worker", "roducer", "onsumer", "afka", "edpanda"];
+    if SHAPES.iter().any(|n| source.contains(n)) {
+        return true;
+    }
+    let mentions_lib = |libs: &[&str]| {
+        libs.iter()
+            .any(|lib| source.contains(lib.trim_end_matches('/')))
+    };
+    FAMILIES.iter().any(|libs| mentions_lib(libs))
+        || mentions_lib(BULLMQ)
+        || mentions_lib(BULL_QUEUES)
+        || CTOR_RULES.iter().any(|r| mentions_lib(r.libs))
+        || DECORATOR_RULES.iter().any(|r| mentions_lib(r.libs))
+}

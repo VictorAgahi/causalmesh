@@ -1073,6 +1073,7 @@ export class JobOutboxFailedPostProcessor {
         PolyglotIndexer::index_file(
             Path::new("orders/src/orders.service.ts"),
             r#"
+import { ClientProxy } from '@nestjs/microservices';
 export class OrdersService {
   place() { return this.client.emit('order.placed', {}); }
   async publish() { await producer.send({ topic: 'order.shipped', messages: [] }); }

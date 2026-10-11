@@ -440,7 +440,7 @@ impl PolyglotIndexer {
                     out.rpc_calls = relations.rpc_calls;
                 }
             }
-            LanguageKind::TypeScript | LanguageKind::Tsx => {
+            LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
                 let mut imports = Vec::new();
                 let mut rpc_calls = Vec::new();
                 let nodes = parsed!(|tree| {

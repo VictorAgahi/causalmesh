@@ -386,8 +386,15 @@ impl TypeScriptExtractor {
         let grpc_annotations = ctx.grpc_annotations;
         match node.kind() {
             "import_statement" => {
+                // `import fs = require('fs')` keeps its source on the
+                // `import_require_clause`, not on the statement.
+                let require_source = node
+                    .children(&mut node.walk())
+                    .find(|c| c.kind() == "import_require_clause")
+                    .and_then(|c| c.child_by_field_name("source"));
                 let from_str_opt = node
                     .child_by_field_name("source")
+                    .or(require_source)
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| {
                         s.trim()
@@ -437,6 +444,49 @@ impl TypeScriptExtractor {
                 {
                     imports.push((String::new(), module.to_string()));
                 }
+                // `export default { … }` / `export default () => …` /
+                // `export default defineComponent({ … })`: an anonymous
+                // declaration, named after its file (`export default app`
+                // only re-exports a declaration that is indexed already).
+                if node
+                    .child_by_field_name("value")
+                    .map(Self::peel_wrappers)
+                    .is_some_and(Self::is_declaring_value)
+                {
+                    let name = Self::file_symbol_name(ctx.file_path);
+                    nodes.push(Self::declaration_node(
+                        ctx,
+                        node,
+                        &name,
+                        NodeKind::ServiceClass,
+                        source,
+                    ));
+                }
+            }
+
+            // CommonJS exports: `module.exports = { … }` is the file's
+            // anonymous declaration, `exports.foo = …` / `module.exports.foo = …`
+            // declare `foo`. A bare alias (`exports.foo = foo`) only
+            // re-exports a declaration that is indexed already.
+            "assignment_expression" if Self::is_top_level_statement(node) => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right").map(Self::peel_wrappers),
+                ) {
+                    if Self::is_declaring_value(right) {
+                        if let Some(name) = Self::commonjs_export_name(left, ctx.file_path, source)
+                        {
+                            let stmt = node.parent().unwrap_or(node);
+                            nodes.push(Self::declaration_node(
+                                ctx,
+                                stmt,
+                                &name,
+                                NodeKind::ServiceClass,
+                                source,
+                            ));
+                        }
+                    }
+                }
             }
 
             // Top-level declarations other than classes: functions, enums,
@@ -444,6 +494,53 @@ impl TypeScriptExtractor {
             // components, `…Options` objects, constants). 7.0.0 indexed none
             // of them, so `smart_search` could not find them without `fuzzy`
             // and a file declaring only these was invisible to `find_dependents`.
+            // `declare function f(): void;` (a `.d.ts` declaration). A plain
+            // `function f(): void;` overload signature is skipped: its
+            // implementation is indexed as a `function_declaration`.
+            "function_signature"
+                if Self::is_top_level(node)
+                    && node
+                        .parent()
+                        .is_some_and(|p| p.kind() == "ambient_declaration") =>
+            {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    // Overloads of one ambient function are one symbol.
+                    if !nodes.iter().any(|n| {
+                        n.name == name
+                            && n.signature
+                                .as_deref()
+                                .is_some_and(|s| s.contains("function"))
+                    }) {
+                        nodes.push(Self::declaration_node(
+                            ctx,
+                            node,
+                            name,
+                            NodeKind::ServiceClass,
+                            source,
+                        ));
+                    }
+                }
+            }
+            // `namespace Foo { … }` / `module Foo { … }` / `declare namespace A.B { … }`.
+            // `declare module 'x' { … }` (a string name) augments a package and
+            // declares nothing of its own.
+            "internal_module" if Self::is_top_level(node) => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    nodes.push(Self::declaration_node(
+                        ctx,
+                        node,
+                        name,
+                        NodeKind::ServiceClass,
+                        source,
+                    ));
+                }
+            }
             "function_declaration"
             | "generator_function_declaration"
             | "enum_declaration"
@@ -468,6 +565,14 @@ impl TypeScriptExtractor {
                     if declarator.kind() != "variable_declarator" {
                         continue;
                     }
+                    // `const express = require('express')` is an import, not a
+                    // declaration: it is recorded as a dependency below.
+                    if declarator
+                        .child_by_field_name("value")
+                        .is_some_and(|v| Self::module_load_specifier(v, source).is_some())
+                    {
+                        continue;
+                    }
                     let Some(name_node) = declarator
                         .child_by_field_name("name")
                         .filter(|n| n.kind() == "identifier")
@@ -484,6 +589,29 @@ impl TypeScriptExtractor {
                             decl.line_end = declarator.end_position().row + 1;
                         }
                         nodes.push(decl);
+                    }
+                }
+            }
+
+            // `const { db, x: y } = require('./db')`: the destructured names
+            // are named imports, like `import { db, x } from './db'`.
+            "variable_declarator" => {
+                let pattern = node.child_by_field_name("name");
+                let loads_module = node
+                    .child_by_field_name("value")
+                    .is_some_and(|v| Self::module_load_specifier(v, source).is_some());
+                if let (true, Some(pattern)) = (loads_module, pattern) {
+                    if pattern.kind() == "object_pattern" {
+                        for member in pattern.named_children(&mut pattern.walk()) {
+                            let imported = match member.kind() {
+                                "shorthand_property_identifier_pattern" => Some(member),
+                                "pair_pattern" => member.child_by_field_name("key"),
+                                _ => None,
+                            };
+                            if let Some(name) = imported.and_then(|n| n.utf8_text(source).ok()) {
+                                imports.push((name.to_string(), name.to_string()));
+                            }
+                        }
                     }
                 }
             }
@@ -632,6 +760,12 @@ impl TypeScriptExtractor {
             // code talks to the named service — what happens to the
             // returned value afterward is not tracked.
             "call_expression" => {
+                // CommonJS `require('x')` and dynamic `import('x')`, wherever
+                // they appear (a lazy `import()` inside a function is a
+                // dependency of the file too).
+                if let Some(module) = Self::module_call_specifier(node, source) {
+                    imports.push((String::new(), module));
+                }
                 if let Some(callee) = node.child_by_field_name("function") {
                     if callee.kind() == "member_expression" {
                         if let Some(prop) = callee.child_by_field_name("property") {
@@ -776,15 +910,148 @@ impl TypeScriptExtractor {
     }
 
     /// Whether a declaration sits at module level: directly under the program,
-    /// or under an `export` there.
+    /// or under an `export` and/or `declare` there (`export declare const X`).
     fn is_top_level(node: Node) -> bool {
-        match node.parent() {
-            Some(p) if p.kind() == "program" => true,
-            Some(p) if p.kind() == "export_statement" => {
-                p.parent().is_some_and(|g| g.kind() == "program")
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            match p.kind() {
+                "program" => return true,
+                "export_statement" | "ambient_declaration" => parent = p.parent(),
+                // `namespace Foo {}` is wrapped in an expression statement.
+                "expression_statement" if node.kind() == "internal_module" => parent = p.parent(),
+                _ => return false,
             }
-            _ => false,
         }
+        false
+    }
+
+    /// Whether `node` is the expression of a statement directly under the program.
+    fn is_top_level_statement(node: Node) -> bool {
+        node.parent().is_some_and(|stmt| {
+            stmt.kind() == "expression_statement"
+                && stmt.parent().is_some_and(|g| g.kind() == "program")
+        })
+    }
+
+    /// Strips wrappers that do not change what is declared:
+    /// `{ … } satisfies T`, `(…)`, `… as T`, `await …`.
+    fn peel_wrappers(mut node: Node) -> Node {
+        while matches!(
+            node.kind(),
+            "parenthesized_expression"
+                | "as_expression"
+                | "satisfies_expression"
+                | "non_null_expression"
+                | "await_expression"
+        ) {
+            match node.named_child(0) {
+                Some(inner) => node = inner,
+                None => break,
+            }
+        }
+        node
+    }
+
+    /// Whether an exported value declares something of its own (an object, a
+    /// function, a class, a call that is handed an inline definition such as
+    /// `defineComponent({…})`) as opposed to naming or invoking an existing
+    /// binding (`export default app`, `export default AdGateway()`).
+    fn is_declaring_value(value: Node) -> bool {
+        let is_definition = |n: Node| {
+            matches!(
+                n.kind(),
+                "object"
+                    | "arrow_function"
+                    | "function_expression"
+                    | "generator_function"
+                    | "class"
+            )
+        };
+        if value.kind() == "call_expression" {
+            return value
+                .child_by_field_name("arguments")
+                .is_some_and(|args| args.named_children(&mut args.walk()).any(is_definition));
+        }
+        is_definition(value)
+    }
+
+    /// Name of the anonymous declaration a file exports: its stem
+    /// (`users.controller.ts` -> `users.controller`), or its directory for an
+    /// `index` file (`routes/index.ts` -> `routes`).
+    fn file_symbol_name(file_path: &FilePath) -> String {
+        let stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("module");
+        if stem == "index" {
+            if let Some(dir) = file_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+            {
+                return dir.to_string();
+            }
+        }
+        stem.to_string()
+    }
+
+    /// The symbol a CommonJS export assignment declares: the file's own name
+    /// for `module.exports = …`, `foo` for `exports.foo = …` and
+    /// `module.exports.foo = …`; `None` for any other assignment target.
+    fn commonjs_export_name(left: Node, file_path: &FilePath, source: &[u8]) -> Option<String> {
+        if left.kind() != "member_expression" {
+            return None;
+        }
+        let object = left.child_by_field_name("object")?;
+        let property = left
+            .child_by_field_name("property")?
+            .utf8_text(source)
+            .ok()?;
+        match object.kind() {
+            "identifier" => {
+                let object = object.utf8_text(source).ok()?;
+                match (object, property) {
+                    ("module", "exports") => Some(Self::file_symbol_name(file_path)),
+                    ("exports", name) => Some(name.to_string()),
+                    _ => None,
+                }
+            }
+            "member_expression" if object.utf8_text(source).ok()? == "module.exports" => {
+                Some(property.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// The module a call loads — `require('x')` or `import('x')` with a string
+    /// literal argument. A computed specifier (`require(name)`) is not a
+    /// statically known dependency and returns `None`.
+    fn module_call_specifier(call: Node, source: &[u8]) -> Option<String> {
+        let callee = call.child_by_field_name("function")?;
+        let is_load = match callee.kind() {
+            "import" => true,
+            "identifier" => callee.utf8_text(source).ok()? == "require",
+            _ => false,
+        };
+        if !is_load {
+            return None;
+        }
+        let module = Self::extract_first_arg_value(call.child_by_field_name("arguments")?, source)?;
+        (!module.is_empty()).then_some(module)
+    }
+
+    /// The module a declarator's initializer loads, looking through `await`
+    /// and a trailing property access (`require('x').default`,
+    /// `(await import('x')).foo`).
+    fn module_load_specifier(value: Node, source: &[u8]) -> Option<String> {
+        let mut node = Self::peel_wrappers(value);
+        while node.kind() == "member_expression" {
+            node = Self::peel_wrappers(node.child_by_field_name("object")?);
+        }
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        Self::module_call_specifier(node, source)
     }
 
     /// A declaration node spanning `node`, named `name`, with the first

@@ -6,10 +6,14 @@ pub enum LanguageKind {
     Go,
     Python,
     TypeScript,
-    /// `.tsx`, and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`): the TSX grammar
-    /// parses JSX, which the TypeScript one turns into error nodes (7.0.0
-    /// parsed `.tsx` with it and missed `const App = () => <View/>`).
+    /// `.tsx`: the TSX grammar parses JSX, which the TypeScript one turns into
+    /// error nodes (7.0.0 parsed `.tsx` with it and missed
+    /// `const App = () => <View/>`).
     Tsx,
+    /// JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`): its own grammar, which
+    /// handles JSX and CommonJS without the TSX grammar's TypeScript-only
+    /// ambiguities (`<T>x` assertions, generic arrows) misparsing plain JS.
+    JavaScript,
     Rust,
     Cpp,
     Kotlin,
@@ -25,8 +29,8 @@ pub enum LanguageKind {
 
 impl LanguageKind {
     /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
-    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Tsx).
-    pub const TREE_SITTER_COUNT: usize = 14;
+    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Tsx, JavaScript).
+    pub const TREE_SITTER_COUNT: usize = 15;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -37,6 +41,7 @@ impl LanguageKind {
             Self::Python => "python",
             Self::TypeScript => "typescript",
             Self::Tsx => "tsx",
+            Self::JavaScript => "javascript",
             Self::Rust => "rust",
             Self::Cpp => "cpp",
             Self::Kotlin => "kotlin",
@@ -69,6 +74,7 @@ impl LanguageKind {
             Self::Scala => Some(11),
             Self::Protobuf => Some(12),
             Self::Tsx => Some(13),
+            Self::JavaScript => Some(14),
             Self::Yaml | Self::Unknown => None,
         }
     }
@@ -81,6 +87,7 @@ impl LanguageKind {
             Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
             Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Self::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Self::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
@@ -108,13 +115,14 @@ impl LanguageKind {
             || path_str.ends_with(".cts")
         {
             Self::TypeScript
-        } else if path_str.ends_with(".tsx")
-            || path_str.ends_with(".js")
+        } else if path_str.ends_with(".tsx") {
+            Self::Tsx
+        } else if path_str.ends_with(".js")
             || path_str.ends_with(".jsx")
             || path_str.ends_with(".mjs")
             || path_str.ends_with(".cjs")
         {
-            Self::Tsx
+            Self::JavaScript
         } else if path_str.ends_with(".rs") {
             Self::Rust
         } else if path_str.ends_with(".kt") || path_str.ends_with(".kts") {
@@ -450,10 +458,13 @@ impl AstDecapitator {
                     return;
                 }
             }
-            LanguageKind::TypeScript | LanguageKind::Tsx
+            LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript
                 if kind == "method_definition"
                     || kind == "function_declaration"
                     || kind == "function_item"
+                    || kind == "function_expression"
+                    || kind == "generator_function"
+                    || kind == "generator_function_declaration"
                     || kind == "arrow_function" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {

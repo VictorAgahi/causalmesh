@@ -7,6 +7,55 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// The wildcard tokens of a subject key: NATS (`.`-separated) has `*` for one token and a final
+/// `>` for one or more; MQTT (`/`-separated) has `+` for one level and a final `#` for zero or
+/// more. The separator picks the dialect, so `cache.+` or `src/*/x` stay literal keys.
+fn subject_dialect(key: &str) -> (char, &'static str, &'static str) {
+    if key.contains('/') {
+        ('/', "+", "#")
+    } else {
+        ('.', "*", ">")
+    }
+}
+
+/// Whether `key` is a wildcard subject.
+pub fn is_subject_pattern(key: &str) -> bool {
+    let (sep, one, rest) = subject_dialect(key);
+    let mut tokens = key.split(sep).peekable();
+    while let Some(t) = tokens.next() {
+        if t == one || (t == rest && tokens.peek().is_none()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the concrete subject `topic` is matched by the wildcard subject `pattern`. Both are
+/// already lowercase. A topic with an empty token matches nothing.
+pub fn subject_matches(pattern: &str, topic: &str) -> bool {
+    let (sep, one, rest) = subject_dialect(pattern);
+    if topic.split(sep).any(str::is_empty) {
+        return false;
+    }
+    let mut p = pattern.split(sep).peekable();
+    let mut t = topic.split(sep).peekable();
+    while let Some(tok) = p.next() {
+        let last = p.peek().is_none();
+        if tok == rest && last {
+            // MQTT `#` also matches its parent level; NATS `>` needs at least one token.
+            return rest == "#" || t.peek().is_some();
+        }
+        match t.next() {
+            Some(x) if tok == one || tok == x => {}
+            _ => return false,
+        }
+    }
+    t.peek().is_none()
+}
+
+/// Most producers one wildcard subscription is linked to.
+const MAX_WILDCARD_PRODUCERS: usize = 256;
+
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
 /// request is what the formatter never needed.
@@ -892,6 +941,10 @@ impl ContractGraph {
             .collect();
         self.remove_nodes(&stale_hubs);
 
+        // Producers of concrete subjects, in a fixed order, built on the first wildcard
+        // subscription only.
+        let mut concrete_producers: Option<Vec<(CompactStr, Vec<NodeId>)>> = None;
+
         for topic_key in all_topics {
             // `add_node` indexes stream-like nodes under their lowercase name, and
             // `topic_key` is already lowercase.
@@ -967,6 +1020,47 @@ impl ContractGraph {
                         // Structural: derived directly from consumer registration.
                         confidence: EdgeConfidence::Exact,
                     });
+                }
+            }
+
+            // A wildcard subscription (`orders.*`, `sensors/+/temp`) also hears the producers
+            // of every concrete subject it matches: heuristic, since the match is by pattern.
+            // Direct edges come first so an exact edge is never shadowed by a heuristic one.
+            if is_subject_pattern(&topic_key) && !consumers.is_empty() {
+                let concrete = concrete_producers.get_or_insert_with(|| {
+                    let mut v: Vec<(CompactStr, Vec<NodeId>)> = self
+                        .topic_producers
+                        .iter()
+                        .filter(|(k, _)| !is_subject_pattern(k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    v
+                });
+                let mut linked = 0usize;
+                'subjects: for (subject, prods) in concrete.iter() {
+                    if !subject_matches(&topic_key, subject) {
+                        continue;
+                    }
+                    for &prod_id in prods {
+                        // A relay that consumes the pattern is not its own cause.
+                        if consumers.contains(&prod_id) {
+                            continue;
+                        }
+                        if linked >= MAX_WILDCARD_PRODUCERS {
+                            break 'subjects;
+                        }
+                        if edge_set.insert((prod_id, topic_id, EdgeKind::Produces)) {
+                            linked += 1;
+                            self.edges.push(ContractEdge {
+                                from: prod_id,
+                                to: topic_id,
+                                kind: EdgeKind::Produces,
+                                metadata: Some(subject.clone()),
+                                confidence: EdgeConfidence::Heuristic,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -2863,6 +2957,57 @@ impl ContractGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subject_wildcards_match_by_token() {
+        assert!(subject_matches("orders.*", "orders.created"));
+        assert!(!subject_matches("orders.*", "orders.created.eu"));
+        assert!(subject_matches("orders.>", "orders.created.eu"));
+        assert!(!subject_matches("orders.>", "orders"));
+        assert!(subject_matches("sensors/#", "sensors"));
+        assert!(!subject_matches(">", ""));
+        assert!(!subject_matches("orders.>", "orders."));
+        // Dialects do not mix, and a wildcard only ends a pattern.
+        assert!(!is_subject_pattern("cache.+") && !is_subject_pattern("src/*/x"));
+        assert!(!is_subject_pattern("a.>.b"));
+        assert!(subject_matches("sensors/+/temp", "sensors/a/temp"));
+        assert!(!subject_matches("sensors/+/temp", "sensors/a/b/temp"));
+        assert!(subject_matches("sensors/#", "sensors/a/b"));
+        assert!(!subject_matches("orders.*", "billing.created"));
+        assert!(is_subject_pattern("a.*.c") && !is_subject_pattern("a.b.c"));
+    }
+
+    #[test]
+    fn a_wildcard_consumer_hears_matching_producers() {
+        let mut g = ContractGraph::new();
+        let p = matrix_node(&mut g, "pub", NodeKind::ServiceClass, "a/p.go", "", 0);
+        let c = matrix_node(&mut g, "sub", NodeKind::ServiceClass, "b/c.go", "", 1);
+        g.add_producer(p, "orders.created");
+        g.add_consumer(c, "orders.*");
+        g.reconcile_edges();
+        let hub = g
+            .all_edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Consumes && e.to == c)
+            .map(|e| e.from)
+            .expect("consume edge");
+        assert!(g
+            .all_edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Produces && e.from == p && e.to == hub));
+    }
+
+    #[test]
+    fn a_relay_is_not_linked_to_its_own_wildcard_subscription() {
+        let mut g = ContractGraph::new();
+        let relay = matrix_node(&mut g, "relay", NodeKind::ServiceClass, "a/r.go", "", 0);
+        g.add_producer(relay, "orders.created");
+        g.add_consumer(relay, "orders.*");
+        g.reconcile_edges();
+        assert!(!g.all_edges().iter().any(|e| e.kind == EdgeKind::Produces
+            && e.from == relay
+            && e.confidence == EdgeConfidence::Heuristic));
+    }
 
     #[test]
     fn normalize_topic_key_reduces_member_references_only() {

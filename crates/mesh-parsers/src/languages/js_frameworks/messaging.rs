@@ -809,6 +809,135 @@ pub(super) const CALL_RULES: &[CallRule] = &[
     call!(REDIS, "rPop", Consume, Queue, "redis rPop", first_arg),
     call!(REDIS, "lpop", Consume, Queue, "redis lpop", first_arg),
     call!(REDIS, "lPop", Consume, Queue, "redis lPop", first_arg),
+    // Reliable-queue moves: the source list is consumed, the destination produced.
+    call!(
+        REDIS,
+        "lmove",
+        Consume,
+        Queue,
+        "redis lmove source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "lmove",
+        Produce,
+        Queue,
+        "redis lmove destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "lMove",
+        Consume,
+        Queue,
+        "redis lMove source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "lMove",
+        Produce,
+        Queue,
+        "redis lMove destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "blmove",
+        Consume,
+        Queue,
+        "redis blmove source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "blmove",
+        Produce,
+        Queue,
+        "redis blmove destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "bLMove",
+        Consume,
+        Queue,
+        "redis bLMove source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "bLMove",
+        Produce,
+        Queue,
+        "redis bLMove destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "rpoplpush",
+        Consume,
+        Queue,
+        "redis rpoplpush source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "rpoplpush",
+        Produce,
+        Queue,
+        "redis rpoplpush destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "rPopLPush",
+        Consume,
+        Queue,
+        "redis rPopLPush source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "rPopLPush",
+        Produce,
+        Queue,
+        "redis rPopLPush destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "brpoplpush",
+        Consume,
+        Queue,
+        "redis brpoplpush source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "brpoplpush",
+        Produce,
+        Queue,
+        "redis brpoplpush destination",
+        second_arg
+    ),
+    call!(
+        REDIS,
+        "bRPopLPush",
+        Consume,
+        Queue,
+        "redis bRPopLPush source",
+        first_arg
+    ),
+    call!(
+        REDIS,
+        "bRPopLPush",
+        Produce,
+        Queue,
+        "redis bRPopLPush destination",
+        second_arg
+    ),
     // STOMP (ActiveMQ, Artemis, RabbitMQ STOMP): destinations are queues or topics.
     call!(
         STOMP,

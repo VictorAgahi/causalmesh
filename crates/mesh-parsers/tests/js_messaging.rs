@@ -1076,3 +1076,27 @@ fn redis_blocking_pop_timeouts_and_stomp_generic_names() {
     );
     assert!(events(&none).is_empty());
 }
+
+#[test]
+fn redis_reliable_queue_moves_and_import_gating() {
+    let redis = index(
+        "svc/mv.ts",
+        "import Redis from 'ioredis';\nconst redis = new Redis();\nexport const f = () => redis.rpoplpush('pending', 'working');\nexport const g = () => redis.lmove('a', 'b', 'LEFT', 'RIGHT');\n",
+    );
+    assert_eq!(
+        events(&redis),
+        vec![
+            ev('C', "a"),
+            ev('C', "pending"),
+            ev('P', "b"),
+            ev('P', "working")
+        ]
+    );
+    for (file, code) in [
+        ("svc/e1.ts", "export const f = (c: any) => c.send(new PutEventsCommand({ Entries: [{ DetailType: 'x' }] }));\n"),
+        ("svc/e2.ts", "export const f = (c: any) => c.publish({ destination: '/queue/x' });\nexport const g = (c: any) => c.subscribe('/topic/y', () => {});\n"),
+        ("svc/e3.ts", "export const f = (c: any) => c.send(new GetShardIteratorCommand({ StreamName: 's' }));\n"),
+    ] {
+        assert!(events(&index(file, code)).is_empty(), "{file}");
+    }
+}

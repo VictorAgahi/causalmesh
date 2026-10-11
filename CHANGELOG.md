@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.2] — 2026-10-12
+
+### Added
+- Wildcard subjects in the graph: a NATS (`orders.*`, `orders.>`) or MQTT (`sensors/+/temp`,
+  `sensors/#`) subscription is now linked to the producers of every concrete subject it
+  matches (token-wise, heuristic confidence).
+- Redis reliable-queue moves (`lmove`, `blmove`, `rpoplpush`, `brpoplpush`, and the camelCase
+  forms): the source list is consumed, the destination produced.
+
+### Tests
+- Negative tests: Kinesis, EventBridge and STOMP rows do not fire without their import.
+
 ## [7.1.1] — 2026-10-11
 
 ### Added

@@ -349,7 +349,7 @@ fn a_component_and_a_module_of_the_same_name_are_two_modules() {
     let file = |id| {
         graph
             .get_node(id)
-            .map(|n| n.file_path.to_string_lossy().into_owned())
+            .map(|n| n.file_path.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default()
     };
     let name = |id| {

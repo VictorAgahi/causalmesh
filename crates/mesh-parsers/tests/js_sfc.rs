@@ -202,3 +202,170 @@ fn malformed_components_do_not_panic_or_parse_the_template() {
         let _ = PolyglotIndexer::extract(Path::new("ui/X.svelte"), code, 0);
     }
 }
+
+// ---- review round 1 (PR #85) ------------------------------------------------------------
+
+#[test]
+fn long_template_and_style_lines_do_not_hide_the_script() {
+    let svg = format!("<svg><path d=\"{}\"/></svg>", "M0 0 L10 10 ".repeat(200));
+    let fi = index(
+        "ui/Long.vue",
+        &format!(
+            "<template>\n  {svg}\n</template>\n<script setup lang=\"ts\">\nimport z from './z';\nfunction realLong(): void {{}}\n</script>\n<style>\n.bg {{ background: url(data:image/png;base64,{}) }}\n</style>\n",
+            "AAAA".repeat(600)
+        ),
+    );
+    assert!(
+        names(&fi).contains(&"realLong".to_string()),
+        "{:?}",
+        names(&fi)
+    );
+    assert!(deps(&fi).contains(&"./z".to_string()));
+}
+
+#[test]
+fn astro_frontmatter_survives_a_bom_blank_lines_and_script_text() {
+    let bom = index(
+        "site/src/components/Bom.astro",
+        "\u{feff}---\nimport L from '../L.astro';\nfunction fm(): void {}\n---\n<L/>\n",
+    );
+    assert!(names(&bom).contains(&"fm".to_string()), "{:?}", names(&bom));
+    assert!(deps(&bom).contains(&"../L.astro".to_string()));
+    let blank = index(
+        "site/src/components/Blank.astro",
+        "\n\n---\nfunction fm2(): void {}\n---\n<p/>\n",
+    );
+    assert!(names(&blank).contains(&"fm2".to_string()));
+    // `<script>` written inside a frontmatter string is not a second block that eats code.
+    let tricky = index(
+        "site/src/components/Tricky.astro",
+        "---\nconst h = '<script>x</script>';\nfunction fm3() {}\nfunction fm4() {}\n---\n<L/>\n",
+    );
+    let n = names(&tricky);
+    assert!(
+        n.contains(&"fm3".to_string()) && n.contains(&"fm4".to_string()),
+        "{n:?}"
+    );
+}
+
+#[test]
+fn script_scanner_holes() {
+    // A `<script>` mentioned in a style or a comment is not an element.
+    let style = index(
+        "ui/A.vue",
+        "<style>/* use <script> here */ .a {}</style>\n<script>\nfunction real() {}\n</script>\n",
+    );
+    assert!(
+        names(&style).contains(&"real".to_string()),
+        "{:?}",
+        names(&style)
+    );
+    let comment = index(
+        "ui/B.vue",
+        "<!-- <script>function inComment() {}</script> -->\n<script>\nfunction real2() {}\n</script>\n",
+    );
+    assert!(!names(&comment).contains(&"inComment".to_string()));
+    assert!(names(&comment).contains(&"real2".to_string()));
+    // A self-closing external script has no body and does not swallow the next block.
+    let external = index(
+        "ui/C.vue",
+        "<script src=\"./a.ts\" />\n<script setup lang=\"ts\">\nfunction real3(): void {}\n</script>\n",
+    );
+    assert!(
+        names(&external).contains(&"real3".to_string()),
+        "{:?}",
+        names(&external)
+    );
+    // A `>` inside an attribute value does not end the tag, and `lang` after it still counts.
+    let generic = index(
+        "ui/D.vue",
+        "<script setup generic=\"T extends Array<string>\" lang=\"ts\">\nimport { x } from './x';\nconst a: number = 1;\nfunction real4(v: T): void {}\n</script>\n",
+    );
+    assert!(
+        names(&generic).contains(&"real4".to_string()),
+        "{:?}",
+        names(&generic)
+    );
+    assert!(deps(&generic).contains(&"./x".to_string()));
+}
+
+#[test]
+fn non_javascript_script_blocks_are_not_read_as_javascript() {
+    let fi = index(
+        "ui/E.vue",
+        "<script type=\"application/ld+json\">{ \"@context\": \"https://schema.org\" }</script>\n<script type=\"importmap\">{ \"imports\": {} }</script>\n<script lang=\"coffee\">x = -> 1</script>\n<script>\nfunction real5() {}\n</script>\n",
+    );
+    assert_eq!(
+        names(&fi),
+        vec!["E".to_string(), "real5".to_string()],
+        "only the JavaScript block is read"
+    );
+}
+
+#[test]
+fn route_files_are_not_named_components_and_pages_follow_the_real_conventions() {
+    let page = index(
+        "web/src/routes/+page.svelte",
+        "<script>\nlet x = 1;\n</script>\n",
+    );
+    assert!(page.nodes.iter().all(|n| n.name != "+page"));
+    assert!(page.nodes.iter().any(|n| n.name == "PAGE /"));
+    // Layout resets, a `routes` folder that is not `src/routes`, `_`-prefixed Astro files.
+    assert!(index("web/src/routes/a/+page@.svelte", "<h1/>\n")
+        .nodes
+        .iter()
+        .any(|n| n.name == "PAGE /a"));
+    assert!(index("web/src/lib/routes/+page.svelte", "<h1/>\n")
+        .nodes
+        .iter()
+        .all(|n| n.kind != NodeKind::HttpEndpoint));
+    assert!(index("site/src/pages/_components/Card.astro", "<p/>\n")
+        .nodes
+        .iter()
+        .all(|n| n.kind != NodeKind::HttpEndpoint));
+}
+
+#[test]
+fn a_component_and_a_module_of_the_same_name_are_two_modules() {
+    let mut graph = ContractGraph::new();
+    for (path, code) in [
+        (
+            "ui/Foo.vue",
+            "<script setup lang=\"ts\">\nconst a = 1;\n</script>\n",
+        ),
+        ("ui/Foo.ts", "export default class Foo {}\n"),
+        (
+            "ui/A.vue",
+            "<script setup lang=\"ts\">\nimport Foo from './Foo.vue';\n</script>\n",
+        ),
+        (
+            "ui/b.ts",
+            "import Foo from './Foo.js';\nexport class B {}\n",
+        ),
+    ] {
+        PolyglotIndexer::extract(Path::new(path), code, 0).apply(&mut graph);
+    }
+    graph.reconcile_edges();
+    let file = |id| {
+        graph
+            .get_node(id)
+            .map(|n| n.file_path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let name = |id| {
+        graph
+            .get_node(id)
+            .map(|n| n.name.to_string())
+            .unwrap_or_default()
+    };
+    let targets = |from: &str| -> Vec<String> {
+        graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports && name(e.from) == from)
+            .map(|e| file(e.to))
+            .collect()
+    };
+    assert_eq!(targets("A"), vec!["ui/Foo.vue".to_string()]);
+    assert_eq!(targets("B"), vec!["ui/Foo.ts".to_string()]);
+}

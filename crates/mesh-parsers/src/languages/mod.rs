@@ -400,7 +400,9 @@ impl PolyglotIndexer {
                     && view
                         .script
                         .lines()
-                        .all(|l| l.len() <= AstGuard::MAX_LINE_LEN_BYTES) =>
+                        // Blanked template / style lines are runs of spaces: only the
+                        // script's own width counts.
+                        .all(|l| l.trim_end().len() <= AstGuard::MAX_LINE_LEN_BYTES) =>
             {
                 Self::extract_as(file_path, &view.script, repo_id, cfg, view.kind)
             }
@@ -408,7 +410,12 @@ impl PolyglotIndexer {
         };
         let name =
             typescript::TypeScriptExtractor::file_symbol_name(&std::sync::Arc::from(file_path));
-        if !out.nodes.iter().any(|n| n.name == name.as_str()) {
+        // SvelteKit's `+page` / `+layout` / `+error` are route files, not named components.
+        let special = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('+'));
+        if !special && !out.nodes.iter().any(|n| n.name == name.as_str()) {
             // The component spans its file; its imports are its dependencies.
             let lines = content.lines().count().max(1);
             let component = ContractNode {
@@ -439,7 +446,11 @@ impl PolyglotIndexer {
             }
         }
         // SvelteKit's `+page.svelte` and Astro's `src/pages/**/*.astro` are pages by location.
-        if let Some(page) = js_frameworks::sfc_route(file_path) {
+        let routing_path = cfg
+            .ts_aliases
+            .relative_to_root(file_path)
+            .unwrap_or_else(|| file_path.to_path_buf());
+        if let Some(page) = js_frameworks::sfc_route(&routing_path) {
             let label = page.label();
             out.nodes.push(ContractNode {
                 id: 0,

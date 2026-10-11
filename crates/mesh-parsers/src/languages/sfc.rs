@@ -47,48 +47,121 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Byte ranges of the content of every `<script …>…</script>` and the grammar each asks for.
-fn script_blocks(content: &str) -> Vec<(usize, usize, LanguageKind)> {
+/// The byte index of the `>` closing an opening tag that starts at `from`, quotes respected
+/// (`<script setup generic="T extends Array<string>">`).
+fn tag_end(content: &str, from: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in content[from..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => return Some(from + i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The grammar a `<script>` asks for, or `None` for a block that is not JavaScript /
+/// TypeScript (`lang="coffee"`, `lang="pug"`, `type="application/ld+json"`, an import map).
+fn script_kind(tag: &str) -> Option<LanguageKind> {
+    if let Some(ty) = attribute(tag, "type").map(str::to_ascii_lowercase) {
+        let js_like = matches!(
+            ty.as_str(),
+            "" | "module"
+                | "text/javascript"
+                | "application/javascript"
+                | "text/typescript"
+                | "application/typescript"
+                | "ts"
+                | "tsx"
+                | "jsx"
+        );
+        if !js_like {
+            return None;
+        }
+    }
+    match attribute(tag, "lang")
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("js" | "javascript" | "jsx" | "mjs") => Some(LanguageKind::JavaScript),
+        Some("ts" | "typescript" | "mts") => Some(LanguageKind::TypeScript),
+        Some("tsx") => Some(LanguageKind::Tsx),
+        Some(_) => None,
+    }
+}
+
+/// Byte ranges of the content of every `<script …>…</script>` from `from` on, with the grammar
+/// each asks for. `<script>` mentioned inside an HTML comment or a `<style>` is not an element.
+fn script_blocks(content: &str, from: usize) -> Vec<(usize, usize, LanguageKind)> {
     let lower = content.to_ascii_lowercase();
     let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(open) = lower[from..].find("<script") {
-        let open = from + open;
-        let after_name = open + "<script".len();
-        // `<scripts>` or `<script-foo>` is not a script element.
-        if !lower[after_name..].starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
-            from = after_name;
-            continue;
+    let mut at = from;
+    while at < lower.len() {
+        let rest = &lower[at..];
+        let next = [("<!--", 0), ("<style", 1), ("<script", 2)]
+            .iter()
+            .filter_map(|(needle, kind)| rest.find(needle).map(|i| (i, *kind)))
+            .min();
+        let Some((offset, kind)) = next else { break };
+        let open = at + offset;
+        match kind {
+            0 => {
+                at = lower[open..]
+                    .find("-->")
+                    .map_or(lower.len(), |i| open + i + 3)
+            }
+            1 => {
+                at = lower[open..]
+                    .find("</style")
+                    .map_or(lower.len(), |i| open + i + 7)
+            }
+            _ => {
+                let after_name = open + "<script".len();
+                // `<scripts>` or `<script-foo>` is not a script element.
+                if !lower[after_name..]
+                    .starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                {
+                    at = after_name;
+                    continue;
+                }
+                let Some(end) = tag_end(content, after_name) else {
+                    break;
+                };
+                let tag = &content[open..end];
+                let body_start = end + 1;
+                // `<script src="./a.ts" />` has no body: the next block is a different one.
+                if tag.trim_end().ends_with('/') {
+                    at = body_start;
+                    continue;
+                }
+                let Some(close) = lower[body_start..].find("</script") else {
+                    break;
+                };
+                let body_end = body_start + close;
+                if let Some(kind) = script_kind(tag) {
+                    out.push((body_start, body_end, kind));
+                }
+                at = body_end + "</script".len();
+            }
         }
-        let Some(tag_end) = lower[after_name..].find('>') else {
-            break;
-        };
-        let tag_end = after_name + tag_end;
-        let tag = &content[open..tag_end];
-        let body_start = tag_end + 1;
-        let self_closing = tag.ends_with('/');
-        let Some(close) = lower[body_start..].find("</script") else {
-            break;
-        };
-        let body_end = body_start + close;
-        let lang = attribute(tag, "lang").map(str::to_ascii_lowercase);
-        let kind = match lang.as_deref() {
-            Some("tsx") => LanguageKind::Tsx,
-            Some("ts" | "typescript") => LanguageKind::TypeScript,
-            _ => LanguageKind::JavaScript,
-        };
-        if !self_closing {
-            out.push((body_start, body_end, kind));
-        }
-        from = body_end;
     }
     out
 }
 
-/// The byte range of an Astro component's frontmatter (between the first two `---` lines).
+/// The byte range of an Astro component's frontmatter (between the first two `---` lines),
+/// which must open the file (a BOM and blank lines before it are allowed).
 fn astro_frontmatter(content: &str) -> Option<(usize, usize)> {
-    let first_line_end = content.find('\n').unwrap_or(content.len());
-    if content[..first_line_end].trim() != "---" {
+    let lead = content.len()
+        - content
+            .trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+            .len();
+    let first_line_end = content[lead..]
+        .find('\n')
+        .map_or(content.len(), |i| lead + i);
+    if content[lead..first_line_end].trim() != "---" {
         return None;
     }
     let start = (first_line_end + 1).min(content.len());
@@ -110,12 +183,15 @@ pub(crate) fn script_view(path: &Path, content: &str) -> Option<ScriptView> {
         return None;
     }
     let mut ranges: Vec<(usize, usize, LanguageKind)> = Vec::new();
+    let mut scan_from = 0;
     if ext == "astro" {
         if let Some((s, e)) = astro_frontmatter(content) {
             ranges.push((s, e, LanguageKind::TypeScript));
+            // The client scripts are searched for after the frontmatter closes.
+            scan_from = e;
         }
     }
-    ranges.extend(script_blocks(content));
+    ranges.extend(script_blocks(content, scan_from));
     if ranges.is_empty() {
         return None;
     }

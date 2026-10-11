@@ -243,13 +243,22 @@ pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
     let (file, dirs) = segs.split_last()?;
     let (stem, ext) = split_ext(file);
     let route = match (ext, stem) {
-        ("svelte", "+page") => {
+        // `+page.svelte`, and `+page@.svelte` / `+page@(group).svelte` (layout resets).
+        ("svelte", s) if s == "+page" || s.starts_with("+page@") => {
             let i = dirs.iter().rposition(|d| d == "routes")?;
+            // SvelteKit's routes live in `src/routes`.
+            if i == 0 || dirs[i - 1] != "src" {
+                return None;
+            }
             route_of(&dirs[i + 1..], None)
         }
         ("astro", _) if !stem.starts_with('_') => {
             let i = dirs.iter().rposition(|d| d == "pages")?;
             if !dirs.iter().any(|d| d == "src") {
+                return None;
+            }
+            // Astro ignores files and folders whose name starts with `_`.
+            if dirs[i + 1..].iter().any(|d| d.starts_with('_')) {
                 return None;
             }
             route_of(&dirs[i + 1..], (stem != "index").then_some(stem))

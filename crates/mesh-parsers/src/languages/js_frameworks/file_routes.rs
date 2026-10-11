@@ -351,7 +351,12 @@ pub(crate) fn file_routes(
                 // `routes/users.$id/route.tsx`: one folder, one route. Deeper nesting is not a
                 // convention this reads.
                 Some(folder) if rest.len() == 1 && (stem == "route" || stem == "index") => {
-                    Some(remix_route(folder))
+                    // A pathless layout in folder form (`routes/_auth/route.tsx`) is no route either.
+                    let pathless = folder
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|last| last.starts_with('_') && last != "_index");
+                    (!pathless).then(|| remix_route(folder))
                 }
                 Some(_) => None,
             };

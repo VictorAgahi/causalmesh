@@ -421,6 +421,15 @@ fn roots_below_the_router_and_unknown_roots_read_no_router() {
     let fi = PolyglotIndexer::extract_with_config(&file, code, 0, &cfg);
     assert!(routes(&fi).is_empty());
     // An absolute path under no known root: its ancestors say nothing about a router.
-    let fi = PolyglotIndexer::extract(Path::new("/app/src/server/route.ts"), code, 0);
+    let unrooted = std::env::temp_dir().join("app/src/server/route.ts");
+    assert!(unrooted.is_absolute());
+    let fi = PolyglotIndexer::extract(&unrooted, code, 0);
     assert!(routes(&fi).is_empty());
+}
+
+#[test]
+fn a_pathless_layout_in_folder_form_is_not_a_route() {
+    let remix = "import { json } from '@remix-run/node';\nexport const loader = () => json({});\nexport default function C() { return null; }\n";
+    assert!(routes(&index("web/app/routes/_auth/route.tsx", remix)).is_empty());
+    assert!(routes(&index("web/app/routes/dashboard._layout/route.tsx", remix)).is_empty());
 }

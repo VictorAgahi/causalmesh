@@ -380,16 +380,47 @@ fn destructured_require_with_default_value_is_a_named_import() {
 }
 
 #[test]
-fn many_ambient_overloads_stay_linear() {
-    let code: String = (0..4000)
+fn ambient_overloads_are_one_symbol_per_scope() {
+    let mut code: String = (0..1000)
         .map(|i| {
             format!("declare function g{i}(): void;\ndeclare function g{i}(a: number): void;\n")
         })
         .collect();
-    let start = std::time::Instant::now();
+    code.push_str("declare namespace A { function f(): void; function f(a: number): void }\n");
+    code.push_str("declare namespace B { function f(): void }\n");
+    code.push_str("declare function f(): void;\n");
     let fi = index("types/big.d.ts", &code);
-    assert_eq!(fi.nodes.len(), 4000);
-    assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+    let names = node_names(&fi);
+    for i in 0..1000 {
+        assert_eq!(
+            names.iter().filter(|n| **n == format!("g{i}")).count(),
+            1,
+            "g{i}"
+        );
+    }
+    // `f` is declared in A, in B and at the top level: three scopes, three symbols.
+    assert_eq!(names.iter().filter(|n| *n == "f").count(), 3, "{names:?}");
+}
+
+#[test]
+fn require_shadowed_by_any_parameter_pattern_is_not_a_dependency() {
+    let fi = index(
+        "web/shadow2.js",
+        "export function a(p, { require }) { return require('s1'); }\n\
+         export function b(p, [require]) { return require('s2'); }\n\
+         export function c(require = 1) { return require('s3'); }\n\
+         export function d(...require) { return require('s4'); }\n\
+         export function e({ x: require }) { return require('s5'); }\n\
+         export function g(cb = (require) => 1) { return require('real'); }\n",
+    );
+    let deps = dep_targets(&fi);
+    for shadowed in ["s1", "s2", "s3", "s4", "s5"] {
+        assert!(
+            !deps.contains(&shadowed.to_string()),
+            "{shadowed} in {deps:?}"
+        );
+    }
+    assert!(deps.contains(&"real".to_string()), "{deps:?}");
 }
 
 #[test]

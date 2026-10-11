@@ -518,7 +518,15 @@ impl TypeScriptExtractor {
                     .and_then(|n| n.utf8_text(source).ok())
                 {
                     // Overloads of one ambient function are one symbol.
-                    if ctx.declared.borrow_mut().insert(format!("fn:{name}")) {
+                    let scope = node
+                        .parent()
+                        .filter(|p| p.kind() == "statement_block")
+                        .map_or(0, |p| p.start_byte());
+                    if ctx
+                        .declared
+                        .borrow_mut()
+                        .insert(format!("fn:{scope}:{name}"))
+                    {
                         nodes.push(Self::declaration_node(
                             ctx,
                             node,
@@ -1119,25 +1127,49 @@ impl TypeScriptExtractor {
                     .child_by_field_name("parameters")
                     .or_else(|| a.child_by_field_name("parameter"));
                 if let Some(params) = params {
-                    if params.utf8_text(source).ok() == Some(name) {
+                    if params.utf8_text(source).ok() == Some(name)
+                        || Self::binds_name(params, name, source, 0)
+                    {
                         return true;
-                    }
-                    let mut cursor = params.walk();
-                    for param in params.named_children(&mut cursor) {
-                        let ident = if param.kind() == "identifier" {
-                            Some(param)
-                        } else {
-                            param.child_by_field_name("pattern")
-                        };
-                        if ident.and_then(|i| i.utf8_text(source).ok()) == Some(name) {
-                            return true;
-                        }
                     }
                 }
             }
             ancestor = a.parent();
         }
         false
+    }
+
+    /// Whether a parameter list binds `name` anywhere in its patterns: a plain
+    /// identifier, `{ name }`, `{ x: name }`, `[name]`, `name = 1`, `...name`.
+    /// Default-value expressions are not entered (a callback parameter named
+    /// `name` there is its own scope).
+    fn binds_name(node: Node, name: &str, source: &[u8], depth: usize) -> bool {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return false;
+        }
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                node.utf8_text(source).ok() == Some(name)
+            }
+            // `pair_pattern`: the bound name is the value, not the key.
+            "pair_pattern" => node
+                .child_by_field_name("value")
+                .is_some_and(|v| Self::binds_name(v, name, source, depth + 1)),
+            // `name = default`: only the left side binds.
+            "assignment_pattern" | "object_assignment_pattern" => node
+                .child_by_field_name("left")
+                .is_some_and(|l| Self::binds_name(l, name, source, depth + 1)),
+            "formal_parameters" | "required_parameter" | "optional_parameter"
+            | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                let bound = node.named_children(&mut cursor).any(|c| {
+                    // A type annotation never binds.
+                    c.kind() != "type_annotation" && Self::binds_name(c, name, source, depth + 1)
+                });
+                bound
+            }
+            _ => false,
+        }
     }
 
     /// The module a declarator's initializer loads, looking through `await`

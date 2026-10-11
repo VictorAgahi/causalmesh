@@ -217,28 +217,24 @@ impl AstDecapitator {
     pub const BOUNDED_ERROR_STUB: &'static str =
         "// [MeshMCP Warning: AST decapitation bounded or parser timeout (>15ms). Body stripped to protect context window.]\n";
 
-    /// A `.js` file that the JavaScript grammar cannot parse cleanly but the
-    /// TSX grammar can (Flow / Babel type annotations, `interface`, `enum`) is
-    /// decapitated as TSX: JavaScript's grammar would drop its classes and types
-    /// into error nodes. Any other language is returned unchanged.
-    fn resolve_dialect(content: &str, lang_kind: LanguageKind) -> LanguageKind {
-        if lang_kind != LanguageKind::JavaScript {
-            return lang_kind;
+    /// Runs `decapitate_under` (one parse + decapitation under a grammar, plus
+    /// whether its tree holds syntax errors). A `.js` file the JavaScript grammar
+    /// cannot parse cleanly but the TSX grammar can (Flow / Babel annotations,
+    /// `interface`, `enum`) is decapitated from the TSX tree instead: JavaScript's
+    /// would drop its classes and types into error nodes. A clean file costs one
+    /// parse; only an erroring `.js` file costs a second one. Any other language
+    /// runs once, as itself.
+    fn with_dialect<R>(
+        lang_kind: LanguageKind,
+        decapitate_under: impl Fn(LanguageKind) -> Option<(R, bool)>,
+    ) -> Option<R> {
+        let (result, has_error) = decapitate_under(lang_kind)?;
+        if lang_kind == LanguageKind::JavaScript && has_error {
+            if let Some((tsx, false)) = decapitate_under(LanguageKind::Tsx) {
+                return Some(tsx);
+            }
         }
-        let has_error = |kind: LanguageKind| {
-            crate::guard::AstGuard::with_parser(kind, |parser| {
-                parser
-                    .parse(content, None)
-                    .is_some_and(|t| t.root_node().has_error())
-            })
-        };
-        if has_error(LanguageKind::JavaScript) == Some(true)
-            && has_error(LanguageKind::Tsx) == Some(false)
-        {
-            LanguageKind::Tsx
-        } else {
-            lang_kind
-        }
+        Some(result)
     }
 
     /// Decapitates imperative method bodies using the appropriate language parser automatically
@@ -246,7 +242,6 @@ impl AstDecapitator {
         if include_body {
             return content.to_string();
         }
-        let lang_kind = Self::resolve_dialect(content, lang_kind);
 
         match lang_kind {
             LanguageKind::Protobuf | LanguageKind::Yaml => return content.to_string(),
@@ -260,8 +255,11 @@ impl AstDecapitator {
             _ => {}
         }
 
-        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
-            Self::decapitate(content, lang_kind, parser, false)
+        Self::with_dialect(lang_kind, |kind| {
+            crate::guard::AstGuard::with_parser(kind, |parser| {
+                Self::decapitate_checked(content, kind, parser)
+            })
+            .flatten()
         })
         .unwrap_or_else(|| Self::BOUNDED_ERROR_STUB.to_string())
     }
@@ -276,23 +274,32 @@ impl AstDecapitator {
         if include_body {
             return content.to_string();
         }
+        Self::decapitate_checked(content, lang_kind, parser)
+            .map(|(text, _)| text)
+            .unwrap_or_else(|| Self::BOUNDED_ERROR_STUB.to_string())
+    }
 
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => {
-                // Commandment 2: NEVER return the raw gigantic file on timeout or failure.
-                // Return bounded error stub <= 256 bytes protecting LLM context window.
-                tracing::warn!(
-                    target: "mesh::parser",
-                    "Parser timeout (>15ms) or C-FFI failure; returning bounded stub (<= 256 bytes)"
-                );
-                return Self::BOUNDED_ERROR_STUB.to_string();
-            }
+    /// One parse and decapitation under `lang_kind`'s grammar; `None` when the
+    /// parse timed out or failed (the caller returns the bounded stub, never the
+    /// raw file - Commandment 2), else the text and whether the tree has errors.
+    fn decapitate_checked(
+        content: &str,
+        lang_kind: LanguageKind,
+        parser: &mut Parser,
+    ) -> Option<(String, bool)> {
+        let Some(tree) = parser.parse(content, None) else {
+            tracing::warn!(
+                target: "mesh::parser",
+                "Parser timeout (>15ms) or C-FFI failure; returning bounded stub (<= 256 bytes)"
+            );
+            return None;
         };
-
         let mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)> = Vec::new();
         Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements, 0);
-        Self::apply_replacements(content, replacements, None)
+        Some((
+            Self::apply_replacements(content, replacements, None),
+            tree.root_node().has_error(),
+        ))
     }
 
     /// [`Self::decapitate_auto`] plus, for every output line, the span of
@@ -318,7 +325,6 @@ impl AstDecapitator {
         if include_body {
             return identity();
         }
-        let lang_kind = Self::resolve_dialect(content, lang_kind);
         match lang_kind {
             LanguageKind::Protobuf | LanguageKind::Yaml => return identity(),
             LanguageKind::Unknown => {
@@ -331,31 +337,36 @@ impl AstDecapitator {
             _ => {}
         }
 
-        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
-            let Some(tree) = parser.parse(content, None) else {
-                tracing::warn!(
-                    target: "mesh::parser",
-                    "Parser timeout or C-FFI failure; returning bounded stub (<= 256 bytes)"
+        Self::with_dialect(lang_kind, |kind| {
+            crate::guard::AstGuard::with_parser(kind, |parser| {
+                let Some(tree) = parser.parse(content, None) else {
+                    tracing::warn!(
+                        target: "mesh::parser",
+                        "Parser timeout or C-FFI failure; returning bounded stub (<= 256 bytes)"
+                    );
+                    return None;
+                };
+                let mut replacements = Vec::new();
+                Self::collect_body_replacements(
+                    content,
+                    tree.root_node(),
+                    kind,
+                    &mut replacements,
+                    0,
                 );
-                return None;
-            };
-            let mut replacements = Vec::new();
-            Self::collect_body_replacements(
-                content,
-                tree.root_node(),
-                lang_kind,
-                &mut replacements,
-                0,
-            );
-            let mut line_map = Vec::new();
-            let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
-            Some(DecapitatedSource {
-                text,
-                line_map,
-                bounded: false,
+                let mut line_map = Vec::new();
+                let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
+                Some((
+                    DecapitatedSource {
+                        text,
+                        line_map,
+                        bounded: false,
+                    },
+                    tree.root_node().has_error(),
+                ))
             })
+            .flatten()
         })
-        .flatten()
         .unwrap_or_else(stub)
     }
 

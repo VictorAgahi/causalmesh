@@ -441,14 +441,17 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
-                // One parse + extraction under `kind`; the flag says the tree
-                // holds syntax errors.
-                let run = |kind: LanguageKind| {
+                // One parse under `kind`'s grammar, extracted from unless
+                // `defer_if_erroneous` and the tree holds syntax errors (`None`).
+                let run = |kind: LanguageKind, defer_if_erroneous: bool| {
                     AstGuard::parse_with(
                         kind,
                         content,
                         AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
                         |tree| {
+                            if defer_if_erroneous && tree.root_node().has_error() {
+                                return None;
+                            }
                             let mut imports = Vec::new();
                             let mut rpc_calls = Vec::new();
                             let nodes = typescript::TypeScriptExtractor::extract_with_config(
@@ -460,31 +463,32 @@ impl PolyglotIndexer {
                                 &mut rpc_calls,
                                 &cfg.controller_annotations,
                             );
-                            (nodes, imports, rpc_calls, tree.root_node().has_error())
+                            Some((nodes, imports, rpc_calls))
                         },
                     )
                 };
-                let mut outcome = run(lang_kind);
                 // Plain JavaScript is parsed by its own grammar. A `.js` file
                 // that carries Flow / Babel annotations does not parse
                 // cleanly there (its classes and types become error nodes),
-                // but does under TSX: take the TSX result when it is clean.
-                if lang_kind == LanguageKind::JavaScript {
-                    if let ParseOutcome::Parsed((.., true)) = &outcome {
-                        if let ParseOutcome::Parsed(tsx @ (.., false)) = run(LanguageKind::Tsx) {
-                            outcome = ParseOutcome::Parsed(tsx);
-                        }
-                    }
+                // but does under TSX: extract from the TSX tree when it is
+                // clean, else from the JavaScript one. A TSX parse failure is
+                // a failure of the file (counted and retried sequentially),
+                // never a silent fall back to the JavaScript result, so the
+                // outcome cannot depend on CPU contention.
+                let mut outcome = run(lang_kind, lang_kind == LanguageKind::JavaScript);
+                if let ParseOutcome::Parsed(None) = outcome {
+                    outcome = match run(LanguageKind::Tsx, true) {
+                        ParseOutcome::Parsed(None) => run(lang_kind, false),
+                        other => other,
+                    };
                 }
                 let (nodes, imports, rpc_calls) = match outcome {
-                    ParseOutcome::Parsed((nodes, imports, rpc_calls, _)) => {
-                        (nodes, imports, rpc_calls)
-                    }
+                    ParseOutcome::Parsed(Some(extracted)) => extracted,
+                    ParseOutcome::Parsed(None) | ParseOutcome::NoGrammar => Default::default(),
                     ParseOutcome::ParseFailed => {
                         out.parse_failed = true;
                         Default::default()
                     }
-                    ParseOutcome::NoGrammar => Default::default(),
                 };
                 out.rpc_calls = rpc_calls;
                 Self::wire_ts_events(&nodes, &mut out);

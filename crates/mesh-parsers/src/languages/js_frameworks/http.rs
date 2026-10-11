@@ -417,7 +417,7 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
 
     let mut prefix = String::new();
     if let Some(k) = key.as_deref() {
-        prefix = mounted_prefix(&fx.mounts(&names), k);
+        prefix = mounted_prefix(fx.mounts(&names), k);
     }
     for scope in &scopes {
         prefix = join(&prefix, &scope.prefix);
@@ -466,13 +466,11 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
             }
         }
         // hono / h3: `app.on('GET', '/p', handler)`, `app.on(['GET', 'POST'], '/p', h)`
-        "on" => {
-            if args.len() >= 3 && args.last().is_some_and(|h| is_handler(*h)) {
-                let methods = methods_of(&names, args[0]);
-                for path in route_paths(&names, args[1]) {
-                    for m in &methods {
-                        routes.push((m.clone(), path.clone()));
-                    }
+        "on" if args.len() >= 3 && args.last().is_some_and(|h| is_handler(*h)) => {
+            let methods = methods_of(&names, args[0]);
+            for path in route_paths(&names, args[1]) {
+                for m in &methods {
+                    routes.push((m.clone(), path.clone()));
                 }
             }
         }

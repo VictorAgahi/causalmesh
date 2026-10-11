@@ -6,8 +6,9 @@
 //! framework, or the exports only that framework's route modules have (`GET` and `POST`
 //! functions in a `route.ts`, a `+server.ts`, `loader` / `action` next to a Remix import).
 
-use super::http::RouteFact;
+use super::http::{join, RouteFact};
 use super::scope::ModuleBindings;
+use super::{arguments, scope::unquote};
 use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::Node;
@@ -265,6 +266,97 @@ pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
     })
 }
 
+/// React Router v7 config routing: the routes `app/routes.ts` declares with `index`, `route`,
+/// `layout` and `prefix` (`export default [ route('users/:id', 'routes/user.tsx') ] satisfies
+/// RouteConfig`), as `PAGE` routes anchored at each call.
+pub(crate) fn react_router_config(root: Node, source: &[u8]) -> Vec<(RouteFact, (usize, usize))> {
+    let array = root
+        .named_children(&mut root.walk())
+        .filter(|s| s.kind() == "export_statement")
+        .filter(|s| s.children(&mut s.walk()).any(|c| c.kind() == "default"))
+        .find_map(|s| s.child_by_field_name("value"))
+        .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers)
+        .filter(|v| v.kind() == "array");
+    let mut out = Vec::new();
+    if let Some(array) = array {
+        walk_route_config(array, "", source, &mut out, 0);
+    }
+    // An index child answers its parent's URL: one route per URL.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(fact, _)| seen.insert(fact.path.clone()));
+    out
+}
+
+fn walk_route_config(
+    array: Node,
+    prefix: &str,
+    source: &[u8],
+    out: &mut Vec<(RouteFact, (usize, usize))>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    for element in array.named_children(&mut array.walk()) {
+        // `...prefix('admin', [..])` spreads the call.
+        let element = if element.kind() == "spread_element" {
+            match element.named_child(0) {
+                Some(inner) => inner,
+                None => continue,
+            }
+        } else {
+            element
+        };
+        if element.kind() != "call_expression" {
+            continue;
+        }
+        let Some(name) = element
+            .child_by_field_name("function")
+            .and_then(|f| f.utf8_text(source).ok())
+        else {
+            continue;
+        };
+        let args = arguments(element);
+        let text_of = |i: usize| args.get(i).and_then(|a| unquote(*a, source));
+        let children_of = |i: usize| args.get(i).copied().filter(|a| a.kind() == "array");
+        let lines = (
+            element.start_position().row + 1,
+            element.end_position().row + 1,
+        );
+        let mut page = |path: &str| {
+            out.push((
+                RouteFact {
+                    method: "PAGE".to_string(),
+                    path: path.to_string(),
+                },
+                lines,
+            ));
+        };
+        match name {
+            "index" => page(&join(prefix, "")),
+            "route" => {
+                let Some(path) = text_of(0) else { continue };
+                let full = join(prefix, &path);
+                page(&full);
+                if let Some(children) = children_of(2) {
+                    walk_route_config(children, &full, source, out, depth + 1);
+                }
+            }
+            "layout" => {
+                if let Some(children) = children_of(1).or_else(|| children_of(2)) {
+                    walk_route_config(children, prefix, source, out, depth + 1);
+                }
+            }
+            "prefix" => {
+                if let (Some(path), Some(children)) = (text_of(0), children_of(1)) {
+                    walk_route_config(children, &join(prefix, &path), source, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The routes the location and exports of one file declare, with the lines each is anchored to.
 pub(crate) fn file_routes(
     path: &Path,
@@ -368,7 +460,9 @@ pub(crate) fn file_routes(
     if let Some(rest) = after_pair("app", "routes") {
         let remix_import =
             bindings.references_any(&["@remix-run/", "react-router", "@react-router/"]);
-        if remix_import {
+        // A module importing its generated `./+types/<name>` is routed by `app/routes.ts`
+        // (React Router v7 config routing): its file name is not its route.
+        if remix_import && !bindings.references_containing("+types/") {
             // A pathless layout (`_auth.tsx`, `_layout.tsx`) wraps routes, it is not one.
             let layout = stem
                 .rsplit('.')

@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.1] — 2026-10-11
+
+### Added
+- React Router v7 config routing: `app/routes.ts` (gated on `@react-router/dev/routes`) now
+  yields one `PAGE` route per `index` / `route` / `layout` / `prefix` call, with nesting and
+  spread `prefix(...)` resolved. Modules importing their generated `./+types/...` are no longer
+  read as Remix flat routes.
+- Brokers: AWS Kinesis (`PutRecord(s)Command`, `GetShardIteratorCommand`), EventBridge
+  (`PutEventsCommand`, by `DetailType` then `EventBusName`), STOMP (`@stomp/stompjs` and
+  relatives: `publish`, `send`, `subscribe`, `watch`), and Redis lists used as queues
+  (`lpush` / `rpush` produce; `brpop` / `blpop` / `rpop` / `lpop` consume).
+
 ## [7.1.0] — 2026-10-11
 
 The JavaScript / TypeScript parser becomes multi-framework. Seven stacked changes, one version.

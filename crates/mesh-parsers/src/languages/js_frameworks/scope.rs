@@ -292,6 +292,13 @@ impl ModuleBindings {
                 .any(|b| libs.iter().any(|lib| module_matches(&b.module, lib)))
     }
 
+    /// Whether any module the file refers to, by load or by type, contains `needle`
+    /// (`+types/`: the generated route types of a React Router v7 route module).
+    pub(crate) fn references_containing(&self, needle: &str) -> bool {
+        self.modules.iter().any(|m| m.contains(needle))
+            || self.locals.values().any(|b| b.module.contains(needle))
+    }
+
     /// The binding of `local`, whether a value or a type.
     pub(crate) fn binding(&self, local: &str) -> Option<&Binding> {
         self.locals.get(local)

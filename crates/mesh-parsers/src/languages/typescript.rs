@@ -1177,6 +1177,38 @@ impl TypeScriptExtractor {
         )
     }
 
+    /// File-system routes (Next, Remix, SvelteKit, Nuxt, Astro): the location is the route.
+    /// `routing_path` is the file's path from its workspace root, `file_path` its real one.
+    pub(crate) fn file_route_nodes(
+        routing_path: &Path,
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        tree: &Tree,
+    ) -> Vec<ContractNode> {
+        let fx = js_frameworks::FrameworkCtx::new(tree.root_node(), content.as_bytes());
+        let file_path: FilePath = Arc::from(file_path);
+        let package_name = mesh_core::detect_service_package(&file_path, None);
+        js_frameworks::detect_file_routes(routing_path, &fx)
+            .into_iter()
+            .map(|(route, lines)| {
+                let label = route.label();
+                ContractNode {
+                    id: 0,
+                    name: CompactStr::new(&label),
+                    kind: NodeKind::HttpEndpoint,
+                    file_path: file_path.clone(),
+                    line_start: lines.0,
+                    line_end: lines.1,
+                    package: package_name.clone(),
+                    repo_id,
+                    signature: Some(CompactStr::new(label)),
+                    docstring: None,
+                }
+            })
+            .collect()
+    }
+
     /// The node of an HTTP route registered at `node`: named and signed by its
     /// method and full path (`GET /api/users/:id`).
     fn route_node(ctx: &VisitCtx, node: Node, route: &js_frameworks::RouteFact) -> ContractNode {

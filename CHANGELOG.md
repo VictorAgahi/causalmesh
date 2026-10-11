@@ -5,6 +5,220 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.0] — 2026-10-11
+
+The JavaScript / TypeScript parser becomes multi-framework. Seven stacked changes, one version.
+
+### Why
+The 7.0.x indexer read `.js` with the TSX grammar, saw no CommonJS dependency, knew a handful of
+hard-coded Kafka / BullMQ / NestJS shapes by substring, resolved no path alias, named a NestJS endpoint after
+its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all. A probe on `server.js`
+(`require('express')`, `app.get('/users/:id')`) found zero dependencies and zero routes.
+
+### Added and changed
+#### Foundations
+- **JavaScript has its own grammar** (`tree-sitter-javascript`, `LanguageKind::JavaScript`): `.js`, `.jsx`,
+  `.mjs`, `.cjs` no longer go through the TSX grammar, which misparses plain JS. `.tsx` stays on TSX.
+  A `.js` file carrying Flow/Babel annotations (`type`, `interface`, `: number`) that does not parse cleanly
+  as JavaScript is re-parsed as TSX when that parse is clean (indexing and decapitation), so such files
+  keep their classes and types.
+- **CommonJS and dynamic imports are dependencies**: `require('x')`, `import('x')` (anywhere in the file),
+  `import x = require('y')`, destructured `const { a, b = 1 } = require('./m')` (named, attributed where used).
+  `const express = require('express')` is an import, no longer a declaration named `express`. Computed
+  specifiers (`require(name)`, template literals) and a `require` shadowed by a parameter are ignored.
+- **More declarations**: `declare function/const/class/enum/type` and bodiless signatures in `.d.ts`,
+  `namespace` / `module X` blocks and their members, anonymous `export default` (object, function, class,
+  call given an inline definition) named after the file (`index.*` -> its directory), CommonJS
+  `module.exports = …`, `exports.foo = …`, `module.exports.foo = …`, `exports = module.exports = …`
+  and chained `a = b = …`. A repeated export is one node. Not covered: `export =`, `export import`,
+  `module['exports']`, UMD/webpack wrappers, members of a string-named `declare module 'x'`.
+- **gRPC client fields in JavaScript**: inherited fields (`^Base#field.method`) and own class fields
+  resolve for `.js` as they do for `.ts`.
+- **Decapitation** also strips `function_expression`, generators and class `static {}` blocks.
+- **Index cache schema v10**: unchanged files are re-extracted once.
+
+#### Module aliases
+- **`tsconfig.json` / `jsconfig.json` `paths`, `baseUrl` and relative `extends` chains** and
+  **`package.json` `imports`** (`#internal/*`, conditional targets) are resolved: an aliased import
+  (`import User from '@/services/User'`, `require('#lib/log')`) is rewritten to the relative path
+  the file would have written, so the graph resolves it. Before, a default/namespace/`require`
+  import of an alias named no symbol and produced no edge (named imports resolved by bare name only).
+- **A relative import from a JS/TS file now links only to the file it names** (graph, `mesh-core`):
+  before, `./utils` matched any same-named symbol in the repo. The specifier is resolved against the
+  importer's directory (extension, `index` and component-folder aware: `./x.js` -> `x.ts`,
+  `./services` -> `services/index.ts`, `./Button` -> `Button/Button.tsx`). On the otel-demo, react and
+  vscode corpora this removed 659 / 57,129 / 4.6M `Imports` edges, sampled and classified as false
+  positives (an import of `../types/Cart` linking a Go file, `./ReactSharedInternals` linking another
+  package's file, ...) and added 57 correct ones on otel-demo (formerly ambiguous edges now pointing at a
+  single file). Only *module* imports are path-aware: a named specifier (`import { util } from
+  './util'`) is still resolved by its bare name, as before, so homonyms stay ambiguous for those.
+  A directory import resolved through `package.json` `"main"` no longer links. Other languages'
+  relative imports are unchanged.
+- Longest-literal-prefix wins (TypeScript's rule); exact aliases match only themselves; a catch-all
+  (`"*": [...]`) never claims bare packages; a package `extends` (`@tsconfig/node18`) and
+  `baseUrl`-only bare specifiers are not resolved; configs are never read from above the file's root: every read is confined to the owning workspace root
+  (symlinks and `..`/absolute `extends` are resolved first and refused when they leave it; the size cap
+  applies to the bytes read), and a file under no root is never looked up.
+- The nearest `tsconfig.json`/`jsconfig.json` (and the nearest `package.json`) governs a file even when it
+  declares no aliases, so a nested package does not inherit its parent's. `extends` may name a directory.
+- JSONC is parsed properly (comments, trailing commas, non-ASCII).
+- Lookup is lazy per directory and per extraction config (no workspace-wide discovery pass, no
+  global state). A script's index-cache key folds in the aliases that govern it, so editing a
+  `tsconfig.json` re-extracts exactly the files under it on the next cold start. Editing an alias
+  config in a running daemon reloads the scripts it governs, so an incremental reload equals a full
+  rebuild (invariant I2): a `tsconfig*.json` / `jsconfig*.json` (any name, since another config may
+  `extends` it from anywhere) governs its whole root, a `package.json` its directory. The daemon keeps a
+  digest of what each config last held (the whole file for a tsconfig, the `imports` map for a
+  `package.json`): an edit that cannot move an alias (a version bump, a dependency) re-extracts
+  nothing, while a config appearing, vanishing or edited for the first time since the daemon started
+  does, once. An `extends` base whose file name does not start with `tsconfig` / `jsconfig` (`base.json`) is
+  not watched: a restart picks up its edits.
+- The extraction-config fingerprint no longer depends on the workspace roots (adding a root does not
+  invalidate the whole cache).
+- A FIFO or special file named like a config is skipped (it used to block the scan forever).
+- Replaces the unused `TsConfigResolver`. Only the first `paths` target is used.
+
+#### Framework layer and message brokers
+- **A rule-table detector layer** (`languages/js_frameworks`) replaces the hard-coded kafkajs / BullMQ /
+  NestJS branches of `visit_node`. Each rule names the modules the file must load, the method,
+  constructor or decorator, the side of the topic (`Produce` / `Consume`), and how to read the name from
+  the arguments. The per-file context is built lazily, on the first call site a rule could match.
+- **Gated on the file and on the receiver**: a generic `.publish()` / `.subscribe()` / `.send()` is a
+  broker call only in a file that loads that broker's library (`require`, `import`, `import()`, aliases and
+  destructuring are followed; `import type` loads nothing) *and*, when the file builds a client of that
+  library (`new Redis()`, `createClient()`, `connect()`, `kafka.producer()`, a typed property or
+  parameter, `.duplicate()` / `.pipeline()` chains), only on those clients. An application event bus in a
+  file that also uses Redis for caching is no longer Redis. When the file builds no such client (an
+  untyped parameter) the import alone gates, as before.
+- **Brokers covered**: Kafka family (kafkajs incl. `sendBatch` and `topics: []`, node-rdkafka,
+  `@confluentinc/kafka-javascript`, kafka-node, `@platformatic/kafka`; Redpanda through these, it speaks
+  the Kafka protocol), Redis (`ioredis`, `redis`, `@redis/client`, `@upstash/redis` and the Nest wrappers:
+  pub/sub, `psubscribe`, streams `xadd` / `xread` / `xreadgroup` in both client styles), NATS (`nats`,
+  `@nats-io/*`, core and JetStream), MQTT, RabbitMQ (`amqplib`), BullMQ / Bull / bee-queue (incl. Bull
+  `queue.process()` as the consumer of the queue the receiver was built for), AWS SQS / SNS (SDK v2 and v3,
+  literal URLs / ARNs), Google Pub/Sub, Apache Pulsar, Azure Service Bus and Event Hubs, NestJS
+  microservice clients, and the queue decorators `@Processor` / `@InjectQueue` (`@nestjs/bull`,
+  `@nestjs/bullmq`), `@RabbitSubscribe` / `@RabbitRPC` (`@golevelup/nestjs-rabbitmq`) and
+  `@SqsMessageHandler` (`@ssut/nestjs-sqs`), each attributed to the class or method it decorates.
+- **Names are resolved within the file, scope-aware**: string literals, template literals, `+`
+  concatenation, module-level `const X = '…'`, `{ A: '…' } as const` / `Object.freeze` objects, string
+  enums, `static readonly` and `this.field` class members, function-local `const`s, `Topics['q-z']` and the
+  shorthand `{ topic }`. `let` / `var`, a parameter or a local declaration of the same name hide the
+  module-level constant. A reference to an *imported* constant (`Topics.ORDER_PLACED`, `ORDER_PLACED`) is
+  kept as written for the graph to reduce, as for Java; a parameter, `process.env.X`, `config.topic` or an
+  undeclared name is not a name and records nothing, nor does an empty one.
+- **Fixes**: `res.send('ok')`, `this.eventEmitter.emit(...)` and `socket.emit(...)` were recorded as NestJS
+  topics in any file that merely imported `@nestjs/microservices` (a microservice client must now be
+  typed `ClientProxy` / `ClientKafka` / …, injected with `@Inject(...)`, or named like a client in such a
+  file); `chat.send({ topic })` and a supertest `.post(...).send({ topic })` were Kafka producers (the
+  kafkajs shape now needs a Kafka import with a client the file built, or a receiver named
+  `producer` / `consumer` / `kafka`); a `Queue` imported from another library, a local `class Queue`, or
+  `new Worker('./sw.js')` is no longer a BullMQ queue; event nodes (`EventStream`) are no longer chosen as
+  the owner of a call site.
+- **Factories**: a client built by a local factory function counts when the factory's body names (as
+  whole identifiers, decided once per factory) something imported from the library; one that delegates to
+  another factory, a `this.makeClient()` method or an imported factory is not followed.
+- **Known limits**: a Kafka topic, a Redis channel and a queue sharing a name still meet on one hub in the
+  graph (the hub key is the lowercased name, whatever the broker): a follow-up. Wildcard subjects / topics
+  (`orders.*`, `sensors/+/temp`) are recorded literally. A NestJS client reached as `this.orderService.emit`
+  (a wrapper service) is no longer recorded.
+
+#### HTTP routes
+- **Route registrations become `HttpEndpoint` nodes** named and signed by method and full path
+  (`GET /api/users/:id`): Express (`app.get`, `router.route('/p').get(h).post(h)`, `all`, path arrays),
+  Fastify (`get(path, opts, handler)`, `route({ method, url })`, `register(plugin, { prefix })`), Koa
+  (`@koa/router`, `new Router({ prefix })`), Hono (`basePath`, `on('GET', …)`, mounted apps), Elysia
+  (`group('/api', app => …)`), h3, restify (`del`), polka, itty-router and hapi (`server.route({ method,
+  path })`, arrays, method lists).
+- **Prefixes are composed**: `group`, `register({ prefix })`, `new Router({ prefix })`, `basePath` and in-file
+  mounts (`app.use('/v1', v1); v1.use('/users', users)`, Hono `app.route('/books', books)`), nested.
+  A mount in *another* file is not followed.
+- **Gated on the file and the receiver**, like the brokers: the file must load an HTTP framework and, when
+  it builds apps or routers of it, the call must be on one of them (or on the router parameter of a
+  `group` / `register` callback). `axios.get('/u', config)`, `res.get('Content-Type')`, `cache.get('/k')`
+  and `request(app).get('/x')` are not routes; a receiver bound to an HTTP client library never is.
+- **Decorated controllers state their full route in the signature**, as Python's do (the node keeps the
+  method's name, so symbol lookups are unchanged): `@Controller('users')` + `@Get(':id')` ->
+  `GET /users/:id` for NestJS (incl. `@Controller({ path })`, `@Controller()`, constants as paths),
+  routing-controllers (`@JsonController`), tsoa (`@Route`, `{id}` kept as written) and
+  inversify-express-utils (`@controller` / `@httpGet`, now recognised as endpoints).
+- **Chained constructors and reused names**: `new Elysia({ prefix }).get(…).post(…)`, `new Hono().get(…)`,
+  `Fastify().get(…)` and `Router().get(…)` register routes whatever else the file builds; a router variable
+  reused in two functions is two routers, and one router mounted under two prefixes serves both (mount
+  cycles stop; at most 4 prefixes are kept per router, in declaration order, so a router mounted thousands
+  of times cannot fan out without bound). koa named routes (`router.get('user', '/users/:id', h)`) and hapi's `method: '*'` are read.
+- **Fewer false positives**: with no app or router built in the file, a receiver must look like one (or be
+  imported); `got.extend()` / `HttpClient` clients are not routes; a verb-named decorator imported from a
+  non-HTTP library declares no route; framework names are matched as modules (`'hono'`), not inside
+  "honor" or `<h3>`.
+- **Known limits**: NestJS global prefixes and `@Version`, Express/Koa mounts across files, file-based routing
+  (Next, Remix, SvelteKit, Nuxt, Astro: next PR), a Fastify plugin passed as a named function, an inherited
+  controller base class's `@Get` (it lacks the child's `@Controller` prefix), `@Get(['a', 'b'])` (first path only) and HTTP client calls are not linked to the routes.
+- Long method chains (more than ~30 links in one expression) are read up to a depth bound and silently stop; at most 5000 route nodes are recorded per file.
+- Type-only framework imports (`import type { FastifyInstance } from 'fastify'`) identify typed routers. Mount chains deeper than 64 are cut. Mount prefixes are independent of the order routes are registered in.
+
+#### File-system routing
+- **The location of a module is its route** for the file-system routers, as `HttpEndpoint` nodes named and
+  signed `METHOD /path` (`PAGE /path` for a UI page), anchored to the export that declares them:
+  Next.js App Router (`app/**/route.ts` verbs, `page.tsx`; `(group)`, `@slot`, `[id]`, `[...slug]`,
+  `[[...slug]]`), Next.js Pages Router (`pages/**`, `pages/api/**` as `ALL`), Remix / React Router flat
+  routes (`users.$id.tsx`, `_index`, pathless `_auth.login`, the `route.tsx` folder form; `loader` is `GET`,
+  `action` is `POST`), SvelteKit (`+server.ts` verbs, `+page(.server).ts` load / `actions`), Nuxt / Nitro
+  (`server/api/**` under `/api`, `server/routes/**`, `x.get.ts` method suffixes) and Astro endpoints
+  (`src/pages/**` verb exports).
+- **A directory name is not evidence**: each convention also needs a signal from the file (an import of the
+  framework, `import type` included, or its handler helpers such as `defineEventHandler`, or its route
+  exports). A CRA-style `src/pages/Home.tsx`, a `routes/helpers.ts`, a `lib/app/util.ts` are not routes.
+- **Conventions handled**: `export const { GET, POST } = handlers` (Auth.js) and `export { GET } from`;
+  Next intercepting `(.)photo` / `(..)photo` and private `_folders`; Remix pathless layouts (`_auth.tsx`) are
+  not routes, `[.]` escapes and `($lang)` optional segments; a Nuxt / Nitro handler is recognised by what
+  the default export *calls* (`defineEventHandler(…)`), not by a mention; SvelteKit's `+page.ts` /
+  `+page.server.ts` only add their form `actions` (the page itself is `+page.svelte`). Paths are read from
+  the workspace root down, so a checkout under `/app` or `~/api` does not make `app` / `api` framework folders.
+- **Known limits**: React Router v7 `app/routes.ts` config routing (the file name is not the route there),
+  Next UI pages that import nothing from `next`, `export * from` re-exports, `pageExtensions`.
+- **Not in this PR**: `.vue` / `.svelte` / `.astro` pages (next PR), TanStack Router / Expo Router / Qwik City /
+  SolidStart conventions, `middleware`, parallel/intercepting route details beyond ignoring `@slot`.
+
+#### Single-file components
+- **`.vue`, `.svelte` and `.astro` files are indexed.** Their code is their `<script>` blocks (Vue
+  `<script>` + `<script setup>`, Svelte `context="module"` + instance, Astro `---` frontmatter + client
+  `<script>`s) read with the JS / TS grammar (`lang="ts"` / `"tsx"`, TypeScript for the Astro
+  frontmatter). Everything outside the blocks is blanked byte for byte, newlines kept, so declarations,
+  imports and broker calls report the **line numbers of the original file**.
+- **A component is a declaration named after its file** (`Dashboard.vue` -> `Dashboard`, `index.vue` -> its
+  directory), spanning the file and owning its imports: `import Card from './Card.vue'` links to the
+  component (the `.vue` / `.svelte` / `.astro` extension is part of the module key), including through
+  `tsconfig` / `package.json` aliases. An options-API `export default` is that declaration (no duplicate).
+- **Pages by location**: SvelteKit `+page.svelte` and Astro `src/pages/**/*.astro` are `PAGE` routes, even
+  with no script.
+- The script gets the lexical guard of any parsed source (nesting depth, line length) measured on the script alone: long template / style lines (inline SVG, data URIs, Tailwind lists) do not hide it.
+- The block scanner skips `<script>` mentioned in comments and `<style>`, self-closing external scripts, reads quoted attributes containing `>` (`generic="T extends Array<string>"`) and ignores non-JS blocks (`lang="coffee"`, `type="application/ld+json"`, import maps); the Astro frontmatter may follow a BOM or blank lines.
+- An explicit `.vue` / `.svelte` / `.astro` import names only such a file, and an explicit `.js` / `.ts` never names a component (`Foo.vue` beside `Foo.ts`).
+- `+page` / `+layout` files are routes, not named components; SvelteKit pages need `src/routes`, Astro skips `_`-prefixed files and folders.
+- The script gets the same lexical guard as any parsed source (nesting depth, line length). The watcher
+  reloads on `.vue` / `.svelte` / `.astro` edits and alias-config edits re-extract them.
+- **Not covered**: template-only component usage (auto-imported components, `<UserCard />` with no import),
+  Nuxt `pages/*.vue` (needs a Nuxt signal the file does not carry), `<script src="…">` external scripts,
+  decapitation and `smart_search` snippets of components (the file is shown as written).
+
+#### Typed API layers
+- **tRPC procedures** (`router({ get: publicProcedure.input(…).query(…) })`, nested routers composing the
+  dotted path, `t.procedure…`) and **GraphQL operations** (`@Query()` / `@Mutation()` / `@Subscription()` of
+  `@nestjs/graphql` and `type-graphql`, honouring the `name` option; the `Query` / `Mutation` /
+  `Subscription` maps of an Apollo-style `resolvers` object in a GraphQL file) are recorded as
+  `HttpEndpoint` nodes signed `TRPC query user.get` / `GRAPHQL Query users`. The REST `@Query()` parameter
+  decorator of `@nestjs/common` is not one.
+
+### Index cache
+Schema v10: unchanged JavaScript / TypeScript files are re-extracted once.
+
+### Measured
+- `Imports` edges after the path-aware resolution, release builds, vs 7.0.19: otel-demo 2,008 -> 1,406
+  (659 removed, 57 added), react 194,325 -> 137,196 (57,129 removed), vscode/src 5,796,592 -> 1,170,703
+  (4,625,889 removed). Removed edges were classified by resolving each specifier on disk: false positives,
+  except the component-folder case (fixed before release).
+
 ## [7.0.19] — 2026-09-29
 
 Routing guidance moves to where agents trust it; the server's own wording stops forbidding checks.

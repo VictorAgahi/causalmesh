@@ -35,6 +35,9 @@
   `producer` / `consumer` / `kafka`); a `Queue` imported from another library, a local `class Queue`, or
   `new Worker('./sw.js')` is no longer a BullMQ queue; event nodes (`EventStream`) are no longer chosen as
   the owner of a call site.
+- **Factories**: a client built by a local factory function counts when the factory's body names (as
+  whole identifiers, decided once per factory) something imported from the library; one that delegates to
+  another factory, a `this.makeClient()` method or an imported factory is not followed.
 - **Known limits**: a Kafka topic, a Redis channel and a queue sharing a name still meet on one hub in the
   graph (the hub key is the lowercased name, whatever the broker): a follow-up. Wildcard subjects / topics
   (`orders.*`, `sensors/+/temp`) are recorded literally. A NestJS client reached as `this.orderService.emit`

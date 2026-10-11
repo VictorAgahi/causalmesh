@@ -959,3 +959,55 @@ fn a_local_factory_that_never_touches_the_library_cannot_return_its_client() {
     );
     assert_eq!(events(&fi), vec![ev('P', "real")]);
 }
+
+#[test]
+fn factory_clients_are_decided_by_whole_identifiers_in_linear_time() {
+    // A short library local does not match unrelated words.
+    let fi = index(
+        "svc/short.ts",
+        "import R from 'ioredis';
+         const redis = new R();
+         function mk() { return new EventBus('NORMAL'); }
+         class S { c = mk(); f() { this.c.publish('app', 1); redis.publish('real-short', 1); } }
+",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "real-short")]);
+    // ... but a factory that names the library's local does build a client.
+    let real = index(
+        "svc/real.ts",
+        "import R from 'ioredis';
+const redis = new R();
+function mk() { return new R(); }
+         class S { c = mk(); f() { this.c.publish('real', 1); } }
+",
+    );
+    assert_eq!(events(&real), vec![ev('P', "real")]);
+    // One large factory called thousands of times, with several libraries imported.
+    let mut code = String::from(
+        "import Redis from 'ioredis';
+import { Kafka } from 'kafkajs';
+import mqtt from 'mqtt';
+import amqp from 'amqplib';
+import { connect } from 'nats';
+function mk() {
+",
+    );
+    for i in 0..4000 {
+        code.push_str(&format!("  const v{i} = compute({i});\n"));
+    }
+    code.push_str(
+        "  return new EventBus();
+}
+",
+    );
+    for i in 0..3000 {
+        code.push_str(&format!(
+            "const c{i} = mk();
+"
+        ));
+    }
+    let start = std::time::Instant::now();
+    let fi = index("svc/many.ts", &code);
+    assert!(events(&fi).is_empty());
+    assert!(start.elapsed().as_secs() < 8, "took {:?}", start.elapsed());
+}

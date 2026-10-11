@@ -863,6 +863,14 @@ pub(crate) struct Receivers {
     queue_names: HashMap<String, String>,
 }
 
+/// The identifiers occurring in `text`, whole words only: a factory is decided by the
+/// names it uses, once per factory, not by a substring search per call of it.
+fn identifier_tokens(text: &str) -> HashSet<&str> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 fn type_identifiers(node: Node, source: &[u8], out: &mut Vec<String>) {
     let mut cursor = node.walk();
     loop {
@@ -961,7 +969,7 @@ impl Receivers {
         }
 
         // The text of each function this file declares at module level, by name.
-        let mut factories: HashMap<String, &str> = HashMap::new();
+        let mut factories: HashMap<String, HashSet<&str>> = HashMap::new();
         for stmt in root.named_children(&mut root.walk()) {
             let decl = if stmt.kind() == "export_statement" {
                 stmt.child_by_field_name("declaration").unwrap_or(stmt)
@@ -973,7 +981,7 @@ impl Receivers {
                     name.and_then(|n| n.utf8_text(source).ok()),
                     body.utf8_text(source),
                 ) {
-                    factories.insert(name.to_string(), text);
+                    factories.insert(name.to_string(), identifier_tokens(text));
                 }
             };
             match decl.kind() {
@@ -1052,7 +1060,7 @@ impl Receivers {
                     d.value
                         .and_then(|v| root_key(v, source))
                         .and_then(|root| factories.get(&root))
-                        .is_some_and(|body| library_names.iter().any(|n| body.contains(n)))
+                        .is_some_and(|tokens| library_names.iter().any(|n| tokens.contains(n)))
                 })
                 .map(|d| d.key.clone())
                 .collect();

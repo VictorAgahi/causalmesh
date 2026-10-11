@@ -1100,3 +1100,24 @@ fn redis_reliable_queue_moves_and_import_gating() {
         assert!(events(&index(file, code)).is_empty(), "{file}");
     }
 }
+
+#[test]
+fn redis_move_spellings_all_link_source_and_destination() {
+    for m in [
+        "lMove",
+        "blmove",
+        "bLMove",
+        "brpoplpush",
+        "bRPopLPush",
+        "rPopLPush",
+    ] {
+        let code = format!(
+            "import Redis from 'ioredis';\nconst redis = new Redis();\nexport const f = () => redis.{m}('src', 'dst');\n"
+        );
+        assert_eq!(
+            events(&index("svc/m.ts", &code)),
+            vec![ev('C', "src"), ev('P', "dst")],
+            "{m}"
+        );
+    }
+}

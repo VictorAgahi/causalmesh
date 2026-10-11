@@ -10,7 +10,10 @@ at 3.0.0 — there is no reconstructed history before it.
 ### Added
 - Wildcard subjects in the graph: a NATS (`orders.*`, `orders.>`) or MQTT (`sensors/+/temp`,
   `sensors/#`) subscription is now linked to the producers of every concrete subject it
-  matches (token-wise, heuristic confidence).
+  matches (token-wise, heuristic confidence). NATS `>` needs one more token, MQTT `#` also
+  matches its parent level; a wildcard is only read in its own dialect (`cache.+` and `src/*/x`
+  stay literal keys); a relay is never linked to its own subscription; at most 256 producers
+  per subscription.
 - Redis reliable-queue moves (`lmove`, `blmove`, `rpoplpush`, `brpoplpush`, and the camelCase
   forms): the source list is consumed, the destination produced.
 

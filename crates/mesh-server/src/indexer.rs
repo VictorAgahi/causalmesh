@@ -730,13 +730,14 @@ impl WorkspaceIndexer {
             }
         }
 
-        // A `tsconfig.json` / `jsconfig.json` / `package.json` edit changes what the
-        // scripts under it import (their aliases) without touching those files: they
-        // are re-extracted, and folded in even though their own bytes are unchanged.
-        let forced = Self::alias_governed_scripts(&vfs, roots, &candidates, &deleted);
+        // An alias config edit changes what the scripts it governs import without
+        // touching those files: they are re-extracted, and folded in even though their
+        // own bytes are unchanged.
+        let forced = Self::alias_governed_scripts(state, &vfs, roots, &candidates, &deleted);
         let forced_paths: HashSet<PathBuf> = forced.iter().map(|(_, p)| p.clone()).collect();
+        let already: HashSet<PathBuf> = candidates.iter().map(|(_, p)| p.clone()).collect();
         for (repo_id, path) in forced {
-            if !candidates.iter().any(|(_, p)| *p == path) {
+            if !already.contains(&path) {
                 candidates.push((repo_id, path));
             }
         }
@@ -858,51 +859,81 @@ impl WorkspaceIndexer {
         );
     }
 
-    /// Whether `path` is a file that defines import aliases for the scripts under it.
+    /// Whether `path` is a file that defines import aliases for the scripts under it:
+    /// a `tsconfig*.json` / `jsconfig*.json` (also reached through `extends`, from
+    /// anywhere under its root) or a `package.json` (`imports`, its own directory).
     fn is_alias_config(path: &Path) -> bool {
-        matches!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("tsconfig.json" | "jsconfig.json" | "package.json")
-        )
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let ts = (name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && name.ends_with(".json");
+        ts || name == "package.json"
     }
 
-    /// The tracked scripts under the directory of every alias config among `changed`
-    /// and `deleted`. A `package.json` counts only when it holds an `imports` map (a
-    /// dependency edit changes no alias), or is gone.
+    /// What of an alias config can move an alias: a `tsconfig*` / `jsconfig*` file
+    /// whole (it may be extended), a `package.json` only through its `imports` map.
+    /// `None` when the file is gone.
+    fn alias_digest(path: &Path) -> Option<[u8; 32]> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let relevant = if path.file_name().is_some_and(|n| n == "package.json") {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("imports").map(|i| i.to_string()))
+                .unwrap_or_default()
+        } else {
+            text
+        };
+        Some(sha256(relevant.as_bytes()))
+    }
+
+    /// The tracked scripts governed by every alias config among `changed` and
+    /// `deleted` whose alias-relevant content differs from the last one seen (or was
+    /// never seen, or is gone). A `tsconfig*` / `jsconfig*` governs its whole root
+    /// (another config may extend it from anywhere); a `package.json` its directory.
     fn alias_governed_scripts(
+        state: &AppState,
         vfs: &DifferentialVfs,
         roots: &[PathBuf],
         changed: &[(RepoId, PathBuf)],
         deleted: &[PathBuf],
     ) -> Vec<(RepoId, PathBuf)> {
+        let mut digests = state
+            .alias_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut scopes: Vec<PathBuf> = Vec::new();
+        for path in changed
+            .iter()
+            .map(|(_, p)| p.as_path())
+            .chain(deleted.iter().map(PathBuf::as_path))
+            .filter(|p| Self::is_alias_config(p))
+        {
+            let now = Self::alias_digest(path);
+            let before = match now {
+                Some(d) => digests.insert(path.to_path_buf(), d),
+                None => digests.remove(path),
+            };
+            if before == now && now.is_some() {
+                continue;
+            }
+            let is_package_json = path.file_name().is_some_and(|n| n == "package.json");
+            let scope = if is_package_json {
+                path.parent().map(Path::to_path_buf)
+            } else {
+                Self::most_specific_root(path, roots).map(|(_, root)| root.to_path_buf())
+            };
+            scopes.extend(scope);
+        }
+        if scopes.is_empty() {
+            return Vec::new();
+        }
         let is_script = |p: &Path| {
             matches!(
                 LanguageKind::from_path(&p.to_string_lossy()),
                 LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript
             )
         };
-        let mut dirs: Vec<&Path> = Vec::new();
-        for path in changed
-            .iter()
-            .map(|(_, p)| p.as_path())
-            .chain(deleted.iter().map(PathBuf::as_path))
-        {
-            if !Self::is_alias_config(path) {
-                continue;
-            }
-            let is_package_json = path.file_name().is_some_and(|n| n == "package.json");
-            let defines_aliases = !is_package_json
-                || !path.exists()
-                || std::fs::read_to_string(path).is_ok_and(|text| text.contains("\"imports\""));
-            if let (true, Some(dir)) = (defines_aliases, path.parent()) {
-                dirs.push(dir);
-            }
-        }
-        if dirs.is_empty() {
-            return Vec::new();
-        }
         vfs.tracked_paths()
-            .filter(|p| is_script(p) && dirs.iter().any(|d| p.starts_with(d)))
+            .filter(|p| is_script(p) && scopes.iter().any(|d| p.starts_with(d)))
             .filter_map(|p| Self::most_specific_root(p, roots).map(|(r, _)| (r, p.to_path_buf())))
             .collect()
     }
@@ -2043,5 +2074,156 @@ resolve_placeholders = true
         std::fs::write(root.join("tsconfig.json"), tsconfig("lib")).expect("rewrite");
         WorkspaceIndexer::reload_paths(&state, &[root.join("tsconfig.json")]);
         assert_eq!(import_target(&state), vec!["lib/services/User.ts"]);
+    }
+
+    /// Builds a state over `root`, indexes it once, and returns it.
+    fn indexed_state(root: &Path) -> Arc<AppState> {
+        let state = make_state(root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        state
+    }
+
+    /// Invariant I2: after an incremental reload the snapshot equals a full rebuild.
+    fn assert_incremental_equals_full(state: &AppState, what: &str) {
+        let full =
+            WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, None, None);
+        assert_eq!(
+            state.snapshot().fingerprint(),
+            full.fingerprint(),
+            "{what}: incremental reload differs from a full rebuild"
+        );
+    }
+
+    fn alias_workspace(root: &Path, package_json: &str) {
+        for dir in ["u", "app", "pkgs/a/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        std::fs::write(root.join("package.json"), package_json).expect("write");
+        std::fs::write(root.join("u/User.js"), "export default class User {}\n").expect("write");
+        std::fs::write(
+            root.join("app/main.js"),
+            "import User from '#u/User.js';\nexport class Main { u = new User(); }\n",
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn package_imports_removed_or_shadowed_converge_with_a_full_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        alias_workspace(&root, r##"{ "imports": { "#u/*": "./u/*" } }"##);
+        let state = indexed_state(&root);
+        assert_incremental_equals_full(&state, "initial");
+
+        // `imports` removed: the alias no longer resolves.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(root.join("package.json"), r#"{ "name": "x" }"#).expect("rewrite");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("package.json")]);
+        assert_incremental_equals_full(&state, "imports removed");
+
+        // Restored, then shadowed by a nested package.json without `imports`.
+        std::fs::write(
+            root.join("package.json"),
+            r##"{ "imports": { "#u/*": "./u/*" } }"##,
+        )
+        .expect("rewrite");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("package.json")]);
+        assert_incremental_equals_full(&state, "imports restored");
+        std::fs::write(root.join("app/package.json"), r#"{ "name": "app" }"#).expect("write");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("app/package.json")]);
+        assert_incremental_equals_full(&state, "nested package.json created");
+        std::fs::remove_file(root.join("app/package.json")).expect("rm");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("app/package.json")]);
+        assert_incremental_equals_full(&state, "nested package.json deleted");
+    }
+
+    #[test]
+    fn a_package_json_edit_that_moves_no_alias_forces_no_script() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        alias_workspace(
+            &root,
+            r##"{ "version": "1", "imports": { "#u/*": "./u/*" } }"##,
+        );
+        let state = indexed_state(&root);
+        let package = |version: &str| {
+            format!(r##"{{ "version": "{version}", "imports": {{ "#u/*": "./u/*" }} }}"##)
+        };
+        let forced = |state: &AppState| {
+            let vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::alias_governed_scripts(
+                state,
+                &vfs,
+                &state.allowed_roots,
+                &[(0, root.join("package.json"))],
+                &[],
+            )
+            .len()
+        };
+        // The first sighting of a config is conservative: its previous aliases are unknown.
+        std::fs::write(root.join("package.json"), package("2")).expect("rewrite");
+        assert_eq!(forced(&state), 2, "both scripts are re-extracted once");
+        // Afterwards an edit that leaves `imports` alone forces nothing...
+        std::fs::write(root.join("package.json"), package("3")).expect("rewrite");
+        assert_eq!(forced(&state), 0);
+        // ...and one that changes it forces the scripts under it again.
+        std::fs::write(
+            root.join("package.json"),
+            r##"{ "imports": { "#u/*": "./other/*" } }"##,
+        )
+        .expect("rewrite");
+        assert_eq!(forced(&state), 2);
+        std::fs::remove_file(root.join("package.json")).expect("rm");
+        assert_eq!(forced(&state), 2, "a vanished config forces them too");
+    }
+
+    #[test]
+    fn editing_an_extended_base_config_reaches_the_scripts_that_extend_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        for dir in ["pkgs/a/src", "shared", "x/src", "y/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        let base = |target: &str| {
+            format!(
+                r#"{{ "compilerOptions": {{ "baseUrl": ".", "paths": {{ "@/*": ["{target}/*"] }} }} }}"#
+            )
+        };
+        std::fs::write(root.join("tsconfig.base.json"), base("x")).expect("write");
+        std::fs::write(
+            root.join("pkgs/a/tsconfig.json"),
+            r#"{ "extends": "../../tsconfig.base.json" }"#,
+        )
+        .expect("write");
+        std::fs::write(root.join("shared/tsconfig.json"), base("y")).expect("write");
+        std::fs::write(root.join("pkgs/b.json"), "{}").expect("write");
+        std::fs::write(root.join("x/src/Dep.ts"), "export default class Dep {}\n").expect("write");
+        std::fs::write(root.join("y/src/Dep.ts"), "export default class Dep {}\n").expect("write");
+        std::fs::write(
+            root.join("pkgs/a/src/main.ts"),
+            "import Dep from '@/src/Dep';\nexport class Main { d: Dep }\n",
+        )
+        .expect("write");
+        let state = indexed_state(&root);
+        assert_incremental_equals_full(&state, "initial");
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(root.join("tsconfig.base.json"), base("y")).expect("rewrite");
+        WorkspaceIndexer::reload_paths(&state, &[root.join("tsconfig.base.json")]);
+        assert_incremental_equals_full(&state, "extended base edited");
+        // The same through a full reload.
+        std::fs::write(root.join("tsconfig.base.json"), base("x")).expect("rewrite");
+        WorkspaceIndexer::reload(&state);
+        assert_incremental_equals_full(&state, "extended base edited, full reload");
     }
 }

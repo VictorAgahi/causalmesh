@@ -640,7 +640,9 @@ impl FileWatcherService {
 
         // The configs that define a script's import aliases: editing one changes what
         // the scripts under it import, though it holds no declaration itself.
-        if matches!(name, "tsconfig.json" | "jsconfig.json" | "package.json") {
+        let is_ts_config = (name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && name.ends_with(".json");
+        if is_ts_config || name == "package.json" {
             return true;
         }
 

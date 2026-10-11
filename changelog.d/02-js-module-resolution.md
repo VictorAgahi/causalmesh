@@ -25,10 +25,14 @@
 - JSONC is parsed properly (comments, trailing commas, non-ASCII).
 - Lookup is lazy per directory and per extraction config (no workspace-wide discovery pass, no
   global state). A script's index-cache key folds in the aliases that govern it, so editing a
-  `tsconfig.json` re-extracts exactly the files under it on the next cold start. Editing a
-  `tsconfig.json` / `jsconfig.json` (or a `package.json` that has an `imports` map) now reloads the
-  scripts under it in a running daemon, so an incremental reload equals a full rebuild (the watcher
-  treats those three file names as relevant).
+  `tsconfig.json` re-extracts exactly the files under it on the next cold start. Editing an alias
+  config in a running daemon reloads the scripts it governs, so an incremental reload equals a full
+  rebuild (invariant I2): a `tsconfig*.json` / `jsconfig*.json` (any name, since another config may
+  `extends` it from anywhere) governs its whole root, a `package.json` its directory. The daemon keeps a
+  digest of what each config last held (the whole file for a tsconfig, the `imports` map for a
+  `package.json`): an edit that cannot move an alias (a version bump, a dependency) re-extracts
+  nothing, while a config appearing, vanishing or edited for the first time since the daemon started
+  does, once.
 - The extraction-config fingerprint no longer depends on the workspace roots (adding a root does not
   invalidate the whole cache).
 - A FIFO or special file named like a config is skipped (it used to block the scan forever).

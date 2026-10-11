@@ -155,6 +155,22 @@ impl TypeScriptExtractor {
             &mut raw_rpc_calls,
             0,
         );
+        // File-system routes (Next, Remix, SvelteKit, Nuxt, Astro): the location is the route.
+        for (route, lines) in js_frameworks::detect_file_routes(&file_path, &ctx.frameworks) {
+            let label = route.label();
+            nodes.push(ContractNode {
+                id: 0,
+                name: CompactStr::new(&label),
+                kind: NodeKind::HttpEndpoint,
+                file_path: file_path.clone(),
+                line_start: lines.0,
+                line_end: lines.1,
+                package: package_name.clone(),
+                repo_id,
+                signature: Some(CompactStr::new(label)),
+                docstring: None,
+            });
+        }
         let fields = Self::client_fields(root, source_bytes);
         Self::collect_method_rpc_calls(root, source_bytes, &fields, &mut raw_rpc_calls);
         Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);

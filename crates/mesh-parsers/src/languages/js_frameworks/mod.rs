@@ -11,6 +11,7 @@
 //! The per-file context (modules, constants, clients) is built on the first call
 //! site a rule could match, so a file with none pays nothing.
 
+mod file_routes;
 mod http;
 mod messaging;
 pub(crate) mod scope;
@@ -316,6 +317,26 @@ fn constructor_origin(
         }
         _ => None,
     }
+}
+
+/// Routes the location and exports of a whole file declare (Next, Remix, SvelteKit, Nuxt,
+/// Astro file-system routing), with the lines each is anchored to.
+pub(crate) fn detect_file_routes(
+    path: &std::path::Path,
+    fx: &FrameworkCtx,
+) -> Vec<(RouteFact, (usize, usize))> {
+    if !file_routes::path_may_route(path) {
+        return Vec::new();
+    }
+    let built = fx.built();
+    let exports = file_routes::exported_names(fx.root, fx.source);
+    if exports.is_empty() {
+        return Vec::new();
+    }
+    let text = std::str::from_utf8(fx.source).unwrap_or("");
+    file_routes::file_routes(path, &exports, &built.bindings, &|needle| {
+        text.contains(needle)
+    })
 }
 
 /// Broker interactions at a `new Ctor(...)`.

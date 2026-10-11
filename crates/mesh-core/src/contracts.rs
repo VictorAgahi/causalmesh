@@ -1026,7 +1026,14 @@ impl ContractGraph {
             // A wildcard subscription (`orders.*`, `sensors/+/temp`) also hears the producers
             // of every concrete subject it matches: heuristic, since the match is by pattern.
             // Direct edges come first so an exact edge is never shadowed by a heuristic one.
-            if is_subject_pattern(&topic_key) && !consumers.is_empty() {
+            // Kafka topics and queues have no subject wildcards: a pattern read only by such
+            // consumers (`orders.*` as a Kafka regex or a Redis glob) is a literal key.
+            let subject_consumer = consumers.iter().any(|id| {
+                self.nodes
+                    .get(id)
+                    .is_none_or(|n| !matches!(n.kind, NodeKind::KafkaTopic | NodeKind::Queue))
+            });
+            if is_subject_pattern(&topic_key) && subject_consumer {
                 let concrete = concrete_producers.get_or_insert_with(|| {
                     let mut v: Vec<(CompactStr, Vec<NodeId>)> = self
                         .topic_producers
@@ -1048,6 +1055,11 @@ impl ContractGraph {
                             continue;
                         }
                         if linked >= MAX_WILDCARD_PRODUCERS {
+                            tracing::debug!(
+                                pattern = %topic_key,
+                                cap = MAX_WILDCARD_PRODUCERS,
+                                "wildcard subscription truncated"
+                            );
                             break 'subjects;
                         }
                         if edge_set.insert((prod_id, topic_id, EdgeKind::Produces)) {
@@ -3007,6 +3019,41 @@ mod tests {
         assert!(!g.all_edges().iter().any(|e| e.kind == EdgeKind::Produces
             && e.from == relay
             && e.confidence == EdgeConfidence::Heuristic));
+    }
+
+    #[test]
+    fn wildcard_edges_follow_the_producers_across_reconciles() {
+        let mut g = ContractGraph::new();
+        let p = matrix_node(&mut g, "pub", NodeKind::ServiceClass, "a/p.go", "", 0);
+        let c = matrix_node(&mut g, "sub", NodeKind::ServiceClass, "b/c.go", "", 1);
+        g.add_producer(p, "orders.created");
+        g.add_consumer(c, "orders.*");
+        g.reconcile_edges();
+        g.reconcile_edges();
+        let heuristic = |g: &ContractGraph| {
+            g.all_edges()
+                .iter()
+                .filter(|e| e.confidence == EdgeConfidence::Heuristic)
+                .count()
+        };
+        assert_eq!(heuristic(&g), 1, "idempotent");
+        g.topic_producers.clear();
+        g.reconcile_edges();
+        assert_eq!(heuristic(&g), 0, "no stale wildcard edge");
+    }
+
+    #[test]
+    fn a_wildcard_read_only_by_kafka_or_queue_consumers_stays_literal() {
+        let mut g = ContractGraph::new();
+        let p = matrix_node(&mut g, "pub", NodeKind::ServiceClass, "a/p.go", "", 0);
+        let k = matrix_node(&mut g, "kafka-sub", NodeKind::KafkaTopic, "b/c.ts", "", 1);
+        g.add_producer(p, "orders.created");
+        g.add_consumer(k, "orders.*");
+        g.reconcile_edges();
+        assert!(!g
+            .all_edges()
+            .iter()
+            .any(|e| e.confidence == EdgeConfidence::Heuristic));
     }
 
     #[test]

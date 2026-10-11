@@ -771,6 +771,9 @@ mod tests {
         assert_eq!(r("/a/b", "/a/b/c/d").as_deref(), Some("./c/d"));
         assert_eq!(r("/a/b/c", "/a/x").as_deref(), Some("../../x"));
         assert_eq!(r("/a", "/a").as_deref(), Some("."));
+        // An absolute and a relative path have no relative form between them. (`/a` is not
+        // absolute on Windows, which has no drive letter to make it so.)
+        #[cfg(unix)]
         assert_eq!(r("/a", "b"), None);
     }
 

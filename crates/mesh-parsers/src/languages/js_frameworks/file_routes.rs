@@ -245,18 +245,12 @@ pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
     let route = match (ext, stem) {
         // `+page.svelte`, and `+page@.svelte` / `+page@(group).svelte` (layout resets).
         ("svelte", s) if s == "+page" || s.starts_with("+page@") => {
-            let i = dirs.iter().rposition(|d| d == "routes")?;
-            // SvelteKit's routes live in `src/routes`.
-            if i == 0 || dirs[i - 1] != "src" {
-                return None;
-            }
+            // SvelteKit's routes live in `src/routes` (the first such pair names the root).
+            let i = (1..dirs.len()).find(|&i| dirs[i] == "routes" && dirs[i - 1] == "src")?;
             route_of(&dirs[i + 1..], None)
         }
         ("astro", _) if !stem.starts_with('_') => {
-            let i = dirs.iter().rposition(|d| d == "pages")?;
-            if !dirs.iter().any(|d| d == "src") {
-                return None;
-            }
+            let i = (1..dirs.len()).find(|&i| dirs[i] == "pages" && dirs[i - 1] == "src")?;
             // Astro ignores files and folders whose name starts with `_`.
             if dirs[i + 1..].iter().any(|d| d.starts_with('_')) {
                 return None;

@@ -446,11 +446,9 @@ impl PolyglotIndexer {
             }
         }
         // SvelteKit's `+page.svelte` and Astro's `src/pages/**/*.astro` are pages by location.
-        let routing_path = cfg
-            .ts_aliases
-            .relative_to_root(file_path)
-            .unwrap_or_else(|| file_path.to_path_buf());
-        if let Some(page) = js_frameworks::sfc_route(&routing_path) {
+        if let Some(page) = Self::routing_path(cfg, file_path)
+            .and_then(|routing_path| js_frameworks::sfc_route(&routing_path))
+        {
             let label = page.label();
             out.nodes.push(ContractNode {
                 id: 0,

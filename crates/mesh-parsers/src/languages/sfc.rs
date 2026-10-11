@@ -94,58 +94,62 @@ fn script_kind(tag: &str) -> Option<LanguageKind> {
 }
 
 /// Byte ranges of the content of every `<script …>…</script>` from `from` on, with the grammar
-/// each asks for. `<script>` mentioned inside an HTML comment or a `<style>` is not an element.
+/// each asks for. One pass over the markup: a comment and a `<style>` are skipped whole, every other
+/// tag is skipped with its quoted attribute values (`<div :title="'<script>'">` holds no script),
+/// and a `<script>` element yields its body. Linear: every position is looked at once.
 fn script_blocks(content: &str, from: usize) -> Vec<(usize, usize, LanguageKind)> {
     let lower = content.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut at = from;
-    while at < lower.len() {
-        let rest = &lower[at..];
-        let next = [("<!--", 0), ("<style", 1), ("<script", 2)]
-            .iter()
-            .filter_map(|(needle, kind)| rest.find(needle).map(|i| (i, *kind)))
-            .min();
-        let Some((offset, kind)) = next else { break };
+    while let Some(offset) = lower.get(at..).and_then(|rest| rest.find('<')) {
         let open = at + offset;
-        match kind {
-            0 => {
-                at = lower[open..]
-                    .find("-->")
-                    .map_or(lower.len(), |i| open + i + 3)
+        let rest = &lower[open..];
+        let delimiter_after = |name: &str| {
+            rest[name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || c == '>' || c == '/')
+        };
+        if rest.starts_with("<!--") {
+            at = lower[open + 4..]
+                .find("-->")
+                .map_or(lower.len(), |i| open + 4 + i + 3);
+        } else if rest.starts_with("<style") && delimiter_after("<style") {
+            at = lower[open..]
+                .find("</style")
+                .map_or(lower.len(), |i| open + i + "</style".len());
+        } else if rest.starts_with("<script") && delimiter_after("<script") {
+            let Some(end) = tag_end(content, open + "<script".len()) else {
+                break;
+            };
+            let tag = &lower[open..end];
+            let body_start = end + 1;
+            // `<script src="./a.ts" />` has no body: the next block is a different one.
+            if tag.trim_end().ends_with('/') {
+                at = body_start;
+                continue;
             }
-            1 => {
-                at = lower[open..]
-                    .find("</style")
-                    .map_or(lower.len(), |i| open + i + 7)
+            let Some(close) = lower[body_start..].find("</script") else {
+                break;
+            };
+            let body_end = body_start + close;
+            if let Some(kind) = script_kind(tag) {
+                out.push((body_start, body_end, kind));
             }
-            _ => {
-                let after_name = open + "<script".len();
-                // `<scripts>` or `<script-foo>` is not a script element.
-                if !lower[after_name..]
-                    .starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                {
-                    at = after_name;
-                    continue;
-                }
-                let Some(end) = tag_end(content, after_name) else {
-                    break;
-                };
-                let tag = &content[open..end];
-                let body_start = end + 1;
-                // `<script src="./a.ts" />` has no body: the next block is a different one.
-                if tag.trim_end().ends_with('/') {
-                    at = body_start;
-                    continue;
-                }
-                let Some(close) = lower[body_start..].find("</script") else {
-                    break;
-                };
-                let body_end = body_start + close;
-                if let Some(kind) = script_kind(tag) {
-                    out.push((body_start, body_end, kind));
-                }
-                at = body_end + "</script".len();
+            at = body_end + "</script".len();
+        } else if rest[1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/')
+        {
+            // Any other tag: skipped with its quoted attribute values. An unterminated
+            // quote makes the rest of the file attribute text: nothing more is read.
+            match tag_end(content, open + 1) {
+                Some(end) => at = end + 1,
+                None => break,
             }
+        } else {
+            at = open + 1;
         }
     }
     out

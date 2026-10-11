@@ -369,3 +369,58 @@ fn a_component_and_a_module_of_the_same_name_are_two_modules() {
     assert_eq!(targets("A"), vec!["ui/Foo.vue".to_string()]);
     assert_eq!(targets("B"), vec!["ui/Foo.ts".to_string()]);
 }
+
+// ---- review round 2 (PR #85) ------------------------------------------------------------
+
+#[test]
+fn the_block_scanner_is_linear_on_hostile_components() {
+    // 380 KB of markup that used to make each iteration rescan the whole remainder.
+    for unit in [
+        "<scripts>\n",
+        "<style></style>\n",
+        "<script src=x />\n",
+        "<script>1</script>\n",
+        "<a \"\n",
+        "<!-- x -->\n",
+    ] {
+        let code = unit.repeat(380_000 / unit.len());
+        let start = std::time::Instant::now();
+        let _ = PolyglotIndexer::extract(Path::new("ui/Big.vue"), &code, 0);
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "{unit:?} took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn script_and_style_text_inside_attributes_and_strings_is_markup_not_blocks() {
+    let attr = index(
+        "ui/Attr.vue",
+        "<template>\n  <div :title=\"'<script>'\" :x=\"'<style>'\" :y=\"'<!--'\">x</div>\n</template>\n<script setup lang=\"ts\">\nimport { real } from './real';\nfunction attrFn(): void {}\n</script>\n<style>.a {}</style>\n",
+    );
+    assert!(
+        names(&attr).contains(&"attrFn".to_string()),
+        "{:?}",
+        names(&attr)
+    );
+    assert!(deps(&attr).contains(&"./real".to_string()));
+}
+
+#[test]
+fn attribute_names_and_values_are_case_insensitive() {
+    let fi = index(
+        "ui/Upper.vue",
+        "<SCRIPT LANG=\"TS\">\nconst a: number = 1;\nexport function upperFn(): void {}\n</SCRIPT>\n",
+    );
+    assert!(names(&fi).contains(&"upperFn".to_string()));
+}
+
+#[test]
+fn page_routes_use_the_first_router_pair() {
+    let svelte = index("web/src/routes/api/routes/+page.svelte", "<h1/>\n");
+    assert!(svelte.nodes.iter().any(|n| n.name == "PAGE /api/routes"));
+    let astro = index("site/src/pages/docs/pages/x.astro", "<p/>\n");
+    assert!(astro.nodes.iter().any(|n| n.name == "PAGE /docs/pages/x"));
+}

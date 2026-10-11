@@ -75,7 +75,7 @@ struct VisitCtx<'a> {
     /// an overload set is one node, in O(1) per statement.
     declared: RefCell<HashSet<String>>,
     /// Modules and constants the broker detectors read.
-    frameworks: js_frameworks::FrameworkCtx,
+    frameworks: js_frameworks::FrameworkCtx<'a>,
 }
 
 impl TypeScriptExtractor {
@@ -810,7 +810,11 @@ impl TypeScriptExtractor {
                 }
                 // Brokers and queues (Kafka, Redis, NATS, RabbitMQ, …): see `js_frameworks`.
                 for fact in js_frameworks::detect_call(node, source, &ctx.frameworks) {
-                    nodes.push(Self::event_node(ctx, node, fact));
+                    nodes.push(Self::event_node(
+                        ctx,
+                        (node.start_position().row + 1, node.end_position().row + 1),
+                        fact,
+                    ));
                 }
             }
             // ts-proto / grpc-js generated clients: `new AdServiceClient(addr, creds)`
@@ -832,7 +836,20 @@ impl TypeScriptExtractor {
                 // Queues and clients that name a topic in their constructor
                 // (BullMQ `new Queue('q')`, SQS commands, …): see `js_frameworks`.
                 for fact in js_frameworks::detect_new(node, source, &ctx.frameworks) {
-                    nodes.push(Self::event_node(ctx, node, fact));
+                    nodes.push(Self::event_node(
+                        ctx,
+                        (node.start_position().row + 1, node.end_position().row + 1),
+                        fact,
+                    ));
+                }
+            }
+            // `@Processor('emails')`, `@InjectQueue('emails')`, `@RabbitSubscribe({ queue })`:
+            // a decorator that declares a queue consumer or producer. It is attributed to
+            // the declaration it decorates, which a decorator preceding a class member is
+            // a sibling of, not part of.
+            "decorator" => {
+                for fact in js_frameworks::detect_decorator(node, source, &ctx.frameworks) {
+                    nodes.push(Self::event_node(ctx, Self::decorated_lines(node), fact));
                 }
             }
             _ => {}
@@ -1024,7 +1041,7 @@ impl TypeScriptExtractor {
     /// (`function f(require) { require('x') }` calls its argument, not
     /// CommonJS). A module-level `const require = createRequire(…)` is not a
     /// shadow: it is how ES modules obtain the real one.
-    fn is_parameter_named(node: Node, name: &str, source: &[u8]) -> bool {
+    pub(crate) fn is_parameter_named(node: Node, name: &str, source: &[u8]) -> bool {
         let mut ancestor = node.parent();
         while let Some(a) = ancestor {
             if matches!(
@@ -1056,7 +1073,7 @@ impl TypeScriptExtractor {
     /// identifier, `{ name }`, `{ x: name }`, `[name]`, `name = 1`, `...name`.
     /// Default-value expressions are not entered (a callback parameter named
     /// `name` there is its own scope).
-    fn binds_name(node: Node, name: &str, source: &[u8], depth: usize) -> bool {
+    pub(crate) fn binds_name(node: Node, name: &str, source: &[u8], depth: usize) -> bool {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
             return false;
         }
@@ -1099,15 +1116,50 @@ impl TypeScriptExtractor {
         Self::module_call_specifier(node, source)
     }
 
+    /// The 1-based line span of what a decorator decorates: the declaration it
+    /// precedes when it is a sibling of it, else the decorator's own span (it sits
+    /// inside the class, member or parameter it decorates). The span stays *within*
+    /// the decorated declaration so that declaration owns the event.
+    fn decorated_lines(decorator: Node) -> (usize, usize) {
+        let mut next = decorator.next_sibling();
+        while let Some(n) = next {
+            // `@D export class C {}`: the `export` keyword sits between them.
+            if !n.is_named() {
+                next = n.next_sibling();
+                continue;
+            }
+            match n.kind() {
+                "decorator" | "comment" => next = n.next_sibling(),
+                "method_definition"
+                | "public_field_definition"
+                | "field_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "export_statement" => {
+                    return (n.start_position().row + 1, n.end_position().row + 1);
+                }
+                _ => break,
+            }
+        }
+        (
+            decorator.start_position().row + 1,
+            decorator.end_position().row + 1,
+        )
+    }
+
     /// The node of a broker interaction found at `node`.
-    fn event_node(ctx: &VisitCtx, node: Node, fact: js_frameworks::EventFact) -> ContractNode {
+    fn event_node(
+        ctx: &VisitCtx,
+        lines: (usize, usize),
+        fact: js_frameworks::EventFact,
+    ) -> ContractNode {
         ContractNode {
             id: 0,
             name: CompactStr::new(fact.name),
             kind: fact.kind,
             file_path: ctx.file_path.clone(),
-            line_start: node.start_position().row + 1,
-            line_end: node.end_position().row + 1,
+            line_start: lines.0,
+            line_end: lines.1,
             package: ctx.package_name.clone(),
             repo_id: ctx.repo_id,
             signature: Some(CompactStr::new(fact.signature)),

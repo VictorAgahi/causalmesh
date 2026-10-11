@@ -46,6 +46,8 @@ fn kafkajs_and_redpanda_producers_and_consumers() {
         "svc/orders.ts",
         "import { Kafka } from 'kafkajs';\n\
          const kafka = new Kafka({ brokers: ['redpanda-0:9092'] });\n\
+         const producer = kafka.producer();\n\
+         const consumer = kafka.consumer({ groupId: 'g' });\n\
          export async function run() {\n\
            await producer.send({ topic: 'orders', messages: [] });\n\
            await producer.sendBatch({ topicMessages: [{ topic: 'audit', messages: [] }, { topic: 'billing' }] });\n\
@@ -153,6 +155,7 @@ fn kafka_node_and_platformatic_kafka() {
         "svc/kn.js",
         "const kafka = require('kafka-node');\n\
          const { Consumer, ConsumerGroup } = kafka;\n\
+         const producer = new kafka.Producer(client);\n\
          function f() { producer.send([{ topic: 'kn-out', messages: 'm' }], cb); }\n\
          const c = new kafka.Consumer(client, [{ topic: 'kn-in' }], {});\n\
          const g = new kafka.ConsumerGroup(opts, ['kn-group']);\n",
@@ -181,6 +184,8 @@ fn redis_pub_sub_through_ioredis_and_node_redis() {
         "svc/redis.ts",
         "import Redis from 'ioredis';\nimport { createClient } from 'redis';\n\
          const pub = new Redis();\n\
+         const sub = new Redis();\n\
+         const client = createClient();\n\
          export async function notify() { await pub.publish('orders:created', JSON.stringify({})); }\n\
          export async function listen() {\n\
            sub.subscribe('orders:paid', 'orders:refunded', (err) => {});\n\
@@ -468,16 +473,15 @@ fn nestjs_clients_need_a_client_shaped_receiver() {
            reply(res) { res.send('ok'); }\n\
          }\n",
     );
-    assert_eq!(
-        events(&fi),
-        vec![ev('P', "user.created"), ev('P', "user.get")]
-    );
+    // `kafkaProxy` is client-shaped but nothing says it is a microservice client here.
+    assert_eq!(events(&fi), vec![ev('P', "user.created")]);
     let typed = index(
         "svc/nest2.ts",
         "import { ClientProxy } from '@nestjs/microservices';\n\
-         export class S { go() { this.bus.emit('any.thing', {}); } }\n",
+         export class S { go() { this.bus.emit('any.thing', {}); this.userClient.emit('user.x', {}); } }\n",
     );
-    assert_eq!(events(&typed), vec![ev('P', "any.thing")]);
+    // The import alone does not make an arbitrary receiver a microservice client.
+    assert_eq!(events(&typed), vec![ev('P', "user.x")]);
 }
 
 // ---- wiring ---------------------------------------------------------------------------
@@ -537,4 +541,250 @@ fn a_redis_producer_and_a_nats_free_consumer_meet_on_one_topic_in_the_graph() {
     });
     assert!(produces, "notify -> orders:created");
     assert!(consumes, "orders:created -> listen");
+}
+
+// ---- review round 1 (PR #82) ------------------------------------------------------------
+
+#[test]
+fn a_nest_hybrid_controller_does_not_turn_responses_and_emitters_into_topics() {
+    let fi = index(
+        "svc/hybrid.controller.ts",
+        "import { MessagePattern } from '@nestjs/microservices';\n\
+         export class C {\n\
+           @MessagePattern('sum') sum() { return 1; }\n\
+           reply(res, socket) {\n\
+             res.send('ok');\n\
+             this.eventEmitter.emit('order.created');\n\
+             socket.emit('chat');\n\
+           }\n\
+         }\n",
+    );
+    let topics: Vec<String> = fi
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::KafkaTopic)
+        .map(|n| n.name.to_string())
+        .collect();
+    assert_eq!(topics, vec!["sum".to_string()], "{topics:?}");
+}
+
+#[test]
+fn only_clients_the_file_can_identify_are_nest_microservice_clients() {
+    let none = index(
+        "svc/mail.ts",
+        "export class M {\n\
+           a() { this.mailClient.send('hello world'); }\n\
+           b() { this.httpClient.send('ping'); }\n\
+           c() { this.proxy.emit('p'); }\n\
+         }\n",
+    );
+    assert!(events(&none).is_empty(), "{:?}", events(&none));
+    let typed = index(
+        "svc/typed.ts",
+        "import { ClientProxy, ClientKafka } from '@nestjs/microservices';\n\
+         import { Inject } from '@nestjs/common';\n\
+         export class S {\n\
+           constructor(private readonly orders: ClientProxy, @Inject('BILLING') private readonly billing) {}\n\
+           a() { this.orders.emit('order.created', {}); }\n\
+           b() { return this.billing.send('invoice.get', {}); }\n\
+           c() { this.eventBus.emit('internal'); }\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&typed),
+        vec![ev('P', "invoice.get"), ev('P', "order.created")]
+    );
+}
+
+#[test]
+fn the_kafkajs_shape_needs_a_kafka_shaped_receiver() {
+    let fi = index(
+        "web/chat.spec.ts",
+        "describe('chat', () => {\n\
+           it('x', async () => {\n\
+             chat.send({ topic: 'greeting' });\n\
+             http.post(url).send({ topic: 'help-request' });\n\
+             await request(app).post('/help').send({ topic: 'billing' });\n\
+             subject.subscribe({ topic: 'x', next: () => {} });\n\
+             await producer.send({ topic: '', messages: [] });\n\
+           });\n\
+         });\n",
+    );
+    assert!(events(&fi).is_empty(), "{:?}", events(&fi));
+    // A Kafka file: only what its Kafka client built is a producer.
+    let kafka = index(
+        "svc/mixed.ts",
+        "import { Kafka } from 'kafkajs';\n\
+         const producer = new Kafka({ brokers: [] }).producer();\n\
+         export async function f() {\n\
+           await producer.send({ topic: 'real', messages: [] });\n\
+           await mailer.send({ topic: 'not-kafka' });\n\
+         }\n",
+    );
+    assert_eq!(events(&kafka), vec![ev('P', "real")]);
+}
+
+#[test]
+fn an_application_bus_in_a_file_that_also_uses_redis_is_not_redis() {
+    let fi = index(
+        "svc/cqrs.ts",
+        "import Redis from 'ioredis';\n\
+         export class Svc {\n\
+           private readonly cache = new Redis();\n\
+           run() {\n\
+             this.cache.publish('real:chan', 'x');\n\
+             this.eventBus.publish('order.created');\n\
+             this.emitter.subscribe('internal');\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "real:chan")]);
+    // A type-only import loads nothing at run time.
+    let type_only = index(
+        "svc/types.ts",
+        "import type Redis from 'ioredis';\n\
+         export class Svc { run(r: Redis) { this.bus.publish('internal.event'); } }\n",
+    );
+    assert!(events(&type_only).is_empty());
+    // The same module used through typed properties and `duplicate()`.
+    let typed = index(
+        "svc/typed.ts",
+        "import Redis from 'ioredis';\n\
+         export class Svc {\n\
+           constructor(private readonly redis: Redis) {}\n\
+           go() {\n\
+             this.redis.publish('a', 'x');\n\
+             this.redis.duplicate().subscribe('b');\n\
+             this.redis.pipeline().publish('c', 'x').exec();\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&typed),
+        vec![ev('C', "b"), ev('P', "a"), ev('P', "c")]
+    );
+    // No client is built in the file (a parameter): the import alone gates.
+    let param = index(
+        "svc/param.js",
+        "const Redis = require('ioredis');\nfunction notify(conn) { conn.publish('p', 'x'); }\n",
+    );
+    assert_eq!(events(&param), vec![ev('P', "p")]);
+}
+
+#[test]
+fn constants_respect_scope_and_mutability() {
+    let fi = index(
+        "svc/scope.ts",
+        "const T = 'a';\n\
+         let U = 'u';\n\
+         U = 'v';\n\
+         const V = 'v-const';\n\
+         export function f(T: string, producer) { producer.send({ topic: T }); }\n\
+         export function g(producer) { producer.send({ topic: U }); }\n\
+         export function h(producer) { const V = process.env.V; producer.send({ topic: V }); }\n\
+         export function k(producer) { producer.send({ topic: T }); }\n",
+    );
+    // Only `k` sees the module-level `T`; `U` can change; `V` is shadowed.
+    let sends: Vec<(String, String)> = fi
+        .producers
+        .iter()
+        .map(|(i, t)| (fi.nodes[*i].name.to_string(), t.to_string()))
+        .collect();
+    assert_eq!(sends, vec![("k".to_string(), "a".to_string())], "{sends:?}");
+}
+
+#[test]
+fn shorthand_local_const_this_field_freeze_and_subscript_names() {
+    let fi = index(
+        "svc/shapes.ts",
+        "const topic = 'top-short';\n\
+         const Frozen = Object.freeze({ A: 'frozen-a' });\n\
+         const Topics = { 'q-z': 'quoted' } as const;\n\
+         export class S {\n\
+           private readonly own = 'own-topic';\n\
+           async run(producer) {\n\
+             const local = 'local-topic';\n\
+             await producer.send({ topic, messages: [] });\n\
+             await producer.send({ topic: local });\n\
+             await producer.send({ topic: this.own });\n\
+             await producer.send({ topic: Frozen.A });\n\
+             await producer.send({ topic: Topics['q-z'] });\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('P', "frozen-a"),
+            ev('P', "local-topic"),
+            ev('P', "own-topic"),
+            ev('P', "quoted"),
+            ev('P', "top-short"),
+        ]
+    );
+}
+
+#[test]
+fn an_import_hidden_by_a_parameter_or_a_local_class_is_not_a_queue() {
+    let fi = index(
+        "svc/shadow.ts",
+        "import { Queue } from 'bullmq';\n\
+         export function f(Queue) { return new Queue('shadowed-q'); }\n\
+         export const real = new Queue('real-q');\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "real-q")]);
+    let local = index(
+        "web/worker.ts",
+        "class Queue {}\nexport const q = new Queue('local');\nexport const w = new Worker('./sw.js');\n",
+    );
+    assert!(events(&local).is_empty(), "{:?}", events(&local));
+}
+
+#[test]
+fn nestjs_bull_rabbitmq_and_sqs_decorators() {
+    let fi = index(
+        "svc/queues.ts",
+        "import { Processor, InjectQueue } from '@nestjs/bullmq';\n\
+         import { RabbitSubscribe } from '@golevelup/nestjs-rabbitmq';\n\
+         import { SqsMessageHandler } from '@ssut/nestjs-sqs';\n\
+         @Processor('video')\n\
+         export class VideoProcessor {\n\
+           @RabbitSubscribe({ exchange: 'x', routingKey: 'rk', queue: 'rabbit-q' })\n\
+           onMessage() {}\n\
+           @SqsMessageHandler('sqs-q', false)\n\
+           async handle() {}\n\
+         }\n\
+         export class Producer {\n\
+           constructor(@InjectQueue('audio') private readonly audio) {}\n\
+         }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('C', "rabbit-q"),
+            ev('C', "sqs-q"),
+            ev('C', "video"),
+            ev('P', "audio"),
+        ]
+    );
+    // Each consumer belongs to what it decorates.
+    let owner = |name: &str| {
+        fi.consumers
+            .iter()
+            .find(|(_, t)| t == name)
+            .map(|(i, _)| fi.nodes[*i].name.to_string())
+    };
+    assert_eq!(owner("video").as_deref(), Some("VideoProcessor"));
+    assert_eq!(owner("rabbit-q").as_deref(), Some("onMessage"));
+    assert_eq!(owner("sqs-q").as_deref(), Some("handle"));
+}
+
+#[test]
+fn a_bull_queue_is_consumed_where_process_is_called() {
+    let fi = index(
+        "svc/bull-consumer.js",
+        "const Bull = require('bull');\nconst emails = new Bull('emails');\n\
+         function start() { emails.process(async (job) => {}); }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('C', "emails"), ev('P', "emails")]);
 }

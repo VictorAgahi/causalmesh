@@ -778,6 +778,14 @@ impl TypeScriptExtractor {
                     }
                 }
 
+                // A `@nestjs/graphql` / `type-graphql` resolver method serves a GraphQL operation.
+                if let Some(operation) =
+                    js_frameworks::graphql_decorator(node, source, &ctx.frameworks)
+                {
+                    kind = NodeKind::HttpEndpoint;
+                    first_line = format!("GRAPHQL {operation}");
+                }
+
                 let final_name = if let Some(g) = grpc_target {
                     CompactStr::new(g)
                 } else {
@@ -871,6 +879,32 @@ impl TypeScriptExtractor {
                         (node.start_position().row + 1, node.end_position().row + 1),
                         fact,
                     ));
+                }
+            }
+            // tRPC procedures (`router({ get: publicProcedure.query(…) })`) and Apollo-style
+            // resolver maps (`Query: { users() {} }`): the API surface of the file.
+            "pair" => {
+                let budget = MAX_ROUTE_NODES_PER_FILE.saturating_sub(ctx.route_nodes.get());
+                if budget > 0 {
+                    if let Some(label) =
+                        js_frameworks::trpc_procedure(node, source, &ctx.frameworks)
+                    {
+                        ctx.route_nodes.set(ctx.route_nodes.get() + 1);
+                        nodes.push(Self::api_node(
+                            ctx,
+                            format!("TRPC {label}"),
+                            (node.start_position().row + 1, node.end_position().row + 1),
+                        ));
+                    }
+                    for (label, lines) in js_frameworks::graphql_map_fields(
+                        node,
+                        source,
+                        &ctx.frameworks,
+                        budget.saturating_sub(1),
+                    ) {
+                        ctx.route_nodes.set(ctx.route_nodes.get() + 1);
+                        nodes.push(Self::api_node(ctx, format!("GRAPHQL {label}"), lines));
+                    }
                 }
             }
             // `@Processor('emails')`, `@InjectQueue('emails')`, `@RabbitSubscribe({ queue })`:
@@ -1207,6 +1241,22 @@ impl TypeScriptExtractor {
                 }
             })
             .collect()
+    }
+
+    /// An API operation (tRPC procedure, GraphQL field) named and signed by its label.
+    fn api_node(ctx: &VisitCtx, label: String, lines: (usize, usize)) -> ContractNode {
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(&label),
+            kind: NodeKind::HttpEndpoint,
+            file_path: ctx.file_path.clone(),
+            line_start: lines.0,
+            line_end: lines.1,
+            package: ctx.package_name.clone(),
+            repo_id: ctx.repo_id,
+            signature: Some(CompactStr::new(label)),
+            docstring: None,
+        }
     }
 
     /// The node of an HTTP route registered at `node`: named and signed by its

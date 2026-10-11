@@ -11,11 +11,13 @@
 //! The per-file context (modules, constants, clients) is built on the first call
 //! site a rule could match, so a file with none pays nothing.
 
+mod api;
 mod file_routes;
 mod http;
 mod messaging;
 pub(crate) mod scope;
 
+pub(crate) use api::{graphql_decorator, graphql_map_fields, trpc_procedure};
 pub(crate) use file_routes::sfc_route;
 pub(crate) use http::{decorator_route, detect_routes, DecoratorRoute, RouteFact};
 use mesh_core::NodeKind;
@@ -59,6 +61,10 @@ pub(crate) struct FrameworkCtx<'t> {
     http_relevant: OnceCell<bool>,
     mounts: OnceCell<http::Mounts>,
     prefix_cache: http::PrefixCache,
+    trpc_text: OnceCell<bool>,
+    graphql_text: OnceCell<bool>,
+    graphql_decorator_text: OnceCell<bool>,
+    router_mounts: OnceCell<api::RouterMounts>,
 }
 
 impl<'t> FrameworkCtx<'t> {
@@ -71,6 +77,10 @@ impl<'t> FrameworkCtx<'t> {
             http_relevant: OnceCell::new(),
             mounts: OnceCell::new(),
             prefix_cache: http::PrefixCache::default(),
+            trpc_text: OnceCell::new(),
+            graphql_text: OnceCell::new(),
+            graphql_decorator_text: OnceCell::new(),
+            router_mounts: OnceCell::new(),
         }
     }
 
@@ -84,6 +94,38 @@ impl<'t> FrameworkCtx<'t> {
         *self
             .http_relevant
             .get_or_init(|| std::str::from_utf8(self.source).is_ok_and(http::mentions_http))
+    }
+
+    /// Whether the file's text contains any of `needles`, decided once per `cell`.
+    fn text_mentions(&self, cell: &OnceCell<bool>, needles: &[&str]) -> bool {
+        *cell.get_or_init(|| {
+            let text = std::str::from_utf8(self.source).unwrap_or("");
+            needles.iter().any(|n| text.contains(n))
+        })
+    }
+
+    fn mentions_trpc(&self) -> bool {
+        self.text_mentions(&self.trpc_text, &["trpc", "TRPC"])
+    }
+
+    fn mentions_graphql(&self) -> bool {
+        self.text_mentions(
+            &self.graphql_text,
+            &["graphql", "apollo", "mercurius", "yoga", "pothos"],
+        )
+    }
+
+    fn mentions_graphql_decorators(&self) -> bool {
+        self.text_mentions(
+            &self.graphql_decorator_text,
+            &["@nestjs/graphql", "type-graphql"],
+        )
+    }
+
+    /// The router variables of the file mounted in another router (tRPC), computed on first use.
+    fn router_mounts(&self) -> &api::RouterMounts {
+        self.router_mounts
+            .get_or_init(|| api::collect_router_mounts(self.root, self.source))
     }
 
     /// The in-file router mounts, computed on first use.

@@ -124,6 +124,30 @@ the extractor directly, so the dispatch wiring of step 3 is covered
 
 ---
 
+### Adding a JavaScript / TypeScript framework or library
+
+JavaScript and TypeScript are not one extractor but a file extractor (`languages/typescript.rs`: imports,
+declarations, gRPC clients) plus a rule-driven layer, `languages/js_frameworks/`, that recognises libraries:
+
+- `scope.rs`: per-file facts every rule reads: `ModuleBindings` (what the file imports or requires, under
+  which local names; `import type` loads nothing), `ConstTable` / `Names` (string constants and how an
+  argument becomes a topic / queue / path name, scope-aware), `Receivers` (which variables and properties
+  hold a client of which library, from `new X()`, `createClient()`, typed or injected members).
+- `messaging.rs`: tables of `CallRule` / `CtorRule` / `DecoratorRule` for brokers (Kafka and Redpanda, Redis,
+  NATS, MQTT, RabbitMQ, queues, cloud). A rule names the modules the file must load, the method, constructor or
+  decorator, the side (`Produce` / `Consume`) and how to read the name; a `signature` string identifies the
+  rule and must be unique (a unit test enforces it). Add a library by adding a row; add a family to
+  `FAMILIES` if its clients are built in the file.
+- `http.rs`: route registrations (`app.get('/p', h)`, groups, mounts, route objects) and decorated controllers;
+  `file_routes.rs`: file-system routers (Next, Remix, SvelteKit, Nuxt, Astro); `api.rs`: tRPC and GraphQL.
+- `languages/sfc.rs`: `.vue` / `.svelte` / `.astro` script blocks, blanked in place so line numbers stay the file's.
+- `languages/ts_config.rs`: `tsconfig` / `jsconfig` `paths` and `package.json` `imports` aliases, jailed to the
+  workspace root and part of each file's index-cache key.
+
+Every walk is bounded (`AstGuard::MAX_NESTING_DEPTH`), the per-file context is built only for a file that
+mentions something a rule knows, and a hostile-input test (deep chains at a 2 MB stack, thousands of mounts,
+a huge block) accompanies each rule family. Tests live in `crates/mesh-parsers/tests/js_*.rs`.
+
 ## 5. Talking to the server by hand
 
 The server speaks newline-delimited JSON-RPC on stdio:

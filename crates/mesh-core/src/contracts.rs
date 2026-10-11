@@ -2500,14 +2500,25 @@ type ResolvedKey<'g> = (&'g CompactStr, RepoId, Option<&'g Path>);
 /// (`./user.js` for `user.ts`), longest first.
 const MODULE_EXTENSIONS: &[&str] = &[
     ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs",
-    ".json",
+    ".json", ".vue", ".svelte", ".astro",
 ];
 
 /// Whether `path` is a JavaScript / TypeScript source file.
 fn is_script_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+        Some(
+            "ts" | "tsx"
+                | "mts"
+                | "cts"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "vue"
+                | "svelte"
+                | "astro"
+        )
     )
 }
 

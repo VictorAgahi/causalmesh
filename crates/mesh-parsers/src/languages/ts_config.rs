@@ -226,7 +226,18 @@ impl TsAliasIndex {
 fn is_script_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+        Some(
+            "ts" | "tsx"
+                | "mts"
+                | "cts"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "vue"
+                | "svelte"
+                | "astro"
+        )
     )
 }
 

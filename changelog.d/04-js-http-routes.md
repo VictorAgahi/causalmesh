@@ -17,5 +17,14 @@
   `GET /users/:id` for NestJS (incl. `@Controller({ path })`, `@Controller()`, constants as paths),
   routing-controllers (`@JsonController`), tsoa (`@Route`, `{id}` kept as written) and
   inversify-express-utils (`@controller` / `@httpGet`, now recognised as endpoints).
+- **Chained constructors and reused names**: `new Elysia({ prefix }).get(…).post(…)`, `new Hono().get(…)`,
+  `Fastify().get(…)` and `Router().get(…)` register routes whatever else the file builds; a router variable
+  reused in two functions is two routers, and one router mounted under two prefixes serves both (mount
+  cycles stop). koa named routes (`router.get('user', '/users/:id', h)`) and hapi's `method: '*'` are read.
+- **Fewer false positives**: with no app or router built in the file, a receiver must look like one (or be
+  imported); `got.extend()` / `HttpClient` clients are not routes; a verb-named decorator imported from a
+  non-HTTP library declares no route; framework names are matched as modules (`'hono'`), not inside
+  "honor" or `<h3>`.
 - **Known limits**: NestJS global prefixes and `@Version`, Express/Koa mounts across files, file-based routing
-  (Next, Remix, SvelteKit, Nuxt, Astro: next PR) and HTTP client calls are not linked to the routes.
+  (Next, Remix, SvelteKit, Nuxt, Astro: next PR), a Fastify plugin passed as a named function, an inherited
+  controller base class's `@Get` (it lacks the child's `@Controller` prefix), `@Get(['a', 'b'])` (first path only) and HTTP client calls are not linked to the routes.

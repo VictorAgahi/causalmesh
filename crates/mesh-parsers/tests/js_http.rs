@@ -263,3 +263,143 @@ fn route_registrations_belong_to_the_declaration_that_makes_them() {
     // `app` is a typed parameter: the file builds no app, the import and the shape gate.
     assert_eq!(routes(&fi), r(&["GET /a"]));
 }
+
+// ---- review round 1 (PR #83) --------------------------------------------------------------
+
+#[test]
+fn chained_constructor_idioms_register_routes_even_with_other_apps_in_the_file() {
+    let fi = index(
+        "edge/chains.ts",
+        "import { Elysia } from 'elysia';
+import { Hono } from 'hono';
+import Fastify from 'fastify';
+         export const a = new Elysia({ prefix: '/p' }).get('/a', h).post('/b', h);
+         export const b = new Hono().get('/c', h).post('/d', h);
+         export const c = Fastify().get('/e', h);
+         const app = new Hono();
+app.get('/f', h);
+",
+    );
+    assert_eq!(
+        routes(&fi),
+        r(&[
+            "GET /c",
+            "GET /e",
+            "GET /f",
+            "GET /p/a",
+            "POST /d",
+            "POST /p/b"
+        ])
+    );
+}
+
+#[test]
+fn a_router_name_reused_in_two_functions_is_two_routers() {
+    let fi = index(
+        "api/two.ts",
+        "import express from 'express';
+         const app = express();
+         export function users() {
+           const router = express.Router();
+           router.get('/', list);
+           app.use('/users', router);
+         }
+         export function orders() {
+           const router = express.Router();
+           router.get('/', list);
+           app.use('/orders', router);
+         }
+",
+    );
+    assert_eq!(routes(&fi), r(&["GET /orders", "GET /users"]));
+}
+
+#[test]
+fn a_router_mounted_under_two_prefixes_serves_both_and_a_cycle_terminates() {
+    let fi = index(
+        "api/versions.ts",
+        "import express from 'express';
+         const app = express();
+         const shared = express.Router();
+         shared.get('/x', h);
+         app.use('/v1', shared);
+         app.use('/v2', shared);
+         const a = express.Router();
+const b = express.Router();
+         a.use('/b', b);
+b.use('/a', a);
+b.get('/z', h);
+",
+    );
+    let got = routes(&fi);
+    assert!(
+        got.contains(&"GET /v1/x".to_string()) && got.contains(&"GET /v2/x".to_string()),
+        "{got:?}"
+    );
+    assert!(got.iter().any(|g| g.ends_with("/z")), "{got:?}");
+}
+
+#[test]
+fn clients_are_not_routes_even_when_the_file_builds_no_app() {
+    let fi = index(
+        "web/client.ts",
+        "import { HTTPException } from 'hono/http-exception';
+import got from 'got';
+         const client = got.extend({});
+         export class S {
+           constructor(private http: HttpClient) {}
+           f() { client.get('/x', opts); return this.http.get('/api/u', opts); }
+         }
+",
+    );
+    assert!(routes(&fi).is_empty(), "{:?}", routes(&fi));
+}
+
+#[test]
+fn koa_named_routes_and_hapi_wildcard_method() {
+    let koa = index(
+        "api/named.ts",
+        "import Router from '@koa/router';
+const router = new Router();
+         router.get('user', '/users/:id', show);
+",
+    );
+    assert_eq!(routes(&koa), r(&["GET /users/:id"]));
+    let hapi = index(
+        "api/any.js",
+        "const Hapi = require('@hapi/hapi');
+const server = Hapi.server();
+         server.route({ method: '*', path: '/any', handler });
+",
+    );
+    assert_eq!(routes(&hapi), r(&["ALL /any"]));
+}
+
+#[test]
+fn a_verb_named_decorator_from_a_non_http_library_is_not_a_route() {
+    let fi = index(
+        "svc/cfg.ts",
+        "import { Get, All } from 'some-config-lib';
+         export class Cfg { @Get('x') a() {} @All() b() {} }
+",
+    );
+    let signatures: Vec<String> = fi
+        .nodes
+        .iter()
+        .filter_map(|n| n.signature.as_deref())
+        .filter(|s| s.starts_with("GET /") || s.starts_with("ALL /"))
+        .map(str::to_string)
+        .collect();
+    assert!(signatures.is_empty(), "{signatures:?}");
+}
+
+#[test]
+fn module_names_are_matched_on_boundaries() {
+    // "honor", "<h3>" and "expression" name no framework: no analysis, no routes.
+    let fi = index(
+        "web/prose.ts",
+        "export function f(store) { /* honor the expression */ store.get('/a', cb); return '<h3>x</h3>'; }
+",
+    );
+    assert!(routes(&fi).is_empty());
+}

@@ -640,6 +640,7 @@ name = "mesh-parsers"
 version = "7.0.19"
 dependencies = [
  "compact_str",
+ "dunce",
  "mesh-core",
  "regex",
  "schemars",

@@ -18,6 +18,7 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 streaming-iterator.workspace = true
 regex.workspace = true
+dunce.workspace = true
 
 tree-sitter.workspace = true
 tree-sitter-language.workspace = true

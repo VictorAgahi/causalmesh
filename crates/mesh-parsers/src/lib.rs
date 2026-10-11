@@ -10,7 +10,7 @@ pub mod topology;
 pub use decapitate::{AstDecapitator, DecapitatedSource, LanguageKind};
 pub use graph::{GraphRenderer, WebEdge, WebGraphPayload, WebNode};
 pub use guard::{AstGuard, BoundedMatch, ParserError};
-pub use languages::{CompiledPattern, ExtractConfig, FileIndex, PolyglotIndexer};
+pub use languages::{CompiledPattern, ExtractConfig, FileIndex, PolyglotIndexer, TsAliasIndex};
 pub use markdown::{
     MarkdownFormatter, SearchPage, SearchResult, MAX_OUTPUT_BYTES, NON_RESULT_RESERVE_BYTES,
 };

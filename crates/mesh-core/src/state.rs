@@ -182,6 +182,12 @@ pub struct AppState {
     /// `index_cache` counters as of the last recorded indexing pass, so each
     /// `install_snapshot` persists only its own pass's lookups (plan 4 step 4.8).
     recorded_cache_stats: Mutex<CacheStats>,
+    /// Digest of what each import-alias config (`tsconfig*.json`, `jsconfig*.json`,
+    /// `package.json`) held when it last governed a reload; absent means unknown. An
+    /// edit that leaves the digest unchanged cannot move an alias, so it re-extracts
+    /// nothing; any other edit (or a config appearing, vanishing or seen for the first
+    /// time) re-extracts the scripts it governs.
+    pub alias_digests: Mutex<std::collections::HashMap<PathBuf, [u8; 32]>>,
 }
 
 impl AppState {
@@ -225,6 +231,7 @@ impl AppState {
             search_cache: SearchCache::default(),
             index_cache: OnceLock::new(),
             recorded_cache_stats: Mutex::new(CacheStats::default()),
+            alias_digests: Mutex::new(std::collections::HashMap::new()),
         };
         state.record_process_start();
         state

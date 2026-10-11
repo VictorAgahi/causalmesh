@@ -20,7 +20,7 @@
 - **Chained constructors and reused names**: `new Elysia({ prefix }).get(…).post(…)`, `new Hono().get(…)`,
   `Fastify().get(…)` and `Router().get(…)` register routes whatever else the file builds; a router variable
   reused in two functions is two routers, and one router mounted under two prefixes serves both (mount
-  cycles stop; at most 16 prefixes are kept per router, in declaration order, so a router mounted thousands
+  cycles stop; at most 4 prefixes are kept per router, in declaration order, so a router mounted thousands
   of times cannot fan out without bound). koa named routes (`router.get('user', '/users/:id', h)`) and hapi's `method: '*'` are read.
 - **Fewer false positives**: with no app or router built in the file, a receiver must look like one (or be
   imported); `got.extend()` / `HttpClient` clients are not routes; a verb-named decorator imported from a
@@ -29,3 +29,4 @@
 - **Known limits**: NestJS global prefixes and `@Version`, Express/Koa mounts across files, file-based routing
   (Next, Remix, SvelteKit, Nuxt, Astro: next PR), a Fastify plugin passed as a named function, an inherited
   controller base class's `@Get` (it lacks the child's `@Controller` prefix), `@Get(['a', 'b'])` (first path only) and HTTP client calls are not linked to the routes.
+- Long method chains (more than ~30 links in one expression) are read up to a depth bound and silently stop; at most 5000 route nodes are recorded per file.

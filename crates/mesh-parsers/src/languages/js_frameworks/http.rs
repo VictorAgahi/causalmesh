@@ -13,7 +13,9 @@
 
 use super::scope::{receiver_key, Names};
 use super::{arguments, FrameworkCtx};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use tree_sitter::Node;
 
 const EXPRESS: &[&str] = &["express"];
@@ -128,21 +130,42 @@ pub(super) fn mentions_http(source: &str) -> bool {
                 .any(|(d, _)| source.contains(&format!("@{d}"))))
 }
 
-/// Whether a name looks like an app or router when nothing in the file says so.
-fn looks_like_router(key: &str, built: &super::Built) -> bool {
-    if key.is_empty() {
-        return false;
+/// Whether a name looks like an app or router when nothing in the file says so: its last
+/// word (`usersRouter`, `api_routes`, `app`) names one. `application`, `routeDecorator`,
+/// `appConfig`, `mapper` and `cache` do not.
+fn looks_like_router(key: &str) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in key.chars() {
+        if c == '_' || c == '-' || c == '$' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else if c.is_ascii_uppercase() && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+            current.push(c.to_ascii_lowercase());
+        } else {
+            current.push(c.to_ascii_lowercase());
+        }
     }
-    // An app or router imported from another module.
-    if built.bindings.value_binding(key).is_some() {
-        return true;
+    if !current.is_empty() {
+        words.push(current);
     }
-    let lower = key.to_ascii_lowercase();
-    [
-        "app", "router", "route", "server", "fastify", "hono", "elysia", "koa",
-    ]
-    .iter()
-    .any(|n| lower.contains(n))
+    words.last().is_some_and(|w| {
+        matches!(
+            w.as_str(),
+            "app"
+                | "router"
+                | "routers"
+                | "route"
+                | "routes"
+                | "server"
+                | "fastify"
+                | "hono"
+                | "elysia"
+                | "koa"
+        )
+    })
 }
 
 /// The framework constructor a method chain starts from (`new Elysia(…)`, `Router()`,
@@ -159,6 +182,10 @@ fn framework_ctor_root<'t>(
             "call_expression" => {
                 let function = current.child_by_field_name("function")?;
                 if function.kind() == "member_expression" {
+                    // `express.Router()` is itself the constructor call.
+                    if is_framework_name(function, source, imported, built) {
+                        return Some(current);
+                    }
                     current = function.child_by_field_name("object")?;
                     continue;
                 }
@@ -334,7 +361,7 @@ fn enclosing_scopes(call: Node, source: &[u8], names: &Names) -> Vec<Scope> {
 
 /// One mount of a router: the prefix it is mounted under, the router it is mounted on,
 /// and the function it happens in (a router variable name is reused across functions).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Mount {
     prefix: String,
     parent: Option<String>,
@@ -365,6 +392,20 @@ fn function_scope(node: Node) -> (usize, usize) {
     }
     (0, usize::MAX)
 }
+
+/// Mounts kept per router: an identical mount is recorded once, and a router mounted more
+/// often than this is truncated (declaration order).
+const MAX_MOUNTS_PER_ROUTER: usize = 64;
+
+fn add_mount(mounts: &mut Mounts, router: &str, mount: Mount) {
+    let entries = mounts.entry(router.to_string()).or_default();
+    if entries.len() < MAX_MOUNTS_PER_ROUTER && !entries.contains(&mount) {
+        entries.push(mount);
+    }
+}
+
+/// `(router, function scope)` -> the prefixes computed for it, per file.
+pub(super) type PrefixCache = RefCell<HashMap<(String, Option<(usize, usize)>), Rc<Vec<String>>>>;
 
 pub(super) fn collect_mounts(root: Node, source: &[u8], names: &Names) -> Mounts {
     let mut mounts = Mounts::new();
@@ -400,11 +441,15 @@ pub(super) fn collect_mounts(root: Node, source: &[u8], names: &Names) -> Mounts
                                 .and_then(|o| receiver_key(o, source))
                         })
                         .flatten();
-                    mounts.entry(key.to_string()).or_default().push(Mount {
-                        prefix,
-                        parent,
-                        scope: function_scope(n),
-                    });
+                    add_mount(
+                        &mut mounts,
+                        key,
+                        Mount {
+                            prefix,
+                            parent,
+                            scope: function_scope(n),
+                        },
+                    );
                 }
             }
         }
@@ -420,11 +465,15 @@ pub(super) fn collect_mounts(root: Node, source: &[u8], names: &Names) -> Mounts
                             .child_by_field_name("function")
                             .and_then(|f| f.child_by_field_name("object"))
                             .and_then(|o| receiver_key(o, source));
-                        mounts.entry(router).or_default().push(Mount {
-                            prefix,
-                            parent,
-                            scope: function_scope(n),
-                        });
+                        add_mount(
+                            &mut mounts,
+                            &router,
+                            Mount {
+                                prefix,
+                                parent,
+                                scope: function_scope(n),
+                            },
+                        );
                     }
                 }
             }
@@ -445,24 +494,34 @@ pub(super) fn collect_mounts(root: Node, source: &[u8], names: &Names) -> Mounts
 
 /// Prefixes kept per router: a router mounted under more is truncated, deterministically
 /// (declaration order), rather than fanned out without bound.
-const MAX_PREFIXES: usize = 16;
+const MAX_PREFIXES: usize = 4;
 
 /// Every prefix a router is mounted under, through nested in-file mounts. At the first
 /// level only the mounts made in the function of the use site count (a name reused
 /// in two functions is two routers); with none there, all of them do. A router mounted
 /// twice has two prefixes. Bounded in depth and in number, and a mount cycle stops.
-fn mounted_prefixes(mounts: &Mounts, router: &str, scope: (usize, usize)) -> Vec<String> {
+fn mounted_prefixes(
+    mounts: &Mounts,
+    cache: &PrefixCache,
+    router: &str,
+    scope: (usize, usize),
+) -> Rc<Vec<String>> {
     fn go(
         mounts: &Mounts,
+        cache: &PrefixCache,
         router: &str,
         scope: Option<(usize, usize)>,
         path: &mut Vec<String>,
-    ) -> Vec<String> {
+    ) -> Rc<Vec<String>> {
+        let key = (router.to_string(), scope);
+        if let Some(hit) = cache.borrow().get(&key) {
+            return Rc::clone(hit);
+        }
         let Some(entries) = mounts.get(router).filter(|_| path.len() < 8) else {
-            return vec![String::new()];
+            return Rc::new(vec![String::new()]);
         };
         if path.iter().any(|r| r == router) {
-            return vec![String::new()];
+            return Rc::new(vec![String::new()]);
         }
         let local: Vec<&Mount> = entries
             .iter()
@@ -477,11 +536,11 @@ fn mounted_prefixes(mounts: &Mounts, router: &str, scope: (usize, usize)) -> Vec
         let mut out: Vec<String> = Vec::new();
         'mounts: for mount in chosen {
             let parents = match &mount.parent {
-                Some(parent) => go(mounts, parent, None, path),
-                None => vec![String::new()],
+                Some(parent) => go(mounts, cache, parent, None, path),
+                None => Rc::new(vec![String::new()]),
             };
-            for parent_prefix in parents {
-                let prefix = join(&parent_prefix, &mount.prefix);
+            for parent_prefix in parents.iter() {
+                let prefix = join(parent_prefix, &mount.prefix);
                 if !out.contains(&prefix) {
                     out.push(prefix);
                 }
@@ -492,9 +551,11 @@ fn mounted_prefixes(mounts: &Mounts, router: &str, scope: (usize, usize)) -> Vec
             }
         }
         path.pop();
+        let out = Rc::new(out);
+        cache.borrow_mut().insert(key, Rc::clone(&out));
         out
     }
-    go(mounts, router, Some(scope), &mut Vec::new())
+    go(mounts, cache, router, Some(scope), &mut Vec::new())
 }
 
 /// The `route('/p')` call at the base of a `route('/p').get(h).post(h)` chain.
@@ -589,14 +650,20 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
         || verdicts.contains(&Some(true))
         // The file builds no app or router of its own (it takes one as an argument, or
         // imports it): the receiver must at least look like one.
-        || (verdicts.iter().all(Option::is_none) && looks_like_router(key_name, built));
+        || (verdicts.iter().all(Option::is_none) && looks_like_router(key_name));
     if !is_router {
         return Vec::new();
     }
 
     let mut prefixes = vec![String::new()];
     if let Some(k) = key.as_deref() {
-        prefixes = mounted_prefixes(fx.mounts(&names), k, function_scope(call));
+        prefixes = mounted_prefixes(
+            fx.mounts(&names),
+            fx.prefix_cache(),
+            k,
+            function_scope(call),
+        )
+        .to_vec();
     }
     if let Some(root) = ctor_root.filter(|r| r.kind() == "new_expression") {
         if let Some(prefix) = arguments(root)
@@ -741,20 +808,33 @@ fn decorator_name<'a>(decorator: Node, source: &'a [u8]) -> Option<&'a str> {
 
 /// The route a decorated controller method serves: the controller prefix
 /// (`@Controller('users')`) joined with the verb decorator's path (`@Get(':id')`).
-pub(crate) fn decorator_route(method: Node, source: &[u8], fx: &FrameworkCtx) -> Option<RouteFact> {
-    let verb_decorator = decorators_of(method).into_iter().find_map(|d| {
+/// What a decorated method's verb decorator says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecoratorRoute {
+    /// A route.
+    Found(RouteFact),
+    /// A verb-named decorator imported from a library that is no HTTP framework.
+    Foreign,
+    /// No verb decorator.
+    Absent,
+}
+
+pub(crate) fn decorator_route(method: Node, source: &[u8], fx: &FrameworkCtx) -> DecoratorRoute {
+    let Some(verb_decorator) = decorators_of(method).into_iter().find_map(|d| {
         let name = decorator_name(d, source)?;
         VERB_DECORATORS
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, verb)| (d, *verb))
-    })?;
+    }) else {
+        return DecoratorRoute::Absent;
+    };
     let built = fx.built();
     // A decorator imported from a module that is no HTTP framework is not a route.
     if let Some(local) = decorator_name(verb_decorator.0, source) {
         if let Some(binding) = built.bindings.value_binding(local) {
             if !super::scope::ModuleBindings::module_in(&binding.module, DECORATOR_LIBS) {
-                return None;
+                return DecoratorRoute::Foreign;
             }
         }
     }
@@ -764,7 +844,9 @@ pub(crate) fn decorator_route(method: Node, source: &[u8], fx: &FrameworkCtx) ->
         bindings: &built.bindings,
         scopes: &built.scopes,
     };
-    let own = decorator_path(verb_decorator.0, &names)?;
+    let Some(own) = decorator_path(verb_decorator.0, &names) else {
+        return DecoratorRoute::Absent;
+    };
     let mut prefix = String::new();
     let mut ancestor = method.parent();
     while let Some(a) = ancestor {
@@ -786,7 +868,7 @@ pub(crate) fn decorator_route(method: Node, source: &[u8], fx: &FrameworkCtx) ->
         }
         ancestor = a.parent();
     }
-    Some(RouteFact {
+    DecoratorRoute::Found(RouteFact {
         method: verb_decorator.1.to_string(),
         path: join(&prefix, &own),
     })

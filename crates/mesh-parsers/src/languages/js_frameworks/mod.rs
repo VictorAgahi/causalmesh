@@ -15,7 +15,7 @@ mod http;
 mod messaging;
 pub(crate) mod scope;
 
-pub(crate) use http::{decorator_route, detect_routes, RouteFact};
+pub(crate) use http::{decorator_route, detect_routes, DecoratorRoute, RouteFact};
 use mesh_core::NodeKind;
 use scope::{is_shadowed, receiver_key, BlockCache, ConstTable, ModuleBindings, Names, Receivers};
 use std::cell::OnceCell;
@@ -56,6 +56,7 @@ pub(crate) struct FrameworkCtx<'t> {
     relevant: OnceCell<bool>,
     http_relevant: OnceCell<bool>,
     mounts: OnceCell<http::Mounts>,
+    prefix_cache: http::PrefixCache,
 }
 
 impl<'t> FrameworkCtx<'t> {
@@ -67,7 +68,13 @@ impl<'t> FrameworkCtx<'t> {
             relevant: OnceCell::new(),
             http_relevant: OnceCell::new(),
             mounts: OnceCell::new(),
+            prefix_cache: http::PrefixCache::default(),
         }
+    }
+
+    /// The memo of the prefixes computed per router (see `http::mounted_prefixes`).
+    fn prefix_cache(&self) -> &http::PrefixCache {
+        &self.prefix_cache
     }
 
     /// Whether the file could declare an HTTP route at all (see [`http::mentions_http`]).

@@ -431,3 +431,110 @@ fn a_router_mounted_thousands_of_times_has_a_bounded_fan_out() {
     let n = routes(&fi).len();
     assert!(n > 0 && n <= 20 * 16, "{n} routes");
 }
+
+#[test]
+fn repeated_identical_mounts_and_deep_mount_chains_stay_cheap() {
+    // 8 routers, each mounted 9 times with the same prefix on the next: N^8 without a memo.
+    let mut code = String::from("import express from 'express';\nconst app = express();\n");
+    for i in 0..8 {
+        code.push_str(&format!("const r{i} = express.Router();\n"));
+    }
+    for i in 0..7 {
+        for _ in 0..9 {
+            code.push_str(&format!("r{}.use('/l{i}', r{i});\n", i + 1));
+        }
+    }
+    for _ in 0..9 {
+        code.push_str("app.use('/top', r7);\n");
+    }
+    for i in 0..300 {
+        code.push_str(&format!("r0.get('/x{i}', h);\n"));
+    }
+    let start = std::time::Instant::now();
+    let fi = index("api/deep.ts", &code);
+    assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    let got = routes(&fi);
+    assert_eq!(got.len(), 300);
+    assert!(
+        got[0].starts_with("GET /top/l6/l5/l4/l3/l2/l1/l0/x"),
+        "{:?}",
+        got[0]
+    );
+}
+
+#[test]
+fn a_router_mounted_thousands_of_times_costs_per_route_not_per_mount() {
+    let mut code = String::from(
+        "import express from 'express';\nconst app = express();\nconst r = express.Router();\n",
+    );
+    for i in 0..3000 {
+        code.push_str(&format!("app.use('/m{i}', r);\n"));
+    }
+    for i in 0..3000 {
+        code.push_str(&format!("r.get('/x{i}', h);\n"));
+    }
+    let start = std::time::Instant::now();
+    let fi = index("api/many.ts", &code);
+    assert!(start.elapsed().as_secs() < 8, "took {:?}", start.elapsed());
+    assert!(!routes(&fi).is_empty());
+}
+
+#[test]
+fn express_namespace_router_chain_and_chain_line_ranges() {
+    let fi = index(
+        "api/ns.ts",
+        "import express from 'express';
+export const r = express.Router().get('/r', h);
+",
+    );
+    assert_eq!(routes(&fi), r(&["GET /r"]));
+    let chain = index(
+        "edge/lines.ts",
+        "import { Elysia } from 'elysia';
+export const a = new Elysia({ prefix: '/api' })
+  .get('/a', h)
+  .post('/b', h)
+  .put('/c', h);
+",
+    );
+    let line = |name: &str| {
+        chain
+            .nodes
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.line_start)
+    };
+    assert_eq!(line("GET /api/a"), Some(3));
+    assert_eq!(line("POST /api/b"), Some(4));
+    assert_eq!(line("PUT /api/c"), Some(5));
+}
+
+#[test]
+fn a_foreign_verb_decorator_is_not_an_endpoint_at_all() {
+    let fi = index(
+        "svc/orm.ts",
+        "import { Get } from 'typeorm-ext';
+class A { @Get('/x') f() {} }
+",
+    );
+    assert!(fi.nodes.iter().all(|n| n.kind != NodeKind::HttpEndpoint));
+}
+
+#[test]
+fn router_looking_names_are_judged_by_their_last_word() {
+    let fi = index(
+        "api/names.ts",
+        "import express from 'express';
+         export function f(application, routeDecorator, appConfig, mapper, cache, usersRouter, api_routes) {
+           application.get('/a', h);
+           routeDecorator.get('/b', h);
+           appConfig.get('/c', h);
+           mapper.get('/d', h);
+           cache.get('/e', h);
+           usersRouter.get('/f', h);
+           api_routes.get('/g', h);
+         }
+",
+    );
+    assert_eq!(routes(&fi), r(&["GET /f", "GET /g"]));
+}

@@ -11,9 +11,11 @@
 //! The per-file context (modules, constants, clients) is built on the first call
 //! site a rule could match, so a file with none pays nothing.
 
+mod http;
 mod messaging;
 pub(crate) mod scope;
 
+pub(crate) use http::{decorator_route, detect_routes, DecoratorRoute, RouteFact};
 use mesh_core::NodeKind;
 use scope::{is_shadowed, receiver_key, BlockCache, ConstTable, ModuleBindings, Names, Receivers};
 use std::cell::OnceCell;
@@ -52,6 +54,9 @@ pub(crate) struct FrameworkCtx<'t> {
     source: &'t [u8],
     built: OnceCell<Built>,
     relevant: OnceCell<bool>,
+    http_relevant: OnceCell<bool>,
+    mounts: OnceCell<http::Mounts>,
+    prefix_cache: http::PrefixCache,
 }
 
 impl<'t> FrameworkCtx<'t> {
@@ -61,7 +66,28 @@ impl<'t> FrameworkCtx<'t> {
             source,
             built: OnceCell::new(),
             relevant: OnceCell::new(),
+            http_relevant: OnceCell::new(),
+            mounts: OnceCell::new(),
+            prefix_cache: http::PrefixCache::default(),
         }
+    }
+
+    /// The memo of the prefixes computed per router (see `http::mounted_prefixes`).
+    fn prefix_cache(&self) -> &http::PrefixCache {
+        &self.prefix_cache
+    }
+
+    /// Whether the file could declare an HTTP route at all (see [`http::mentions_http`]).
+    fn http_relevant(&self) -> bool {
+        *self
+            .http_relevant
+            .get_or_init(|| std::str::from_utf8(self.source).is_ok_and(http::mentions_http))
+    }
+
+    /// The in-file router mounts, computed on first use.
+    fn mounts(&self, names: &Names) -> &http::Mounts {
+        self.mounts
+            .get_or_init(|| http::collect_mounts(self.root, self.source, names))
     }
 
     /// Whether the file could contain a broker interaction at all: it names a
@@ -77,13 +103,13 @@ impl<'t> FrameworkCtx<'t> {
         self.built.get_or_init(|| {
             let bindings = ModuleBindings::collect(self.root, self.source);
             let consts = ConstTable::collect(self.root, self.source, &bindings);
-            let receivers = Receivers::collect(
-                self.root,
-                self.source,
-                &bindings,
-                &consts,
-                messaging::FAMILIES,
-            );
+            let families: Vec<&'static [&'static str]> = messaging::FAMILIES
+                .iter()
+                .chain(http::FAMILIES.iter())
+                .copied()
+                .collect();
+            let receivers =
+                Receivers::collect(self.root, self.source, &bindings, &consts, &families);
             Built {
                 bindings,
                 consts,

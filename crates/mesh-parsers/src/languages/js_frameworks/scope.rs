@@ -281,6 +281,17 @@ impl ModuleBindings {
             .any(|m| libs.iter().any(|lib| module_matches(m, lib)))
     }
 
+    /// Whether the file refers to a module matching one of `libs` at all, by a run-time
+    /// load or by an `import type` (the types of a framework's route modules are evidence
+    /// the module is one, though they load nothing).
+    pub(crate) fn references_any(&self, libs: &[&str]) -> bool {
+        self.imports_any(libs)
+            || self
+                .locals
+                .values()
+                .any(|b| libs.iter().any(|lib| module_matches(&b.module, lib)))
+    }
+
     /// The binding of `local`, whether a value or a type.
     pub(crate) fn binding(&self, local: &str) -> Option<&Binding> {
         self.locals.get(local)

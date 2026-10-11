@@ -12,6 +12,9 @@ use tree_sitter::{Node, Parser, Tree};
 
 pub struct TypeScriptExtractor;
 
+/// HTTP route nodes recorded per file at most (a generated router of thousands of routes).
+const MAX_ROUTE_NODES_PER_FILE: usize = 5000;
+
 /// Historical hardcoded gRPC decorator, used when `controller_annotations`
 /// is not configured.
 const DEFAULT_GRPC_ANNOTATION: &str = "@GrpcMethod";
@@ -76,6 +79,8 @@ struct VisitCtx<'a> {
     declared: RefCell<HashSet<String>>,
     /// Modules and constants the broker detectors read.
     frameworks: js_frameworks::FrameworkCtx<'a>,
+    /// Route nodes emitted so far for the file.
+    route_nodes: std::cell::Cell<usize>,
 }
 
 impl TypeScriptExtractor {
@@ -137,6 +142,7 @@ impl TypeScriptExtractor {
             import_bindings: &import_bindings,
             declared: RefCell::new(HashSet::new()),
             frameworks: js_frameworks::FrameworkCtx::new(root, source_bytes),
+            route_nodes: std::cell::Cell::new(0),
         };
 
         let mut raw_rpc_calls: Vec<RawRpcCall> = Vec::new();
@@ -755,6 +761,22 @@ impl TypeScriptExtractor {
                     .ok()
                     .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
                     .unwrap_or_else(|| format!("{method_name}()"));
+                // A route handler states its HTTP contract in its signature, as Python's
+                // do: the controller prefix joined with the verb decorator's path
+                // (`@Controller('users')` + `@Get(':id')` -> `GET /users/:id`). The name
+                // stays the method's, so symbol lookups are unaffected.
+                let mut first_line = first_line;
+                if kind == NodeKind::ServiceClass || kind == NodeKind::HttpEndpoint {
+                    match js_frameworks::decorator_route(node, source, &ctx.frameworks) {
+                        js_frameworks::DecoratorRoute::Found(route) => {
+                            kind = NodeKind::HttpEndpoint;
+                            first_line = route.label();
+                        }
+                        // `@Get` of a config / ORM library: the text sniff above was wrong.
+                        js_frameworks::DecoratorRoute::Foreign => kind = NodeKind::ServiceClass,
+                        js_frameworks::DecoratorRoute::Absent => {}
+                    }
+                }
 
                 let final_name = if let Some(g) = grpc_target {
                     CompactStr::new(g)
@@ -809,6 +831,14 @@ impl TypeScriptExtractor {
                     }
                 }
                 // Brokers and queues (Kafka, Redis, NATS, RabbitMQ, …): see `js_frameworks`.
+                for route in js_frameworks::detect_routes(node, source, &ctx.frameworks) {
+                    // Bounded per file: the import attribution of a file is quadratic in its nodes.
+                    if ctx.route_nodes.get() >= MAX_ROUTE_NODES_PER_FILE {
+                        break;
+                    }
+                    ctx.route_nodes.set(ctx.route_nodes.get() + 1);
+                    nodes.push(Self::route_node(ctx, node, &route));
+                }
                 for fact in js_frameworks::detect_call(node, source, &ctx.frameworks) {
                     nodes.push(Self::event_node(
                         ctx,
@@ -1145,6 +1175,29 @@ impl TypeScriptExtractor {
             decorator.start_position().row + 1,
             decorator.end_position().row + 1,
         )
+    }
+
+    /// The node of an HTTP route registered at `node`: named and signed by its
+    /// method and full path (`GET /api/users/:id`).
+    fn route_node(ctx: &VisitCtx, node: Node, route: &js_frameworks::RouteFact) -> ContractNode {
+        let label = route.label();
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(&label),
+            kind: NodeKind::HttpEndpoint,
+            file_path: ctx.file_path.clone(),
+            // A chained registration starts at its own verb, not at the head of the chain.
+            line_start: node
+                .child_by_field_name("function")
+                .and_then(|f| f.child_by_field_name("property"))
+                .map_or(node.start_position().row, |p| p.start_position().row)
+                + 1,
+            line_end: node.end_position().row + 1,
+            package: ctx.package_name.clone(),
+            repo_id: ctx.repo_id,
+            signature: Some(CompactStr::new(label)),
+            docstring: None,
+        }
     }
 
     /// The node of a broker interaction found at `node`.

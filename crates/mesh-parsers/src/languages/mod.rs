@@ -353,6 +353,19 @@ impl PolyglotIndexer {
         Self::extract_with_config(file_path, content, repo_id, &ExtractConfig::default())
     }
 
+    /// The path a file-system router is read from: the file's path below its workspace root,
+    /// so a checkout under `/app` or `~/api` does not make `app` / `api` framework folders;
+    /// `None` for an absolute path under no root (any ancestor would be a guess). A workspace
+    /// root that is itself the router folder (`web/app` registered as a root) has no marker
+    /// left in the relative path: register the project root.
+    fn routing_path(cfg: &ExtractConfig, file_path: &Path) -> Option<std::path::PathBuf> {
+        match cfg.ts_aliases.relative_to_root(file_path) {
+            Some(relative) => Some(relative),
+            None if file_path.is_absolute() => None,
+            None => Some(file_path.to_path_buf()),
+        }
+    }
+
     /// Same as [`Self::extract`], but honours `[engines.contracts.grpc]` /
     /// `.openapi` / `.asyncapi` extraction knobs. Safe to call from any thread.
     pub fn extract_with_config(
@@ -470,17 +483,15 @@ impl PolyglotIndexer {
                             );
                             // The path a file-system router is read from is the one below
                             // the workspace root, not the whole checkout path.
-                            let routing_path = cfg
-                                .ts_aliases
-                                .relative_to_root(file_path)
-                                .unwrap_or_else(|| file_path.to_path_buf());
-                            nodes.extend(typescript::TypeScriptExtractor::file_route_nodes(
-                                &routing_path,
-                                file_path,
-                                content,
-                                repo_id,
-                                tree,
-                            ));
+                            if let Some(routing_path) = Self::routing_path(cfg, file_path) {
+                                nodes.extend(typescript::TypeScriptExtractor::file_route_nodes(
+                                    &routing_path,
+                                    file_path,
+                                    content,
+                                    repo_id,
+                                    tree,
+                                ));
+                            }
                             Some((nodes, imports, rpc_calls))
                         },
                     )

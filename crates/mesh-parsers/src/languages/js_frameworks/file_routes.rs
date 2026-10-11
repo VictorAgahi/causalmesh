@@ -113,7 +113,7 @@ pub(super) fn exported_names(root: Node, source: &[u8]) -> Exports {
 }
 
 /// Whether the location could be a route's at all (a cheap test made before the file is analysed).
-pub(super) fn path_may_route(path: &Path) -> bool {
+pub(crate) fn path_may_route(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|f| f.starts_with('+'))
@@ -150,18 +150,9 @@ fn is_script_ext(ext: &str) -> bool {
 /// `*rest`, `[[...rest]]` / `[[id]]` -> optional, `[id=int]` -> `:id`, a `(group)` or
 /// `@slot` -> nothing.
 fn dynamic_segment(seg: &str) -> Option<String> {
-    // `(group)`, `@slot` and the intercepting markers `(.)x` / `(..)x` / `(...)x` are no
-    // path segments (an intercepting route is served at the path it intercepts).
+    // `(group)` and `@slot` are no path segments (intercepting markers are read in `route_of`).
     if (seg.starts_with('(') && seg.ends_with(')')) || seg.starts_with('@') {
         return None;
-    }
-    if let Some(rest) = seg
-        .strip_prefix("(...)")
-        .or_else(|| seg.strip_prefix("(..)(..)"))
-        .or_else(|| seg.strip_prefix("(..)"))
-        .or_else(|| seg.strip_prefix("(.)"))
-    {
-        return Some(rest.to_string());
     }
     if let Some(inner) = seg.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
         let name = inner.trim_start_matches("...");
@@ -183,17 +174,30 @@ fn dynamic_segment(seg: &str) -> Option<String> {
 }
 
 fn route_of(dirs: &[String], leaf: Option<&str>) -> String {
-    let mut out = String::new();
-    for seg in dirs.iter().map(String::as_str).chain(leaf) {
+    let mut segs: Vec<String> = Vec::new();
+    for raw in dirs.iter().map(String::as_str).chain(leaf) {
+        let mut seg = raw;
+        // Intercepting routes are served at the path they intercept: `(.)x` the same level,
+        // `(..)x` one route segment up, `(..)(..)x` two, `(...)x` from the root.
+        if let Some(rest) = seg.strip_prefix("(...)") {
+            segs.clear();
+            seg = rest;
+        } else if seg.starts_with("(..)") {
+            while let Some(rest) = seg.strip_prefix("(..)") {
+                segs.pop();
+                seg = rest;
+            }
+        } else if let Some(rest) = seg.strip_prefix("(.)") {
+            seg = rest;
+        }
         if let Some(s) = dynamic_segment(seg).filter(|s| !s.is_empty()) {
-            out.push('/');
-            out.push_str(&s);
+            segs.push(s);
         }
     }
-    if out.is_empty() {
+    if segs.is_empty() {
         "/".to_string()
     } else {
-        out
+        format!("/{}", segs.join("/"))
     }
 }
 
@@ -237,7 +241,6 @@ pub(crate) fn file_routes(
     path: &Path,
     exports: &Exports,
     bindings: &ModuleBindings,
-    mentions: &dyn Fn(&str) -> bool,
 ) -> Vec<(RouteFact, (usize, usize))> {
     let segs = segments(path);
     let Some((file, dirs)) = segs.split_last() else {
@@ -271,15 +274,22 @@ pub(crate) fn file_routes(
             lines,
         )
     };
+    // The FIRST marker names the router root: a route folder that happens to be called
+    // `app` or `api` (`app/app/dashboard`, `server/api/v1/api/x`) is part of the route.
     let after = |marker: &str| -> Option<&[String]> {
         dirs.iter()
-            .rposition(|d| d == marker)
+            .position(|d| d == marker)
+            .map(|i| &dirs[i + 1..])
+    };
+    let after_pair = |parent: &str, marker: &str| -> Option<&[String]> {
+        (1..dirs.len())
+            .find(|&i| dirs[i] == marker && dirs[i - 1] == parent)
             .map(|i| &dirs[i + 1..])
     };
 
     // SvelteKit: `src/routes/**/+server.ts` (verbs) and `+page(.server).ts` (load / actions).
     if stem.starts_with('+') {
-        if let Some(rest) = after("routes") {
+        if let Some(rest) = after_pair("src", "routes") {
             let route = route_of(rest, None);
             return match stem {
                 "+server" => verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect(),
@@ -296,37 +306,40 @@ pub(crate) fn file_routes(
     // Next.js App Router: `app/**/route.ts` (verbs) and `app/**/page.tsx`.
     if (stem == "route" || stem == "page") && dirs.iter().any(|d| d == "app") {
         let rest = after("app").unwrap_or(&[]);
-        // A folder prefixed with `_` is private to the app router: nothing under it is routed.
-        if rest.iter().any(|d| d.starts_with('_')) {
-            return Vec::new();
-        }
-        let route = route_of(rest, None);
-        if stem == "route" && !verbs.is_empty() {
-            return verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect();
-        }
-        if stem == "page" && exports.contains_key("default") && bindings.references_any(&["next"]) {
-            return vec![page(&route)];
+        // A folder prefixed with `_` is private to the app router: nothing under it is routed
+        // (Remix's `app/routes/_index/route.tsx` is handled below, not here).
+        if !rest.iter().any(|d| d.starts_with('_')) {
+            let route = route_of(rest, None);
+            if stem == "route" && !verbs.is_empty() {
+                return verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect();
+            }
+            if stem == "page"
+                && exports.contains_key("default")
+                && bindings.references_any(&["next"])
+            {
+                return vec![page(&route)];
+            }
         }
     }
 
     // Nuxt / Nitro: `server/api/**` (under `/api`), `server/routes/**`; `x.get.ts` pins the method.
-    if let Some(rest) = after("api").filter(|_| dirs.iter().any(|d| d == "server")) {
-        if let Some(r) = nitro_route(&["api"], rest, stem, exports, mentions) {
+    if let Some(rest) = after_pair("server", "api") {
+        if let Some(r) = nitro_route(&["api"], rest, stem, exports) {
             return r;
         }
     }
-    if let Some(rest) = after("routes").filter(|_| dirs.iter().any(|d| d == "server")) {
-        if let Some(r) = nitro_route(&[], rest, stem, exports, mentions) {
+    if let Some(rest) = after_pair("server", "routes") {
+        if let Some(r) = nitro_route(&[], rest, stem, exports) {
             return r;
         }
     }
 
     // Remix / React Router: `app/routes/users.$id.tsx` (flat routes) and the folder form
     // `app/routes/users.$id/route.tsx`.
-    if let Some(rest) = after("routes") {
+    if let Some(rest) = after_pair("app", "routes") {
         let remix_import =
             bindings.references_any(&["@remix-run/", "react-router", "@react-router/"]);
-        if remix_import && dirs.iter().any(|d| d == "app") {
+        if remix_import {
             // A pathless layout (`_auth.tsx`, `_layout.tsx`) wraps routes, it is not one.
             let layout = stem
                 .rsplit('.')
@@ -335,7 +348,11 @@ pub(crate) fn file_routes(
             let route = match rest.last() {
                 None if layout => None,
                 None => Some(remix_route(stem)),
-                Some(folder) if stem == "route" || stem == "index" => Some(remix_route(folder)),
+                // `routes/users.$id/route.tsx`: one folder, one route. Deeper nesting is not a
+                // convention this reads.
+                Some(folder) if rest.len() == 1 && (stem == "route" || stem == "index") => {
+                    Some(remix_route(folder))
+                }
                 Some(_) => None,
             };
             if let Some(route) = route {
@@ -359,10 +376,11 @@ pub(crate) fn file_routes(
     // Next.js Pages Router and Astro endpoints: both live in `pages/`.
     if let Some(rest) = after("pages") {
         let is_index = stem == "index";
+        let astro_rest = after_pair("src", "pages").unwrap_or(rest);
         let leaf = (!is_index).then_some(stem);
         // Astro: `src/pages/**/x.ts` exporting verbs (`export const GET: APIRoute`).
         if !verbs.is_empty() && bindings.references_any(&["astro"]) {
-            let route = route_of(rest, leaf);
+            let route = route_of(astro_rest, leaf);
             return verbs.iter().map(|(v, l)| fact(v, &route, *l)).collect();
         }
         // Next: needs a `next` import, and skips `_app`, `_document`, `_error`, middleware.
@@ -390,11 +408,9 @@ fn nitro_route(
     rest: &[String],
     stem: &str,
     exports: &Exports,
-    mentions: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<(RouteFact, (usize, usize))>> {
     // The file must define a handler: `export default defineEventHandler(…)`.
     let lines = exports.get("default").copied()?;
-    let _ = mentions;
     let handler = [
         "defineEventHandler",
         "eventHandler",
@@ -402,9 +418,16 @@ fn nitro_route(
         "defineCachedEventHandler",
         "defineWebSocketHandler",
         "defineLazyEventHandler",
+        "cachedEventHandler",
     ]
     .iter()
-    .any(|h| exports.contains_key(&format!("default@{h}")));
+    .any(|h| {
+        exports
+            .keys()
+            .filter_map(|k| k.strip_prefix("default@"))
+            // `h3.defineEventHandler(...)` is the same helper under a namespace.
+            .any(|callee| callee == *h || callee.ends_with(&format!(".{h}")))
+    });
     if !handler {
         return None;
     }

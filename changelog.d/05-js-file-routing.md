@@ -16,7 +16,14 @@
   the default export *calls* (`defineEventHandler(…)`), not by a mention; SvelteKit's `+page.ts` /
   `+page.server.ts` only add their form `actions` (the page itself is `+page.svelte`). Paths are read from
   the workspace root down, so a checkout under `/app` or `~/api` does not make `app` / `api` framework folders.
-- **Known limits**: React Router v7 `app/routes.ts` config routing (the file name is not the route there),
+- **Anchoring**: the first router marker of the root-relative path names the router root, so a route folder
+  called `app` / `api` / `pages` / `routes` is part of the route (`app/app/dashboard` is `/app/dashboard`).
+  Next intercepting routes are served at the path they intercept (`(.)` same level, `(..)` one route segment
+  up, `(..)(..)` two, `(...)` from the root). Remix's folder form works under `_`-prefixed folders
+  (`routes/_index/route.tsx`); deeper nested folders are not read. Nitro also recognises `h3.defineEventHandler`
+  and `cachedEventHandler`.
+- **Known limits**: a workspace root that is itself the router folder (`web/app` registered as a root) has no
+  marker left: register the project root; plain `export default async function (event)` Nitro handlers; React Router v7 `app/routes.ts` config routing (the file name is not the route there),
   Next UI pages that import nothing from `next`, `export * from` re-exports, `pageExtensions`.
 - **Not in this PR**: `.vue` / `.svelte` / `.astro` pages (next PR), TanStack Router / Expo Router / Qwik City /
   SolidStart conventions, `middleware`, parallel/intercepting route details beyond ignoring `@slot`.

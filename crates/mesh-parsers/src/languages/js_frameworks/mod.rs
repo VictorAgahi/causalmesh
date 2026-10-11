@@ -333,10 +333,7 @@ pub(crate) fn detect_file_routes(
     if exports.is_empty() {
         return Vec::new();
     }
-    let text = std::str::from_utf8(fx.source).unwrap_or("");
-    file_routes::file_routes(path, &exports, &built.bindings, &|needle| {
-        text.contains(needle)
-    })
+    file_routes::file_routes(path, &exports, &built.bindings)
 }
 
 /// Broker interactions at a `new Ctor(...)`.

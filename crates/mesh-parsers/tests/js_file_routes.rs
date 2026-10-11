@@ -314,3 +314,113 @@ fn directories_above_the_workspace_root_are_not_framework_folders() {
     let ok = PolyglotIndexer::extract_with_config(&file, code, 0, &cfg);
     assert_eq!(routes(&ok), r(&["GET /api/x"]));
 }
+
+// ---- review round 2 (PR #84) ------------------------------------------------------------
+
+#[test]
+fn a_route_folder_named_like_a_marker_is_part_of_the_route() {
+    let page = "import Link from 'next/link';\nexport default function P() { return null; }\n";
+    assert_eq!(
+        routes(&index("app/app/dashboard/page.tsx", page)),
+        r(&["PAGE /app/dashboard"])
+    );
+    assert_eq!(
+        routes(&index("app/dashboard/app/page.tsx", page)),
+        r(&["PAGE /dashboard/app"])
+    );
+    assert_eq!(
+        routes(&index("pages/docs/pages/x.tsx", page)),
+        r(&["PAGE /docs/pages/x"])
+    );
+    assert_eq!(
+        routes(&index(
+            "src/routes/api/routes/+server.ts",
+            "export function GET() {}\n"
+        )),
+        r(&["GET /api/routes"])
+    );
+    let nitro = "export default defineEventHandler(() => 1);\n";
+    assert_eq!(
+        routes(&index("server/api/v1/api/x.ts", nitro)),
+        r(&["ALL /api/v1/api/x"])
+    );
+}
+
+#[test]
+fn remix_folder_routes_under_underscore_folders_and_nested_folders() {
+    let remix = "import { json } from '@remix-run/node';\nexport const loader = () => json({});\nexport default function C() { return null; }\n";
+    assert_eq!(
+        routes(&index("web/app/routes/_index/route.tsx", remix)),
+        r(&["GET /", "PAGE /"])
+    );
+    assert_eq!(
+        routes(&index("web/app/routes/_auth.login/route.tsx", remix)),
+        r(&["GET /login", "PAGE /login"])
+    );
+    // Deeper nesting is no convention this reads: no route rather than a wrong one.
+    assert!(routes(&index("web/app/routes/users/$id/route.tsx", remix)).is_empty());
+}
+
+#[test]
+fn intercepting_routes_are_served_at_the_path_they_intercept() {
+    let page = "import Link from 'next/link';\nexport default function P() { return null; }\n";
+    let at = |path: &str| routes(&index(path, page));
+    assert_eq!(
+        at("web/app/feed/(.)photo/[id]/page.tsx"),
+        r(&["PAGE /feed/photo/:id"])
+    );
+    assert_eq!(
+        at("web/app/feed/(..)photo/[id]/page.tsx"),
+        r(&["PAGE /photo/:id"])
+    );
+    assert_eq!(
+        at("web/app/a/b/(..)(..)photo/page.tsx"),
+        r(&["PAGE /photo"])
+    );
+    assert_eq!(
+        at("web/app/feed/x/(...)photo/[id]/page.tsx"),
+        r(&["PAGE /photo/:id"])
+    );
+    assert_eq!(at("web/app/feed/(.)[id]/page.tsx"), r(&["PAGE /feed/:id"]));
+    // A modal slot between the folders is no route segment.
+    assert_eq!(
+        at("web/app/feed/@modal/(..)photo/[id]/page.tsx"),
+        r(&["PAGE /photo/:id"])
+    );
+}
+
+#[test]
+fn nitro_namespace_and_cached_handlers() {
+    for code in [
+        "export default h3.defineEventHandler(() => 1);\n",
+        "export default cachedEventHandler(() => 1, { maxAge: 60 });\n",
+    ] {
+        assert_eq!(
+            routes(&index("web/server/api/z.ts", code)),
+            r(&["ALL /api/z"]),
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn roots_below_the_router_and_unknown_roots_read_no_router() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = dunce::canonicalize(tmp.path()).expect("canon");
+    // A workspace root that IS the `app` folder has no `app` left in its relative paths:
+    // documented limit (register the project root), and the price of not guessing from ancestors.
+    let root = base.join("app");
+    std::fs::create_dir_all(root.join("api/x")).expect("mkdir");
+    let file = root.join("api/x/route.ts");
+    let code = "export function GET() {}\n";
+    std::fs::write(&file, code).expect("write");
+    let cfg = mesh_parsers::ExtractConfig {
+        ts_aliases: mesh_parsers::TsAliasIndex::new(std::slice::from_ref(&root)),
+        ..mesh_parsers::ExtractConfig::default()
+    };
+    let fi = PolyglotIndexer::extract_with_config(&file, code, 0, &cfg);
+    assert!(routes(&fi).is_empty());
+    // An absolute path under no known root: its ancestors say nothing about a router.
+    let fi = PolyglotIndexer::extract(Path::new("/app/src/server/route.ts"), code, 0);
+    assert!(routes(&fi).is_empty());
+}

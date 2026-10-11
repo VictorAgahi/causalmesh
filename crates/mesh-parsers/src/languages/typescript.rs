@@ -755,6 +755,19 @@ impl TypeScriptExtractor {
                     .ok()
                     .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
                     .unwrap_or_else(|| format!("{method_name}()"));
+                // A route handler states its HTTP contract in its signature, as Python's
+                // do: the controller prefix joined with the verb decorator's path
+                // (`@Controller('users')` + `@Get(':id')` -> `GET /users/:id`). The name
+                // stays the method's, so symbol lookups are unaffected.
+                let mut first_line = first_line;
+                if kind == NodeKind::ServiceClass || kind == NodeKind::HttpEndpoint {
+                    if let Some(route) =
+                        js_frameworks::decorator_route(node, source, &ctx.frameworks)
+                    {
+                        kind = NodeKind::HttpEndpoint;
+                        first_line = route.label();
+                    }
+                }
 
                 let final_name = if let Some(g) = grpc_target {
                     CompactStr::new(g)
@@ -809,6 +822,9 @@ impl TypeScriptExtractor {
                     }
                 }
                 // Brokers and queues (Kafka, Redis, NATS, RabbitMQ, …): see `js_frameworks`.
+                for route in js_frameworks::detect_routes(node, source, &ctx.frameworks) {
+                    nodes.push(Self::route_node(ctx, node, &route));
+                }
                 for fact in js_frameworks::detect_call(node, source, &ctx.frameworks) {
                     nodes.push(Self::event_node(
                         ctx,
@@ -1145,6 +1161,24 @@ impl TypeScriptExtractor {
             decorator.start_position().row + 1,
             decorator.end_position().row + 1,
         )
+    }
+
+    /// The node of an HTTP route registered at `node`: named and signed by its
+    /// method and full path (`GET /api/users/:id`).
+    fn route_node(ctx: &VisitCtx, node: Node, route: &js_frameworks::RouteFact) -> ContractNode {
+        let label = route.label();
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(&label),
+            kind: NodeKind::HttpEndpoint,
+            file_path: ctx.file_path.clone(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            package: ctx.package_name.clone(),
+            repo_id: ctx.repo_id,
+            signature: Some(CompactStr::new(label)),
+            docstring: None,
+        }
     }
 
     /// The node of a broker interaction found at `node`.

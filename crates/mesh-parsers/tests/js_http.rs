@@ -403,3 +403,31 @@ fn module_names_are_matched_on_boundaries() {
     );
     assert!(routes(&fi).is_empty());
 }
+
+#[test]
+fn a_router_mounted_thousands_of_times_has_a_bounded_fan_out() {
+    // 3000 mounts of `p` on the app x 200 mounts of `r` on `p`, 20 registrations on `r`:
+    // 600,000 prefixes per route without a cap, 16 with it.
+    let mut code = String::from(
+        "import express from 'express';\nconst app = express();\nconst p = express.Router();\nconst r = express.Router();\n",
+    );
+    for i in 0..3000 {
+        code.push_str(&format!("app.use('/p{i}', p);\n"));
+    }
+    for i in 0..200 {
+        code.push_str(&format!("p.use('/c{i}', r);\n"));
+    }
+    for i in 0..20 {
+        code.push_str(&format!("r.get('/x{i}', h);\n"));
+    }
+    let start = std::time::Instant::now();
+    let fi = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || index("api/fanout.ts", &code))
+        .expect("spawn")
+        .join()
+        .expect("no overflow");
+    assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+    let n = routes(&fi).len();
+    assert!(n > 0 && n <= 20 * 16, "{n} routes");
+}

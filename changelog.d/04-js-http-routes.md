@@ -20,7 +20,8 @@
 - **Chained constructors and reused names**: `new Elysia({ prefix }).get(…).post(…)`, `new Hono().get(…)`,
   `Fastify().get(…)` and `Router().get(…)` register routes whatever else the file builds; a router variable
   reused in two functions is two routers, and one router mounted under two prefixes serves both (mount
-  cycles stop). koa named routes (`router.get('user', '/users/:id', h)`) and hapi's `method: '*'` are read.
+  cycles stop; at most 16 prefixes are kept per router, in declaration order, so a router mounted thousands
+  of times cannot fan out without bound). koa named routes (`router.get('user', '/users/:id', h)`) and hapi's `method: '*'` are read.
 - **Fewer false positives**: with no app or router built in the file, a receiver must look like one (or be
   imported); `got.extend()` / `HttpClient` clients are not routes; a verb-named decorator imported from a
   non-HTTP library declares no route; framework names are matched as modules (`'hono'`), not inside

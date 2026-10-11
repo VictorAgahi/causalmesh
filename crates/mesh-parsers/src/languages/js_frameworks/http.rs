@@ -443,6 +443,10 @@ pub(super) fn collect_mounts(root: Node, source: &[u8], names: &Names) -> Mounts
     }
 }
 
+/// Prefixes kept per router: a router mounted under more is truncated, deterministically
+/// (declaration order), rather than fanned out without bound.
+const MAX_PREFIXES: usize = 16;
+
 /// Every prefix a router is mounted under, through nested in-file mounts. At the first
 /// level only the mounts made in the function of the use site count (a name reused
 /// in two functions is two routers); with none there, all of them do. A router mounted
@@ -470,16 +474,20 @@ fn mounted_prefixes(mounts: &Mounts, router: &str, scope: (usize, usize)) -> Vec
             local
         };
         path.push(router.to_string());
-        let mut out = Vec::new();
-        for mount in chosen {
+        let mut out: Vec<String> = Vec::new();
+        'mounts: for mount in chosen {
             let parents = match &mount.parent {
                 Some(parent) => go(mounts, parent, None, path),
                 None => vec![String::new()],
             };
             for parent_prefix in parents {
-                out.push(join(&parent_prefix, &mount.prefix));
-                if out.len() >= 16 {
-                    break;
+                let prefix = join(&parent_prefix, &mount.prefix);
+                if !out.contains(&prefix) {
+                    out.push(prefix);
+                }
+                // The cap bounds the whole fan-out, not just one level of it.
+                if out.len() >= MAX_PREFIXES {
+                    break 'mounts;
                 }
             }
         }

@@ -10,7 +10,7 @@ description: >-
 
 Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today, all
 through tree-sitter: Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#,
-Ruby, PHP, Swift, Scala and Protobuf (`tree-sitter-proto`). YAML (OpenAPI / AsyncAPI specs,
+Ruby, PHP, Swift, Scala and Protobuf (`tree-sitter-proto`); JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) has its own grammar. YAML (OpenAPI / AsyncAPI specs,
 Spring properties) is handled without tree-sitter (`spec_shape.rs`, `mesh_core::yaml_stream`).
 
 ---
@@ -31,7 +31,7 @@ Spring properties) is handled without tree-sitter (`spec_shape.rs`, `mesh_core::
   - `create_bounded_parser()` — the constructor behind both; `verify_all_parsers()`
   - `execute_bounded_query()`, `BoundedMatch<'tree>`, `ParserError`
 - **Language kinds & decapitation**: [`crates/mesh-parsers/src/decapitate.rs`](../../../crates/mesh-parsers/src/decapitate.rs)
-  - `LanguageKind { Java, Go, Python, TypeScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Yaml, Unknown }`
+  - `LanguageKind { Java, Go, Python, TypeScript, Tsx, JavaScript, Rust, Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Yaml, Unknown }`
   - `LanguageKind::TREE_SITTER_COUNT`, `as_str()`, `language()`, `from_path()`, `tree_sitter_slot()`
   - `AstDecapitator::decapitate_auto()`, `::decapitate_auto_mapped()` (keeps original line
     numbers), `::decapitate()`, `BOUNDED_ERROR_STUB`

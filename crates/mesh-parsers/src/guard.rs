@@ -297,6 +297,7 @@ impl AstGuard {
             && Self::create_bounded_parser(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
                 .is_ok()
             && Self::create_bounded_parser(&tree_sitter_typescript::LANGUAGE_TSX.into()).is_ok()
+            && Self::create_bounded_parser(&tree_sitter_javascript::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_rust::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_cpp::LANGUAGE.into()).is_ok()
             && Self::create_bounded_parser(&tree_sitter_kotlin_ng::LANGUAGE.into()).is_ok()
@@ -336,7 +337,7 @@ impl AstGuard {
             static PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
                 const {
                     RefCell::new([
-                        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                     ])
                 };
         }
@@ -386,7 +387,7 @@ impl AstGuard {
             static INDEX_PARSERS: RefCell<[Option<Parser>; LanguageKind::TREE_SITTER_COUNT]> =
                 const {
                     RefCell::new([
-                        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                     ])
                 };
         }

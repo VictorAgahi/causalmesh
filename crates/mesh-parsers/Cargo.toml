@@ -22,6 +22,7 @@ regex.workspace = true
 tree-sitter.workspace = true
 tree-sitter-language.workspace = true
 tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-java.workspace = true
 tree-sitter-python.workspace = true

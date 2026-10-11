@@ -6,10 +6,14 @@ pub enum LanguageKind {
     Go,
     Python,
     TypeScript,
-    /// `.tsx`, and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`): the TSX grammar
-    /// parses JSX, which the TypeScript one turns into error nodes (7.0.0
-    /// parsed `.tsx` with it and missed `const App = () => <View/>`).
+    /// `.tsx`: the TSX grammar parses JSX, which the TypeScript one turns into
+    /// error nodes (7.0.0 parsed `.tsx` with it and missed
+    /// `const App = () => <View/>`).
     Tsx,
+    /// JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`): its own grammar, which
+    /// handles JSX and CommonJS without the TSX grammar's TypeScript-only
+    /// ambiguities (`<T>x` assertions, generic arrows) misparsing plain JS.
+    JavaScript,
     Rust,
     Cpp,
     Kotlin,
@@ -25,8 +29,8 @@ pub enum LanguageKind {
 
 impl LanguageKind {
     /// Number of variants backed by a tree-sitter grammar (Java, Go, Python, TypeScript, Rust,
-    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Tsx).
-    pub const TREE_SITTER_COUNT: usize = 14;
+    /// Cpp, Kotlin, CSharp, Ruby, Php, Swift, Scala, Protobuf, Tsx, JavaScript).
+    pub const TREE_SITTER_COUNT: usize = 15;
 
     /// Lowercase name, allocation-free (was `format!("{:?}").to_lowercase()` per file).
     #[inline]
@@ -37,6 +41,7 @@ impl LanguageKind {
             Self::Python => "python",
             Self::TypeScript => "typescript",
             Self::Tsx => "tsx",
+            Self::JavaScript => "javascript",
             Self::Rust => "rust",
             Self::Cpp => "cpp",
             Self::Kotlin => "kotlin",
@@ -69,6 +74,7 @@ impl LanguageKind {
             Self::Scala => Some(11),
             Self::Protobuf => Some(12),
             Self::Tsx => Some(13),
+            Self::JavaScript => Some(14),
             Self::Yaml | Self::Unknown => None,
         }
     }
@@ -81,6 +87,7 @@ impl LanguageKind {
             Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
             Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Self::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Self::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
@@ -108,13 +115,14 @@ impl LanguageKind {
             || path_str.ends_with(".cts")
         {
             Self::TypeScript
-        } else if path_str.ends_with(".tsx")
-            || path_str.ends_with(".js")
+        } else if path_str.ends_with(".tsx") {
+            Self::Tsx
+        } else if path_str.ends_with(".js")
             || path_str.ends_with(".jsx")
             || path_str.ends_with(".mjs")
             || path_str.ends_with(".cjs")
         {
-            Self::Tsx
+            Self::JavaScript
         } else if path_str.ends_with(".rs") {
             Self::Rust
         } else if path_str.ends_with(".kt") || path_str.ends_with(".kts") {
@@ -209,6 +217,26 @@ impl AstDecapitator {
     pub const BOUNDED_ERROR_STUB: &'static str =
         "// [MeshMCP Warning: AST decapitation bounded or parser timeout (>15ms). Body stripped to protect context window.]\n";
 
+    /// Runs `decapitate_under` (one parse + decapitation under a grammar, plus
+    /// whether its tree holds syntax errors). A `.js` file the JavaScript grammar
+    /// cannot parse cleanly but the TSX grammar can (Flow / Babel annotations,
+    /// `interface`, `enum`) is decapitated from the TSX tree instead: JavaScript's
+    /// would drop its classes and types into error nodes. A clean file costs one
+    /// parse; only an erroring `.js` file costs a second one. Any other language
+    /// runs once, as itself.
+    fn with_dialect<R>(
+        lang_kind: LanguageKind,
+        decapitate_under: impl Fn(LanguageKind) -> Option<(R, bool)>,
+    ) -> Option<R> {
+        let (result, has_error) = decapitate_under(lang_kind)?;
+        if lang_kind == LanguageKind::JavaScript && has_error {
+            if let Some((tsx, false)) = decapitate_under(LanguageKind::Tsx) {
+                return Some(tsx);
+            }
+        }
+        Some(result)
+    }
+
     /// Decapitates imperative method bodies using the appropriate language parser automatically
     pub fn decapitate_auto(content: &str, lang_kind: LanguageKind, include_body: bool) -> String {
         if include_body {
@@ -227,8 +255,11 @@ impl AstDecapitator {
             _ => {}
         }
 
-        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
-            Self::decapitate(content, lang_kind, parser, false)
+        Self::with_dialect(lang_kind, |kind| {
+            crate::guard::AstGuard::with_parser(kind, |parser| {
+                Self::decapitate_checked(content, kind, parser)
+            })
+            .flatten()
         })
         .unwrap_or_else(|| Self::BOUNDED_ERROR_STUB.to_string())
     }
@@ -243,23 +274,32 @@ impl AstDecapitator {
         if include_body {
             return content.to_string();
         }
+        Self::decapitate_checked(content, lang_kind, parser)
+            .map(|(text, _)| text)
+            .unwrap_or_else(|| Self::BOUNDED_ERROR_STUB.to_string())
+    }
 
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => {
-                // Commandment 2: NEVER return the raw gigantic file on timeout or failure.
-                // Return bounded error stub <= 256 bytes protecting LLM context window.
-                tracing::warn!(
-                    target: "mesh::parser",
-                    "Parser timeout (>15ms) or C-FFI failure; returning bounded stub (<= 256 bytes)"
-                );
-                return Self::BOUNDED_ERROR_STUB.to_string();
-            }
+    /// One parse and decapitation under `lang_kind`'s grammar; `None` when the
+    /// parse timed out or failed (the caller returns the bounded stub, never the
+    /// raw file - Commandment 2), else the text and whether the tree has errors.
+    fn decapitate_checked(
+        content: &str,
+        lang_kind: LanguageKind,
+        parser: &mut Parser,
+    ) -> Option<(String, bool)> {
+        let Some(tree) = parser.parse(content, None) else {
+            tracing::warn!(
+                target: "mesh::parser",
+                "Parser timeout (>15ms) or C-FFI failure; returning bounded stub (<= 256 bytes)"
+            );
+            return None;
         };
-
         let mut replacements: Vec<(usize, usize, std::borrow::Cow<'static, str>)> = Vec::new();
         Self::collect_body_replacements(content, tree.root_node(), lang_kind, &mut replacements, 0);
-        Self::apply_replacements(content, replacements, None)
+        Some((
+            Self::apply_replacements(content, replacements, None),
+            tree.root_node().has_error(),
+        ))
     }
 
     /// [`Self::decapitate_auto`] plus, for every output line, the span of
@@ -297,31 +337,36 @@ impl AstDecapitator {
             _ => {}
         }
 
-        crate::guard::AstGuard::with_parser(lang_kind, |parser| {
-            let Some(tree) = parser.parse(content, None) else {
-                tracing::warn!(
-                    target: "mesh::parser",
-                    "Parser timeout or C-FFI failure; returning bounded stub (<= 256 bytes)"
+        Self::with_dialect(lang_kind, |kind| {
+            crate::guard::AstGuard::with_parser(kind, |parser| {
+                let Some(tree) = parser.parse(content, None) else {
+                    tracing::warn!(
+                        target: "mesh::parser",
+                        "Parser timeout or C-FFI failure; returning bounded stub (<= 256 bytes)"
+                    );
+                    return None;
+                };
+                let mut replacements = Vec::new();
+                Self::collect_body_replacements(
+                    content,
+                    tree.root_node(),
+                    kind,
+                    &mut replacements,
+                    0,
                 );
-                return None;
-            };
-            let mut replacements = Vec::new();
-            Self::collect_body_replacements(
-                content,
-                tree.root_node(),
-                lang_kind,
-                &mut replacements,
-                0,
-            );
-            let mut line_map = Vec::new();
-            let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
-            Some(DecapitatedSource {
-                text,
-                line_map,
-                bounded: false,
+                let mut line_map = Vec::new();
+                let text = Self::apply_replacements(content, replacements, Some(&mut line_map));
+                Some((
+                    DecapitatedSource {
+                        text,
+                        line_map,
+                        bounded: false,
+                    },
+                    tree.root_node().has_error(),
+                ))
             })
+            .flatten()
         })
-        .flatten()
         .unwrap_or_else(stub)
     }
 
@@ -450,10 +495,14 @@ impl AstDecapitator {
                     return;
                 }
             }
-            LanguageKind::TypeScript | LanguageKind::Tsx
+            LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript
                 if kind == "method_definition"
                     || kind == "function_declaration"
                     || kind == "function_item"
+                    || kind == "function_expression"
+                    || kind == "class_static_block"
+                    || kind == "generator_function"
+                    || kind == "generator_function_declaration"
                     || kind == "arrow_function" =>
             {
                 if let Some(body) = node.child_by_field_name("body") {

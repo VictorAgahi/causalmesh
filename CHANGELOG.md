@@ -151,8 +151,7 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
   imported); `got.extend()` / `HttpClient` clients are not routes; a verb-named decorator imported from a
   non-HTTP library declares no route; framework names are matched as modules (`'hono'`), not inside
   "honor" or `<h3>`.
-- **Known limits**: NestJS global prefixes and `@Version`, Express/Koa mounts across files, file-based routing
-  (Next, Remix, SvelteKit, Nuxt, Astro: next PR), a Fastify plugin passed as a named function, an inherited
+- **Known limits**: NestJS global prefixes and `@Version`, Express/Koa mounts across files, a Fastify plugin passed as a named function, an inherited
   controller base class's `@Get` (it lacks the child's `@Controller` prefix), `@Get(['a', 'b'])` (first path only) and HTTP client calls are not linked to the routes.
 - Long method chains (more than ~30 links in one expression) are read up to a depth bound and silently stop; at most 5000 route nodes are recorded per file.
 - Type-only framework imports (`import type { FastifyInstance } from 'fastify'`) identify typed routers. Mount chains deeper than 64 are cut. Mount prefixes are independent of the order routes are registered in.
@@ -184,8 +183,7 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
 - **Known limits**: a workspace root that is itself the router folder (`web/app` registered as a root) has no
   marker left: register the project root; plain `export default async function (event)` Nitro handlers; React Router v7 `app/routes.ts` config routing (the file name is not the route there),
   Next UI pages that import nothing from `next`, `export * from` re-exports, `pageExtensions`.
-- **Not in this PR**: `.vue` / `.svelte` / `.astro` pages (next PR), TanStack Router / Expo Router / Qwik City /
-  SolidStart conventions, `middleware`, parallel/intercepting route details beyond ignoring `@slot`.
+- **Not covered**: TanStack Router / Expo Router / Qwik City / SolidStart conventions and `middleware`.
 
 #### Single-file components
 - **`.vue`, `.svelte` and `.astro` files are indexed.** Their code is their `<script>` blocks (Vue
@@ -203,11 +201,12 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
 - The block scanner is one linear pass over the markup: it skips comments and `<style>`, every other tag with its quoted attribute values (`<div :title="'<script>'">` holds no script), and reads attributes case-insensitively. It skips `<script>` mentioned in comments and `<style>`, self-closing external scripts, reads quoted attributes containing `>` (`generic="T extends Array<string>"`) and ignores non-JS blocks (`lang="coffee"`, `type="application/ld+json"`, import maps); the Astro frontmatter may follow a BOM or blank lines.
 - An explicit `.vue` / `.svelte` / `.astro` import names only such a file, and an explicit `.js` / `.ts` never names a component (`Foo.vue` beside `Foo.ts`).
 - `+page` / `+layout` files are routes, not named components; SvelteKit pages need `src/routes`, Astro skips `_`-prefixed files and folders.
-- The script gets the same lexical guard as any parsed source (nesting depth, line length). The watcher
-  reloads on `.vue` / `.svelte` / `.astro` edits and alias-config edits re-extract them.
+- The watcher reloads on `.vue` / `.svelte` / `.astro` edits, and alias-config edits re-extract them.
 - **Not covered**: template-only component usage (auto-imported components, `<UserCard />` with no import),
   Nuxt `pages/*.vue` (needs a Nuxt signal the file does not carry), `<script src="…">` external scripts,
-  decapitation and `smart_search` snippets of components (the file is shown as written).
+  decapitation and `smart_search` snippets of components (the file is shown as written). A tag holding an odd
+  quote the scanner does not track (a Svelte `<p title={`it's`}>`, a Pug template with `p(v-if="a<b")`) hides
+  the script that follows it, and a `<script>` inside `<textarea>`, `<pre>` or an Astro expression is read as one.
 
 #### Typed API layers
 - **tRPC procedures** (`router({ get: publicProcedure.input(…).query(…) })`, `t.procedure…`), in a file that
@@ -218,8 +217,9 @@ its method with no route, and did not read `.vue` / `.svelte` / `.astro` at all.
   inline or through a router variable of the same file (`post: postRouter`) compose the dotted path.
   The REST `@Query()` parameter decorator of `@nestjs/common`, Apollo Client `typePolicies` and data keyed
   `Query` are not operations. At most 5000 route nodes are recorded per file.
-- **Not covered**: routers mounted from another file, procedures defined as variables and referenced by
-  name, `@ResolveField`, resolver maps for custom types, schema (`typeDefs`) parsing, Pothos / Nexus builders.
+- **Not covered**: routers mounted from another file (router variables are matched by name within the file: a
+  router mounted twice keeps its first mount, a shorthand `{ sub }` is not followed), procedures defined as
+  variables and referenced by name, `@ResolveField`, resolver maps for custom types, schema (`typeDefs`) parsing, Pothos / Nexus builders.
 
 ### Index cache
 Schema v10, and the workspace id folds in the version: unchanged JavaScript / TypeScript files are

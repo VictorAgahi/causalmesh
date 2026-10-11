@@ -1011,3 +1011,68 @@ function mk() {
     assert!(events(&fi).is_empty());
     assert!(start.elapsed().as_secs() < 8, "took {:?}", start.elapsed());
 }
+
+// ---- Kinesis, EventBridge, STOMP, Redis lists -----------------------------------------
+
+#[test]
+fn kinesis_eventbridge_stomp_and_redis_lists() {
+    let kinesis = index(
+        "svc/k.ts",
+        "import { PutRecordCommand } from '@aws-sdk/client-kinesis';\n\
+         export const f = (c: any) => c.send(new PutRecordCommand({ StreamName: 'orders-stream', Data: d }));\n",
+    );
+    assert_eq!(events(&kinesis), vec![ev('P', "orders-stream")]);
+
+    let bridge = index(
+        "svc/b.ts",
+        "import { PutEventsCommand } from '@aws-sdk/client-eventbridge';\n\
+         export const f = (c: any) => c.send(new PutEventsCommand({ Entries: [{ DetailType: 'order.created' }] }));\n",
+    );
+    assert_eq!(events(&bridge), vec![ev('P', "order.created")]);
+
+    let stomp = index(
+        "svc/s.ts",
+        "import { Client } from '@stomp/stompjs';\n\
+         const client = new Client({});\n\
+         client.publish({ destination: '/queue/x', body: '' });\n\
+         client.subscribe('/topic/y', () => {});\n",
+    );
+    assert_eq!(
+        events(&stomp),
+        vec![ev('C', "/topic/y"), ev('P', "/queue/x")]
+    );
+
+    let redis = index(
+        "svc/r.ts",
+        "import Redis from 'ioredis';\n\
+         const redis = new Redis();\n\
+         export async function f() { await redis.lpush('jobs', 'x'); await redis.brpop('done', 0); }\n",
+    );
+    assert_eq!(events(&redis), vec![ev('C', "done"), ev('P', "jobs")]);
+
+    // No library import, no broker.
+    let bare = index(
+        "svc/n.ts",
+        "export const f = (c: any) => c.lpush('jobs', 'x');\n",
+    );
+    assert!(events(&bare).is_empty());
+}
+
+#[test]
+fn redis_blocking_pop_timeouts_and_stomp_generic_names() {
+    let redis = index(
+        "svc/r2.ts",
+        "import Redis from 'ioredis';\nconst redis = new Redis();\nexport const f = () => redis.brpop('q', '5');\n",
+    );
+    assert_eq!(events(&redis), vec![ev('C', "q")]);
+    let ws = index(
+        "svc/w.ts",
+        "import { Client } from '@stomp/stompjs';\nexport const f = (ws: WebSocket) => ws.send('ping');\n",
+    );
+    assert!(events(&ws).is_empty());
+    let none = index(
+        "svc/n2.ts",
+        "export const f = (c: any) => c.send(new PutRecordCommand({ StreamName: 'x' }));\n",
+    );
+    assert!(events(&none).is_empty());
+}

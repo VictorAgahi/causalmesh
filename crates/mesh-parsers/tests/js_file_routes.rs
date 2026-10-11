@@ -433,3 +433,37 @@ fn a_pathless_layout_in_folder_form_is_not_a_route() {
     assert!(routes(&index("web/app/routes/_auth/route.tsx", remix)).is_empty());
     assert!(routes(&index("web/app/routes/dashboard._layout/route.tsx", remix)).is_empty());
 }
+
+#[test]
+fn react_router_v7_routes_config_declares_the_routes() {
+    let config = "import { type RouteConfig, index, route, layout, prefix } from '@react-router/dev/routes';\n\
+        export default [\n\
+          index('routes/home.tsx'),\n\
+          route('users/:id', 'routes/user.tsx'),\n\
+          layout('routes/shell.tsx', [ route('about', 'routes/about.tsx') ]),\n\
+          ...prefix('admin', [ route('stats', 'routes/stats.tsx', [ index('routes/stats-home.tsx') ]) ]),\n\
+        ] satisfies RouteConfig;\n";
+    assert_eq!(
+        routes(&index("web/app/routes.ts", config)),
+        r(&[
+            "PAGE /",
+            "PAGE /about",
+            "PAGE /admin/stats",
+            "PAGE /users/:id"
+        ])
+    );
+    // Without the react-router config import, `routes.ts` is just a module.
+    let plain = "export default [ route('x', 'y') ];\n";
+    assert!(routes(&index("web/app/routes.ts", plain)).is_empty());
+}
+
+#[test]
+fn react_router_v7_config_forms() {
+    let wrapper = "import { route } from '@react-router/dev/routes';\nexport default [ route(null, 'routes/shell.tsx', [ route('a', 'routes/a.tsx') ]) ];\n";
+    assert_eq!(
+        routes(&index("web/app/routes.ts", wrapper)),
+        r(&["PAGE /a"])
+    );
+    let named = "import { route, type RouteConfig } from '@react-router/dev/routes';\nconst routes: RouteConfig = [ route('b', 'routes/b.tsx') ];\nexport default routes;\n";
+    assert_eq!(routes(&index("web/app/routes.ts", named)), r(&["PAGE /b"]));
+}

@@ -43,6 +43,14 @@ fn all_string_args(s: &Site) -> Vec<String> {
         .collect()
 }
 
+/// Every string argument but a numeric one: `brpop('q', '5')` has a timeout, not a key.
+fn key_args(s: &Site) -> Vec<String> {
+    all_string_args(s)
+        .into_iter()
+        .filter(|n| !n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .collect()
+}
+
 /// Names under `keys` of the object at argument `index`.
 fn object_keys(s: &Site, index: usize, keys: &[&str]) -> Vec<String> {
     let Some(object) = s.args.get(index) else {
@@ -313,6 +321,42 @@ fn rabbit_queue(s: &Site) -> Vec<String> {
     }
 }
 
+/// AWS Kinesis: the stream of a record / shard-iterator command.
+fn kinesis_stream(s: &Site) -> Vec<String> {
+    object_keys(s, 0, &["StreamName"])
+}
+
+/// AWS EventBridge `PutEventsCommand({ Entries: [{ DetailType, EventBusName, … }] })`: the event
+/// type consumers match on, else the bus.
+fn eventbridge_events(s: &Site) -> Vec<String> {
+    let Some(entries) = s
+        .args
+        .first()
+        .and_then(|o| s.names.object_value(*o, "Entries"))
+    else {
+        return Vec::new();
+    };
+    let entries = super::super::typescript::TypeScriptExtractor::peel_wrappers(entries);
+    if entries.kind() != "array" {
+        return Vec::new();
+    }
+    entries
+        .named_children(&mut entries.walk())
+        .flat_map(|entry| {
+            ["DetailType", "EventBusName"]
+                .iter()
+                .find_map(|k| s.names.object_value(entry, k))
+                .map(|v| s.names.resolve_all(v))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// STOMP `client.publish({ destination: '/queue/x', body })`.
+fn stomp_destination(s: &Site) -> Vec<String> {
+    object_keys(s, 0, &["destination"])
+}
+
 // ---- libraries --------------------------------------------------------------------
 
 const KAFKAJS: &[&str] = &["kafkajs", "@confluentinc/kafka-javascript"];
@@ -352,6 +396,14 @@ const AWS_V2: &[&str] = &["aws-sdk"];
 const PUBSUB: &[&str] = &["@google-cloud/pubsub"];
 const PULSAR: &[&str] = &["pulsar-client"];
 const SERVICE_BUS: &[&str] = &["@azure/service-bus"];
+const KINESIS: &[&str] = &["@aws-sdk/client-kinesis"];
+const EVENTBRIDGE: &[&str] = &["@aws-sdk/client-eventbridge"];
+const STOMP: &[&str] = &[
+    "@stomp/stompjs",
+    "@stomp/rx-stomp",
+    "stompjs",
+    "stomp-client",
+];
 const EVENT_HUBS: &[&str] = &["@azure/event-hubs"];
 const KAFKA_NODE: &[&str] = &["kafka-node"];
 const PLATFORMATIC: &[&str] = &["@platformatic/kafka"];
@@ -371,6 +423,7 @@ pub(super) const FAMILIES: &[&[&str]] = &[
     PUBSUB,
     PULSAR,
     SERVICE_BUS,
+    STOMP,
     NEST,
 ];
 
@@ -743,6 +796,36 @@ pub(super) const CALL_RULES: &[CallRule] = &[
         "servicebus createReceiver",
         first_arg
     ),
+    // Redis lists used as queues: `lpush` / `rpush` produce, `brpop` / `blpop` / `rpop` / `lpop` consume.
+    call!(REDIS, "lpush", Produce, Queue, "redis lpush", first_arg),
+    call!(REDIS, "lPush", Produce, Queue, "redis lPush", first_arg),
+    call!(REDIS, "rpush", Produce, Queue, "redis rpush", first_arg),
+    call!(REDIS, "rPush", Produce, Queue, "redis rPush", first_arg),
+    call!(REDIS, "brpop", Consume, Queue, "redis brpop", key_args),
+    call!(REDIS, "bRPop", Consume, Queue, "redis bRPop", key_args),
+    call!(REDIS, "blpop", Consume, Queue, "redis blpop", key_args),
+    call!(REDIS, "bLPop", Consume, Queue, "redis bLPop", key_args),
+    call!(REDIS, "rpop", Consume, Queue, "redis rpop", first_arg),
+    call!(REDIS, "rPop", Consume, Queue, "redis rPop", first_arg),
+    call!(REDIS, "lpop", Consume, Queue, "redis lpop", first_arg),
+    call!(REDIS, "lPop", Consume, Queue, "redis lPop", first_arg),
+    // STOMP (ActiveMQ, Artemis, RabbitMQ STOMP): destinations are queues or topics.
+    call!(
+        STOMP,
+        "publish",
+        Produce,
+        EventStream,
+        "stomp publish",
+        stomp_destination
+    ),
+    call!(
+        STOMP,
+        "subscribe",
+        Consume,
+        EventStream,
+        "stomp subscribe",
+        first_arg
+    ),
 ];
 
 /// Pulsar `{ topic | topics }` of the options object.
@@ -872,6 +955,43 @@ pub(super) const CTOR_RULES: &[CtorRule] = &[
         EventStream,
         "sns new PublishBatchCommand()",
         sns_topic
+    ),
+    // AWS Kinesis commands and EventBridge events.
+    ctor!(
+        KINESIS,
+        Some("PutRecordCommand"),
+        false,
+        Produce,
+        EventStream,
+        "kinesis new PutRecordCommand()",
+        kinesis_stream
+    ),
+    ctor!(
+        KINESIS,
+        Some("PutRecordsCommand"),
+        false,
+        Produce,
+        EventStream,
+        "kinesis new PutRecordsCommand()",
+        kinesis_stream
+    ),
+    ctor!(
+        KINESIS,
+        Some("GetShardIteratorCommand"),
+        false,
+        Consume,
+        EventStream,
+        "kinesis new GetShardIteratorCommand()",
+        kinesis_stream
+    ),
+    ctor!(
+        EVENTBRIDGE,
+        Some("PutEventsCommand"),
+        false,
+        Produce,
+        EventStream,
+        "eventbridge new PutEventsCommand()",
+        eventbridge_events
     ),
 ];
 

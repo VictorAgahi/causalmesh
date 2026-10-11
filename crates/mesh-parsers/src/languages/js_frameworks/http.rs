@@ -229,7 +229,7 @@ fn is_framework_name(
 }
 
 /// Joins path segments with single slashes: `("/api/", "/users")` -> `/api/users`.
-fn join(prefix: &str, path: &str) -> String {
+pub(super) fn join(prefix: &str, path: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
     let path = path.trim_start_matches('/');
     let joined = match (prefix.is_empty(), path.is_empty()) {

@@ -372,6 +372,15 @@ pub(crate) fn detect_file_routes(
         return Vec::new();
     }
     let built = fx.built();
+    // React Router v7 `app/routes.ts`: the file declares the routes of other files.
+    let is_routes_config = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s == "routes")
+        && built.bindings.references_any(&["@react-router/dev/routes"]);
+    if is_routes_config {
+        return file_routes::react_router_config(fx.root, fx.source);
+    }
     let exports = file_routes::exported_names(fx.root, fx.source);
     if exports.is_empty() {
         return Vec::new();

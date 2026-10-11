@@ -6,8 +6,9 @@
 //! framework, or the exports only that framework's route modules have (`GET` and `POST`
 //! functions in a `route.ts`, a `+server.ts`, `loader` / `action` next to a Remix import).
 
-use super::http::RouteFact;
+use super::http::{join, RouteFact};
 use super::scope::ModuleBindings;
+use super::{arguments, scope::unquote};
 use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::Node;
@@ -263,6 +264,131 @@ pub(crate) fn sfc_route(path: &Path) -> Option<RouteFact> {
         method: "PAGE".to_string(),
         path: route,
     })
+}
+
+/// React Router v7 config routing: the routes `app/routes.ts` declares with `index`, `route`,
+/// `layout` and `prefix` (`export default [ route('users/:id', 'routes/user.tsx') ] satisfies
+/// RouteConfig`), as `PAGE` routes anchored at each call.
+pub(crate) fn react_router_config(root: Node, source: &[u8]) -> Vec<(RouteFact, (usize, usize))> {
+    let exported = root
+        .named_children(&mut root.walk())
+        .filter(|s| s.kind() == "export_statement")
+        .filter(|s| s.children(&mut s.walk()).any(|c| c.kind() == "default"))
+        .find_map(|s| s.child_by_field_name("value"))
+        .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers);
+    // `const routes = [..]; export default routes;`: follow the identifier to its array.
+    let array = exported.and_then(|v| {
+        if v.kind() != "identifier" {
+            return Some(v);
+        }
+        let name = v.utf8_text(source).ok()?;
+        root.named_children(&mut root.walk())
+            .flat_map(|s| {
+                let decl = if s.kind() == "export_statement" {
+                    s.child_by_field_name("declaration")
+                } else {
+                    Some(s)
+                };
+                decl.into_iter().flat_map(|d| {
+                    d.named_children(&mut d.walk())
+                        .filter(|c| c.kind() == "variable_declarator")
+                        .collect::<Vec<_>>()
+                })
+            })
+            .find(|d| {
+                d.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    == Some(name)
+            })
+            .and_then(|d| d.child_by_field_name("value"))
+            .map(crate::languages::typescript::TypeScriptExtractor::peel_wrappers)
+    });
+    let array = array.filter(|v| v.kind() == "array");
+    let mut out = Vec::new();
+    if let Some(array) = array {
+        walk_route_config(array, "", source, &mut out, 0);
+    }
+    // An index child answers its parent's URL: one route per URL.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(fact, _)| seen.insert(fact.path.clone()));
+    out
+}
+
+fn walk_route_config(
+    array: Node,
+    prefix: &str,
+    source: &[u8],
+    out: &mut Vec<(RouteFact, (usize, usize))>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    for element in array.named_children(&mut array.walk()) {
+        // `...prefix('admin', [..])` spreads the call.
+        let element = if element.kind() == "spread_element" {
+            match element.named_child(0) {
+                Some(inner) => inner,
+                None => continue,
+            }
+        } else {
+            element
+        };
+        if element.kind() != "call_expression" {
+            continue;
+        }
+        let Some(name) = element
+            .child_by_field_name("function")
+            .and_then(|f| f.utf8_text(source).ok())
+        else {
+            continue;
+        };
+        let args = arguments(element);
+        let text_of = |i: usize| args.get(i).and_then(|a| unquote(*a, source));
+        let children_of = |i: usize| args.get(i).copied().filter(|a| a.kind() == "array");
+        let lines = (
+            element.start_position().row + 1,
+            element.end_position().row + 1,
+        );
+        let mut page = |path: &str| {
+            out.push((
+                RouteFact {
+                    method: "PAGE".to_string(),
+                    path: path.to_string(),
+                },
+                lines,
+            ));
+        };
+        match name {
+            "index" => page(&join(prefix, "")),
+            "route" => {
+                // `route(null, file, [..])` is a pathless wrapper: its children keep the prefix.
+                if args.first().is_some_and(|a| a.kind() == "null") {
+                    if let Some(children) = children_of(2) {
+                        walk_route_config(children, prefix, source, out, depth + 1);
+                    }
+                    continue;
+                }
+                let Some(path) = text_of(0) else { continue };
+                let full = join(prefix, &path);
+                page(&full);
+                if let Some(children) = children_of(2) {
+                    walk_route_config(children, &full, source, out, depth + 1);
+                }
+            }
+            "layout" => {
+                if let Some(children) = children_of(1).or_else(|| children_of(2)) {
+                    walk_route_config(children, prefix, source, out, depth + 1);
+                }
+            }
+            "prefix" => {
+                if let (Some(path), Some(children)) = (text_of(0), children_of(1)) {
+                    walk_route_config(children, &join(prefix, &path), source, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The routes the location and exports of one file declare, with the lines each is anchored to.

@@ -62,6 +62,33 @@ pub fn is_test_path(path: &Path) -> bool {
             && stem.chars().next().is_some_and(char::is_uppercase))
 }
 
+/// Whether `path` looks machine-generated (protobuf/gRPC stubs, codegen output,
+/// declaration files). Used only to rank a representative location below
+/// hand-written code, never to hide a dependent.
+pub fn is_generated_path(path: &Path) -> bool {
+    let in_gen_dir = path.components().any(|c| match c {
+        Component::Normal(name) => name.to_str().is_some_and(|n| {
+            ["__generated__", "generated", "gen", "codegen", "proto-gen"]
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(n))
+        }),
+        _ => false,
+    });
+    if in_gen_dir {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".d.ts")
+        || name.contains(".generated.")
+        || name.contains(".gen.")
+        || name.contains(".pb.")
+        || name.contains("_pb.")
+        || name.contains("_pb2")
+        || name.contains("_grpc.")
+}
+
 /// Whether `node` is declared in test code. The path is judged RELATIVE to its
 /// workspace root: a checkout that itself lives under `~/testing/` or `/work/e2e/`
 /// must not classify every node as test code. A node under no known root keeps
@@ -107,6 +134,23 @@ mod tests {
             "src/events/events.e2e-spec.ts",
         ] {
             assert!(is_test_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn recognizes_generated_code() {
+        for p in [
+            "src/__generated__/schema.ts",
+            "gen/go/user.pb.go",
+            "src/user_pb.js",
+            "types/api.d.ts",
+            "src/client.generated.ts",
+            "proto/user_pb2.py",
+        ] {
+            assert!(is_generated_path(Path::new(p)), "{p}");
+        }
+        for p in ["src/user.service.ts", "src/general/index.ts", "src/pbx.ts"] {
+            assert!(!is_generated_path(Path::new(p)), "{p}");
         }
     }
 

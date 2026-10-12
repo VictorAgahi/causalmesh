@@ -5,6 +5,7 @@
 //! to the shared AppState tool handlers without allocating any additional
 //! graph, watcher, or crawler.
 
+use crate::host::StateHandle;
 use crate::idle::ClientCounter;
 use mesh_core::AppState;
 use std::sync::Arc;
@@ -45,7 +46,8 @@ async fn dispatch(line: &str, state: &Arc<AppState>, session_id: &str) -> Option
 /// pipes without duplication.
 async fn handle_client<S>(
     stream: S,
-    state: Arc<AppState>,
+    host: StateHandle,
+
     cancel_token: CancellationToken,
     counter: ClientCounter,
 ) where
@@ -70,6 +72,9 @@ async fn handle_client<S>(
                         if trimmed.is_empty() {
                             continue;
                         }
+                        // Resolved per request, not per connection: a config edit
+                        // reaches clients that are already connected.
+                        let state = host.current();
                         if let Some(resp) = dispatch(trimmed, &state, &session_id).await {
                             let mut out = resp;
                             out.push('\n');
@@ -97,8 +102,10 @@ pub use unix_impl::run_uds_server_then;
 
 #[cfg(unix)]
 mod unix_impl {
-    use super::{handle_client, ClientCounter};
+    use super::{handle_client, ClientCounter, StateHandle};
+    #[cfg(test)]
     use mesh_core::AppState;
+    #[cfg(test)]
     use std::sync::Arc;
     use tokio::net::UnixListener;
     use tokio_util::sync::CancellationToken;
@@ -144,13 +151,14 @@ mod unix_impl {
     #[allow(clippy::too_many_arguments)]
     pub async fn run_uds_server_then(
         socket_path: &std::path::Path,
-        state: Arc<AppState>,
+        state: impl Into<StateHandle>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
         workspace_id: &str,
         version: &str,
         after_bind: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state: StateHandle = state.into();
         if let Some(parent) = socket_path.parent() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
@@ -169,6 +177,7 @@ mod unix_impl {
             return Err(e.into());
         }
         mesh_core::socket::write_daemon_meta(workspace_id, version);
+        state.publish_status();
         tracing::info!(
             target: "meshd::server",
             "meshd listening on {}",
@@ -218,9 +227,7 @@ pub use windows_impl::run_named_pipe_server;
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{handle_client, ClientCounter};
-    use mesh_core::AppState;
-    use std::sync::Arc;
+    use super::{handle_client, ClientCounter, StateHandle};
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio_util::sync::CancellationToken;
 
@@ -239,14 +246,16 @@ mod windows_impl {
     #[allow(clippy::too_many_arguments)]
     pub async fn run_named_pipe_server(
         pipe_name: &str,
-        state: Arc<AppState>,
+        state: impl Into<StateHandle>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
         workspace_id: &str,
         version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state: StateHandle = state.into();
         let mut server = create_instance(pipe_name, true)?;
         mesh_core::socket::write_daemon_meta(workspace_id, version);
+        state.publish_status();
         tracing::info!(
             target: "meshd::server",
             "meshd listening on named pipe {}",

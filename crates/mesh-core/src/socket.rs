@@ -169,6 +169,7 @@ pub fn read_daemon_meta(workspace_id: &str) -> Option<DaemonMeta> {
 /// or not one exists.
 pub fn remove_daemon_meta(workspace_id: &str) {
     let _ = std::fs::remove_file(daemon_meta_path(workspace_id));
+    crate::config_watch::remove_daemon_config_status(workspace_id);
 }
 
 /// Whether `pid` is still a live process. `false` on any error (already

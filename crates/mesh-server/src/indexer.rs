@@ -134,32 +134,117 @@ pub struct WorkspaceIndexer;
 impl WorkspaceIndexer {
     // ── Configuration discovery ─────────────────────────────────────────────
 
+    /// The config file `discover_config` would load: the first existing among
+    /// `explicit`, `.agents/mesh-mcp.toml` and `mesh-mcp.toml` (relative ones
+    /// against the current directory), as an absolute path when it can be made
+    /// one, so a later change of cwd cannot point it elsewhere.
+    pub fn locate_config(explicit: Option<&Path>) -> Option<PathBuf> {
+        let candidates = [
+            explicit.map(Path::to_path_buf),
+            Some(PathBuf::from(".agents/mesh-mcp.toml")),
+            Some(PathBuf::from("mesh-mcp.toml")),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+            .map(|p| std::path::absolute(&p).unwrap_or(p))
+    }
+
+    /// Loads the config file at `path` the way `discover_config` does (skill
+    /// paths and workspace root resolved against its directory) and returns it
+    /// with that directory.
+    pub fn load_config_at(path: &Path) -> Result<(Config, PathBuf), Box<dyn std::error::Error>> {
+        let (cfg, base, _sha) = Self::load_config_stamped(path)?;
+        Ok((cfg, base))
+    }
+
+    /// [`Self::load_config_at`] that also returns the SHA-256 of the bytes the
+    /// `Config` was parsed from. The file is read exactly once, so the hash
+    /// always describes the very content the returned config came from (a
+    /// separate read for the hash could see a newer edit).
+    pub fn load_config_stamped(
+        path: &Path,
+    ) -> Result<(Config, PathBuf, String), Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| mesh_core::ConfigError::IoError(path.to_path_buf(), e))?;
+        let digest = mesh_core::config_watch::config_sha256(&bytes);
+        let (cfg, base) = Self::parse_config_bytes(path, &bytes)?;
+        Ok((cfg, base, digest))
+    }
+
+    /// Parses config `bytes` that were read from `path` (which only anchors
+    /// relative paths), exactly like [`Self::load_config_at`] does after its read.
+    pub fn parse_config_bytes(
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(Config, PathBuf), Box<dyn std::error::Error>> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| format!("config {} is not valid UTF-8: {e}", path.display()))?;
+        let mut cfg = Config::load_from_str(text)?;
+        let base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        // Skill paths are written relative to the config file; the server is
+        // spawned by an IDE with an arbitrary cwd.
+        cfg.resolve_skill_paths(&base);
+        // Same reason: relative tool scopes anchor on the workspace root,
+        // not on whatever CWD the IDE launched us from.
+        cfg.resolve_workspace_root(&base);
+        Ok((cfg, base))
+    }
+
+    /// The one workspace-root guard (`mesh_core::guard_workspace_root`) for
+    /// `run`, the daemon spawn, `meshd` and `doctor`: a config file that was
+    /// found pins its roots and is always honoured; without one the workspace
+    /// is the current directory, which must not be `/`, a drive root or HOME.
+    pub fn guard_workspace(
+        explicit: Option<&Path>,
+        base_dir: &Path,
+    ) -> Result<(), mesh_core::root_guard::DegenerateRootError> {
+        Self::guard_workspace_with_home(
+            explicit,
+            base_dir,
+            mesh_core::root_guard::home_dir().as_deref(),
+        )
+    }
+
+    /// [`Self::guard_workspace`] with the home directory given (tests). A config
+    /// pins the roots only if it lists at least one: a stray `mesh-mcp.toml`
+    /// with an empty `roots` in HOME falls back to its own directory and is
+    /// refused like no config at all.
+    pub fn guard_workspace_with_home(
+        explicit: Option<&Path>,
+        base_dir: &Path,
+        home: Option<&Path>,
+    ) -> Result<(), mesh_core::root_guard::DegenerateRootError> {
+        let pins_roots = Self::locate_config(explicit)
+            .and_then(|p| Self::load_config_at(&p).ok())
+            .is_some_and(|(cfg, _)| !cfg.workspace.roots.is_empty());
+        mesh_core::root_guard::guard_workspace_root(base_dir, pins_roots, home)
+    }
+
     /// Loads the first config found among `explicit`, `.agents/mesh-mcp.toml`,
     /// `mesh-mcp.toml`, falling back to a single-root default. Returns the config
     /// and the directory relative roots are resolved against.
     pub fn discover_config(
         explicit: Option<&Path>,
     ) -> Result<(Config, PathBuf), Box<dyn std::error::Error>> {
-        let candidates = [
-            explicit.map(Path::to_path_buf),
-            Some(PathBuf::from(".agents/mesh-mcp.toml")),
-            Some(PathBuf::from("mesh-mcp.toml")),
-        ];
-        match candidates.into_iter().flatten().find(|p| p.exists()) {
+        let (cfg, base, _digest) = Self::discover_config_stamped(explicit)?;
+        Ok((cfg, base))
+    }
+
+    /// [`Self::discover_config`] plus the SHA-256 of the config file's bytes
+    /// (`None` for the built-in default), taken from the same read.
+    pub fn discover_config_stamped(
+        explicit: Option<&Path>,
+    ) -> Result<(Config, PathBuf, Option<String>), Box<dyn std::error::Error>> {
+        match Self::locate_config(explicit) {
             Some(path) => {
-                let mut cfg = Config::load_from_file(&path)?;
-                let base = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                // Skill paths are written relative to the config file; the server is
-                // spawned by an IDE with an arbitrary cwd.
-                cfg.resolve_skill_paths(&base);
-                // Same reason: relative tool scopes anchor on the workspace root,
-                // not on whatever CWD the IDE launched us from.
-                cfg.resolve_workspace_root(&base);
-                Ok((cfg, base))
+                let (cfg, base, digest) = Self::load_config_stamped(&path)?;
+                Ok((cfg, base, Some(digest)))
             }
             None => {
                 let default = concat!(
@@ -169,7 +254,7 @@ impl WorkspaceIndexer {
                 );
                 let mut cfg = Config::load_from_str(default)?;
                 cfg.resolve_workspace_root(Path::new("."));
-                Ok((cfg, PathBuf::from(".")))
+                Ok((cfg, PathBuf::from("."), None))
             }
         }
     }
@@ -2228,5 +2313,45 @@ resolve_placeholders = true
         std::fs::write(root.join("tsconfig.base.json"), base("x")).expect("rewrite");
         WorkspaceIndexer::reload(&state);
         assert_incremental_equals_full(&state, "extended base edited, full reload");
+    }
+    /// Review fix: a stray `mesh-mcp.toml` in HOME must not switch the guard
+    /// off unless it lists roots.
+    #[test]
+    fn a_config_pins_roots_only_when_it_lists_some() {
+        let home = tempfile::tempdir().expect("home");
+        let home_dir = dunce::canonicalize(home.path()).expect("canon");
+        let cfg = home_dir.join("mesh-mcp.toml");
+        let guard = |text: &str| {
+            std::fs::write(&cfg, text).expect("write config");
+            WorkspaceIndexer::guard_workspace_with_home(Some(&cfg), &home_dir, Some(&home_dir))
+        };
+        // Empty roots: falls back to HOME itself, refused.
+        assert!(guard("[workspace]\nname = \"w\"\nroots = []\n").is_err());
+        // Only a name (roots missing, the file does not even load): refused.
+        assert!(guard("[workspace]\nname = \"w\"\n").is_err());
+        // An explicit root is honoured.
+        assert!(guard("[workspace]\nname = \"w\"\nroots = [\"proj\"]\n").is_ok());
+    }
+
+    #[test]
+    fn the_stamped_loader_hashes_the_bytes_the_config_was_parsed_from() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("mesh-mcp.toml");
+        let text = "[workspace]\nname = \"w\"\nroots = [\"a\"]\n";
+        std::fs::write(&p, text).expect("write");
+        let (cfg, base, digest) = WorkspaceIndexer::load_config_stamped(&p).expect("load");
+        assert_eq!(
+            digest,
+            mesh_core::config_watch::config_sha256(text.as_bytes())
+        );
+        assert_eq!(cfg.workspace.roots, vec!["a".to_string()]);
+        assert_eq!(base, dir.path());
+        // A later edit does not change what an earlier load reported.
+        std::fs::write(&p, text.replace("\"a\"", "\"b\"")).expect("edit");
+        let (_, _, digest2) = WorkspaceIndexer::load_config_stamped(&p).expect("load");
+        assert_ne!(digest, digest2);
+        // `discover_config_stamped` with an explicit file agrees.
+        let (_, _, found) = WorkspaceIndexer::discover_config_stamped(Some(&p)).expect("find");
+        assert_eq!(found, Some(digest2));
     }
 }

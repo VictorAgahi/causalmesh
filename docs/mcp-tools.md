@@ -223,7 +223,7 @@ strings that merely contain `target` (3 characters at least), under an explicit 
     },
     "granularity": {
       "type": "string",
-      "description": "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair — use it to see which *services* depend on the target. Any other value is a tool error (`isError: true`), not a silent fallback to 'symbol'."
+      "description": "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair, with file and symbol counts and up to 3 representative locations — use it to see which *services* depend on the target. Any other value is a tool error (`isError: true`), not a silent fallback to 'symbol'."
     },
     "include_tests": {
       "type": "boolean",
@@ -252,13 +252,13 @@ the root they were found in):
 
 ### /work/shop/api-gateway (1 match(es))
 
-[1] `PaymentController` (ServiceClass)
+[1] `PaymentController` (class)
 - **File**: `/work/shop/api-gateway/src/controllers/payment.controller.ts:12-58`
 - **Package**: `api-gateway`
 
 ### /work/shop/services/order-service (1 match(es))
 
-[2] `CheckoutWorkflow` (ServiceClass)
+[2] `CheckoutWorkflow` (function)
 - **File**: `/work/shop/services/order-service/internal/workflow/checkout.go:30-140`
 - **Package**: `order-service`
 
@@ -266,6 +266,32 @@ the root they were found in):
 *2 dependent(s) in 2 file(s); showing 1-2.*
 *1 dependent(s) in test files left out (`include_tests: true` to list them).*
 ```
+
+With `granularity: "package"` the unit is the dependent package, not a declaration. Each entry
+gives the package and its root, how many files and declarations use the target, and up to three
+representative locations (root-relative `file:line`, each in a different file):
+```markdown
+## Dependent packages of `@shop/domain-user`
+
+[1] `api-gateway` (root `/work/shop/api-gateway`): 4 file(s), 5 symbol(s) use it
+- `PaymentController` (class) `src/controllers/payment.controller.ts:12`
+- `PARTICIPATION_BADGE_SLUGS` (const) `src/consts.ts:2`
+- `Thing` (interface) `src/types.ts:2`
+- ... and 1 more file(s)
+
+---
+*1 dependent package(s); showing 1-1.*
+*1 more package(s) in test files left out (`include_tests: true` to list them).*
+```
+The locations of a package are chosen deterministically: production code before test code,
+hand-written before generated (`__generated__/`, `*.pb.*`, `*.d.ts`, ...), a declaration before an
+import-only file, then the declaration referenced most in the graph, then path and line. Packages
+are ordered by files using the target, then declarations, then repo and name. The kind in
+parentheses is the declaration's own, read from its signature line (`class`, `function`, `const`,
+`variable`, `enum`, `interface`, `type alias`, `struct`, `namespace`), or `declaration` when it
+cannot be told; it is not the indexer's generic `ServiceClass` bucket. The "indexed source files
+scanned" figure of an empty answer is the number of files the index parsed, the one `doctor`
+reports as indexed.
 
 When the scope of the query contains files the indexer rejected (oversized, binary, guard, parse
 failure), a note lists up to 20 of those source files so the agent can read them directly.

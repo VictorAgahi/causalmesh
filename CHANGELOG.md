@@ -5,6 +5,70 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.7] — 2026-10-12
+
+### Fixed
+Three defects from a field report on a 16-root NestJS/gRPC workspace:
+- `find_dependents` with `granularity: "package"` printed one arbitrary "first symbol seen" per
+  package, with a misleading kind (a constant and an interface shown as `ServiceClass`) and, in one
+  case, a test-utils factory as the representative. The unit is now the dependent package (repo
+  root and package name) with the number of files and of declarations that use the target and up
+  to three representative `file:line` locations, each in a different file, root-relative. They
+  prefer production over test code, hand-written over generated, a declaration over a bare
+  import-only file, then the most referenced declaration, then path and line, so the choice is
+  deterministic (ranking runs for the listed page only, not for every dependent package). Packages are ordered by files, then declarations, then repo and name. Test-only
+  packages are left out and counted as packages (`include_tests: true` lists them).
+- The kind shown for a dependent is the declaration's own (`class`, `function`, `const`,
+  `variable`, `enum`, `interface`, `type alias`, `struct`, `namespace`) read from its signature
+  line, no kind at all when the shape is unknown (never a guess). Decorators, attributes and modifiers are
+  looked past (`@Injectable() export class X` is a class, a bare `@app.route(...)` line has no
+  keyword to read and prints no kind); Go `type X struct` / `type X interface` print their real
+  kind, `object`, `fun interface` and `export default async function*` are recognised. Cause: `NodeKind::ServiceClass` is the indexer's generic
+  bucket for every non-interface declaration of every language (a TypeScript `const`, `enum`
+  or free `function`, a C++ free function), and the formatter printed the enum variant. The enum is
+  unchanged (the index cache and `visualize_mesh` depend on it); the label is derived at display
+  time in `mesh_parsers::declaration_label`, used by symbol and file granularity as well.
+- The "N indexed source files scanned" note of an empty `find_dependents` answer used the number of
+  files that carry a contract node, which is not what `doctor` reports. It now uses the files the
+  index parsed (the `indexed` figure of `doctor`). The `analyze_grpc` and `analyze_impact` notes,
+  which really count contract-bearing files, say so ("contract-bearing files").
+- `meshd` never reloaded a changed config: after editing `mesh-mcp.toml` it served the old one
+  until killed. The daemon now reads and hashes its config file at most every 250 ms (on a request;
+  mtime and length are not trusted, a same-length edit within one mtime tick would hide behind
+  them), and a different hash rebuilds the workspace state
+  (new `AppState`, index, file watcher) on a blocking thread while the previous state keeps serving.
+  The swap happens once the new state has its first snapshot; the old watcher is then stopped.
+  Clients already connected see the new state on their next request. A config that does not parse
+  or whose roots do not resolve is refused: the previous state keeps serving, a warning is logged
+  on stderr, and the reason is recorded for `doctor`. Only the main toml is followed. The served
+  hash comes from the very read the daemon parsed its config from (never a second read that could
+  describe newer bytes), a panic during a reload is caught, logged and recorded as a refusal (it
+  cannot leave the daemon unable to follow its config again), and refused bytes are not retried
+  until the file changes.
+- `doctor` gains a "Daemon config" check: it warns when the running daemon refused the current
+  file (only while the refused bytes are still on disk; an edit since then is reported as pending,
+  the daemon reloads it by itself), serves a different config hash than the one on disk, or is a
+  pre-7.1.7 daemon (no status record) that started before the config was last modified (its
+  `.meta` file's mtime is its start time), with the remedy
+  (`mesh-mcp doctor --fix` stops the stale daemon so the next `run` starts a fresh one).
+- A degenerate workspace root is refused: when the resolved workspace is `/`, a drive root or the
+  user's HOME and no config file was found, `mesh-mcp run` spawns no daemon and scans nothing. The
+  session stays up as a server that answers `initialize` with the reason and every `tools/call`
+  with a tool error naming the resolved cwd and the remedy (`-c <config>` or start from the
+  project). `meshd` exits with the same error, and `doctor` reports a "Workspace root" error
+  instead of scanning. A found config file that lists at least one root pins its roots and is honoured, in HOME too; a
+  config with an empty `roots` pins nothing and falls back to its own directory, which is then
+  checked. HOME comes from `HOME`/`USERPROFILE`, else the OS passwd entry (`HOMEDRIVE`+`HOMEPATH`
+  on Windows), so a GUI-launched client with an empty environment is still guarded.
+  One shared helper, `mesh_core::guard_workspace_root`, serves all four; paths are canonicalized
+  first (symlinks, `..`, trailing slashes).
+
+### Known follow-ups
+- Only the main config file is followed; files it refers to (skills, mounted aliases) are not.
+- The first request after an edit is still answered by the previous state until the rebuild ends
+  (seconds on a large workspace); the daemon does not make that request wait.
+- A drive root is only exercised by a Windows-only unit test.
+
 ## [7.1.6] — 2026-10-12
 
 ### Fixed

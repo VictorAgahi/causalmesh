@@ -91,6 +91,13 @@ impl DoctorCommand {
         let Ok((config, base_dir)) = WorkspaceIndexer::discover_config(config_path) else {
             return DoctorCheck::info("Index health", "skipped (no config to scan)");
         };
+        // Never scan `/` or HOME on the strength of the default config.
+        if WorkspaceIndexer::guard_workspace(config_path, &base_dir).is_err() {
+            return DoctorCheck::info(
+                "Index health",
+                "skipped (the workspace root is refused, see 'Workspace root')",
+            );
+        }
         let roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
         let snapshot = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
         let health = &snapshot.health;
@@ -104,6 +111,16 @@ impl DoctorCommand {
                 format!("{summary}\n    Searches cannot return these files; read them directly."),
             )
         }
+    }
+
+    /// The shared workspace-root guard (`mesh_core::guard_workspace_root`), as an
+    /// error finding naming the resolved directory and the remedy. `None` when
+    /// the root is acceptable: nothing is added to the report then.
+    fn workspace_root_check(config_path: Option<&Path>) -> Option<DoctorCheck> {
+        let (_, base_dir) = WorkspaceIndexer::discover_config(config_path).ok()?;
+        WorkspaceIndexer::guard_workspace(config_path, &base_dir)
+            .err()
+            .map(|refusal| DoctorCheck::error("Workspace root", refusal.to_string()))
     }
 
     /// Config-derived checks (sections 1-1d): syntax, jailed roots, skill files,
@@ -586,6 +603,9 @@ impl DoctorCommand {
         // 6. Toolchain utilities.
         checks.push(Self::toolchain_check());
 
+        // 6b. A degenerate workspace root (`/`, a drive root, HOME with no config).
+        checks.extend(Self::workspace_root_check(config_path));
+
         // 7. Index health (plan 4 step 4.1): the files a search can never
         // return, with the same reasons and sizes the tools' notes give.
         checks.push(Self::index_health_check(config_path));
@@ -662,6 +682,7 @@ impl DoctorCommand {
 
         Self::check_socket(&workspace, fix, &mut checks);
         Self::check_daemon_version(&workspace, fix, &mut checks);
+        Self::check_daemon_config(config_path, &workspace, fix, &mut checks);
         Self::check_daemon_sandbox(&workspace, &mut checks);
         Self::check_legacy_global_cache(fix, &mut checks);
         Self::check_workspace_cache(&workspace, fix, &mut checks);
@@ -827,6 +848,89 @@ impl DoctorCommand {
             check = check.with_fixed(fixed);
         }
         checks.push(check);
+    }
+
+    /// Whether the running `meshd` serves the config file as it is on disk.
+    /// `meshd` follows its config (7.1.7) and records which config hash it was
+    /// built from; this warns when the file moved on and the daemon did not follow
+    /// (it was started before the file's last change, or built from another hash),
+    /// or when it refused the new file and keeps serving the old one.
+    fn check_daemon_config(
+        config_path: Option<&Path>,
+        workspace: &Option<(PathBuf, String)>,
+        fix: bool,
+        checks: &mut Vec<DoctorCheck>,
+    ) {
+        use mesh_core::config_watch::{config_drift, read_daemon_config_status, ConfigDrift};
+        const NAME: &str = "Daemon config";
+        let Some((_, workspace_id)) = workspace else {
+            return;
+        };
+        let status = read_daemon_config_status(workspace_id);
+        // Only a daemon confirmed to serve this workspace's socket right now
+        // (a crash leaves the records behind).
+        if !mesh_core::socket::daemon_is_reachable(workspace_id) {
+            return;
+        }
+        let Some(path) = WorkspaceIndexer::locate_config(config_path)
+            .or_else(|| status.as_ref().and_then(|s| s.config_path.clone()))
+        else {
+            return;
+        };
+        let pid = mesh_core::socket::read_daemon_meta(workspace_id).map(|m| m.pid);
+        let pid_text = pid.map_or_else(|| "unknown pid".to_string(), |p| format!("pid {p}"));
+        let drift = match &status {
+            Some(status) => config_drift(status, &path),
+            // A daemon from before 7.1.7 records no config status. Its `.meta`
+            // file is written once, when it is ready to serve, so its mtime is
+            // when it started: a config modified after that is one it never saw.
+            None if legacy_daemon_started_before(workspace_id, &path) => ConfigDrift::Stale {
+                reason: "this daemon predates config reloading and started before the file \
+                         was last modified"
+                    .to_string(),
+            },
+            None => return,
+        };
+        match drift {
+            ConfigDrift::InSync => checks.push(DoctorCheck::ok(
+                NAME,
+                format!(
+                    "meshd ({pid_text}) serves {} as it is on disk",
+                    path.display()
+                ),
+            )),
+            ConfigDrift::Rejected { error } => checks.push(DoctorCheck::warn(
+                NAME,
+                format!(
+                    "meshd ({pid_text}) refused the current {}: {error}. It keeps serving the \
+                     previous config. Fix the file; the daemon picks it up on its own within a \
+                     second of the next request, no restart needed",
+                    path.display()
+                ),
+            )),
+            ConfigDrift::Stale { reason } => {
+                let mut check = DoctorCheck::warn(
+                    NAME,
+                    format!(
+                        "meshd ({pid_text}) is not serving the current {} ({reason}). Stop it \
+                         so the next `mesh-mcp run` starts a fresh one: `mesh-mcp doctor --fix`{}",
+                        path.display(),
+                        pid.map_or_else(String::new, |p| format!(" (or `kill {p}`)"))
+                    ),
+                );
+                if fix {
+                    let fixed = pid.is_some_and(|p| {
+                        mesh_core::socket::process_is_alive(p)
+                            && mesh_core::socket::terminate_process(p)
+                    });
+                    if fixed {
+                        mesh_core::socket::remove_daemon_meta(workspace_id);
+                    }
+                    check = check.with_fixed(fixed);
+                }
+                checks.push(check);
+            }
+        }
     }
 
     /// Plan 4 step 4.10: whether the running `meshd` actually confined itself.
@@ -1048,6 +1152,49 @@ fn seccomp_confined(daemon: &str, own: &str) -> Option<bool> {
     ) {
         (Some(daemon_filters), Some(own_filters)) => Some(daemon_filters > own_filters),
         _ => Some(true),
+    }
+}
+
+/// Whether the daemon of `workspace_id` started (its `.meta` file's mtime)
+/// before `config` was last modified. `false` whenever either time is unknown.
+fn legacy_daemon_started_before(workspace_id: &str, config: &Path) -> bool {
+    modified_after(&mesh_core::socket::daemon_meta_path(workspace_id), config)
+}
+
+/// Whether `config` was modified after `reference`; `false` if either mtime is
+/// unknown.
+fn modified_after(reference: &Path, config: &Path) -> bool {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (mtime(reference), mtime(config)) {
+        (Some(started), Some(modified)) => modified > started,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod legacy_daemon_tests {
+    use super::modified_after;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn touch(path: &std::path::Path, secs: u64) {
+        let f = std::fs::File::create(path).expect("create");
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .expect("mtime");
+    }
+
+    #[test]
+    fn a_config_newer_than_the_daemon_start_is_flagged_and_an_older_one_is_not() {
+        let dir = tempfile::tempdir().expect("dir");
+        let meta = dir.path().join("ws.meta");
+        let config = dir.path().join("mesh-mcp.toml");
+        touch(&meta, 1_700_000_000);
+        touch(&config, 1_700_000_100);
+        assert!(modified_after(&meta, &config));
+        touch(&config, 1_699_999_000);
+        assert!(!modified_after(&meta, &config));
+        // Unknown times stay silent.
+        assert!(!modified_after(&dir.path().join("absent"), &config));
+        assert!(!modified_after(&meta, &dir.path().join("absent")));
     }
 }
 

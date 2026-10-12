@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod config_watch;
 pub mod contracts;
 pub mod crawler;
 pub mod docs;
@@ -11,6 +12,7 @@ pub mod index_cache;
 pub mod paths;
 pub mod properties;
 pub mod rescan;
+pub mod root_guard;
 pub mod routes;
 pub mod search_cache;
 pub mod security;
@@ -52,7 +54,7 @@ pub use socket::{cleanup_stale_socket, socket_path, socket_path_for, workspace_i
 #[cfg(windows)]
 pub use socket::{pipe_name, pipe_name_for};
 pub use state::{AppState, MeshSnapshot, SnapshotFingerprint};
-pub use test_paths::{is_test_node, is_test_path};
+pub use test_paths::{is_generated_path, is_test_node, is_test_path};
 pub use types::{
     detect_service_package, to_pascal_case, CanonicalMethodId, CompactStr, ContractEdge,
     ContractNode, EdgeConfidence, EdgeKind, FilePath, NodeId, NodeKind, PathStr, RepoId, RepoState,

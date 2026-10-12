@@ -182,6 +182,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // standalone on a discovery error would silently index the wrong
             // (default, cwd-relative) workspace instead.
             let (_, base_dir) = WorkspaceIndexer::discover_config(cli.config.as_deref())?;
+            // A client launched with cwd = `/` (or HOME) and no config would
+            // spawn a daemon for, and scan, the whole filesystem. Refused before
+            // any daemon is spawned or socket touched; the session stays up as a
+            // server that explains itself on every tool call instead of dying
+            // with a message only the client's log shows.
+            if let Err(refusal) =
+                WorkspaceIndexer::guard_workspace(cli.config.as_deref(), &base_dir)
+            {
+                let message = refusal.to_string();
+                tracing::error!(target: "mesh::config", "{message}");
+                return mesh_server::run_refusing_server(message, CancellationToken::new()).await;
+            }
             let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
             let workspace_id = mesh_core::workspace_id(&canonical_base);
 

@@ -1,0 +1,14 @@
+# Fixture for the HTTP route tools (smart_search, analyze_impact, visualize_mesh).
+[workspace]
+name = "http-routes-fixture"
+version = "1.0.0"
+roots = ["gateway", "billing"]
+# Global prefix a framework applies at bootstrap (setGlobalPrefix): configured, never detected.
+http_prefix = "/api/v1"
+
+exclude_patterns = [
+  "**/node_modules/**"
+]
+
+[engines.contracts]
+enabled = true

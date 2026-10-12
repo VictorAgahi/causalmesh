@@ -1136,6 +1136,7 @@ roots = ["."]
             fuzzy: None,
             limit: None,
             offset: None,
+            include_tests: None,
             _meta: None,
         };
         let hint_search = SmartSearchTool::truncation_hint(&search_args, &state).unwrap();

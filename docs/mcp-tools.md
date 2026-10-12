@@ -89,6 +89,24 @@ dropped on every index reload (snapshot generation bump), and re-validated again
 mtime of every file they read, so an on-disk edit the index has not yet picked up is never
 served from the cache.
 
+**HTTP routes.** A query shaped like a route is also answered from the `HttpEndpoint` nodes
+(NestJS controllers, Express/Fastify-style registrations, Python and other route decorators): the
+node's *name* is the handler, its *signature* the route (`PATCH /events/:id/state`). Accepted
+spellings: `PATCH /events/:id/state`, a bare `/events/:id` fragment, and a verb with a partial path
+(`GET attendees`, `patch events/state`). Matching compares **path structure**: `:id`, `{id}`,
+`<id>`, `[id]` and `:eventId` are the same parameter (names ignored), literals and the HTTP verb
+are case-insensitive, a trailing slash or `?query` is ignored. Ranking: whole path first, then a
+whole path where the query holds a concrete value for a parameter (`/events/42/state`), then
+leading segments (`/events`), then a fragment. In a fragment a literal never stands for a
+parameter (`/state` finds `/events/:id/state`, `/events/state` does not). Each hit starts with a
+`// PATCH /api/v1/events/:id/state  ->  changeEventState  [root: gateway]` line followed by the
+handler's decapitated declaration (exact file and `L<start>-L<end>`). Routes declared in test files
+(see `include_tests`) are left out and counted. A route-shaped query with no route hit falls back
+to the ordinary symbol search, and when that also finds nothing, the nearest routes are listed. The
+workspace key `http_prefix` (see below) is accepted with or without in the query and prepended
+when displayed. Routes built at runtime (a path assembled from variables, `setGlobalPrefix`
+read from an environment variable) are not in the graph.
+
 Line numbers (`L<start>-L<end>`) are original-file coordinates: an indexed hit is anchored on
 the symbol's recorded declaration line, and every decapitated line maps back to the original
 lines it came from (a stripped body spans its full extent). The anchor is only trusted when the
@@ -114,7 +132,7 @@ specific implementation.
   "properties": {
     "query": {
       "type": "string",
-      "description": "Symbol, class, or method name to search for (case-insensitive substring, not a regex). Example: 'UserAuthRequest', 'createEvent'"
+      "description": "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', a bare '/events/:id' fragment, or 'PATCH events/state'. Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
     },
     "scope": {
       "type": ["string", "null"],
@@ -131,6 +149,10 @@ specific implementation.
     "limit": {
       "type": "integer",
       "description": "Upper bound on files returned in this page (1-100, default 20). A page also stops at about 8 KB of results, whichever comes first, so a page may hold fewer entries than `limit`. Results are ranked: exact symbol matches first. DO NOT raise it to see everything; page with the `offset` given in the 'More results' footer or narrow `scope` instead."
+    },
+    "include_tests": {
+      "type": "boolean",
+      "description": "Route queries only: also list HTTP routes declared in test files and test-only directories (*.spec.ts, __tests__/, __test-utils__/, ...). Default false: they are left out and counted. Has no effect on symbol-name queries."
     },
     "offset": {
       "type": "integer",
@@ -404,9 +426,23 @@ the trace is still valid there, only the comparison is impossible.
 ### Tool 4: `analyze_impact`
 
 #### Description
-Impact matrix of a change. For a proto/gRPC method or service: its server handlers and clients, resolved like `analyze_grpc` (`Implements` / `CallsRpc` edges). For an event, topic, queue or saga: its producers, topics, consumers and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. Each row is classified `EXTERNAL` or `INTERNAL` and carries the confidence of its edge (`exact` / `heuristic` / `ambiguous`).
+Impact matrix of a change. For an HTTP route written `VERB /path` (verb in GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS, any case): the handler(s) it resolves to, with file:line and root, plus the graph edges that touch the handler node (events it produces or consumes, RPCs it calls). For a proto/gRPC method or service: its server handlers and clients, resolved like `analyze_grpc` (`Implements` / `CallsRpc` edges). For an event, topic, queue or saga: its producers, topics, consumers and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. Each row is classified `EXTERNAL` or `INTERNAL` and carries the confidence of its edge (`exact` / `heuristic` / `ambiguous`).
 
 **Negative Constraints**: A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
+
+#### HTTP route targets
+`analyze_impact(target: "PATCH /events/:id/state")` resolves the target against the `HttpEndpoint`
+nodes with the same path-structure matching as `smart_search` (parameter spellings and names are
+ignored, the verb is case-insensitive, the configured `http_prefix` is optional; a concrete value
+such as `/events/42/state` fits a parameter). The verb and a leading `/` are both required: `GET
+events` is an ordinary target. The answer lists the handler, its root and `file:line`, and any
+`Produces` / `Consumes` / `CallsRpc` / `Implements` / `DispatchesTo` edges the graph holds on the
+handler node. **The analysis covers the handler only**: the graph has no cross-repo edge for HTTP
+clients (a `fetch`, `axios` or `HttpService` call to the route is not linked), so the callers of a
+route are not reported, and the output says so instead of showing an empty column. With no match,
+the answer says so and lists the nearest routes (same leading segments, then same verb) instead of
+the generic proto/event hint. Route handlers in test files are left out and counted unless
+`include_tests: true`.
 
 #### Topic matching
 Topic keys are lowercase. A code reference to an enum or constant member — `Streams.EVENT_CREATED`,
@@ -453,7 +489,7 @@ Same rules as `smart_search`: a page holds at most `limit` rows (default 100, ma
   "properties": {
     "target": {
       "type": "string",
-      "description": "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, post-processor class, or saga."
+      "description": "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, consumer handler class, or saga; or an HTTP route written 'VERB /path' (ex: 'PATCH /events/:id/state'; verb in GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS, case-insensitive; ':id', '{id}', '<id>', '[id]' are the same parameter). A route target needs both the verb and a leading '/'."
     },
     "depth": {
       "type": "integer",
@@ -550,7 +586,12 @@ Size is bounded like `smart_search`'s truncation: the best-connected `max_servic
 drawn (default 40), the rest fold into one "other services" / "other topics" node, the view
 shrinks further on its own until it fits, and the footer lists the largest hidden groups plus the
 exact `visualize_mesh(service: "...")` call to zoom. A zoom draws that service's own contracts
-(best-connected first, capped) and the services they talk to. Mermaid, JSON and HTML all render
+(best-connected first, capped) and the services they talk to. In the Mermaid view a zoom also
+prints, under the footer, the service's contract counts by kind (`6 HTTP`, ...) and its HTTP routes
+(`PATCH /api/v1/events/:id/state -> changeEventState (src/events/events.controller.ts:16)`, at most
+15, the rest counted), routes in test files left out and counted; a route has no cross-service
+edge, so without that list it folded into "other contracts". In the whole-mesh view a service's
+caption keeps its HTTP count even when more than three kinds compete. Mermaid, JSON and HTML all render
 this same view; JSON/HTML stay parseable documents (no prose appended). Names longer than 120
 bytes are shortened when drawn (never offered as zoom targets). For the complete graph,
 use the CLI: `mesh-mcp graph --format html -o graph.html`.
@@ -565,7 +606,7 @@ use the CLI: `mesh-mcp graph --format html -o graph.html`.
   "type": "object",
   "properties": {
     "format": { "type": "string", "description": "'mermaid' (default), 'json' or 'html' — all render the aggregated per-service view." },
-    "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to." },
+    "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to, and its HTTP routes (bounded)." },
     "max_services": { "type": ["integer", "null"], "description": "Groups drawn before folding into 'other' (1-200, default 40)." }
   },
   "additionalProperties": false

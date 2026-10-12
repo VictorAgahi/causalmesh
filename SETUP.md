@@ -194,6 +194,21 @@ A path argument starting with `/workspace` is translated before the jail check i
 rejected. The translation applies to the path arguments tools accept (`smart_search`'s `scope`,
 a `.proto` path given to `analyze_grpc`).
 
+### HTTP routes behind a global prefix
+
+Route handlers (`@Controller('events')` + `@Patch(':id/state')`) are indexed with the path the
+source declares. If your framework prepends a global prefix at bootstrap (`app.setGlobalPrefix`),
+the source never states it, so say it once:
+
+```toml
+[workspace]
+http_prefix = "/api/v1"
+```
+
+`smart_search`, `analyze_impact` and `visualize_mesh` then display `PATCH /api/v1/events/:id/state`
+and accept the route with or without the prefix. It is workspace-wide and optional; MeshMCP does
+not try to detect `setGlobalPrefix`.
+
 ---
 
 ## Step 4 — Check it actually indexed something
@@ -522,6 +537,7 @@ Every key below changes behaviour.
 | Section / key | Status |
 | :--- | :--- |
 | `[workspace]` `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` | **wired** |
+| `[workspace]` `http_prefix` | **wired** — global HTTP route prefix (`"/api/v1"`) shown on routes and accepted optionally when matching |
 | `[workspace.mount_aliases]` | **wired** — translates container bind-mount paths (e.g. `/workspace`) to local host roots |
 | `[engines.docs]` `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` | **wired** — `enabled` toggles doc indexing, `paths` restricts doc scope (`"docs/**"` or `"${workspace_root}/docs/**"`), `fuzzy_fallback` controls full-text fallback |
 | `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` | **wired** |

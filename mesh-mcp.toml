@@ -19,6 +19,12 @@ roots = [
   "${workspace_root}/docs"                  # Markdown / C4 Architecture
 ]
 
+# Global HTTP route prefix your framework applies at bootstrap (NestJS `app.setGlobalPrefix`,
+# Express `app.use('/api/v1', ...)`). Optional, never auto-detected. When set, `smart_search`,
+# `analyze_impact` and `visualize_mesh` display routes with it prepended and accept a route
+# query with or without it (`GET /events/:id` and `GET /api/v1/events/:id` both match).
+# http_prefix = "/api/v1"
+
 exclude_patterns = [
   "**/.env*",
   "**/secrets/**",

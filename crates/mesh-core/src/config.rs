@@ -92,6 +92,12 @@ pub struct WorkspaceConfig {
     pub exclude_patterns: Vec<String>,
     #[serde(default)]
     pub mount_aliases: HashMap<String, String>,
+    /// Global HTTP route prefix (`"/api/v1"`, as set by a framework's
+    /// `setGlobalPrefix`), prepended when `smart_search`, `analyze_impact` and
+    /// `visualize_mesh` display routes and accepted with or without when
+    /// matching. Never detected from source.
+    #[serde(default)]
+    pub http_prefix: Option<String>,
     /// `workspace_root` expanded and canonicalized against the config file's
     /// directory by [`Config::resolve_workspace_root`]. Relative tool scopes are
     /// anchored here instead of on the process CWD, which an IDE-spawned server

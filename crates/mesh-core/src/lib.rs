@@ -11,6 +11,7 @@ pub mod index_cache;
 pub mod paths;
 pub mod properties;
 pub mod rescan;
+pub mod routes;
 pub mod search_cache;
 pub mod security;
 pub mod socket;

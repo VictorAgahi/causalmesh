@@ -20,6 +20,12 @@ const TEST_DIRS: &[&str] = &[
     "testutils",
     "testing",
     "fixtures",
+    "__test-utils__",
+    "__test_utils__",
+    "__testutils__",
+    "__specs__",
+    "__e2e__",
+    "__testing__",
 ];
 
 /// Whether `path` is test code: a file named like a test in any supported
@@ -75,6 +81,12 @@ mod tests {
             "npm-packages/packages/test-utils/src/factory.ts",
             "web/src/__tests__/App.tsx",
             "web/src/__mocks__/api.ts",
+            "web/src/__fixtures__/events.ts",
+            "libs/common/src/__test-utils__/factory.ts",
+            "libs/common/src/__testutils__/factory.ts",
+            "src/events/events.controller.test.stories.ts",
+            "src/events/events.spec.helpers.ts",
+            "src/events/events.e2e-spec.ts",
         ] {
             assert!(is_test_path(Path::new(p)), "{p}");
         }
@@ -93,6 +105,9 @@ mod tests {
             "src/latest/contest.ts",
             "src/attestation/verify.ts",
             "src/protest_it.ts",
+            "src/events/events.controller.ts",
+            "src/__generated__/schema.ts",
+            "src/contest.config.ts",
         ] {
             assert!(!is_test_path(Path::new(p)), "{p}");
         }

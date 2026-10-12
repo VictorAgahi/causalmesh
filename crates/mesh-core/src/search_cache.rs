@@ -23,6 +23,8 @@ pub struct SearchCacheKey {
     pub raw_scope: CompactStr,
     pub include_body: bool,
     pub fuzzy: bool,
+    /// Route hits in test files are listed.
+    pub include_tests: bool,
     pub limit: u32,
     pub offset: u32,
 }
@@ -129,6 +131,7 @@ mod tests {
             raw_scope: "/ws".into(),
             include_body: false,
             fuzzy: false,
+            include_tests: false,
             limit: 20,
             offset: 0,
         }

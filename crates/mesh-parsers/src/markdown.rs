@@ -693,17 +693,21 @@ impl MarkdownFormatter {
         header
     }
 
+    /// Most handlers [`Self::format_route_impact`] lists.
+    pub const MAX_ROUTE_ENTRIES: usize = 25;
+
     /// `analyze_impact` answer for a `VERB /path` target: the handler(s) the route
     /// resolves to and the edges the graph holds on them. When nothing matched, the
     /// nearest routes instead of the generic proto/event hint.
     pub fn format_route_impact(
         target: &str,
         entries: &[RouteImpactEntry],
+        total_handlers: usize,
         nearest: &[(String, &ContractNode)],
         hidden_tests: usize,
         roots: &[PathBuf],
     ) -> String {
-        const MAX_ENTRIES: usize = 25;
+        const MAX_ENTRIES: usize = MarkdownFormatter::MAX_ROUTE_ENTRIES;
         const MAX_EDGES: usize = 12;
         let labels = Self::root_labels(roots);
         let label_of = |repo: RepoId| -> &str {
@@ -742,7 +746,7 @@ impl MarkdownFormatter {
         }
         out.push_str(&format!(
             "*Handlers: {} (route matched on path structure, parameter names ignored).*\n\n",
-            entries.len()
+            total_handlers
         ));
         out.push_str("| # | Route | Handler | Root | Location |\n|---|---|---|---|---|\n");
         for (idx, e) in entries.iter().take(MAX_ENTRIES).enumerate() {
@@ -755,10 +759,10 @@ impl MarkdownFormatter {
                 Self::code_cell(&Self::location(e.node, roots)),
             ));
         }
-        if entries.len() > MAX_ENTRIES {
+        if total_handlers > entries.len() {
             out.push_str(&format!(
                 "\n*{} more handler(s) not listed.*\n",
-                entries.len() - MAX_ENTRIES
+                total_handlers - entries.len()
             ));
         }
         for e in entries.iter().take(MAX_ENTRIES) {

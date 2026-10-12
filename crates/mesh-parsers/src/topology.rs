@@ -17,7 +17,7 @@
 use crate::graph::{WebEdge, WebGraphPayload, WebNode};
 use mesh_core::routes::{display_label, route_label};
 use mesh_core::{
-    is_test_path, ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId,
+    is_test_node, ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -110,6 +110,9 @@ pub struct TopologyOptions {
     pub max_focus_contracts: usize,
     /// Zoom into one service (exact group name, case-insensitive).
     pub focus: Option<String>,
+    /// Workspace roots (indexed by `RepoId`) that test paths and route files are
+    /// judged against; empty for synthetic graphs with root-relative paths.
+    pub roots: Vec<std::path::PathBuf>,
 }
 
 impl Default for TopologyOptions {
@@ -118,6 +121,7 @@ impl Default for TopologyOptions {
             max_groups: 40,
             max_focus_contracts: 40,
             focus: None,
+            roots: Vec::new(),
         }
     }
 }
@@ -232,15 +236,15 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
-    /// Displays routes with the configured global prefix (`http_prefix`), their
-    /// files relative to the workspace `roots` (indexed by `repo_id`).
-    pub fn with_route_context(
-        mut self,
-        prefix: Option<&str>,
-        roots: &[std::path::PathBuf],
-    ) -> Self {
+    /// Superseded by [`Self::with_http_prefix`] (roots are now a [`Self::build`] argument).
+    #[deprecated(note = "pass the roots to `Aggregate::build` and use `with_http_prefix`")]
+    pub fn with_route_context(self, prefix: Option<&str>, _roots: &[std::path::PathBuf]) -> Self {
+        self.with_http_prefix(prefix)
+    }
+
+    /// Displays routes with the configured global prefix (`http_prefix`).
+    pub fn with_http_prefix(mut self, prefix: Option<&str>) -> Self {
         self.http_prefix = prefix.map(str::to_string);
-        self.roots = roots.to_vec();
         self
     }
 
@@ -248,7 +252,17 @@ impl Aggregate {
     /// explode into its own contracts: an exact match wins, otherwise the
     /// case-insensitive one (the first in byte order if several differ only by
     /// case). An unknown `focus` leaves `focus()` at `None`.
-    pub fn build(graph: &ContractGraph, repo_names: &[String], focus: Option<&str>) -> Self {
+    ///
+    /// `roots` are the workspace roots (indexed by `RepoId`): route files are shown
+    /// relative to their root and test code is judged relative to it, so a checkout
+    /// under `~/testing/` does not hide its routes. Pass `&[]` only for synthetic
+    /// graphs whose paths are already root-relative.
+    pub fn build(
+        graph: &ContractGraph,
+        repo_names: &[String],
+        focus: Option<&str>,
+        roots: &[std::path::PathBuf],
+    ) -> Self {
         // One root → grouping by root would draw a single box; use packages.
         // Stops at the second distinct root instead of collecting every id.
         let by_root = {
@@ -289,7 +303,7 @@ impl Aggregate {
             let (name, kind) = group_of(node, repo_names, by_root);
             let gi = if kind == GroupKind::Service && focus.as_deref() == Some(name) {
                 match route_label(node) {
-                    Some(_) if is_test_path(&node.file_path) => routes_in_tests += 1,
+                    Some(_) if is_test_node(node, roots) => routes_in_tests += 1,
                     label => {
                         *focus_kinds.entry(kind_label(node.kind)).or_default() += 1;
                         if let Some(label) = label {
@@ -435,7 +449,7 @@ impl Aggregate {
             routes,
             routes_in_tests,
             http_prefix: None,
-            roots: Vec::new(),
+            roots: roots.to_vec(),
         };
         agg.routes.sort_by(|a, b| {
             a.label
@@ -635,7 +649,7 @@ pub fn inline_code_text(s: &str) -> String {
 
 impl Topology {
     pub fn build(graph: &ContractGraph, repo_names: &[String], opts: &TopologyOptions) -> Self {
-        Aggregate::build(graph, repo_names, opts.focus.as_deref()).select(opts)
+        Aggregate::build(graph, repo_names, opts.focus.as_deref(), &opts.roots).select(opts)
     }
 
     /// Node caption: `(title, detail)`, e.g. `("checkout", "30 interface · 503 class")`.
@@ -1172,7 +1186,7 @@ mod tests {
     #[test]
     fn select_on_one_aggregate_matches_a_fresh_build() {
         let (g, repos) = two_root_graph();
-        let agg = Aggregate::build(&g, &repos, None);
+        let agg = Aggregate::build(&g, &repos, None, &[]);
         for max_groups in [1, 2, 40] {
             let opts = TopologyOptions {
                 max_groups,
@@ -1231,8 +1245,8 @@ mod tests {
             t.to_mermaid("ws")
         );
 
-        let zoom = Aggregate::build(&g, &repos, Some("a"))
-            .with_route_context(Some("/api"), &[])
+        let zoom = Aggregate::build(&g, &repos, Some("a"), &[])
+            .with_http_prefix(Some("/api"))
             .select(&TopologyOptions {
                 focus: Some("a".into()),
                 ..Default::default()

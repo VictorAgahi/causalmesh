@@ -3,7 +3,7 @@ use crate::protocol::RequestMeta;
 use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::routes::{
-    display_route, find_routes, nearest_routes, prefix_segments, RouteHit, RouteQuery,
+    display_route, find_routes, nearest_routes, prefix_segments, RouteHit, RouteQuery, RouteRank,
 };
 use mesh_core::{
     file_stamp, AppState, CachedSearch, CompactStr, ContractNode, FileStamp, FilesystemCrawler,
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub struct SmartSearchArgs {
     #[schemars(
         with = "String",
-        description = "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', a bare '/events/:id' fragment, or 'PATCH events/state'. Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
+        description = "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', or a bare '/events/:id' fragment (a route always contains a '/path', so 'get user' is a symbol query). Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
     )]
     pub query: CompactStr,
 
@@ -199,7 +199,7 @@ pub struct SmartSearchTool;
 
 impl McpTool for SmartSearchTool {
     const NAME: &'static str = "smart_search";
-    const DESCRIPTION: &'static str = "Scans scoped repositories for symbol declarations and decapitated AST signatures. Also finds HTTP routes by `METHOD /path` (verb-insensitive, path parameter names ignored, optional configured prefix), listing verb, path, handler, file:line and root. Results are ranked and paginated (`limit`/`offset`); line numbers are original source coordinates. DO NOT USE to map package import hierarchies (use find_dependents).";
+    const DESCRIPTION: &'static str = "Scans scoped repositories for symbol declarations and decapitated AST signatures. Also finds HTTP routes by `METHOD /path` or `/path` (verb-insensitive, path parameter names ignored, optional configured prefix), listing verb, path, handler, file:line and root. Results are ranked and paginated (`limit`/`offset`); line numbers are original source coordinates. DO NOT USE to map package import hierarchies (use find_dependents).";
     type Args = SmartSearchArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -304,37 +304,38 @@ impl McpTool for SmartSearchTool {
         let prefix_text = state.config.workspace.http_prefix.as_deref();
         let prefix = prefix_segments(prefix_text);
         let mut route_note: Option<String> = None;
-        let route_page = route_query.as_ref().and_then(|rq| {
-            let (hits, hidden_tests) = find_routes(
+        let (route_hits, hidden_tests) = match &route_query {
+            Some(rq) => find_routes(
                 &snapshot.contract_graph,
                 rq,
                 &prefix,
                 scope_path,
                 include_tests,
-            );
-            if hits.is_empty() {
-                if hidden_tests > 0 {
-                    route_note = Some(format!(
-                        "*{hidden_tests} route(s) match only in test files (`include_tests: true` to list them).*\n"
-                    ));
-                } else {
-                    route_note = Self::nearest_routes_note(
-                        &snapshot.contract_graph,
-                        rq,
-                        &prefix,
-                        prefix_text,
-                        include_tests,
-                    );
-                }
-                return None;
-            }
+                &state.allowed_roots,
+                RouteRank::Fragment,
+            ),
+            None => (Vec::new(), 0),
+        };
+        // A fragment of a route (`/state`) is a weak hit: it never replaces the
+        // symbol results of the same query, it is only shown when there are none.
+        let strong_route = route_hits.iter().any(|h| h.rank != RouteRank::Fragment);
+        let ranked = if strong_route {
+            Vec::new()
+        } else {
+            Self::rank_indexed_files(
+                snapshot.contract_graph.search_symbols(query, scope_path),
+                query,
+            )
+        };
+        let use_routes = !route_hits.is_empty() && (strong_route || ranked.is_empty());
+        let route_page = if use_routes {
             if hidden_tests > 0 {
                 route_note = Some(format!(
                     "*{hidden_tests} route(s) in test files left out (`include_tests: true` to list them).*\n"
                 ));
             }
             Some(Self::collect_route_page(
-                &hits,
+                &route_hits,
                 &RouteRender {
                     repo_names: &WorkspaceIndexer::repo_names(&state.allowed_roots),
                     prefix: prefix_text,
@@ -344,15 +345,30 @@ impl McpTool for SmartSearchTool {
                 limit,
                 budget,
             ))
-        });
-        let ranked = if route_page.is_some() {
-            Vec::new()
         } else {
-            Self::rank_indexed_files(
-                snapshot.contract_graph.search_symbols(query, scope_path),
-                query,
-            )
+            None
         };
+        if let (Some(rq), false, true) = (&route_query, use_routes, route_hits.is_empty()) {
+            // A route-shaped query with no route hit: test-only matches are said
+            // whatever the symbol search found; "what is near" only when nothing was.
+            route_note = if hidden_tests > 0 {
+                Some(format!(
+                    "*{hidden_tests} route(s) match only in test files (`include_tests: true` to list them).*\n"
+                ))
+            } else if !ranked.is_empty() {
+                None
+            } else {
+                Self::nearest_routes_note(
+                    &snapshot.contract_graph,
+                    rq,
+                    &prefix,
+                    prefix_text,
+                    include_tests,
+                    &state.allowed_roots,
+                )
+            };
+        }
+        drop(route_hits);
 
         let routes_used = route_page.is_some();
         let (matches, page, file_stamps) = if let Some(found) = route_page {
@@ -431,6 +447,26 @@ impl McpTool for SmartSearchTool {
             files_accessed,
             secrets_redacted,
         })
+    }
+}
+
+/// One file read and decapitated once, shared by every route hit it holds.
+struct DecapFile {
+    decap: mesh_parsers::DecapitatedSource,
+    lang: LanguageKind,
+}
+
+impl DecapFile {
+    /// `None` when the file is unreadable, over the AstGuard budget or not
+    /// decapitable (the route line then stands alone).
+    fn load(path: &Path, include_body: bool) -> Option<Self> {
+        let file = ReadFile::load(path)?;
+        if !AstGuard::should_parse_path(path, &file.metadata, file.text.as_bytes()) {
+            return None;
+        }
+        let lang = LanguageKind::from_path(&path.to_string_lossy());
+        let decap = AstDecapitator::decapitate_auto_mapped(&file.text, lang, include_body);
+        (!decap.bounded).then_some(Self { decap, lang })
     }
 }
 
@@ -597,8 +633,9 @@ impl SmartSearchTool {
         prefix: &[mesh_core::routes::Seg],
         prefix_text: Option<&str>,
         include_tests: bool,
+        roots: &[PathBuf],
     ) -> Option<String> {
-        let near = nearest_routes(graph, query, prefix, include_tests, 5);
+        let near = nearest_routes(graph, query, prefix, include_tests, roots, 5);
         if near.is_empty() {
             return None;
         }
@@ -631,8 +668,13 @@ impl SmartSearchTool {
         let mut stamps = Vec::new();
         let mut bytes = 0usize;
         let mut consumed = start;
+        // Each file is read and decapitated once per page, however many routes it holds.
+        let mut files: HashMap<&Path, Option<DecapFile>> = HashMap::new();
         for hit in &hits[start..end] {
-            let result = Self::route_result(hit, render);
+            let decap = files
+                .entry(&hit.node.file_path)
+                .or_insert_with(|| DecapFile::load(&hit.node.file_path, render.include_body));
+            let result = Self::route_result(hit, render, decap.as_ref());
             let size = MarkdownFormatter::format_search_entry(matches.len(), &result).len();
             if bytes + size > budget && !matches.is_empty() {
                 break;
@@ -652,7 +694,11 @@ impl SmartSearchTool {
         (matches, page, stamps)
     }
 
-    fn route_result(hit: &RouteHit, render: &RouteRender) -> SearchResult {
+    fn route_result(
+        hit: &RouteHit,
+        render: &RouteRender,
+        file: Option<&DecapFile>,
+    ) -> SearchResult {
         let node = hit.node;
         let route = display_route(node, render.prefix)
             .unwrap_or_else(|| format!("{} (route)", hit.route.verb));
@@ -664,8 +710,7 @@ impl SmartSearchTool {
         let header = format!("// {route}  ->  {}  [root: {repo}]", node.name);
         let path_string = node.file_path.to_string_lossy().into_owned();
         let language = LanguageKind::from_path(&path_string).as_str().to_string();
-        let declaration = ReadFile::load(&node.file_path)
-            .and_then(|file| Self::route_declaration(&file, node, render.include_body));
+        let declaration = file.and_then(|file| Self::route_declaration(file, node));
         match declaration {
             Some((line_start, line_end, snippet)) => SearchResult {
                 file_path: path_string,
@@ -689,20 +734,8 @@ impl SmartSearchTool {
     /// whose original span overlaps the node's `line_start..=line_end`, with the
     /// same redaction and width cap as any snippet. `None` when the file cannot be
     /// parsed under the AstGuard budget (the caller then keeps the route line).
-    fn route_declaration(
-        file: &ReadFile,
-        node: &ContractNode,
-        include_body: bool,
-    ) -> Option<(usize, usize, String)> {
-        if !AstGuard::should_parse_path(&node.file_path, &file.metadata, file.text.as_bytes()) {
-            return None;
-        }
-        let path_string = node.file_path.to_string_lossy();
-        let lang_kind = LanguageKind::from_path(&path_string);
-        let decap = AstDecapitator::decapitate_auto_mapped(&file.text, lang_kind, include_body);
-        if decap.bounded {
-            return None;
-        }
+    fn route_declaration(file: &DecapFile, node: &ContractNode) -> Option<(usize, usize, String)> {
+        let (decap, lang_kind) = (&file.decap, file.lang);
         let lines: Vec<&str> = decap.text.lines().collect();
         let picked: Vec<usize> = (0..lines.len().min(decap.line_map.len()))
             .filter(|&i| {

@@ -5,6 +5,52 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.6] — 2026-10-12
+
+### Fixed
+Review fixes for the HTTP route tools of 7.1.5:
+- Test code is judged on the path relative to its workspace root. A checkout living under a
+  directory named `test`, `testing`, `e2e`, `spec` or `fixtures` no longer hides every route
+  (`find_routes`, `smart_search`, `analyze_impact` and the `visualize_mesh` zoom).
+- A query is a route only when it starts with `/` or is a verb followed by a path starting with
+  `/`. `get user`, `delete account` and `post message` are ordinary symbol queries again, with no
+  bogus "Nearest routes" note. A fragment-only route hit (`/state`) never replaces the symbol
+  results of the same query; it is shown only when no symbol matches.
+- `smart_search` reads and decapitates each file once per page instead of once per route hit.
+- `analyze_impact` looks up the graph edges of the listed handlers in one pass, only for the
+  handlers it displays, instead of scanning every edge per hit.
+- Only whole segments are path parameters (`:name`, `{name}`, `<name>`, `[name]`, `${name}`,
+  `*`). Mixed segments such as `{name}.json`, `[id]-details` or `$metadata` are literals compared
+  exactly, so `/files/{name}.json` and `/files/{name}.xml` stay distinct.
+- `analyze_impact` counts only the ranks it accepts (exact and concrete-value matches) among the
+  routes hidden in test files; fragment matches no longer produce a false "match only in test
+  files" note.
+- `visualize_mesh` states in its description and in `docs/mcp-tools.md` that the zoom route list
+  and per-kind counts are part of the Mermaid text only; json and html do not include them. The
+  footer is built once per shrink iteration.
+
+- Parameter detection is balanced and complete: the outer delimiters define the parameter and the
+  inner text is free (`[[...slug]]`, `[...slug]`, `{id:\d{2}}`), Express `:id(\d+)?`, `:id(\d+)+`,
+  `:id(\d+)*` and splats `*splat` are parameters. `$name` (Remix / React Router file routes) is a
+  parameter again. Choice: an OData-style literal `$metadata` is therefore also a parameter, since
+  file-route parameters are the more common case.
+- Test classification is root-relative everywhere a node path is judged: `find_dependents`,
+  `analyze_grpc`, `analyze_impact` (matrix and route views), `smart_search` and `visualize_mesh`
+  share `mesh_core::is_test_node`. A workspace under `/work/e2e/gw` or `~/testing/app` no longer
+  has every node classified as test code.
+- API change: `Aggregate::build` takes the workspace roots (`Topology::build` reads
+  `TopologyOptions::roots`); `Aggregate::with_route_context` is deprecated in favour of
+  `with_http_prefix`, `is_test_node` moved from `mesh_core::routes` to `mesh_core::test_paths`.
+- The `visualize_mesh` size check keeps its original `<=` comparison for json and html.
+- The "route(s) match only in test files" note is given whenever a route-shaped query has test-only
+  route matches, whatever the symbol search found.
+- `analyze_impact` builds route entries only for the handlers it lists (the total is still stated).
+
+### Known follow-ups
+- `display_label` treats a route as already prefixed when its first segments equal `http_prefix`
+  (a `/api` prefix and a controller literally starting with `api`).
+- The zoom per-kind counts exclude test-file route nodes while other kinds are counted as is.
+
 ## [7.1.5] — 2026-10-12
 
 ### Added

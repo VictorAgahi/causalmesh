@@ -92,8 +92,9 @@ served from the cache.
 **HTTP routes.** A query shaped like a route is also answered from the `HttpEndpoint` nodes
 (NestJS controllers, Express/Fastify-style registrations, Python and other route decorators): the
 node's *name* is the handler, its *signature* the route (`PATCH /events/:id/state`). Accepted
-spellings: `PATCH /events/:id/state`, a bare `/events/:id` fragment, and a verb with a partial path
-(`GET attendees`, `patch events/state`). Matching compares **path structure**: `:id`, `{id}`,
+spellings: `PATCH /events/:id/state`, a bare `/events/:id` fragment, and a verb with a path
+fragment (`GET /attendees`). A query is a route only when it starts with `/` or is a verb followed
+by a path starting with `/`; `get user` or `delete account` are ordinary symbol queries. Matching compares **path structure**: `:id`, `{id}`,
 `<id>`, `[id]` and `:eventId` are the same parameter (names ignored), literals and the HTTP verb
 are case-insensitive, a trailing slash or `?query` is ignored. Ranking: whole path first, then a
 whole path where the query holds a concrete value for a parameter (`/events/42/state`), then
@@ -102,7 +103,10 @@ parameter (`/state` finds `/events/:id/state`, `/events/state` does not). Each h
 `// PATCH /api/v1/events/:id/state  ->  changeEventState  [root: gateway]` line followed by the
 handler's decapitated declaration (exact file and `L<start>-L<end>`). Routes declared in test files
 (see `include_tests`) are left out and counted. A route-shaped query with no route hit falls back
-to the ordinary symbol search, and when that also finds nothing, the nearest routes are listed. The
+to the ordinary symbol search, and when that also finds nothing, the nearest routes are listed. A
+fragment-only route hit (`/state`) never replaces the symbol results of the same query: it is shown
+only when no symbol matches. Test code is judged on the path relative to its workspace root, so a
+checkout living under a directory named `testing` or `e2e` keeps its routes visible. The
 workspace key `http_prefix` (see below) is accepted with or without in the query and prepended
 when displayed. Routes built at runtime (a path assembled from variables, `setGlobalPrefix`
 read from an environment variable) are not in the graph.
@@ -132,7 +136,7 @@ specific implementation.
   "properties": {
     "query": {
       "type": "string",
-      "description": "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', a bare '/events/:id' fragment, or 'PATCH events/state'. Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
+      "description": "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', or a bare '/events/:id' fragment (a route always contains a '/path', so 'get user' is a symbol query). Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
     },
     "scope": {
       "type": ["string", "null"],
@@ -435,7 +439,8 @@ Impact matrix of a change. For an HTTP route written `VERB /path` (verb in GET/P
 nodes with the same path-structure matching as `smart_search` (parameter spellings and names are
 ignored, the verb is case-insensitive, the configured `http_prefix` is optional; a concrete value
 such as `/events/42/state` fits a parameter). The verb and a leading `/` are both required: `GET
-events` is an ordinary target. The answer lists the handler, its root and `file:line`, and any
+events` is an ordinary target. Fragment matches are not impact targets and are not counted among
+the routes hidden in test files. The answer lists the handler, its root and `file:line`, and any
 `Produces` / `Consumes` / `CallsRpc` / `Implements` / `DispatchesTo` edges the graph holds on the
 handler node. **The analysis covers the handler only**: the graph has no cross-repo edge for HTTP
 clients (a `fetch`, `axios` or `HttpService` call to the route is not linked), so the callers of a
@@ -591,7 +596,9 @@ prints, under the footer, the service's contract counts by kind (`6 HTTP`, ...) 
 (`PATCH /api/v1/events/:id/state -> changeEventState (src/events/events.controller.ts:16)`, at most
 15, the rest counted), routes in test files left out and counted; a route has no cross-service
 edge, so without that list it folded into "other contracts". In the whole-mesh view a service's
-caption keeps its HTTP count even when more than three kinds compete. Mermaid, JSON and HTML all render
+caption keeps its HTTP count even when more than three kinds compete. The route list and the
+per-kind counts are part of the Mermaid text only: `format: "json"` and `"html"` stay the
+per-group documents and do NOT include them. Mermaid, JSON and HTML all render
 this same view; JSON/HTML stay parseable documents (no prose appended). Names longer than 120
 bytes are shortened when drawn (never offered as zoom targets). For the complete graph,
 use the CLI: `mesh-mcp graph --format html -o graph.html`.
@@ -606,7 +613,7 @@ use the CLI: `mesh-mcp graph --format html -o graph.html`.
   "type": "object",
   "properties": {
     "format": { "type": "string", "description": "'mermaid' (default), 'json' or 'html' — all render the aggregated per-service view." },
-    "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to, and its HTTP routes (bounded)." },
+    "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to, and, in the mermaid format only, its HTTP routes (bounded)." },
     "max_services": { "type": ["integer", "null"], "description": "Groups drawn before folding into 'other' (1-200, default 40)." }
   },
   "additionalProperties": false

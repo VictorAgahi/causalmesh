@@ -416,9 +416,17 @@ impl MarkdownFormatter {
                 trace.server_handlers.len()
             ));
             for (handler, confidence) in &trace.server_handlers {
+                // A handler declared with enum members / constants shows the RPC
+                // they resolved to, then the decorator text it was written with.
+                let shown = match trace.handler_rpc_names.get(&handler.id) {
+                    Some(rpc) if rpc.as_str() != handler.name.as_str() => {
+                        format!("`{rpc}` (declared as `{}`)", handler.name)
+                    }
+                    _ => format!("`{}`", handler.name),
+                };
                 out.push_str(&format!(
-                    "- `{}` in `{}:{}` _(match: {})_\n",
-                    handler.name,
+                    "- {} in `{}:{}` _(match: {})_\n",
+                    shown,
                     handler.file_path.display(),
                     handler.line_start,
                     confidence.label()
@@ -1018,6 +1026,7 @@ mod tests {
             client_stubs: Vec::new(),
             service_level_clients: Vec::new(),
             server_handlers: Vec::new(),
+            handler_rpc_names: Default::default(),
             files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_grpc_trace(&empty_trace);

@@ -5,6 +5,59 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.4] — 2026-10-12
+
+### Fixed
+- `analyze_grpc` listed a server handler under "Client Stubs" when its body delegated to an
+  application service of the same name (`this.userService.addBadgeToUser(...)` inside the
+  `AddBadgeToUser` handler). Client detection through a field NAME (`userService`, `userClient`
+  with a `UserService` declared in a proto) was a documented heuristic; it is now tightened:
+  - A field whose declared type is a plain application class (`private userService: UserService`,
+    a domain service that merely shares the proto service's name) is never a client. The name
+    decides only when the field has no type information, and the match stays labelled `heuristic`.
+  - A name-based call located in the body of a handler serving the RPC of the same name is not a
+    client call. Calls through a field typed or bound as a generated client (`XClient`,
+    `getService<XClient>(...)`) stay exact, including inside a handler that really forwards.
+- Handlers declared with `@GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`
+  were all `heuristic` and shown with the raw expression. `Enum.MEMBER`, `OBJ.KEY` (also
+  `as const` / `Object.freeze`) and imported string constants are now resolved to their literal
+  across files (same repository first); when the result names exactly one proto RPC the handler
+  is matched `exact` and shown as that RPC (`declared as` the raw expression). An unresolved or
+  ambiguous expression (two different values, or an RPC declared by two protos) keeps its raw
+  name and `heuristic`. Constants resolve by their exact qualified path only (`Enum.MEMBER` never
+  falls back to an unrelated constant named `MEMBER`); a package-qualified service name must match
+  the proto package; a template literal with interpolation or an escaped string is not a literal.
+- The same-RPC delegation drop is decided when the graph is reconciled, where the handler's own
+  RPC is known, so it also works when the constant's name differs from the RPC name; only
+  name-based guesses are dropped, never a field bound or typed as a generated client (including a
+  base-class field bound in another file).
+- The delegation drop also requires the called service to be the handler's own service (the
+  resolved proto service, else the literal one): a handler calling another service's same-named
+  method stays a client. A handler with no method argument serves the PascalCase form of its
+  method name (`@GrpcMethod('UserService') addBadgeToUser()`); a bare `@GrpcMethod()` names no
+  service, so nothing is guessed or dropped.
+- A field declared with a plain application type in a base class is not a client of its
+  subclasses either. `@GrpcMethod(...)` arguments are read from the method's decorators only.
+- Inherited client fields were not recorded for an undecorated, non-abstract `class Base {}`
+  (the `class` keyword token was found instead of the declaration).
+- `@GrpcMethod(...)` arguments are read from a decorator at code level (comments, strings and
+  escaped quotes are skipped).
+
+### Known limits
+- A handler whose method argument is a constant that cannot be resolved (non-indexed package) and
+  whose constant name differs from the RPC name keeps a possible name-based client false positive.
+- A field typed with the generated service interface (`UserService`) that is injected rather than
+  assigned from `getService<...>` in the same class is indistinguishable from a domain service and
+  is not reported by name; type aliases are followed only within the same file, and an aliased
+  client type is detected by name only (heuristic), not bound exact.
+- Namespace-qualified constants (`ns.Enum.MEMBER`) are not resolved.
+- Follow-up: move the `$` / `@` records out of the shared `rpc_calls` channel into dedicated fields.
+
+### Tests
+- Delegating handler, domain service named like the proto, untyped name-only client, typed
+  clients under arbitrary field names, typed client inside a handler, enum / const-object /
+  imported-const resolution, unresolved and ambiguous expressions.
+
 ## [7.1.3] — 2026-10-12
 
 ### Changed

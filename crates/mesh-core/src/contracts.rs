@@ -113,6 +113,18 @@ pub const RPC_INHERITED_METHOD_PREFIX: char = '^';
 /// (`#commandService=EventCommandService`), so subclasses in other files can
 /// resolve calls through it. Never becomes an edge by itself.
 pub const CLIENT_FIELD_BINDING_PREFIX: char = '#';
+/// Not a call: a string constant a top-level declaration carries
+/// (`$USER_COMMAND_METHODS.ADD_BADGE_TO_USER=AddBadgeToUser`, `$USER_SERVICE_NAME=UserService`),
+/// so a `@GrpcMethod(...)` argument spelled as an enum member, an `as const`
+/// object key or an imported constant can be resolved to its literal across
+/// files ([`HANDLER_REF_PREFIX`]). Never becomes an edge by itself.
+pub const CONST_VALUE_PREFIX: char = '$';
+/// Not a call: the two raw `@GrpcMethod(service, method)` arguments of a server
+/// handler (`@'UserService'|USER_COMMAND_METHODS.ADD_BADGE_TO_USER`; literal
+/// arguments are kept quoted, a non-literal that starts like a quote is
+/// prefixed with `?`, a missing service is empty). Resolved against [`CONST_VALUE_PREFIX`]
+/// records when the graph is reconciled. Never becomes an edge by itself.
+pub const HANDLER_REF_PREFIX: char = '@';
 
 /// `userService` / `userClient` -> `UserService`; anything else -> `None`.
 /// The service a client field is assumed to talk to when nothing binds it.
@@ -126,6 +138,15 @@ pub fn service_from_client_field_name(field: &str) -> Option<String> {
     let mut chars = stem.chars();
     let first = chars.next()?.to_ascii_uppercase();
     Some(format!("{first}{}Service", chars.as_str()))
+}
+
+/// Lowercase alphanumerics only: `AddBadgeToUser`, `addBadgeToUser` and
+/// `ADD_BADGE_TO_USER` fold to the same key.
+pub fn fold_rpc_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// How [`ContractGraph::find_dependents_matched`] found its result.
@@ -153,6 +174,10 @@ pub struct GrpcTrace<'g> {
     /// Each handler paired with the confidence of the match that linked it
     /// to the proto definition (bare-name scan vs. an exact `Implements` edge).
     pub server_handlers: Vec<(&'g ContractNode, EdgeConfidence)>,
+    /// Handlers (by node id) declared with enum members / constants whose
+    /// literals resolved to exactly one RPC: the proto RPC name to show in
+    /// place of the raw decorator expression.
+    pub handler_rpc_names: HashMap<NodeId, CompactStr>,
     /// When the target is a method: callers linked to the method's *service*
     /// (a client constructed for it, `getService<UserServiceClient>(…)`)
     /// without the called method being resolved, in files with no resolved
@@ -298,6 +323,10 @@ pub struct ContractGraph {
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
     topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
     rpc_calls: Vec<(NodeId, CompactStr)>,
+    /// Handlers whose `@GrpcMethod(...)` arguments resolved to exactly one RPC
+    /// of a declared proto service (`Service.Method`). Derived by
+    /// `reconcile_edges`, never stored incrementally.
+    handler_rpc_names: HashMap<NodeId, CompactStr>,
 
     next_node_id: u32,
 }
@@ -1099,6 +1128,11 @@ impl ContractGraph {
             pascal_name: String,
             signature: Option<&'a str>,
         }
+        // A handler declared with an enum member / constant instead of literals
+        // (`@GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`)
+        // is matched by the literal those resolve to, when it names exactly one
+        // declared proto RPC; unresolved or ambiguous, it keeps its raw name.
+        let resolved_handlers = self.resolve_handler_rpc_names(&proto_methods);
         let handlers: Vec<Handler<'_>> = self
             .nodes
             .values()
@@ -1109,11 +1143,16 @@ impl ContractGraph {
                     && !n.name.starts_with("produce:")
                     && !n.name.starts_with("consume:")
             })
-            .map(|n| Handler {
-                id: n.id,
-                name: n.name.as_str(),
-                pascal_name: crate::types::to_pascal_case(n.name.as_str()),
-                signature: n.signature.as_deref(),
+            .map(|n| {
+                let name = resolved_handlers
+                    .get(&n.id)
+                    .map_or(n.name.as_str(), CompactStr::as_str);
+                Handler {
+                    id: n.id,
+                    name,
+                    pascal_name: crate::types::to_pascal_case(name),
+                    signature: n.signature.as_deref(),
+                }
             })
             .collect();
 
@@ -1172,6 +1211,7 @@ impl ContractGraph {
             }
         }
         self.edges.extend(new_edges);
+        self.handler_rpc_names = resolved_handlers;
 
         // 5. Reconcile RPC Client Calls (CallsRpc) — proto methods indexed by
         // lowercase full and bare name; first declaration wins, as before.
@@ -1246,9 +1286,14 @@ impl ContractGraph {
                 .push((class.repo_id, service));
         }
 
+        let handler_methods = self.handler_served_methods();
         let mut rpc_edges = Vec::new();
         for (caller_id, recorded) in &self.rpc_calls {
-            if recorded.starts_with(CLIENT_FIELD_BINDING_PREFIX) {
+            if recorded.starts_with([
+                CLIENT_FIELD_BINDING_PREFIX,
+                CONST_VALUE_PREFIX,
+                HANDLER_REF_PREFIX,
+            ]) {
                 continue;
             }
             // Method-level call sites (`this.users.signUp(…)`) are recorded with
@@ -1284,6 +1329,25 @@ impl ContractGraph {
             // otel-demo's spurious `checkout -> health`).
             if Self::is_grpc_health_fqcn(target_str) {
                 continue;
+            }
+            // A name-based guess made inside the handler of the RPC it names is
+            // delegation to an application service, not a client call.
+            if inferred && method_level {
+                let (called_service, called) =
+                    target_str.rsplit_once('.').unwrap_or(("", target_str));
+                if handler_methods
+                    .get(caller_id)
+                    .is_some_and(|(service, method)| {
+                        *method == fold_rpc_name(called)
+                            && service.as_deref().is_some_and(|s| {
+                                s.eq_ignore_ascii_case(
+                                    called_service.rsplit('.').next().unwrap_or(called_service),
+                                )
+                            })
+                    })
+                {
+                    continue;
+                }
             }
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
             if method_level {
@@ -1657,7 +1721,15 @@ impl ContractGraph {
                 match edge.kind {
                     EdgeKind::Implements => {
                         if let Some(handler) = self.nodes.get(&edge.from) {
-                            if !server_handlers.iter().any(|(h, _)| h.id == handler.id) {
+                            if let Some(seen) =
+                                server_handlers.iter_mut().find(|(h, _)| h.id == handler.id)
+                            {
+                                // The symbol-name scan above only ever sees the raw
+                                // decorator text; an exact edge is stronger evidence.
+                                if edge.confidence == EdgeConfidence::Exact {
+                                    seen.1 = EdgeConfidence::Exact;
+                                }
+                            } else {
                                 server_handlers.push((handler, edge.confidence));
                             }
                         }
@@ -1730,14 +1802,161 @@ impl ContractGraph {
             }
         }
 
+        let handler_rpc_names = server_handlers
+            .iter()
+            .filter_map(|(h, _)| {
+                self.handler_rpc_names
+                    .get(&h.id)
+                    .map(|name| (h.id, name.clone()))
+            })
+            .collect();
         GrpcTrace {
             target: CompactStr::new(norm_target),
             proto_definition,
             client_stubs,
             server_handlers,
+            handler_rpc_names,
             service_level_clients,
             related_rpcs,
             files_scanned: self.file_to_nodes.len(),
+        }
+    }
+
+    /// The (service, method) each handler serves: the resolved proto RPC when
+    /// known, else what the decorator spells (a literal service, and the method
+    /// literal or the last segment of the constant's name). The service is
+    /// `None` when it is not a literal (the delegation drop then keeps the
+    /// call); the method is folded (see [`fold_rpc_name`]).
+    fn handler_served_methods(&self) -> HashMap<NodeId, (Option<String>, String)> {
+        let unquote = |part: &str| {
+            part.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '?'))
+                .to_string()
+        };
+        let mut out = HashMap::new();
+        for (id, recorded) in &self.rpc_calls {
+            let Some(reference) = recorded.strip_prefix(HANDLER_REF_PREFIX) else {
+                continue;
+            };
+            let served = match self.handler_rpc_names.get(id) {
+                Some(rpc) => rpc
+                    .rsplit_once('.')
+                    .map(|(service, method)| (Some(service.to_string()), method.to_string())),
+                None => reference.split_once('|').map(|(service, method)| {
+                    let literal_service = service
+                        .starts_with(['\'', '"', '`'])
+                        .then(|| unquote(service))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string());
+                    let method = unquote(method);
+                    let method = method.rsplit('.').next().unwrap_or(&method).to_string();
+                    (literal_service, method)
+                }),
+            };
+            if let Some((service, method)) = served {
+                out.insert(*id, (service, fold_rpc_name(&method)));
+            }
+        }
+        out
+    }
+
+    /// Resolves every [`HANDLER_REF_PREFIX`] record to `Service.Method` when
+    /// both arguments reduce to a literal (a quoted string, or a constant /
+    /// enum member / `as const` key recorded as [`CONST_VALUE_PREFIX`], same
+    /// repository first) and that name is declared by exactly one proto RPC.
+    /// Anything unresolved or ambiguous is left out, so the handler keeps its
+    /// raw name and its heuristic match.
+    fn resolve_handler_rpc_names(
+        &self,
+        proto_methods: &[(NodeId, CompactStr)],
+    ) -> HashMap<NodeId, CompactStr> {
+        let mut out = HashMap::new();
+        let mut consts: HashMap<&str, Vec<(RepoId, &str)>> = HashMap::new();
+        let mut refs: Vec<(NodeId, &str)> = Vec::new();
+        for (id, recorded) in &self.rpc_calls {
+            if let Some(c) = recorded.strip_prefix(CONST_VALUE_PREFIX) {
+                if let (Some(node), Some((key, value))) = (self.nodes.get(id), c.split_once('=')) {
+                    consts.entry(key).or_default().push((node.repo_id, value));
+                }
+            } else if let Some(r) = recorded.strip_prefix(HANDLER_REF_PREFIX) {
+                refs.push((*id, r));
+            }
+        }
+        if refs.is_empty() {
+            return out;
+        }
+        let mut declared: HashMap<&str, usize> = HashMap::new();
+        for (_, name) in proto_methods {
+            *declared.entry(name.as_str()).or_default() += 1;
+        }
+        for (id, recorded) in refs {
+            let (Some(node), Some((service_expr, method_expr))) =
+                (self.nodes.get(&id), recorded.split_once('|'))
+            else {
+                continue;
+            };
+            let (Some(service), Some(method)) = (
+                Self::resolve_literal_expr(service_expr, node.repo_id, &consts),
+                Self::resolve_literal_expr(method_expr, node.repo_id, &consts),
+            ) else {
+                continue;
+            };
+            // A package-qualified service (`demo.user.UserService`) must be
+            // declared in that package.
+            let (qualifier, service) = match service.rsplit_once('.') {
+                Some((q, s)) => (Some(q), s),
+                None => (None, service),
+            };
+            let name = format!("{service}.{method}");
+            if declared.get(name.as_str()) != Some(&1) {
+                continue;
+            }
+            if let Some(q) = qualifier {
+                let in_package = proto_methods.iter().any(|(pid, n)| {
+                    n.as_str() == name
+                        && self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
+                });
+                if !in_package {
+                    continue;
+                }
+            }
+            out.insert(id, CompactStr::new(name));
+        }
+        out
+    }
+
+    /// A quoted literal as-is, else the one string constant `expr` names:
+    /// `Enum.MEMBER`, `OBJ.KEY` or `CONST`, spelled exactly as declared. Candidates from the caller's repository win; more
+    /// than one distinct value left is ambiguous (`None`).
+    fn resolve_literal_expr<'a>(
+        expr: &'a str,
+        repo: RepoId,
+        consts: &HashMap<&str, Vec<(RepoId, &'a str)>>,
+    ) -> Option<&'a str> {
+        let expr = expr.trim();
+        let quoted = expr.len() >= 2
+            && ["'", "\"", "`"]
+                .iter()
+                .any(|q| expr.starts_with(q) && expr.ends_with(q));
+        if quoted {
+            return expr.get(1..expr.len() - 1).filter(|l| !l.is_empty());
+        }
+        // The exact qualified path only: `Enum.MEMBER` never falls back to an
+        // unrelated constant that happens to be called `MEMBER`.
+        let candidates = consts.get(expr)?;
+        let same_repo: Vec<&str> = candidates
+            .iter()
+            .filter(|(r, _)| *r == repo)
+            .map(|(_, v)| *v)
+            .collect();
+        let values: BTreeSet<&str> = if same_repo.is_empty() {
+            candidates.iter().map(|(_, v)| *v).collect()
+        } else {
+            same_repo.into_iter().collect()
+        };
+        let mut it = values.into_iter();
+        match (it.next(), it.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
         }
     }
 
@@ -1811,7 +2030,14 @@ impl ContractGraph {
             } else {
                 same_repo
             };
-            if let [service] = services.into_iter().collect::<Vec<_>>()[..] {
+            let services: Vec<&str> = services.into_iter().collect();
+            // `#field=` (no service): the base class declares the field with a
+            // plain application type, so it is not a client at all.
+            let real: Vec<&str> = services.iter().copied().filter(|s| !s.is_empty()).collect();
+            if real.is_empty() && !services.is_empty() {
+                return None;
+            }
+            if let [service] = real[..] {
                 return Some((format!("{service}.{method}"), false));
             }
         }

@@ -24,7 +24,27 @@ at 3.0.0 — there is no reconstructed history before it.
   across files (same repository first); when the result names exactly one proto RPC the handler
   is matched `exact` and shown as that RPC (`declared as` the raw expression). An unresolved or
   ambiguous expression (two different values, or an RPC declared by two protos) keeps its raw
-  name and `heuristic`.
+  name and `heuristic`. Constants resolve by their exact qualified path only (`Enum.MEMBER` never
+  falls back to an unrelated constant named `MEMBER`); a package-qualified service name must match
+  the proto package; a template literal with interpolation or an escaped string is not a literal.
+- The same-RPC delegation drop is decided when the graph is reconciled, where the handler's own
+  RPC is known, so it also works when the constant's name differs from the RPC name; only
+  name-based guesses are dropped, never a field bound or typed as a generated client (including a
+  base-class field bound in another file).
+- Inherited client fields were not recorded for an undecorated, non-abstract `class Base {}`
+  (the `class` keyword token was found instead of the declaration).
+- `@GrpcMethod(...)` arguments are read from a decorator at code level (comments, strings and
+  escaped quotes are skipped).
+
+### Known limits
+- A handler whose method argument is a constant that cannot be resolved (non-indexed package) and
+  whose constant name differs from the RPC name keeps a possible name-based client false positive.
+- A field typed with the generated service interface (`UserService`) that is injected rather than
+  assigned from `getService<...>` in the same class is indistinguishable from a domain service and
+  is not reported by name; type aliases are followed only within the same file, and an aliased
+  client type is detected by name only (heuristic), not bound exact.
+- Namespace-qualified constants (`ns.Enum.MEMBER`) are not resolved.
+- Follow-up: move the `$` / `@` records out of the shared `rpc_calls` channel into dedicated fields.
 
 ### Tests
 - Delegating handler, domain service named like the proto, untyped name-only client, typed

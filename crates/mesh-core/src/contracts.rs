@@ -120,8 +120,9 @@ pub const CLIENT_FIELD_BINDING_PREFIX: char = '#';
 /// files ([`HANDLER_REF_PREFIX`]). Never becomes an edge by itself.
 pub const CONST_VALUE_PREFIX: char = '$';
 /// Not a call: the two raw `@GrpcMethod(service, method)` arguments of a server
-/// handler when at least one is not a string literal (`@'UserService'|USER_COMMAND_METHODS.ADD_BADGE_TO_USER`;
-/// literal arguments are kept quoted). Resolved against [`CONST_VALUE_PREFIX`]
+/// handler (`@'UserService'|USER_COMMAND_METHODS.ADD_BADGE_TO_USER`; literal
+/// arguments are kept quoted, a non-literal that starts like a quote is
+/// prefixed with `?`, a missing service is empty). Resolved against [`CONST_VALUE_PREFIX`]
 /// records when the graph is reconciled. Never becomes an edge by itself.
 pub const HANDLER_REF_PREFIX: char = '@';
 
@@ -137,6 +138,15 @@ pub fn service_from_client_field_name(field: &str) -> Option<String> {
     let mut chars = stem.chars();
     let first = chars.next()?.to_ascii_uppercase();
     Some(format!("{first}{}Service", chars.as_str()))
+}
+
+/// Lowercase alphanumerics only: `AddBadgeToUser`, `addBadgeToUser` and
+/// `ADD_BADGE_TO_USER` fold to the same key.
+pub fn fold_rpc_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// How [`ContractGraph::find_dependents_matched`] found its result.
@@ -1276,6 +1286,7 @@ impl ContractGraph {
                 .push((class.repo_id, service));
         }
 
+        let handler_methods = self.handler_served_methods();
         let mut rpc_edges = Vec::new();
         for (caller_id, recorded) in &self.rpc_calls {
             if recorded.starts_with([
@@ -1318,6 +1329,17 @@ impl ContractGraph {
             // otel-demo's spurious `checkout -> health`).
             if Self::is_grpc_health_fqcn(target_str) {
                 continue;
+            }
+            // A name-based guess made inside the handler of the RPC it names is
+            // delegation to an application service, not a client call.
+            if inferred && method_level {
+                let called = target_str.rsplit('.').next().unwrap_or(target_str);
+                if handler_methods
+                    .get(caller_id)
+                    .is_some_and(|served| *served == fold_rpc_name(called))
+                {
+                    continue;
+                }
             }
             let caller_package = self.nodes.get(caller_id).map(|n| n.package.clone());
             if method_level {
@@ -1772,16 +1794,52 @@ impl ContractGraph {
             }
         }
 
+        let handler_rpc_names = server_handlers
+            .iter()
+            .filter_map(|(h, _)| {
+                self.handler_rpc_names
+                    .get(&h.id)
+                    .map(|name| (h.id, name.clone()))
+            })
+            .collect();
         GrpcTrace {
             target: CompactStr::new(norm_target),
             proto_definition,
             client_stubs,
             server_handlers,
-            handler_rpc_names: self.handler_rpc_names.clone(),
+            handler_rpc_names,
             service_level_clients,
             related_rpcs,
             files_scanned: self.file_to_nodes.len(),
         }
+    }
+
+    /// The RPC method each handler serves, folded (see [`fold_rpc_name`]):
+    /// the resolved proto RPC when known, else the method argument as written
+    /// (a literal, or the last segment of the constant's name).
+    fn handler_served_methods(&self) -> HashMap<NodeId, String> {
+        let mut out = HashMap::new();
+        for (id, recorded) in &self.rpc_calls {
+            let Some(reference) = recorded.strip_prefix(HANDLER_REF_PREFIX) else {
+                continue;
+            };
+            let served = match self.handler_rpc_names.get(id) {
+                Some(rpc) => rpc.rsplit('.').next().unwrap_or(rpc.as_str()).to_string(),
+                None => {
+                    let Some((_, method)) = reference.split_once('|') else {
+                        continue;
+                    };
+                    method
+                        .trim_matches(|c| matches!(c, '\'' | '"' | '`' | '?'))
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(method)
+                        .to_string()
+                }
+            };
+            out.insert(*id, fold_rpc_name(&served));
+        }
+        out
     }
 
     /// Resolves every [`HANDLER_REF_PREFIX`] record to `Service.Method` when
@@ -1825,19 +1883,32 @@ impl ContractGraph {
             ) else {
                 continue;
             };
-            // A fully qualified service name (`demo.user.UserService`) names the service by its last segment.
-            let service = service.rsplit('.').next().unwrap_or(service);
+            // A package-qualified service (`demo.user.UserService`) must be
+            // declared in that package.
+            let (qualifier, service) = match service.rsplit_once('.') {
+                Some((q, s)) => (Some(q), s),
+                None => (None, service),
+            };
             let name = format!("{service}.{method}");
-            if declared.get(name.as_str()) == Some(&1) {
-                out.insert(id, CompactStr::new(name));
+            if declared.get(name.as_str()) != Some(&1) {
+                continue;
             }
+            if let Some(q) = qualifier {
+                let in_package = proto_methods.iter().any(|(pid, n)| {
+                    n.as_str() == name
+                        && self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
+                });
+                if !in_package {
+                    continue;
+                }
+            }
+            out.insert(id, CompactStr::new(name));
         }
         out
     }
 
     /// A quoted literal as-is, else the one string constant `expr` names:
-    /// `Enum.MEMBER`, `OBJ.KEY` or `CONST`, also behind a namespace import
-    /// (`ns.Enum.MEMBER`). Candidates from the caller's repository win; more
+    /// `Enum.MEMBER`, `OBJ.KEY` or `CONST`, spelled exactly as declared. Candidates from the caller's repository win; more
     /// than one distinct value left is ambiguous (`None`).
     fn resolve_literal_expr<'a>(
         expr: &'a str,
@@ -1852,26 +1923,23 @@ impl ContractGraph {
         if quoted {
             return expr.get(1..expr.len() - 1).filter(|l| !l.is_empty());
         }
-        let mut key = expr;
-        loop {
-            if let Some(candidates) = consts.get(key) {
-                let same_repo: Vec<&str> = candidates
-                    .iter()
-                    .filter(|(r, _)| *r == repo)
-                    .map(|(_, v)| *v)
-                    .collect();
-                let values: BTreeSet<&str> = if same_repo.is_empty() {
-                    candidates.iter().map(|(_, v)| *v).collect()
-                } else {
-                    same_repo.into_iter().collect()
-                };
-                let mut it = values.into_iter();
-                return match (it.next(), it.next()) {
-                    (Some(only), None) => Some(only),
-                    _ => None,
-                };
-            }
-            key = key.split_once('.')?.1;
+        // The exact qualified path only: `Enum.MEMBER` never falls back to an
+        // unrelated constant that happens to be called `MEMBER`.
+        let candidates = consts.get(expr)?;
+        let same_repo: Vec<&str> = candidates
+            .iter()
+            .filter(|(r, _)| *r == repo)
+            .map(|(_, v)| *v)
+            .collect();
+        let values: BTreeSet<&str> = if same_repo.is_empty() {
+            candidates.iter().map(|(_, v)| *v).collect()
+        } else {
+            same_repo.into_iter().collect()
+        };
+        let mut it = values.into_iter();
+        match (it.next(), it.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
         }
     }
 

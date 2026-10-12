@@ -65,20 +65,13 @@ struct ImportBindings {
     namespaces: HashSet<String>,
 }
 
-/// A server handler (`@GrpcMethod(...)` method) of the file: where its body
-/// sits, which RPC it serves (normalized method name), and, when its decorator
-/// arguments are not both string literals, the raw expressions to resolve once
-/// the whole workspace is indexed.
+/// A server handler (`@GrpcMethod(...)` method) of the file: its node and the
+/// `service|method` reference of its decorator arguments, resolved once the
+/// whole workspace is indexed (see `mesh_core::HANDLER_REF_PREFIX`).
 struct HandlerSite {
     /// Index into the file's node list.
     node_idx: usize,
-    start_byte: usize,
-    end_byte: usize,
-    /// Method name of the RPC with case and separators folded away
-    /// (`AddBadgeToUser`, `ADD_BADGE_TO_USER` and `addBadgeToUser` agree).
-    method_key: String,
-    /// `service|method`, literals quoted, expressions verbatim.
-    reference: Option<String>,
+    reference: String,
 }
 
 /// Records per file at most for string constants (a generated constants file).
@@ -179,16 +172,14 @@ impl TypeScriptExtractor {
         );
         let fields = Self::client_fields(root, source_bytes);
         let handlers = ctx.handlers.take();
-        Self::collect_method_rpc_calls(root, source_bytes, &fields, &handlers, &mut raw_rpc_calls);
+        Self::collect_method_rpc_calls(root, source_bytes, &fields, &mut raw_rpc_calls);
         Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);
         Self::record_client_field_bindings(root, source_bytes, &fields, &nodes, rpc_calls);
         for handler in &handlers {
-            if let Some(reference) = &handler.reference {
-                rpc_calls.push((
-                    handler.node_idx,
-                    CompactStr::new(format!("{HANDLER_REF_PREFIX}{reference}")),
-                ));
-            }
+            rpc_calls.push((
+                handler.node_idx,
+                CompactStr::new(format!("{HANDLER_REF_PREFIX}{}", handler.reference)),
+            ));
         }
         Self::record_string_constants(root, source_bytes, &nodes, rpc_calls);
         nodes
@@ -821,13 +812,9 @@ impl TypeScriptExtractor {
                 if kind == NodeKind::GrpcMethod {
                     if let Some(annotation) = matched_annotation {
                         let args = Self::decorator_args(&full_text, annotation);
-                        let (method_key, reference) = Self::handler_keys(&args, method_name);
                         ctx.handlers.borrow_mut().push(HandlerSite {
                             node_idx: nodes.len(),
-                            start_byte: node.start_byte(),
-                            end_byte: node.end_byte(),
-                            method_key,
-                            reference,
+                            reference: Self::handler_reference(&args, method_name),
                         });
                     }
                 }
@@ -1394,10 +1381,10 @@ impl TypeScriptExtractor {
         root: Node,
         source: &[u8],
         fields: &HashMap<(Option<usize>, String), String>,
-        handlers: &[HandlerSite],
         raw: &mut Vec<RawRpcCall>,
     ) {
         let declared = Self::declared_fields(root, source);
+        let aliases = Self::type_aliases(root, source);
         Self::walk(root, &mut |node| {
             if node.kind() != "call_expression" {
                 return;
@@ -1425,21 +1412,11 @@ impl TypeScriptExtractor {
             let base = class
                 .filter(|_| !declared.contains_key(&key))
                 .and_then(|c| Self::class_base_name(c, source));
-            // A call in the body of the handler serving the RPC of the same name
-            // is the ubiquitous NestJS delegation to an application service
-            // (`this.userService.addBadgeToUser(...)` inside the
-            // `AddBadgeToUser` handler), not a client call. Only the name-based
-            // guesses are dropped: a field bound to a generated client
-            // (`=` records) is evidence of its own.
-            let method_key = Self::fold_name(method);
-            let in_same_rpc_handler = handlers.iter().any(|h| {
-                h.start_byte <= node.start_byte()
-                    && node.end_byte() <= h.end_byte
-                    && h.method_key == method_key
-            });
+            // A name-based guess inside the handler of the RPC it names (delegation
+            // to an application service) is dropped when the graph is reconciled,
+            // where the handler's own RPC is known (`handler_served_methods`).
             let target = match (fields.get(&key), base) {
                 (Some(service), _) => format!("{RPC_EXACT_METHOD_PREFIX}{service}.{method}"),
-                (None, _) if in_same_rpc_handler => return,
                 (None, Some(base)) => {
                     format!("{RPC_INHERITED_METHOD_PREFIX}{base}#{field}.{method}")
                 }
@@ -1451,7 +1428,7 @@ impl TypeScriptExtractor {
                     if declared
                         .get(&key)
                         .and_then(|t| t.as_deref())
-                        .is_some_and(Self::type_rules_out_grpc_client)
+                        .is_some_and(|t| Self::type_rules_out_grpc_client(t, &aliases))
                     {
                         return;
                     }
@@ -1472,44 +1449,118 @@ impl TypeScriptExtractor {
         });
     }
 
-    /// Lowercase alphanumerics only: `AddBadgeToUser`, `addBadgeToUser` and
-    /// `ADD_BADGE_TO_USER` fold to the same key.
-    fn fold_name(name: &str) -> String {
-        name.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .map(|c| c.to_ascii_lowercase())
-            .collect()
-    }
-
     /// Whether an annotated field type is a plain application type, i.e. cannot
-    /// hold a gRPC client: anything that mentions a client, gRPC or a proxy, or
-    /// is `any` / `unknown` / `object`, stays a candidate.
-    fn type_rules_out_grpc_client(type_text: &str) -> bool {
-        let lowered = type_text.to_ascii_lowercase();
-        !(lowered.contains("client")
-            || lowered.contains("grpc")
-            || lowered.contains("proxy")
-            || matches!(lowered.trim(), "any" | "unknown" | "object" | ""))
+    /// hold a gRPC client: anything that mentions a client, gRPC or a proxy
+    /// (directly or through a type alias of this file), or is `any` /
+    /// `unknown` / `object`, stays a candidate.
+    fn type_rules_out_grpc_client(type_text: &str, aliases: &HashMap<String, String>) -> bool {
+        fn client_like(text: &str) -> bool {
+            let lowered = text.to_ascii_lowercase();
+            lowered.contains("client")
+                || lowered.contains("grpc")
+                || lowered.contains("proxy")
+                || matches!(lowered.trim(), "any" | "unknown" | "object" | "")
+        }
+        if client_like(type_text) {
+            return false;
+        }
+        !type_text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+            .filter_map(|token| aliases.get(token))
+            .any(|body| client_like(body))
     }
 
-    /// Top-level arguments of the first `annotation(...)` call in `text`, raw
-    /// and trimmed (quote- and nesting-aware; an unterminated call yields none).
+    /// `type Name = <body>` declarations of the file, name to body text.
+    fn type_aliases(root: Node, source: &[u8]) -> HashMap<String, String> {
+        let mut aliases = HashMap::new();
+        Self::walk(root, &mut |node| {
+            if node.kind() != "type_alias_declaration" {
+                return;
+            }
+            if let (Some(name), Some(value)) = (
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok()),
+                node.child_by_field_name("value")
+                    .and_then(|v| v.utf8_text(source).ok()),
+            ) {
+                aliases.insert(name.to_string(), value.to_string());
+            }
+        });
+        aliases
+    }
+
+    /// Top-level arguments of the first `annotation(...)` call in `text` that
+    /// sits at code level: comments and string literals are skipped, the name
+    /// must end at a word boundary and be followed by `(`. Raw and trimmed; an
+    /// unterminated call yields none.
     fn decorator_args(text: &str, annotation: &str) -> Vec<String> {
-        let Some(idx) = text.find(annotation) else {
-            return Vec::new();
-        };
-        let rest = &text[idx + annotation.len()..];
-        let Some(open) = rest.find('(') else {
-            return Vec::new();
-        };
+        let mut quote: Option<char> = None;
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            let Some(c) = rest.chars().next() else {
+                break;
+            };
+            if let Some(q) = quote {
+                if c == '\\' {
+                    i += c.len_utf8()
+                        + rest[c.len_utf8()..]
+                            .chars()
+                            .next()
+                            .map_or(0, char::len_utf8);
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+                i += c.len_utf8();
+                continue;
+            }
+            if rest.starts_with("//") {
+                i += rest.find('\n').unwrap_or(rest.len());
+                continue;
+            }
+            if let Some(comment) = rest.strip_prefix("/*") {
+                i += comment.find("*/").map_or(rest.len(), |e| e + 4);
+                continue;
+            }
+            if matches!(c, '\'' | '"' | '`') {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix(annotation) {
+                let word_continues = after
+                    .chars()
+                    .next()
+                    .is_some_and(|n| n.is_alphanumeric() || n == '_' || n == '$');
+                if !word_continues {
+                    if let Some(args) = after.trim_start().strip_prefix('(') {
+                        return Self::call_args(args);
+                    }
+                }
+            }
+            i += c.len_utf8();
+        }
+        Vec::new()
+    }
+
+    /// Splits the text after a call's `(` into its top-level arguments, up to
+    /// the matching `)` (quote-, escape- and nesting-aware).
+    fn call_args(rest: &str) -> Vec<String> {
         let mut args = Vec::new();
         let mut current = String::new();
         let mut depth = 0usize;
         let mut quote: Option<char> = None;
-        for c in rest[open + 1..].chars() {
+        let mut escaped = false;
+        for c in rest.chars() {
             if let Some(q) = quote {
                 current.push(c);
-                if c == q {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
                     quote = None;
                 }
                 continue;
@@ -1544,39 +1595,50 @@ impl TypeScriptExtractor {
         Vec::new()
     }
 
-    fn is_quoted_literal(arg: &str) -> bool {
-        arg.len() >= 2
-            && ['\'', '"', '`']
-                .iter()
-                .any(|q| arg.starts_with(*q) && arg.ends_with(*q))
+    /// The text of a plain string literal argument: one pair of matching
+    /// quotes around text with no quote, escape or `${` interpolation.
+    fn literal_inner(arg: &str) -> Option<&str> {
+        let q = arg
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+        let inner = arg.strip_prefix(q)?.strip_suffix(q)?;
+        (!inner.is_empty() && !inner.contains([q, '\\']) && !inner.contains("${")).then_some(inner)
     }
 
-    /// (normalized RPC method name, `service|method` reference to resolve) of a
-    /// handler decorated with `args`. The reference exists only when an
-    /// argument is not a string literal; a one-argument or bare decorator
-    /// serves the method it decorates.
-    fn handler_keys(args: &[String], method_name: &str) -> (String, Option<String>) {
-        let method_arg = args.get(1);
-        let method_key = match method_arg {
-            Some(arg) if Self::is_quoted_literal(arg) => {
-                Self::fold_name(arg.trim_matches(|c| matches!(c, '\'' | '"' | '`')))
+    /// One argument of a handler's decorator as a `service|method` half: a
+    /// plain literal is kept quoted, anything else verbatim (without spaces and
+    /// `|`), prefixed with `?` when it would be mistaken for a literal.
+    fn reference_part(arg: &str) -> String {
+        if let Some(inner) = Self::literal_inner(arg) {
+            if !inner.contains('|') {
+                return format!("'{inner}'");
             }
-            Some(arg) => Self::fold_name(arg.rsplit('.').next().unwrap_or(arg)),
-            None => Self::fold_name(method_name),
+        }
+        let squashed: String = arg
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '|')
+            .take(200)
+            .collect();
+        if squashed.starts_with(['\'', '"', '`', '?']) {
+            format!("?{squashed}")
+        } else {
+            squashed
+        }
+    }
+
+    /// `service|method` of a handler decorated with `args`; a missing service
+    /// is empty and a missing method is the name of the method it decorates.
+    fn handler_reference(args: &[String], method_name: &str) -> String {
+        let service = args
+            .first()
+            .map(|a| Self::reference_part(a))
+            .unwrap_or_default();
+        let method = match args.get(1) {
+            Some(a) => Self::reference_part(a),
+            None => format!("'{}'", method_name.replace(['\'', '|'], "")),
         };
-        let reference = match (args.first(), method_arg) {
-            (Some(service), Some(method))
-                if !(Self::is_quoted_literal(service) && Self::is_quoted_literal(method))
-                    && service.len() + method.len() <= 200
-                    && !service.contains('|')
-                    && !method.contains('|') =>
-            {
-                let squash = |a: &str| a.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-                Some(format!("{}|{}", squash(service), squash(method)))
-            }
-            _ => None,
-        };
-        (method_key, reference)
+        format!("{service}|{method}")
     }
 
     /// One [`CONST_VALUE_PREFIX`] record per top-level string constant, `as const`
@@ -1865,7 +1927,9 @@ impl TypeScriptExtractor {
             let Some(class) = root
                 .descendant_for_byte_range(start, start)
                 .and_then(|mut n| loop {
-                    if Self::is_class(n) && n.start_byte() == start {
+                    // Named only: the bare `class` keyword token of an undecorated
+                    // declaration has the same kind and start byte as the declaration.
+                    if Self::is_class(n) && n.is_named() && n.start_byte() == start {
                         break Some(n);
                     }
                     n = n.parent()?;
@@ -3779,6 +3843,246 @@ export class C {
         assert!(
             found.iter().all(|(_, c)| *c != EdgeConfidence::Exact),
             "{found:?}"
+        );
+    }
+
+    // ---- 7.1.4 review round ------------------------------------------------
+
+    /// `Enum.MEMBER` from a package that is not indexed must not resolve to an
+    /// unrelated constant that happens to be called `MEMBER`.
+    #[test]
+    fn unresolved_enum_member_does_not_fall_back_to_a_same_named_constant() {
+        let unrelated = "export const ADD_BADGE_TO_USER = 'AddBadgeToUser';\n";
+        let code = r#"
+import { External } from '@acme/not-indexed';
+export class C {
+  @GrpcMethod('UserService', External.ADD_BADGE_TO_USER)
+  add() {}
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/k.ts", unrelated), ("src/c.ts", code)]);
+        let found = implements_of(&graph, "UserService.AddBadgeToUser");
+        assert!(
+            found.iter().all(|(_, c)| *c != EdgeConfidence::Exact),
+            "{found:?}"
+        );
+        assert!(graph
+            .analyze_grpc("UserService.AddBadgeToUser")
+            .handler_rpc_names
+            .is_empty());
+    }
+
+    /// The constant's own name differs from the RPC (`ADD_BADGE` = 'AddBadgeToUser'):
+    /// the delegation is still recognised once the constant is resolved.
+    #[test]
+    fn delegation_is_recognised_when_the_constant_name_differs_from_the_rpc() {
+        let methods = "export enum M { ADD_BADGE = 'AddBadgeToUser' }\n";
+        let code = r#"
+import { M } from './methods';
+export class C {
+  private userService;
+  @GrpcMethod('UserService', M.ADD_BADGE)
+  add(id: string) {
+    return this.userService.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/methods.ts", methods), ("src/c.ts", code)]);
+        assert!(client_stubs(&graph, "UserService.AddBadgeToUser").is_empty());
+    }
+
+    /// A field a base class (another file) binds to a generated client stays a
+    /// client when a subclass handler of the same RPC calls through it.
+    #[test]
+    fn inherited_bound_client_inside_a_handler_stays_a_client() {
+        let base = r#"
+export class Base {
+  protected users!: UserServiceClient;
+}
+"#;
+        let sub = r#"
+import { Base } from './base';
+export class Sub extends Base {
+  @GrpcMethod('UserService', 'AddBadgeToUser')
+  forward(id: string) {
+    return this.users.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/base.ts", base), ("src/sub.ts", sub)]);
+        let stubs = client_stubs(&graph, "UserService.AddBadgeToUser");
+        assert_eq!(stubs.len(), 1, "{stubs:?}");
+        assert_eq!(stubs[0].1, EdgeConfidence::Exact);
+    }
+
+    /// An inherited field with no binding anywhere falls back to its name, and
+    /// that guess is dropped inside the handler of the same RPC.
+    #[test]
+    fn inherited_name_guess_inside_its_own_handler_is_dropped() {
+        let sub = r#"
+export class Sub extends Base {
+  @GrpcMethod('UserService', 'AddBadgeToUser')
+  add(id: string) {
+    return this.userService.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/sub.ts", sub)]);
+        assert!(client_stubs(&graph, "UserService.AddBadgeToUser").is_empty());
+    }
+
+    #[test]
+    fn decorator_args_ignores_comments_and_handles_escapes() {
+        let ann = "@GrpcMethod";
+        let text = "/* @GrpcMethod('Wrong', 'Wrong') */ // @GrpcMethod('No', 'No')\n @GrpcMethod('UserService', 'SignUp') signUp() {}";
+        assert_eq!(
+            TypeScriptExtractor::decorator_args(text, ann),
+            vec!["'UserService'".to_string(), "'SignUp'".to_string()]
+        );
+        // A string mentioning the annotation, and a word that merely starts with it.
+        let text =
+            "@Other('@GrpcMethod(1, 2)') @GrpcMethodX('a', 'b') @GrpcMethod('S', 'M') m() {}";
+        assert_eq!(
+            TypeScriptExtractor::decorator_args(text, ann),
+            vec!["'S'".to_string(), "'M'".to_string()]
+        );
+        // An escaped quote and a `)` inside a string do not end the argument.
+        let text = r#"@GrpcMethod('Svc', 'a\')b') m() {}"#;
+        assert_eq!(
+            TypeScriptExtractor::decorator_args(text, ann),
+            vec!["'Svc'".to_string(), r#"'a\')b'"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn escaped_or_interpolated_literals_are_not_literals() {
+        let args = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+        assert_eq!(
+            TypeScriptExtractor::handler_reference(&args("'UserService'", "'SignUp'"), "m"),
+            "'UserService'|'SignUp'"
+        );
+        let r = TypeScriptExtractor::handler_reference(&args("'UserService'", "`Add${X}`"), "m");
+        assert_eq!(r, "'UserService'|?`Add${X}`");
+        let r = TypeScriptExtractor::handler_reference(&args("'UserService'", r"'a\'b'"), "m");
+        assert!(r.starts_with("'UserService'|?"), "{r}");
+        let r = TypeScriptExtractor::handler_reference(&args("'A'", "'B' + 'C'"), "m");
+        assert!(r.starts_with("'A'|?"), "{r}");
+    }
+
+    #[test]
+    fn interpolated_template_method_stays_heuristic() {
+        let code = r#"
+export class C {
+  @GrpcMethod('UserService', `AddBadge${SUFFIX}`)
+  add() {}
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        assert!(graph
+            .analyze_grpc("UserService.AddBadgeToUser")
+            .handler_rpc_names
+            .is_empty());
+    }
+
+    const QUALIFIED_CONTROLLER: &str = r#"
+export class C {
+  @GrpcMethod(SVC, 'AddBadgeToUser')
+  add() {}
+}
+"#;
+
+    #[test]
+    fn package_qualified_service_requires_the_package_to_match() {
+        let right = "export const SVC = 'demo.user.UserService';\n";
+        let wrong = "export const SVC = 'other.pkg.UserService';\n";
+        let graph = grpc_graph(
+            &[],
+            &[("src/n.ts", right), ("src/c.ts", QUALIFIED_CONTROLLER)],
+        );
+        let found = implements_of(&graph, "UserService.AddBadgeToUser");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, EdgeConfidence::Exact);
+
+        let graph = grpc_graph(
+            &[],
+            &[("src/n.ts", wrong), ("src/c.ts", QUALIFIED_CONTROLLER)],
+        );
+        let found = implements_of(&graph, "UserService.AddBadgeToUser");
+        assert!(
+            found.iter().all(|(_, c)| *c != EdgeConfidence::Exact),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn trace_carries_only_its_own_handler_names() {
+        let graph = grpc_graph(
+            &[],
+            &[
+                ("src/names.ts", NAMES_TS),
+                ("src/methods.ts", METHODS_TS),
+                ("src/user.controller.ts", ENUM_CONTROLLER),
+            ],
+        );
+        let trace = graph.analyze_grpc("UserService.SignUp");
+        assert_eq!(trace.handler_rpc_names.len(), 1);
+        for (h, _) in &trace.server_handlers {
+            assert!(trace.handler_rpc_names.contains_key(&h.id));
+        }
+    }
+
+    /// `getService` assigned anywhere in the class (constructor, `onModuleInit`,
+    /// with the generated interface rather than `XClient` as the generic) binds
+    /// the field, whatever it is typed or called.
+    #[test]
+    fn get_service_binding_wins_over_the_declared_type() {
+        let code = r#"
+export class Gw implements OnModuleInit {
+  private userService: UserService;
+  private b: UserService;
+  constructor(@Inject('U') private client: ClientGrpc) {
+    this.b = client.getService<UserService>('UserService');
+  }
+  onModuleInit() {
+    this.userService = this.client.getService<UserService>(USER_SERVICE_NAME);
+  }
+  viaInit(id: string) { return this.userService.addBadgeToUser(id); }
+  viaCtor(id: string) { return this.b.removeBadgeFromUser(id); }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/gw.ts", code)]);
+        assert_eq!(
+            client_stubs(&graph, "UserService.AddBadgeToUser"),
+            vec![("viaInit".to_string(), EdgeConfidence::Exact)]
+        );
+        assert_eq!(
+            client_stubs(&graph, "UserService.RemoveBadgeFromUser"),
+            vec![("viaCtor".to_string(), EdgeConfidence::Exact)]
+        );
+    }
+
+    /// Wrapped and aliased client types are not "plain application types".
+    #[test]
+    fn wrapped_and_aliased_client_types_stay_candidates() {
+        let code = r#"
+type Users = UserServiceClient;
+export class Gw {
+  private userService: Users;
+  private userClient: Promise<UserServiceClient>;
+  fromAlias(id: string) { return this.userService.addBadgeToUser(id); }
+  fromWrapped(id: string) { return this.userClient.removeBadgeFromUser(id); }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/gw.ts", code)]);
+        assert_eq!(
+            client_stubs(&graph, "UserService.AddBadgeToUser").len(),
+            1,
+            "alias"
+        );
+        assert_eq!(
+            client_stubs(&graph, "UserService.RemoveBadgeFromUser").len(),
+            1,
+            "wrapped"
         );
     }
 }

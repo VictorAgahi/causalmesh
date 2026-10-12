@@ -109,7 +109,7 @@ impl McpTool for VisualizeMeshTool {
             opts.focus.as_deref(),
             &state.allowed_roots,
         )
-        .with_http_prefix(state.config.workspace.http_prefix.as_deref());
+        .with_http_prefixes(state.http_prefixes.clone());
         if let (Some(asked), None) = (&opts.focus, aggregate.focus()) {
             return Err((
                 -32602,

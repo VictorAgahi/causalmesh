@@ -3,7 +3,7 @@ use crate::protocol::RequestMeta;
 use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::routes::{
-    display_route, find_routes, nearest_routes, prefix_segments, RouteHit, RouteQuery, RouteRank,
+    display_route, find_routes, nearest_routes, HttpPrefixes, RouteHit, RouteQuery, RouteRank,
 };
 use mesh_core::{
     file_stamp, AppState, CachedSearch, CompactStr, ContractNode, FileStamp, FilesystemCrawler,
@@ -301,14 +301,13 @@ impl McpTool for SmartSearchTool {
         // is answered from the `HttpEndpoint` nodes' signatures when any matches;
         // otherwise it is an ordinary symbol query (a route-named node, a path).
         let route_query = RouteQuery::parse(query);
-        let prefix_text = state.config.workspace.http_prefix.as_deref();
-        let prefix = prefix_segments(prefix_text);
+        let prefixes = &state.http_prefixes;
         let mut route_note: Option<String> = None;
         let (route_hits, hidden_tests) = match &route_query {
             Some(rq) => find_routes(
                 &snapshot.contract_graph,
                 rq,
-                &prefix,
+                prefixes,
                 scope_path,
                 include_tests,
                 &state.allowed_roots,
@@ -338,7 +337,7 @@ impl McpTool for SmartSearchTool {
                 &route_hits,
                 &RouteRender {
                     repo_names: &WorkspaceIndexer::repo_names(&state.allowed_roots),
-                    prefix: prefix_text,
+                    prefixes,
                     include_body: args.include_body,
                 },
                 offset,
@@ -361,8 +360,7 @@ impl McpTool for SmartSearchTool {
                 Self::nearest_routes_note(
                     &snapshot.contract_graph,
                     rq,
-                    &prefix,
-                    prefix_text,
+                    prefixes,
                     include_tests,
                     &state.allowed_roots,
                 )
@@ -473,7 +471,7 @@ impl DecapFile {
 /// What rendering a route hit needs besides the hit itself.
 struct RouteRender<'a> {
     repo_names: &'a [String],
-    prefix: Option<&'a str>,
+    prefixes: &'a HttpPrefixes,
     include_body: bool,
 }
 
@@ -630,18 +628,17 @@ impl SmartSearchTool {
     fn nearest_routes_note(
         graph: &mesh_core::ContractGraph,
         query: &RouteQuery,
-        prefix: &[mesh_core::routes::Seg],
-        prefix_text: Option<&str>,
+        prefixes: &HttpPrefixes,
         include_tests: bool,
         roots: &[PathBuf],
     ) -> Option<String> {
-        let near = nearest_routes(graph, query, prefix, include_tests, roots, 5);
+        let near = nearest_routes(graph, query, prefixes, include_tests, roots, 5);
         if near.is_empty() {
             return None;
         }
         let mut out = String::from("\n*No route matches. Nearest routes:*\n");
         for node in near {
-            if let Some(route) = display_route(node, prefix_text) {
+            if let Some(route) = display_route(node, prefixes.text(node.repo_id)) {
                 out.push_str(&format!(
                     "- `{route}` -> `{}` (`{}:{}`)\n",
                     node.name,
@@ -700,7 +697,7 @@ impl SmartSearchTool {
         file: Option<&DecapFile>,
     ) -> SearchResult {
         let node = hit.node;
-        let route = display_route(node, render.prefix)
+        let route = display_route(node, render.prefixes.text(node.repo_id))
             .unwrap_or_else(|| format!("{} (route)", hit.route.verb));
         let repo = render
             .repo_names

@@ -8,6 +8,7 @@
 //! save without changes never rebuilds a workspace.
 
 use crate::index_cache::sha256;
+use crate::reload_kind::ReloadKind;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -56,6 +57,16 @@ pub fn stamp_config(path: &Path) -> std::io::Result<ConfigStamp> {
     })
 }
 
+/// The last config reload `meshd` applied, for `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReloadRecord {
+    pub kind: ReloadKind,
+    /// Wall-clock time from noticing the change to serving it.
+    pub duration_ms: u64,
+    /// When it finished (ms since the Unix epoch).
+    pub at_ms: u128,
+}
+
 /// What `meshd` records about the config it serves, next to its
 /// [`crate::socket::DaemonMeta`]: enough for `doctor` to say whether the running
 /// daemon is behind the file on disk.
@@ -75,6 +86,13 @@ pub struct DaemonConfigStatus {
     /// a still-rejected file from one the user has since edited.
     #[serde(default)]
     pub rejected_sha256: Option<String>,
+    /// When the serving config was loaded (ms since the Unix epoch): the daemon
+    /// start for the config it booted with, the reload time after that.
+    #[serde(default)]
+    pub loaded_ms: Option<u128>,
+    /// The last reload applied since the daemon started; `None` before the first.
+    #[serde(default)]
+    pub last_reload: Option<ReloadRecord>,
 }
 
 /// Where [`DaemonConfigStatus`] of `workspace_id` lives.
@@ -212,6 +230,8 @@ mod tests {
             config_sha256: Some(stamp_config(&p).expect("stamp").sha256),
             last_error: None,
             rejected_sha256: None,
+            loaded_ms: None,
+            last_reload: None,
         };
         assert_eq!(config_drift(&status, &p), ConfigDrift::InSync);
         std::fs::write(&p, "a = 2\n").expect("rewrite");
@@ -242,6 +262,8 @@ mod tests {
             config_sha256: Some(served.clone()),
             last_error: Some("bad".to_string()),
             rejected_sha256: Some(stamp_config(&p).expect("stamp").sha256),
+            loaded_ms: None,
+            last_reload: None,
         };
         assert!(matches!(
             config_drift(&status, &p),

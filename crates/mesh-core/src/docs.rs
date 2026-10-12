@@ -125,6 +125,16 @@ impl DocIndex {
         }
     }
 
+    /// Takes the query-time settings (aliases, stop words, phrase boost, fuzzy
+    /// fallback) of `other`, keeping the sections. `sanitize_injections` is not
+    /// adopted: it is applied while parsing, so changing it re-parses the files.
+    pub fn adopt_query_settings(&mut self, other: &DocIndex) {
+        self.aliases = other.aliases.clone();
+        self.stop_words = other.stop_words.clone();
+        self.exact_phrase_boost = other.exact_phrase_boost;
+        self.fuzzy_fallback = other.fuzzy_fallback;
+    }
+
     #[inline]
     pub fn section_count(&self) -> usize {
         self.sections.len()

@@ -7,6 +7,7 @@ use crate::health::IndexHealth;
 use crate::index_cache::{CacheStats, PersistentIndexCache};
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
+use crate::routes::HttpPrefixes;
 use crate::search_cache::SearchCache;
 use crate::types::RepoId;
 use crate::vfs::DifferentialVfs;
@@ -145,6 +146,9 @@ impl MeshSnapshot {
 pub struct AppState {
     pub config: Arc<Config>,
     pub allowed_roots: Arc<[PathBuf]>,
+    /// The HTTP prefix of each root (`http_prefix` and `[workspace.http_prefixes]`),
+    /// resolved once against `allowed_roots`.
+    pub http_prefixes: HttpPrefixes,
     pub governance: Arc<GovernanceEngine>,
     pub snapshot: ArcSwap<MeshSnapshot>,
     pub audit: Arc<AuditLogger>,
@@ -213,9 +217,11 @@ impl AppState {
             })
             .unwrap_or_default();
 
+        let http_prefixes = HttpPrefixes::resolve(&config.workspace, &allowed_roots);
         let state = Self {
             config: Arc::new(config),
             allowed_roots: allowed_roots.into(),
+            http_prefixes,
             governance: Arc::new(GovernanceEngine::new(
                 stop_rules,
                 skills,
@@ -330,6 +336,26 @@ impl AppState {
         self.snapshot.store(Arc::new(snapshot));
         self.record_index_cache_pass();
         generation
+    }
+
+    /// Starts this state from the indexed content of `old`: its snapshot (after
+    /// `adjust`), file signatures and alias digests. Used by a config reload that
+    /// keeps the index (display-only and partial changes), so nothing is re-read.
+    /// Taken under `old`'s `reload_lock`, so the three pieces are consistent.
+    pub fn adopt_index_of(&self, old: &AppState, adjust: impl FnOnce(&mut MeshSnapshot)) {
+        let _guard = old.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let vfs = old.vfs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let digests = old
+            .alias_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut snapshot = old.snapshot_clone();
+        drop(_guard);
+        adjust(&mut snapshot);
+        *self.vfs.lock().unwrap_or_else(|e| e.into_inner()) = vfs;
+        *self.alias_digests.lock().unwrap_or_else(|e| e.into_inner()) = digests;
+        self.install_snapshot(snapshot);
     }
 
     /// Clones the current snapshot so it can be mutated and re-installed.

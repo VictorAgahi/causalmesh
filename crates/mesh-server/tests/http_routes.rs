@@ -412,3 +412,113 @@ async fn test_only_route_note_survives_symbol_hits() {
     assert!(text.contains("match only in test files"), "{text}");
     assert!(!text.contains("fakeOnly"), "{text}");
 }
+
+fn controller(class: &str, base: &str, route: &str) -> String {
+    format!(
+        "import {{ Controller, Get }} from '@nestjs/common';\n@Controller('{base}')\nexport class {class} {{\n  @Get('{route}')\n  {class}Handler() {{ return 1; }}\n}}\n"
+    )
+}
+
+/// A gateway root and a shared-packages root, each with one route.
+fn two_root_state(workspace: &str) -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dunce::canonicalize(dir.path()).expect("canonical");
+    for (root, class, path, id) in [
+        ("api-gateway", "Users", "users", ":id"),
+        ("npm-packages", "Shared", "shared", ":key"),
+    ] {
+        let src = base.join(root).join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("c.controller.ts"), controller(class, path, id)).expect("write");
+    }
+    let config = Config::load_from_str(&format!(
+        "[workspace]\nname = \"tmp\"\nroots = [\"api-gateway\", \"npm-packages\"]\n{workspace}"
+    ))
+    .expect("config");
+    let prefix = config.workspace.http_prefix.clone();
+    let state = build_state(config, &base, prefix.as_deref());
+    (dir, state)
+}
+
+#[tokio::test]
+async fn a_per_root_prefix_applies_only_to_the_routes_of_that_root() {
+    let (_guard, state) =
+        two_root_state("[workspace.http_prefixes]\n\"api-gateway\" = \"/api/v1\"\n");
+    let text = call(&state, "smart_search", json!({"query": "GET /users/:id"})).await;
+    assert!(text.contains("GET /api/v1/users/:id"), "{text}");
+    let text = call(&state, "smart_search", json!({"query": "GET /shared/:key"})).await;
+    assert!(text.contains("GET /shared/:key"), "{text}");
+    assert!(!text.contains("/api/v1/shared"), "{text}");
+    // The routes of the unlisted root are not reachable through the gateway's prefix.
+    let text = call(
+        &state,
+        "smart_search",
+        json!({"query": "GET /api/v1/shared/:key"}),
+    )
+    .await;
+    assert!(text.contains("Matches: 0 definitions"), "{text}");
+}
+
+#[tokio::test]
+async fn a_per_root_prefix_beats_the_workspace_one_and_matching_accepts_both_spellings() {
+    let (_guard, state) = two_root_state(
+        "http_prefix = \"/pkg\"\n[workspace.http_prefixes]\n\"api-gateway\" = \"/api/v1\"\n",
+    );
+    for query in ["GET /users/:id", "GET /api/v1/users/:id", "/users/{id}"] {
+        let text = call(&state, "smart_search", json!({"query": query})).await;
+        assert!(text.contains("GET /api/v1/users/:id"), "{query}\n{text}");
+        assert!(!text.contains("/pkg/users"), "{query}\n{text}");
+    }
+    // The unlisted root keeps the workspace-wide prefix, accepted with or without.
+    for query in ["GET /shared/:key", "GET /pkg/shared/:key"] {
+        let text = call(&state, "smart_search", json!({"query": query})).await;
+        assert!(text.contains("GET /pkg/shared/:key"), "{query}\n{text}");
+    }
+    let text = call(
+        &state,
+        "analyze_impact",
+        json!({"target": "GET /api/v1/users/:id"}),
+    )
+    .await;
+    assert!(text.contains("UsersHandler"), "{text}");
+    assert!(text.contains("GET /api/v1/users/:id"), "{text}");
+    let text = call(
+        &state,
+        "analyze_impact",
+        json!({"target": "GET /shared/:key"}),
+    )
+    .await;
+    assert!(text.contains("GET /pkg/shared/:key"), "{text}");
+}
+
+#[tokio::test]
+async fn visualize_mesh_zoom_shows_each_roots_own_prefix() {
+    let (_guard, state) =
+        two_root_state("[workspace.http_prefixes]\n\"api-gateway\" = \"/api/v1\"\n");
+    let text = call(&state, "visualize_mesh", json!({"service": "api-gateway"})).await;
+    assert!(text.contains("/api/v1/users/:id"), "{text}");
+    let text = call(&state, "visualize_mesh", json!({"service": "npm-packages"})).await;
+    assert!(text.contains("/shared/:key"), "{text}");
+    assert!(!text.contains("/api/v1/shared"), "{text}");
+}
+
+#[test]
+fn http_prefixes_is_a_strict_string_map() {
+    let ok = Config::load_from_str(
+        "[workspace]\nname = \"w\"\nroots = [\".\"]\n[workspace.http_prefixes]\n\"gw\" = \"/api\"\n",
+    )
+    .expect("table of strings");
+    assert_eq!(
+        ok.workspace.http_prefixes.get("gw").map(String::as_str),
+        Some("/api")
+    );
+    assert!(Config::load_from_str(
+        "[workspace]\nname = \"w\"\nroots = [\".\"]\n[workspace.http_prefixes]\n\"gw\" = 3\n"
+    )
+    .is_err());
+    // A misspelt table name is an unknown workspace key.
+    assert!(Config::load_from_str(
+        "[workspace]\nname = \"w\"\nroots = [\".\"]\n[workspace.http_prefix_map]\n\"gw\" = \"/api\"\n"
+    )
+    .is_err());
+}

@@ -96,8 +96,8 @@ pub struct Topology {
     pub routes: Vec<RouteLine>,
     /// Zoom only: HTTP routes left out because they sit in test files.
     pub routes_in_tests: usize,
-    /// Global route prefix to display routes with.
-    pub http_prefix: Option<String>,
+    /// Route prefix of each root to display routes with.
+    pub http_prefixes: mesh_core::routes::HttpPrefixes,
     /// Workspace roots, indexed by `RepoId`, to show route files relative to.
     pub roots: Vec<std::path::PathBuf>,
 }
@@ -231,7 +231,7 @@ pub struct Aggregate {
     focus_kinds: BTreeMap<&'static str, usize>,
     routes: Vec<RouteLine>,
     routes_in_tests: usize,
-    http_prefix: Option<String>,
+    http_prefixes: mesh_core::routes::HttpPrefixes,
     roots: Vec<std::path::PathBuf>,
 }
 
@@ -244,7 +244,14 @@ impl Aggregate {
 
     /// Displays routes with the configured global prefix (`http_prefix`).
     pub fn with_http_prefix(mut self, prefix: Option<&str>) -> Self {
-        self.http_prefix = prefix.map(str::to_string);
+        self.http_prefixes = mesh_core::routes::HttpPrefixes::uniform(prefix);
+        self
+    }
+
+    /// Displays routes with the prefix of the root each one lives under
+    /// (`http_prefix` and `[workspace.http_prefixes]`).
+    pub fn with_http_prefixes(mut self, prefixes: mesh_core::routes::HttpPrefixes) -> Self {
+        self.http_prefixes = prefixes;
         self
     }
 
@@ -448,7 +455,7 @@ impl Aggregate {
             focus_kinds,
             routes,
             routes_in_tests,
-            http_prefix: None,
+            http_prefixes: mesh_core::routes::HttpPrefixes::default(),
             roots: roots.to_vec(),
         };
         agg.routes.sort_by(|a, b| {
@@ -596,7 +603,7 @@ impl Aggregate {
             focus_kinds: self.focus_kinds.clone(),
             routes: self.routes.clone(),
             routes_in_tests: self.routes_in_tests,
-            http_prefix: self.http_prefix.clone(),
+            http_prefixes: self.http_prefixes.clone(),
             roots: self.roots.clone(),
         }
     }
@@ -810,7 +817,7 @@ impl Topology {
             ));
         }
         for r in self.routes.iter().take(MAX_ROUTES_LISTED) {
-            let route = display_label(&r.label, self.http_prefix.as_deref())
+            let route = display_label(&r.label, self.http_prefixes.text(r.repo_id))
                 .unwrap_or_else(|| r.label.clone());
             let place = self
                 .roots

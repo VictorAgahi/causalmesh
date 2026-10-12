@@ -5,15 +5,23 @@
 //! [`WorkspaceHost`] holds the current one behind an `ArcSwap`: on a request,
 //! at most every [`CHECK_INTERVAL`], it reads and hashes the config file (a few
 //! hundred bytes; mtime and length are not trusted, a same-length edit within
-//! one mtime tick would hide behind them), and only a different hash rebuilds. The
-//! rebuild (parse, expand roots, index, start a watcher) runs on a blocking
-//! thread while the old state keeps serving, and the swap happens once the new
-//! state has its first snapshot. A config that does not parse, or whose roots do
-//! not resolve, is refused: the old state keeps serving, the reason is logged to
-//! stderr and recorded for `mesh-mcp doctor`.
+//! one mtime tick would hide behind them), and only a different hash rebuilds.
+//! How much a rebuild costs depends on what changed ([`ReloadKind`]): keys read at
+//! query time (route prefixes, policy, docs aliases) only swap the config over
+//! the running index; a changed custom pattern re-extracts the files it applies
+//! to; anything else re-indexes the workspace, reusing the per-file parse cache.
+//! The rebuild runs on a blocking thread while the old state keeps serving, and
+//! the swap happens once the new state is ready. The check runs when a request
+//! arrives (there is no timer), so an edit made while no client is talking to the
+//! daemon is applied by the next request. A config that does not parse, or whose
+//! roots do not resolve, is refused: the old state keeps serving, the reason is
+//! logged to stderr and recorded for `mesh-mcp doctor`.
 
 use arc_swap::ArcSwap;
-use mesh_core::config_watch::{config_sha256, write_daemon_config_status_in, DaemonConfigStatus};
+use mesh_core::config_watch::{
+    config_sha256, write_daemon_config_status_in, DaemonConfigStatus, ReloadRecord,
+};
+use mesh_core::reload_kind::{classify, ReloadKind, ReloadPlan};
 use mesh_core::{
     expand_roots, AppState, AuditLogger, BackgroundRescanEngine, PersistentIndexCache,
 };
@@ -47,6 +55,10 @@ struct Book {
     /// Cancels the file watcher of the serving state.
     watcher_cancel: CancellationToken,
     last_error: Option<String>,
+    /// When the serving config was loaded (ms since the Unix epoch).
+    loaded_ms: u128,
+    /// The last reload applied: kind, duration, time.
+    last_reload: Option<ReloadRecord>,
 }
 
 pub struct WorkspaceHost {
@@ -136,6 +148,30 @@ pub fn start_watcher_blocking(state: &Arc<AppState>, cancel: CancellationToken) 
     }
 }
 
+/// [`start_watcher_blocking`] for a state that replaces a serving one: someone is
+/// waiting for the swap, so the closing differential reload runs on the global
+/// (normal priority) pool instead of the QoS-background one, which a busy machine
+/// starves. `plan` forces the files a changed pattern governs through it.
+pub fn start_watcher_for_reload(
+    state: &Arc<AppState>,
+    cancel: CancellationToken,
+    plan: &ReloadPlan,
+) {
+    match FileWatcherService::spawn(state.clone(), cancel) {
+        Ok(_handle) => {
+            let forced = |path: &Path| plan.forces(&path.to_string_lossy());
+            let force: Option<&(dyn Fn(&Path) -> bool + Sync)> = if plan.changed_patterns.is_empty()
+            {
+                None
+            } else {
+                Some(&forced)
+            };
+            WorkspaceIndexer::reload_with(state, None, force);
+        }
+        Err(e) => tracing::warn!(target: "meshd", "Failed to start FileWatcherService: {e}"),
+    }
+}
+
 impl WorkspaceHost {
     /// A host serving `state`, which was built from `config_path` (`None` for the
     /// built-in default config: nothing to follow). `serving_sha` is the SHA-256
@@ -198,6 +234,8 @@ impl WorkspaceHost {
                 rejected_sha: None,
                 watcher_cancel,
                 last_error: None,
+                loaded_ms: now_ms(),
+                last_reload: None,
             }),
             cache_dir,
             #[cfg(test)]
@@ -232,6 +270,8 @@ impl WorkspaceHost {
                 rejected_sha: None,
                 watcher_cancel: watcher,
                 last_error: None,
+                loaded_ms: now_ms(),
+                last_reload: None,
             }),
             cache_dir: None,
             #[cfg(test)]
@@ -352,6 +392,8 @@ impl WorkspaceHost {
                 config_sha256: book.serving_sha.clone(),
                 last_error: book.last_error.clone(),
                 rejected_sha256: book.rejected_sha.clone(),
+                loaded_ms: Some(book.loaded_ms),
+                last_reload: book.last_reload.clone(),
             },
         );
     }
@@ -434,9 +476,14 @@ impl WorkspaceHost {
             }
         };
 
+        let started = Instant::now();
+        let old = self.current.load_full();
+        let plan = classify(&old.config, &old.allowed_roots, &config, &roots);
+        let kind = plan.kind;
         tracing::info!(
             target: "meshd::config",
-            "Config {shown} changed; rebuilding the workspace state ({} root(s)) while the previous one keeps serving.",
+            "Config {shown} changed; {} reload started ({} root(s)); the previous state keeps serving.",
+            kind.as_str(),
             roots.len()
         );
         let state = Arc::new(AppState::new(
@@ -449,21 +496,47 @@ impl WorkspaceHost {
             static TAG: AtomicU64 = AtomicU64::new(1);
             seed_index_cache(&state, dir, TAG.fetch_add(1, Ordering::Relaxed));
         }
-        ingest_blocking(&state, &base_dir);
         let watcher_cancel = self.shutdown.child_token();
-        start_watcher_blocking(&state, watcher_cancel.clone());
+        match kind {
+            ReloadKind::Full => {
+                ingest_blocking(&state, &base_dir);
+            }
+            ReloadKind::DisplayOnly | ReloadKind::Partial => {
+                // The index stays valid: carry it over instead of reading the
+                // workspace again. Only the query-time docs settings follow the
+                // new config.
+                state.open_index_cache(&base_dir);
+                let settings = WorkspaceIndexer::doc_index_for(&state.config);
+                state.adopt_index_of(&old, |snapshot| {
+                    snapshot.doc_index.adopt_query_settings(&settings);
+                });
+            }
+        }
+        start_watcher_for_reload(&state, watcher_cancel.clone(), &plan);
 
         self.current.store(Arc::clone(&state));
+        let elapsed = started.elapsed();
         let old_watcher = {
             let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
             book.serving_sha = Some(sha);
             book.rejected_sha = None;
             book.last_error = None;
+            book.loaded_ms = now_ms();
+            book.last_reload = Some(ReloadRecord {
+                kind,
+                duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                at_ms: now_ms(),
+            });
             std::mem::replace(&mut book.watcher_cancel, watcher_cancel)
         };
         old_watcher.cancel();
         self.publish_status();
-        tracing::info!(target: "meshd::config", "Now serving the new config ({shown}).");
+        tracing::info!(
+            target: "meshd::config",
+            "Now serving the new config ({shown}): {} reload took {} ms.",
+            kind.as_str(),
+            elapsed.as_millis()
+        );
         ReloadOutcome::Reloaded
     }
 }
@@ -809,6 +882,139 @@ mod tests {
         ));
         write_config(&fx.config, &["b"]);
         assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        fx.shutdown.cancel();
+    }
+
+    const PATTERN_A: &str = "\n[engines.contracts]\n[[engines.contracts.patterns]]\nname = \"p\"\nkind = \"topic_producer\"\nregex = 'class (Only[A-Z])'\nfile_pattern = \"*.ts\"\n";
+
+    fn write_text(path: &Path, roots: &[&str], extra: &str) {
+        let list: Vec<String> = roots.iter().map(|r| format!("\"{r}\"")).collect();
+        let text = format!(
+            "[workspace]\nname = \"w\"\nroots = [{}]\n{extra}",
+            list.join(", ")
+        );
+        std::fs::write(path, text).expect("write config");
+    }
+
+    /// Fingerprint of a from-scratch build under the config now on disk.
+    fn fresh_fingerprint(fx: &Fixture) -> String {
+        let (cfg, base) = WorkspaceIndexer::load_config_at(&fx.config).expect("load");
+        let roots = expand_roots(&cfg.workspace.roots, &base, &cfg.workspace.workspace_root)
+            .expect("roots");
+        WorkspaceIndexer::build_snapshot(&cfg, &roots, None, None, None)
+            .fingerprint()
+            .combined
+    }
+
+    fn served_fingerprint(fx: &Fixture) -> String {
+        fx.host.peek().snapshot().fingerprint().combined
+    }
+
+    fn last_kind(fx: &Fixture) -> Option<ReloadKind> {
+        fx.host
+            .book
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_reload
+            .as_ref()
+            .map(|r| r.kind)
+    }
+
+    #[test]
+    fn a_display_only_edit_swaps_the_config_without_reindexing() {
+        let fx = fixture(&["a"]);
+        write_text(&fx.config, &["a"], "http_prefix = \"/api\"\n");
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::DisplayOnly));
+        let before = fx.host.peek();
+
+        // Prove no file is read again: a file that changed on disk stays unseen
+        // by a display-only swap only if the swap reuses the old index. The
+        // closing differential reload would pick the edit up, so check the
+        // inverse instead: nothing changed, and the file signatures were carried.
+        write_text(&fx.config, &["a"], "http_prefix = \"/api/v2\"\n");
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::DisplayOnly));
+        let after = fx.host.peek();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            after.config.workspace.http_prefix.as_deref(),
+            Some("/api/v2")
+        );
+        assert_eq!(after.http_prefixes.text(0), Some("/api/v2"));
+        assert!(knows(&after, "OnlyA"));
+        assert!(
+            !after.vfs.lock().expect("vfs").is_empty(),
+            "signatures carried over"
+        );
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        let recorded = fx
+            .host
+            .book
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_reload
+            .clone();
+        assert!(recorded.is_some());
+        fx.shutdown.cancel();
+    }
+
+    #[test]
+    fn a_pattern_edit_is_partial_and_equals_a_full_rebuild() {
+        let fx = fixture(&["a", "b"]);
+        write_text(&fx.config, &["a", "b"], "");
+        let _ = fx.host.reload_if_changed();
+
+        write_text(&fx.config, &["a", "b"], PATTERN_A);
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::Partial));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        let with_pattern = served_fingerprint(&fx);
+
+        let edited = PATTERN_A.replace("class (Only[A-Z])", "class (Only)[A-Z]");
+        write_text(&fx.config, &["a", "b"], &edited);
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::Partial));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        assert_ne!(
+            served_fingerprint(&fx),
+            with_pattern,
+            "the edit changed the facts"
+        );
+
+        write_text(&fx.config, &["a", "b"], "");
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::Partial));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        fx.shutdown.cancel();
+    }
+
+    #[test]
+    fn a_root_change_is_a_full_rebuild_equal_to_a_fresh_one() {
+        let fx = fixture(&["a"]);
+        write_text(&fx.config, &["a", "b"], PATTERN_A);
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::Full));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        fx.shutdown.cancel();
+    }
+
+    #[test]
+    fn a_failing_partial_or_display_reload_keeps_the_old_state() {
+        let fx = fixture(&["a"]);
+        write_text(&fx.config, &["a"], "http_prefix = \"/api\"\n");
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        let before = fx.host.peek();
+        std::fs::write(
+            &fx.config,
+            "[workspace]\nname = \"w\"\nroots = [\"a\"]\nhttp_prefix = 3\n",
+        )
+        .expect("write");
+        assert!(matches!(
+            fx.host.reload_if_changed(),
+            ReloadOutcome::Rejected(_)
+        ));
+        assert!(Arc::ptr_eq(&before, &fx.host.peek()));
         fx.shutdown.cancel();
     }
 

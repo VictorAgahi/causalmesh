@@ -178,6 +178,10 @@ pub struct GrpcTrace<'g> {
     /// literals resolved to exactly one RPC: the proto RPC name to show in
     /// place of the raw decorator expression.
     pub handler_rpc_names: HashMap<NodeId, CompactStr>,
+    /// The decorator arguments of those handlers as written
+    /// (`USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER`), for the
+    /// "declared as" text. Absent for a handler without a recorded decorator.
+    pub handler_declared_as: HashMap<NodeId, String>,
     /// When the target is a method: callers linked to the method's *service*
     /// (a client constructed for it, `getService<UserServiceClient>(…)`)
     /// without the called method being resolved, in files with no resolved
@@ -1830,12 +1834,23 @@ impl ContractGraph {
                     .map(|name| (h.id, name.clone()))
             })
             .collect();
+        let handler_declared_as = self
+            .rpc_calls
+            .iter()
+            .filter(|(id, _)| self.handler_rpc_names.contains_key(id))
+            .filter(|(id, _)| server_handlers.iter().any(|(h, _)| h.id == *id))
+            .filter_map(|(id, recorded)| {
+                let reference = recorded.strip_prefix(HANDLER_REF_PREFIX)?;
+                Some((*id, Self::declared_as(reference)?))
+            })
+            .collect();
         GrpcTrace {
             target: CompactStr::new(norm_target),
             proto_definition,
             client_stubs,
             server_handlers,
             handler_rpc_names,
+            handler_declared_as,
             service_level_clients,
             related_rpcs,
             files_scanned: self.file_to_nodes.len(),
@@ -1879,6 +1894,30 @@ impl ContractGraph {
         out
     }
 
+    /// The decorator arguments of a [`HANDLER_REF_PREFIX`] record as they were
+    /// written: `service, method`, or the service alone when the method was
+    /// not written. Truncated to 120 characters. `None` when nothing is left.
+    fn declared_as(reference: &str) -> Option<String> {
+        const MAX: usize = 120;
+        let (service, rest) = reference.split_once('|')?;
+        let mut parts = rest.split('|');
+        let method = parts.next()?;
+        let method_written = parts.next() != Some("~");
+        let text = match (service.is_empty(), method_written) {
+            (true, _) => method.to_string(),
+            (false, true) => format!("{service}, {method}"),
+            (false, false) => service.to_string(),
+        };
+        if text.is_empty() {
+            return None;
+        }
+        if text.chars().count() > MAX {
+            let cut: String = text.chars().take(MAX).collect();
+            return Some(format!("{cut}..."));
+        }
+        Some(text)
+    }
+
     /// Resolves every [`HANDLER_REF_PREFIX`] record to `Service.Method` when
     /// both arguments reduce to a literal (a quoted string, or a constant /
     /// enum member / `as const` key recorded as [`CONST_VALUE_PREFIX`], same
@@ -1910,6 +1949,8 @@ impl ContractGraph {
             else {
                 continue;
             };
+            // A trailing `|~` only says the method argument was not written.
+            let method_expr = method_expr.split('|').next().unwrap_or(method_expr);
             let (Some(service), Some(method)) = (
                 Self::resolve_literal_expr(service_expr, node.repo_id, &consts),
                 Self::resolve_literal_expr(method_expr, node.repo_id, &consts),

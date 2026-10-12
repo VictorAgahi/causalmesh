@@ -269,6 +269,33 @@ impl DoctorCommand {
             format!("{} allowed root(s) resolved", roots.len()),
         ));
 
+        // 1b'. Every `[workspace.http_prefixes]` key must name a root, or it
+        // silently prefixes nothing.
+        if !cfg.workspace.http_prefixes.is_empty() {
+            let mut anchored = cfg.clone();
+            anchored.resolve_workspace_root(base_dir);
+            let unmatched =
+                mesh_core::routes::HttpPrefixes::unmatched_keys(&anchored.workspace, &roots);
+            if unmatched.is_empty() {
+                checks.push(DoctorCheck::ok(
+                    "HTTP prefixes",
+                    format!(
+                        "{} per-root prefix(es), each names at least one root",
+                        cfg.workspace.http_prefixes.len()
+                    ),
+                ));
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "HTTP prefixes",
+                    format!(
+                        "[workspace.http_prefixes] key(s) matching no root, so they prefix nothing: {}. \
+                         Keys are a root directory name, a path relative to the workspace root, or a glob on either",
+                        unmatched.join(", ")
+                    ),
+                ));
+            }
+        }
+
         // 1c. Dead configuration pattern inspection on positive selection fields.
         let root_names: Vec<String> = roots
             .iter()
@@ -736,7 +763,14 @@ impl DoctorCommand {
     /// (skipped entirely otherwise — there is no workspace to look one up
     /// for). Shared by the socket-permission and version checks below.
     fn resolved_workspace(config_path: Option<&Path>) -> Option<(PathBuf, String)> {
-        let (_, base_dir) = WorkspaceIndexer::discover_config(config_path).ok()?;
+        // A config that does not parse still pins the workspace (its directory):
+        // the daemon serving it must stay visible to the daemon checks.
+        let base_dir = match WorkspaceIndexer::discover_config(config_path) {
+            Ok((_, base_dir)) => base_dir,
+            Err(_) => WorkspaceIndexer::locate_config(config_path)?
+                .parent()?
+                .to_path_buf(),
+        };
         let canonical = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
         let id = mesh_core::workspace_id(&canonical);
         Some((canonical, id))
@@ -935,12 +969,27 @@ impl DoctorCommand {
         let status = read_daemon_config_status(workspace_id);
         // Only a daemon confirmed to serve this workspace's socket right now
         // (a crash leaves the records behind).
-        if !mesh_core::socket::daemon_is_reachable(workspace_id) {
+        let reachable = mesh_core::socket::daemon_is_reachable(workspace_id);
+        let located = WorkspaceIndexer::locate_config(config_path)
+            .or_else(|| status.as_ref().and_then(|s| s.config_path.clone()));
+        // A file that does not parse cannot be compared with what the daemon
+        // serves: say what the daemon is doing instead.
+        if let Some(path) = located.as_deref().filter(|p| p.exists()) {
+            if Config::load_from_file(path).is_err() {
+                checks.push(Self::invalid_config_daemon_check(
+                    NAME,
+                    path,
+                    workspace_id,
+                    reachable,
+                    status.as_ref(),
+                ));
+                return;
+            }
+        }
+        if !reachable {
             return;
         }
-        let Some(path) = WorkspaceIndexer::locate_config(config_path)
-            .or_else(|| status.as_ref().and_then(|s| s.config_path.clone()))
-        else {
+        let Some(path) = located else {
             return;
         };
         let pid = mesh_core::socket::read_daemon_meta(workspace_id).map(|m| m.pid);
@@ -958,13 +1007,26 @@ impl DoctorCommand {
             None => return,
         };
         match drift {
-            ConfigDrift::InSync => checks.push(DoctorCheck::ok(
-                NAME,
-                format!(
-                    "meshd ({pid_text}) serves {} as it is on disk",
-                    path.display()
-                ),
-            )),
+            ConfigDrift::InSync => {
+                let last = status
+                    .as_ref()
+                    .and_then(|s| s.last_reload.as_ref())
+                    .map_or_else(String::new, |r| {
+                        format!(
+                            "; last reload: {}, {} ms, {} ago",
+                            r.kind.as_str(),
+                            r.duration_ms,
+                            Self::ago(r.at_ms)
+                        )
+                    });
+                checks.push(DoctorCheck::ok(
+                    NAME,
+                    format!(
+                        "meshd ({pid_text}) serves {} as it is on disk{last}",
+                        path.display()
+                    ),
+                ));
+            }
             ConfigDrift::Rejected { error } => checks.push(DoctorCheck::warn(
                 NAME,
                 format!(
@@ -996,6 +1058,65 @@ impl DoctorCommand {
                 }
                 checks.push(check);
             }
+        }
+    }
+
+    /// `doctor` on a config that does not parse: what the daemon is doing about
+    /// it. The daemon keeps the config it last loaded, so either it is still
+    /// serving that one (with its hash and load time), or nothing is running.
+    fn invalid_config_daemon_check(
+        name: &'static str,
+        path: &Path,
+        workspace_id: &str,
+        reachable: bool,
+        status: Option<&mesh_core::config_watch::DaemonConfigStatus>,
+    ) -> DoctorCheck {
+        if !reachable {
+            return DoctorCheck::info(
+                name,
+                format!(
+                    "{} is invalid and no meshd is running for this workspace; fix the file \
+                     before the next `mesh-mcp run`",
+                    path.display()
+                ),
+            );
+        }
+        let pid = mesh_core::socket::read_daemon_meta(workspace_id)
+            .map_or_else(|| "unknown pid".to_string(), |m| format!("pid {}", m.pid));
+        let serving = match status {
+            Some(s) => {
+                let hash = s
+                    .config_sha256
+                    .as_deref()
+                    .map_or("built-in default", |h| h.get(..12).unwrap_or(h));
+                let loaded = s.loaded_ms.unwrap_or(s.started_ms);
+                format!("hash {hash}, loaded {} ago", Self::ago(loaded))
+            }
+            None => "its hash and load time are unknown: this daemon predates config reloading"
+                .to_string(),
+        };
+        DoctorCheck::warn(
+            name,
+            format!(
+                "{} is invalid (see Config syntax); meshd ({pid}) is still serving its previous \
+                 config ({serving}). Fix the file; the daemon picks it up on its own within a \
+                 second of the next request, no restart needed",
+                path.display()
+            ),
+        )
+    }
+
+    /// `3s`, `12m`, `5h` or `2d` since `ms` (Unix epoch milliseconds).
+    fn ago(ms: u128) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let secs = now.saturating_sub(ms) / 1000;
+        match secs {
+            0..=59 => format!("{secs}s"),
+            60..=3599 => format!("{}m", secs / 60),
+            3600..=86399 => format!("{}h", secs / 3600),
+            _ => format!("{}d", secs / 86400),
         }
     }
 

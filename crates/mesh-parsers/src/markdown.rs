@@ -587,7 +587,13 @@ impl MarkdownFormatter {
                 // they resolved to, then the decorator text it was written with.
                 let shown = match trace.handler_rpc_names.get(&handler.id) {
                     Some(rpc) if rpc.as_str() != handler.name.as_str() => {
-                        format!("`{rpc}` (declared as `{}`)", handler.name)
+                        // The decorator arguments as written; the handler's own
+                        // name (service and member recombined) only as a fallback.
+                        let written = trace
+                            .handler_declared_as
+                            .get(&handler.id)
+                            .map_or(handler.name.as_str(), String::as_str);
+                        format!("`{rpc}` (declared as `{written}`)")
                     }
                     _ => format!("`{}`", handler.name),
                 };
@@ -1292,6 +1298,7 @@ mod tests {
             service_level_clients: Vec::new(),
             server_handlers: Vec::new(),
             handler_rpc_names: Default::default(),
+            handler_declared_as: Default::default(),
             files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_grpc_trace(&empty_trace);

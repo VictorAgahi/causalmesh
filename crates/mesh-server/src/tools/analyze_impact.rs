@@ -1,6 +1,6 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
-use mesh_core::routes::{display_route, find_routes, nearest_routes, prefix_segments, RouteQuery};
+use mesh_core::routes::{display_route, find_routes, nearest_routes, RouteQuery};
 use mesh_core::{AppState, CompactStr, EdgeKind};
 use mesh_parsers::{MarkdownFormatter, RouteImpactEntry};
 use schemars::JsonSchema;
@@ -120,14 +120,13 @@ impl AnalyzeImpactTool {
         graph: &mesh_core::ContractGraph,
     ) -> String {
         let include_tests = args.include_tests.unwrap_or(false);
-        let prefix_text = state.config.workspace.http_prefix.as_deref();
-        let prefix = prefix_segments(prefix_text);
+        let prefixes = &state.http_prefixes;
         // Impact is about the declared route: a fragment of one is not it, so
         // neither is it counted among the hidden test routes.
         let (hits, hidden_tests) = find_routes(
             graph,
             route,
-            &prefix,
+            prefixes,
             None,
             include_tests,
             &state.allowed_roots,
@@ -137,13 +136,13 @@ impl AnalyzeImpactTool {
             let near: Vec<(String, &mesh_core::ContractNode)> = nearest_routes(
                 graph,
                 route,
-                &prefix,
+                prefixes,
                 include_tests,
                 &state.allowed_roots,
                 8,
             )
             .into_iter()
-            .filter_map(|n| display_route(n, prefix_text).map(|r| (r, n)))
+            .filter_map(|n| display_route(n, prefixes.text(n.repo_id)).map(|r| (r, n)))
             .collect();
             return MarkdownFormatter::format_route_impact(
                 args.target.as_str(),
@@ -166,7 +165,7 @@ impl AnalyzeImpactTool {
             .iter()
             .take(MarkdownFormatter::MAX_ROUTE_ENTRIES)
             .map(|h| RouteImpactEntry {
-                route: display_route(h.node, prefix_text)
+                route: display_route(h.node, prefixes.text(h.node.repo_id))
                     .unwrap_or_else(|| h.node.name.to_string()),
                 node: h.node,
                 edges: edges.remove(&h.node.id).unwrap_or_default(),

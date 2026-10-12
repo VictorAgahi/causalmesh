@@ -67,6 +67,9 @@ pub struct WorkspaceHost {
     workspace_id: String,
     audit: Arc<AuditLogger>,
     rescan: Arc<BackgroundRescanEngine>,
+    /// Pool of the config-driven closing reload, at an intermediate priority
+    /// (see [`close_reload_gap`]); the watcher pool stays in `rescan`.
+    reload_pool: Arc<BackgroundRescanEngine>,
     /// Parent of every watcher token: cancelled at daemon shutdown.
     shutdown: CancellationToken,
     started_ms: u128,
@@ -82,6 +85,9 @@ pub struct WorkspaceHost {
     /// Test hook: make the next reload panic.
     #[cfg(test)]
     panic_next: AtomicBool,
+    /// Test hook: make the watcher spawn of the next reload fail.
+    #[cfg(test)]
+    fail_watcher_next: AtomicBool,
 }
 
 /// Clears `reloading` when dropped, so even a reload that unwinds (or a task
@@ -148,31 +154,70 @@ pub fn start_watcher_blocking(state: &Arc<AppState>, cancel: CancellationToken) 
     }
 }
 
-/// [`start_watcher_blocking`] for a state that replaces a serving one: someone is
-/// waiting for the swap, so the closing differential reload runs on the global
-/// (normal priority) pool instead of the QoS-background one, which a busy machine
-/// starves. `plan` forces the files a changed pattern governs through it.
+/// [`start_watcher_blocking`] for a state that replaces a serving one. The
+/// closing differential reload (which also re-extracts the files a changed
+/// pattern governs, per `plan`) runs whether or not the watcher could be
+/// started: a watcher failure only costs live watching, never the correctness of
+/// the state about to be served. `fail_spawn` forces a spawn failure (tests).
 pub fn start_watcher_for_reload(
     state: &Arc<AppState>,
     cancel: CancellationToken,
     plan: &ReloadPlan,
+    pool: &BackgroundRescanEngine,
+    fail_spawn: bool,
 ) {
-    match FileWatcherService::spawn(state.clone(), cancel) {
-        Ok(_handle) => {
-            let forced = |path: &Path| plan.forces(&path.to_string_lossy());
-            let force: Option<&(dyn Fn(&Path) -> bool + Sync)> = if plan.changed_patterns.is_empty()
-            {
-                None
-            } else {
-                Some(&forced)
-            };
-            WorkspaceIndexer::reload_with(state, None, force);
-        }
-        Err(e) => tracing::warn!(target: "meshd", "Failed to start FileWatcherService: {e}"),
+    let spawned: Result<(), String> = if fail_spawn {
+        Err("forced watcher failure".to_string())
+    } else {
+        FileWatcherService::spawn(state.clone(), cancel)
+            .map(|_handle| ())
+            .map_err(|e| e.to_string())
+    };
+    close_reload_gap(state, plan, pool, spawned);
+}
+
+/// The catch-up reload of [`start_watcher_for_reload`], given the outcome of the
+/// watcher spawn.
+fn close_reload_gap(
+    state: &Arc<AppState>,
+    plan: &ReloadPlan,
+    pool: &BackgroundRescanEngine,
+    spawned: Result<(), String>,
+) {
+    if let Err(e) = spawned {
+        tracing::warn!(
+            target: "meshd",
+            "Failed to start FileWatcherService: {e}; this state will not follow file changes live"
+        );
     }
+    let forced = |path: &Path| plan.forces(&path.to_string_lossy());
+    let force: Option<&(dyn Fn(&Path) -> bool + Sync)> = if plan.changed_patterns.is_empty() {
+        None
+    } else {
+        Some(&forced)
+    };
+    // A request is waiting for this swap, so it does not run on the watcher's
+    // QoS-background pool (`QOS_CLASS_BACKGROUND` / `nice(10)`), which a saturated
+    // machine starves: see CHANGELOG 7.1.9 for the measured times. It runs on a
+    // dedicated pool at an intermediate priority (`QOS_CLASS_UTILITY` / `nice(5)`):
+    // still polite to the editor (commandment 7), not starved. Event-driven reloads
+    // of the serving state keep the background pool.
+    WorkspaceIndexer::reload_with(state, Some(pool), force);
 }
 
 impl WorkspaceHost {
+    /// The intermediate-priority pool of the config-driven reload; should it not
+    /// build, the watcher's own (lower priority) pool serves instead.
+    fn reload_pool_for(fallback: &Arc<BackgroundRescanEngine>) -> Arc<BackgroundRescanEngine> {
+        match BackgroundRescanEngine::with_priority(mesh_core::rescan::RescanPriority::Utility) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                tracing::warn!(target: "meshd", "Cannot build the reload pool: {e}; using the watcher pool");
+                Arc::clone(fallback)
+            }
+        }
+    }
+
     /// A host serving `state`, which was built from `config_path` (`None` for the
     /// built-in default config: nothing to follow). `serving_sha` is the SHA-256
     /// of the very bytes `state`'s `Config` was parsed from (from the same read:
@@ -222,6 +267,7 @@ impl WorkspaceHost {
             config_path,
             workspace_id: workspace_id.to_string(),
             audit,
+            reload_pool: Self::reload_pool_for(&rescan),
             rescan,
             shutdown,
             started_ms: now_ms(),
@@ -240,6 +286,8 @@ impl WorkspaceHost {
             cache_dir,
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_watcher_next: AtomicBool::new(false),
         });
         // Not published here: a daemon that then loses the bind race for its
         // socket must not overwrite the winner's record (see `write_daemon_meta`'s
@@ -258,6 +306,7 @@ impl WorkspaceHost {
             config_path: None,
             workspace_id: String::new(),
             audit,
+            reload_pool: Self::reload_pool_for(&rescan),
             rescan,
             shutdown,
             started_ms: now_ms(),
@@ -276,6 +325,8 @@ impl WorkspaceHost {
             cache_dir: None,
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_watcher_next: AtomicBool::new(false),
         })
     }
 
@@ -512,7 +563,17 @@ impl WorkspaceHost {
                 });
             }
         }
-        start_watcher_for_reload(&state, watcher_cancel.clone(), &plan);
+        #[cfg(test)]
+        let fail_spawn = self.fail_watcher_next.swap(false, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let fail_spawn = false;
+        start_watcher_for_reload(
+            &state,
+            watcher_cancel.clone(),
+            &plan,
+            &self.reload_pool,
+            fail_spawn,
+        );
 
         self.current.store(Arc::clone(&state));
         let elapsed = started.elapsed();
@@ -985,6 +1046,31 @@ mod tests {
         write_text(&fx.config, &["a", "b"], "");
         assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
         assert_eq!(last_kind(&fx), Some(ReloadKind::Partial));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+        fx.shutdown.cancel();
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_start_does_not_skip_the_catch_up() {
+        let fx = fixture(&["a", "b"]);
+        write_text(&fx.config, &["a", "b"], "");
+        let _ = fx.host.reload_if_changed();
+
+        // The pattern edit is partial; the watcher spawn is forced to fail.
+        fx.host.fail_watcher_next.store(true, Ordering::SeqCst);
+        write_text(&fx.config, &["a", "b"], PATTERN_A);
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
+        assert_eq!(last_kind(&fx), Some(ReloadKind::Partial));
+        assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
+
+        // A file edited between the handover and the catch-up is picked up too.
+        fx.host.fail_watcher_next.store(true, Ordering::SeqCst);
+        write_text(
+            &fx.config,
+            &["a", "b"],
+            &PATTERN_A.replace("Only[A-Z]", "Only"),
+        );
+        assert_eq!(fx.host.reload_if_changed(), ReloadOutcome::Reloaded);
         assert_eq!(served_fingerprint(&fx), fresh_fingerprint(&fx));
         fx.shutdown.cancel();
     }

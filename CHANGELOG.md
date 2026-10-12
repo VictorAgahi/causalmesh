@@ -19,10 +19,16 @@ daemon's config reload latency, whose cause was measured before it was changed.
   QoS-background pool (`QOS_CLASS_BACKGROUND`, starved on a busy machine), and it re-read every
   file the guards had refused (too big, binary, a line over 1024 bytes, nesting) on every
   reload, because a refused file never entered the VFS and so always looked changed. Both are
-  fixed: a refused file is remembered with its stat and is read again only once its mtime or size
-  moves, and the reload of a replacing state runs on the normal-priority pool, since a request is
-  waiting for the swap. Same corpus, same saturation: a display-only edit is served in 135 ms,
-  a pattern edit in 161 ms, a new root in 498 ms. The check itself still runs only when a
+  fixed: a refused file is remembered with the stat it had before it was read (so a file fixed
+  during a scan is not hidden) and is read again only once its mtime or size moves, the memo is
+  pruned against every crawl, and the closing reload of a replacing state, which a request is
+  waiting for, runs on a dedicated pool at an intermediate priority (`QOS_CLASS_UTILITY` on macOS,
+  `nice(5)` on Linux, below-normal on Windows) instead of the watcher's background pool
+  (`QOS_CLASS_BACKGROUND` / `nice(10)`, unchanged for watcher-triggered rescans). Same corpus, same
+  saturation: a display-only edit is served in about 135-195 ms and a new root in about 0.6 s.
+  A pattern edit whose `file_pattern` selects every one of the 3680 files re-extracts them all:
+  0.7 s on the normal pool, 2.6-5.2 s on the utility pool, and more than 3 minutes on the
+  background pool (not finished when the run ended). The check itself still runs only when a
   request arrives (there is no timer), so an edit made while no client talks to the daemon is
   applied by the next request; SETUP.md says so.
 - `doctor` with a config that does not parse reported the parse error and nothing about the
@@ -38,6 +44,21 @@ daemon's config reload latency, whose cause was measured before it was changed.
   `@GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`: the service
   expression and the method member were recombined. It now prints the decorator arguments as
   written (`USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER`), cut at 120 characters.
+
+- A `partial` or `display-only` reload no longer skips its catch-up (and so serves stale pattern
+  facts) when the file watcher cannot be started; a watcher failure only loses live watching.
+- Classifying a config edit now fails closed: every config struct is destructured field by field,
+  so a new key is a compile error until it is classified, and a test changes each
+  serialised key in turn and checks the resulting kind. `[engines.policy]` (including
+  `read_governance_mode` and `enabled`) is display-only because `AppState::new` rebuilds the
+  governance engine from the new config and nothing in it reaches the index.
+- `analyze_grpc` decides "under `proto_dirs`" by path components relative to the candidate's root
+  (or the workspace root), never as text on the absolute path: a checkout in `/home/me/proto-work`
+  no longer makes every candidate canonical, and `registry-proto` is not `registry`.
+- "declared as" for `@GrpcMethod()` with no written argument shows nothing instead of the method
+  name NestJS derives; the handler record parser is shared by all three users and understands the
+  `|~` marker everywhere (the unresolved-handler fallback used to keep it in the method name). The
+  index cache schema version is bumped (11) so no record of the older shape is reused.
 
 ### Added
 - A config edit is classified by what it costs. Display-only keys (`http_prefix`,

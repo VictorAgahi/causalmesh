@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 /// Crawl depth used for every full workspace scan.
 pub const SCAN_DEPTH: usize = 10;
 
+/// A file the guards refused for a reason only its bytes decide, with the
+/// `(mtime_nanos, size)` it had before it was read.
+type StableReject = (PathBuf, (u128, u64));
+
 /// Why `process_file` never produced a fragment for a file — a deliberate,
 /// counted policy rejection (see `IndexHealth`), distinct from
 /// `FileIndex::parse_failed`, which means the file passed every one of these
@@ -445,7 +449,7 @@ impl WorkspaceIndexer {
         roots: &[PathBuf],
         scan_cfg: &ScanConfig,
         pool: Option<&BackgroundRescanEngine>,
-    ) -> (Vec<FileFragment>, IndexHealth, Vec<PathBuf>) {
+    ) -> (Vec<FileFragment>, IndexHealth, Vec<StableReject>) {
         let work = || {
             files
                 .par_iter()
@@ -453,10 +457,16 @@ impl WorkspaceIndexer {
                     let root = roots
                         .get(*repo_id as usize)
                         .map_or(path.as_path(), |r| r.as_path());
+                    // The stat a refusal is remembered by is the one from before the
+                    // file is read: a file fixed during the pass then differs from it.
+                    let stat = std::fs::metadata(path)
+                        .ok()
+                        .map(|m| DifferentialVfs::stat_of(&m));
                     (
                         *repo_id,
                         path.clone(),
                         Self::process_file(path, *repo_id, root, scan_cfg),
+                        stat,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -470,8 +480,8 @@ impl WorkspaceIndexer {
         health.record_scanned(results.len());
         let mut fragments = Vec::with_capacity(results.len());
         let mut needs_retry: Vec<(RepoId, PathBuf)> = Vec::new();
-        let mut stable_rejects: Vec<PathBuf> = Vec::new();
-        for (repo_id, path, outcome) in results {
+        let mut stable_rejects: Vec<StableReject> = Vec::new();
+        for (repo_id, path, outcome, stat) in results {
             match outcome {
                 Ok(frag) if frag.code.parse_failed => needs_retry.push((repo_id, path)),
                 Ok(frag) => {
@@ -481,8 +491,8 @@ impl WorkspaceIndexer {
                 Err(reason) => {
                     // A read error may be transient; the other refusals are a
                     // function of the file's bytes alone.
-                    if !matches!(reason, RejectKind::ReadError) {
-                        stable_rejects.push(path.clone());
+                    if let (false, Some(stat)) = (matches!(reason, RejectKind::ReadError), stat) {
+                        stable_rejects.push((path.clone(), stat));
                     }
                     Self::record_rejection(&mut health, reason, path);
                 }
@@ -572,11 +582,9 @@ impl WorkspaceIndexer {
 
     /// Remembers the stat of every file the guards refused for a reason that only
     /// its bytes decide, so a later differential reload does not read it again.
-    fn note_stable_rejects(vfs: &mut DifferentialVfs, paths: &[PathBuf]) {
-        for path in paths {
-            if let Ok(meta) = std::fs::metadata(path) {
-                vfs.note_rejected(path, &meta);
-            }
+    fn note_stable_rejects(vfs: &mut DifferentialVfs, rejects: &[StableReject]) {
+        for (path, stat) in rejects {
+            vfs.note_rejected(path, *stat);
         }
     }
 
@@ -627,7 +635,7 @@ impl WorkspaceIndexer {
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);
 
-        let vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
         // Deleted: tracked by the VFS but no longer on disk. Only a full crawl's
         // complete file surface can answer this by set difference — a targeted,
         // path-driven reload (`reload_paths`) instead knows about a deletion
@@ -638,6 +646,10 @@ impl WorkspaceIndexer {
             .filter(|p| !present.contains(p))
             .map(Path::to_path_buf)
             .collect();
+        // The refusal memo follows the crawl too: a deleted file (or one that fell
+        // out of the capped rejected list) must not stay in it, or a path recreated
+        // with the same mtime and size would be taken for the file that was refused.
+        vfs.retain_rejected(|p| present.contains(p));
         drop(vfs);
         // A rejected file never enters the VFS, so the sweep above cannot see it
         // vanish; its entry in the rejected list must still go (plan 4 step 4.1).
@@ -1971,6 +1983,67 @@ mod tests {
             .contract_graph
             .all_nodes()
             .any(|n| n.name.as_str() == "Bundle"));
+    }
+
+    /// A refused file that is deleted leaves nothing in the refusal memo, so the
+    /// same path recreated with the same size and mtime but fixed content is
+    /// indexed instead of being taken for the file that was refused.
+    #[test]
+    fn a_recreated_path_with_the_same_stat_is_not_hidden_by_a_stale_refusal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let path = root.join("bundle.ts");
+        let long = format!("export const a = '{}';\n", "x".repeat(3000));
+        std::fs::write(&path, &long).expect("write");
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.vfs.lock().expect("vfs").rejected_len(), 1);
+
+        std::fs::remove_file(&path).expect("rm");
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            state.vfs.lock().expect("vfs").rejected_len(),
+            0,
+            "memo pruned"
+        );
+
+        // Same size, same mtime, but lines short enough to pass the guards.
+        let mut fixed = String::from("export class Recreated {}\n");
+        while fixed.len() < long.len() {
+            fixed.push('\n');
+        }
+        fixed.truncate(long.len());
+        std::fs::write(&path, &fixed).expect("recreate");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("restore mtime");
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert!(
+            view.health.rejected.is_empty(),
+            "{:?}",
+            view.health.rejected
+        );
+        assert!(view
+            .contract_graph
+            .all_nodes()
+            .any(|n| n.name.as_str() == "Recreated"));
     }
 
     /// `[engines.contracts.spring]` `property_files` / `auto_redact_secrets` /

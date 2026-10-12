@@ -59,48 +59,103 @@ impl ReloadPlan {
     }
 }
 
-/// Keys that are read at query time (or only displayed) and so never need a
-/// re-index, as `(section path, key)` pairs of the serialized config.
-const QUERY_TIME_KEYS: &[(&[&str], &str)] = &[
-    (&["workspace"], "name"),
-    (&["workspace"], "version"),
-    (&["workspace"], "http_prefix"),
-    (&["workspace"], "http_prefixes"),
-    (&["engines"], "policy"),
-    (&["engines", "docs"], "aliases"),
-    (&["engines", "docs"], "stop_words"),
-    (&["engines", "docs"], "exact_phrase_boost"),
-    (&["engines", "docs"], "fuzzy_fallback"),
-];
-
-fn strip(value: &mut Value, section: &[&str], key: &str) {
-    let mut cur = value;
-    for part in section {
-        match cur.get_mut(*part) {
-            Some(next) => cur = next,
-            None => return,
-        }
-    }
-    if let Some(map) = cur.as_object_mut() {
-        map.remove(key);
-    }
-}
-
-/// The part of `config` that decides what gets indexed: the serialized config
-/// without the query-time keys and without custom patterns.
+/// The part of `config` that decides what gets indexed, as a comparable value.
+///
+/// Fails closed: every config struct is destructured with every field named and
+/// no `..`, so adding a field to any of them is a compile error here until it is
+/// classified. A field is listed in the returned value (it can move what gets
+/// indexed: a change is a full rebuild), bound to `_` with a reason (read at
+/// query time or only displayed: a change swaps the config), or, for custom
+/// patterns, handled by [`changed_patterns`] (a change is partial).
 fn index_inputs(config: &Config) -> Option<Value> {
-    let mut config = config.clone();
-    // An absent `[engines.contracts]` means the section with its defaults, so
-    // adding one only to hold patterns is not a change of anything else.
-    if config.engines.contracts.is_none() {
-        config.engines.contracts = serde_json::from_value(serde_json::json!({})).ok();
-    }
-    let mut value = serde_json::to_value(&config).ok()?;
-    for (section, key) in QUERY_TIME_KEYS {
-        strip(&mut value, section, key);
-    }
-    strip(&mut value, &["engines", "contracts"], "patterns");
-    Some(value)
+    use crate::config::{
+        CacheConfig, ContractsConfig, DocsConfig, EnginesConfig, PolicyConfig, WorkspaceConfig,
+    };
+    let Config {
+        workspace,
+        engines,
+        cache,
+    } = config;
+    let WorkspaceConfig {
+        // Display only.
+        name: _,
+        version: _,
+        // Route prefixes are applied when a route is displayed or matched.
+        http_prefix: _,
+        http_prefixes: _,
+        workspace_root,
+        roots,
+        exclude_patterns,
+        mount_aliases,
+        // Derived from `workspace_root`, compared by `classify`.
+        resolved_workspace_root: _,
+    } = workspace;
+    let EnginesConfig {
+        docs,
+        contracts,
+        policy,
+    } = engines;
+    // An absent section means the section with its defaults.
+    let docs: DocsConfig = match docs {
+        Some(d) => d.clone(),
+        None => serde_json::from_value(serde_json::json!({})).ok()?,
+    };
+    let contracts: ContractsConfig = match contracts {
+        Some(c) => c.clone(),
+        None => serde_json::from_value(serde_json::json!({})).ok()?,
+    };
+    let DocsConfig {
+        enabled: docs_enabled,
+        paths: docs_paths,
+        // Query time: ranking and expansion settings read by every search.
+        aliases: _,
+        stop_words: _,
+        exact_phrase_boost: _,
+        fuzzy_fallback: _,
+        // Applied while a markdown file is parsed: moves what is indexed.
+        sanitize_prompt_injections,
+    } = docs;
+    let ContractsConfig {
+        enabled: contracts_enabled,
+        grpc,
+        spring,
+        openapi,
+        asyncapi,
+        cpp,
+        // Partial reload, see `changed_patterns`.
+        patterns: _,
+    } = contracts;
+    // Nothing in the policy engine reaches the index. `AppState::new` rebuilds the
+    // governance engine (stop rules, skills, `read_governance_mode`, `enabled`)
+    // from the new config, `cryptographic_audit_trail` is read from the serving
+    // state on every audit write, and `enforce_git_hooks` only matters to
+    // `mesh-mcp install-hooks`. When in doubt about a new key, bind it above, not here.
+    let PolicyConfig {
+        enabled: _,
+        enforce_git_hooks: _,
+        cryptographic_audit_trail: _,
+        read_governance_mode: _,
+        stop_rules: _,
+        skills: _,
+    } = policy.clone().unwrap_or_default();
+    let CacheConfig { max_size_mb } = cache;
+    serde_json::to_value((
+        workspace_root,
+        roots,
+        exclude_patterns,
+        mount_aliases,
+        docs_enabled,
+        docs_paths,
+        sanitize_prompt_injections,
+        contracts_enabled,
+        grpc,
+        spring,
+        openapi,
+        asyncapi,
+        cpp,
+        max_size_mb,
+    ))
+    .ok()
 }
 
 fn patterns(config: &Config) -> &[CustomPatternConfig] {
@@ -282,5 +337,186 @@ mod tests {
             .replace("name = \"TMP\"", "name = \"p2\"");
         // Renaming is an edit, not a reorder: still partial, both sides listed.
         assert_eq!(plan(&two, &swapped).kind, ReloadKind::Partial);
+    }
+
+    /// Every key the config can serialize, with the kind of reload its change
+    /// must cause. The compile-time guard is the exhaustive destructuring in
+    /// `index_inputs`; this table is the behavioural one: a key missing from it
+    /// (a field added without being classified here) fails the test, and each
+    /// key is changed in turn and must classify as listed.
+    const KEY_KINDS: &[(&str, ReloadKind)] = &[
+        ("workspace.name", ReloadKind::DisplayOnly),
+        ("workspace.version", ReloadKind::DisplayOnly),
+        ("workspace.http_prefix", ReloadKind::DisplayOnly),
+        ("workspace.http_prefixes", ReloadKind::DisplayOnly),
+        ("workspace.workspace_root", ReloadKind::Full),
+        ("workspace.roots", ReloadKind::Full),
+        ("workspace.exclude_patterns", ReloadKind::Full),
+        ("workspace.mount_aliases", ReloadKind::Full),
+        ("cache.max_size_mb", ReloadKind::Full),
+        ("engines.docs.enabled", ReloadKind::Full),
+        ("engines.docs.paths", ReloadKind::Full),
+        ("engines.docs.aliases", ReloadKind::DisplayOnly),
+        ("engines.docs.stop_words", ReloadKind::DisplayOnly),
+        ("engines.docs.exact_phrase_boost", ReloadKind::DisplayOnly),
+        ("engines.docs.fuzzy_fallback", ReloadKind::DisplayOnly),
+        ("engines.docs.sanitize_prompt_injections", ReloadKind::Full),
+        ("engines.contracts.enabled", ReloadKind::Full),
+        ("engines.contracts.patterns", ReloadKind::Partial),
+        ("engines.contracts.grpc.proto_dirs", ReloadKind::Full),
+        (
+            "engines.contracts.grpc.controller_annotations",
+            ReloadKind::Full,
+        ),
+        (
+            "engines.contracts.grpc.canonical_fqcn_projection",
+            ReloadKind::Full,
+        ),
+        ("engines.contracts.spring.enabled", ReloadKind::Full),
+        ("engines.contracts.spring.property_files", ReloadKind::Full),
+        (
+            "engines.contracts.spring.resolve_placeholders",
+            ReloadKind::Full,
+        ),
+        (
+            "engines.contracts.spring.auto_redact_secrets",
+            ReloadKind::Full,
+        ),
+        ("engines.contracts.openapi.enabled", ReloadKind::Full),
+        ("engines.contracts.openapi.spec_files", ReloadKind::Full),
+        ("engines.contracts.asyncapi.enabled", ReloadKind::Full),
+        ("engines.contracts.asyncapi.spec_files", ReloadKind::Full),
+        (
+            "engines.contracts.asyncapi.infer_string_topics",
+            ReloadKind::Full,
+        ),
+        ("engines.contracts.cpp.include_paths", ReloadKind::Full),
+        ("engines.policy.enabled", ReloadKind::DisplayOnly),
+        ("engines.policy.enforce_git_hooks", ReloadKind::DisplayOnly),
+        (
+            "engines.policy.cryptographic_audit_trail",
+            ReloadKind::DisplayOnly,
+        ),
+        (
+            "engines.policy.read_governance_mode",
+            ReloadKind::DisplayOnly,
+        ),
+        ("engines.policy.stop_rules", ReloadKind::DisplayOnly),
+        ("engines.policy.skills", ReloadKind::DisplayOnly),
+    ];
+
+    /// Maps whose keys are chosen by the user: the map is one config key.
+    const USER_KEYED: &[&str] = &[
+        "workspace.mount_aliases",
+        "workspace.http_prefixes",
+        "engines.docs.aliases",
+        "engines.policy.stop_rules",
+        "engines.policy.skills",
+    ];
+
+    const FULL: &str = "[workspace]\nname = \"w\"\nversion = \"1\"\nworkspace_root = \".\"\n\
+        roots = [\"a\"]\nexclude_patterns = [\"**/x/**\"]\nhttp_prefix = \"/api\"\n\
+        [workspace.mount_aliases]\n\"/ws\" = \"a\"\n\
+        [workspace.http_prefixes]\n\"a\" = \"/a\"\n\
+        [cache]\nmax_size_mb = 10\n\
+        [engines.docs]\nenabled = true\npaths = [\"docs/**\"]\nstop_words = [\"the\"]\n\
+        exact_phrase_boost = 5\nfuzzy_fallback = false\nsanitize_prompt_injections = false\n\
+        [engines.docs.aliases]\nk = \"v\"\n\
+        [engines.contracts]\nenabled = true\n\
+        [engines.contracts.grpc]\nproto_dirs = [\"p\"]\ncontroller_annotations = [\"@G\"]\ncanonical_fqcn_projection = false\n\
+        [engines.contracts.spring]\nenabled = true\nproperty_files = [\"a.properties\"]\nresolve_placeholders = false\nauto_redact_secrets = false\n\
+        [engines.contracts.openapi]\nenabled = true\nspec_files = [\"o.yaml\"]\n\
+        [engines.contracts.asyncapi]\nenabled = true\nspec_files = [\"a.yaml\"]\ninfer_string_topics = false\n\
+        [engines.contracts.cpp]\ninclude_paths = [\"inc\"]\n\
+        [[engines.contracts.patterns]]\nname = \"p\"\nkind = \"saga\"\nregex = 'x'\nfile_pattern = \"*.ts\"\ntarget_group = 1\nconsumer_group = 2\nconfidence = \"exact\"\n\
+        [engines.policy]\nenabled = true\nenforce_git_hooks = false\ncryptographic_audit_trail = false\n\
+        read_governance_mode = \"audit_warn\"\n\
+        [engines.policy.stop_rules]\nr = \"stop\"\n\
+        [engines.policy.skills]\ns = \"s.md\"\n";
+
+    fn key_paths(value: &Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) if !USER_KEYED.contains(&prefix) => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    key_paths(v, &path, out);
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    fn mutate(value: &mut Value, path: &str) {
+        match value {
+            Value::String(s) => {
+                *s = match s.as_str() {
+                    "audit_warn" => "enforce_refusal".to_string(),
+                    other => format!("{other}-changed"),
+                }
+            }
+            Value::Bool(b) => *b = !*b,
+            Value::Number(n) => {
+                *value = Value::from(n.as_u64().unwrap_or(0) + 1);
+            }
+            Value::Array(items) => {
+                if path == "engines.contracts.patterns" {
+                    items.push(serde_json::json!({
+                        "name": "added", "kind": "saga", "regex": "y",
+                        "file_pattern": null, "target_group": 1,
+                        "consumer_group": null, "confidence": null
+                    }));
+                } else {
+                    items.push(Value::String("added".to_string()));
+                }
+            }
+            Value::Object(map) => {
+                map.insert("added".to_string(), Value::String("added".to_string()));
+            }
+            Value::Null => *value = Value::String("added".to_string()),
+        }
+    }
+
+    fn at<'v>(root: &'v mut Value, path: &str) -> &'v mut Value {
+        let mut cur = root;
+        for part in path.split('.') {
+            cur = cur.get_mut(part).expect("path exists");
+        }
+        cur
+    }
+
+    #[test]
+    fn every_config_key_is_classified_and_classifies_as_listed() {
+        let config = Config::load_from_str(FULL).expect("fully populated config");
+        let value = serde_json::to_value(&config).expect("serialize");
+        let mut keys = Vec::new();
+        key_paths(&value, "", &mut keys);
+        keys.sort();
+        let mut listed: Vec<&str> = KEY_KINDS.iter().map(|(k, _)| *k).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            listed,
+            "a config key is missing from KEY_KINDS (or KEY_KINDS lists a key that no longer exists): classify it"
+        );
+
+        let roots = roots();
+        for (path, expected) in KEY_KINDS {
+            let mut changed = value.clone();
+            mutate(at(&mut changed, path), path);
+            let mut new: Config = serde_json::from_value(changed).expect(path);
+            new.workspace.resolved_workspace_root =
+                config.workspace.resolved_workspace_root.clone();
+            let plan = classify(&config, &roots, &new, &roots);
+            assert_eq!(plan.kind, *expected, "{path}");
+        }
+        // And the unchanged config is a pure swap.
+        assert_eq!(
+            classify(&config, &roots, &config, &roots).kind,
+            ReloadKind::DisplayOnly
+        );
     }
 }

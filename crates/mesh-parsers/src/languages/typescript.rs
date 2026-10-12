@@ -3854,6 +3854,26 @@ export class UserController {
         assert!(!rendered.contains("declared as `USER_SERVICE_NAME.ADD_BADGE_TO_USER`"));
     }
 
+    /// An unresolved (non-constant) service and no written method: nothing is
+    /// shown as "declared as" for what was never written.
+    #[test]
+    fn an_unresolved_service_without_a_written_method_shows_no_declared_as() {
+        let code = r#"
+export class C {
+  @GrpcMethod(UNKNOWN_SERVICE)
+  addBadgeToUser() {}
+  @GrpcMethod()
+  removeBadge() {}
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        let trace = graph.analyze_grpc("UserService.AddBadgeToUser");
+        assert!(trace.handler_declared_as.is_empty());
+        let rendered = crate::markdown::MarkdownFormatter::format_grpc_trace(&trace);
+        assert!(!rendered.contains("|~"), "{rendered}");
+        assert!(!rendered.contains("declared as"), "{rendered}");
+    }
+
     #[test]
     fn a_handler_with_no_written_method_argument_is_declared_as_its_service_alone() {
         let code = r#"

@@ -69,7 +69,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v9: TypeScript `Module` node for a file with imports and no declaration.
 /// v10: JavaScript grammar for `.js/.jsx/.mjs/.cjs`, CommonJS/dynamic imports,
 /// ambient declarations, namespaces, default and CommonJS export declarations.
-const SCHEMA_VERSION: u8 = 10;
+/// v11: gRPC handler records end in `|~` when the method argument was not written
+/// (7.1.9), so "declared as" never invents a method.
+const SCHEMA_VERSION: u8 = 11;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

@@ -198,6 +198,25 @@ What it actually checks:
   permissions, orphaned socket, daemon version drift, daemon seccomp confinement (Linux),
   legacy machine-wide cache, corrupt workspace cache, orphaned per-version cache directories, and
   audit-chain verification (reported, never repaired).
+- **Daemon config** (7.1.7): `meshd` records which config hash it serves
+  (`<cache>/meshd/<workspace_id>.config.json`); doctor warns when the file on disk differs or the
+  daemon refused it, with the remedy.
+- **Workspace root** (7.1.7): an error when the workspace resolves to `/`, a drive root or HOME
+  with no config file (`mesh_core::guard_workspace_root`); the index-health scan is then skipped.
+
+### The daemon follows its config (7.1.7)
+
+`meshd` serves a `WorkspaceHost` (`crates/mesh-daemon/src/host.rs`) instead of a fixed `AppState`
+(`config` and `allowed_roots` are immutable, only the snapshot hot-swaps). Per request, at most
+every 250 ms, it `stat`s the config file it was started from (`WorkspaceIndexer::locate_config`,
+absolute); when mtime or length moved it hashes the bytes (`mesh_core::config_watch`), and a
+different hash builds a new `AppState` (parse, expand roots, ingest, file watcher) on a blocking
+thread. The previous state keeps serving until the new one has its first snapshot, then an
+`ArcSwap` store swaps it and the old watcher token is cancelled. A config that fails to parse or
+whose roots do not resolve is refused (stderr warning, `last_error` in the status file, shown by
+`doctor`) and is not retried until the file changes again. Only the main toml is followed. Tests:
+`host::tests` edit a config on disk and observe the state change, and an invalid edit keep the old
+state.
 
 The last line counts the `error` and `warn` checks above it (a check repaired by `--fix` is not
 counted).

@@ -12,7 +12,7 @@ pub use graph::{GraphRenderer, WebEdge, WebGraphPayload, WebNode};
 pub use guard::{AstGuard, BoundedMatch, ParserError};
 pub use languages::{CompiledPattern, ExtractConfig, FileIndex, PolyglotIndexer, TsAliasIndex};
 pub use markdown::{
-    MarkdownFormatter, RouteImpactEntry, SearchPage, SearchResult, MAX_OUTPUT_BYTES,
-    NON_RESULT_RESERVE_BYTES,
+    declaration_label, MarkdownFormatter, RouteImpactEntry, SearchPage, SearchResult,
+    MAX_OUTPUT_BYTES, NON_RESULT_RESERVE_BYTES,
 };
 pub use topology::{Aggregate, Topology, TopologyOptions};

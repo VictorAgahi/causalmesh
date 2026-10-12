@@ -10,6 +10,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod host;
 mod idle;
 mod sandbox;
 mod server;
@@ -17,7 +18,7 @@ mod socket;
 
 use clap::Parser;
 use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
-use mesh_server::{FileWatcherService, WorkspaceIndexer};
+use mesh_server::WorkspaceIndexer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolved before the socket path: the default (no `--socket`) is scoped
     // to this workspace specifically (see below), which needs `base_dir` first.
     let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
+    // Same guard as `mesh-mcp run`: a daemon started with cwd = `/` or HOME and
+    // no config would index the whole filesystem or home. `mesh-mcp` never
+    // spawns one in that case; this covers a hand-started or older-proxy start.
+    if let Err(refusal) = WorkspaceIndexer::guard_workspace(args.config.as_deref(), &base_dir) {
+        tracing::error!(target: "meshd", "{refusal}");
+        return Err(refusal.into());
+    }
+    // The config file this daemon follows (absolute), if one was found.
+    let config_path = WorkspaceIndexer::locate_config(args.config.as_deref());
     let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
 
     // ── Socket path (Unix) / named pipe address (Windows) ───────────────────────
@@ -98,10 +108,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => socket::pipe_name_for(&workspace_id),
     };
 
+    // ── Cancellation token + signal handler ───────────────────────────────────
+    let cancel_token = CancellationToken::new();
+    let cancel_sig = cancel_token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(target: "meshd", "SIGINT received. Initiating graceful shutdown.");
+        cancel_sig.cancel();
+    });
+
     // ── AppState (shared, single instance) ───────────────────────────────────
     let audit = Arc::new(AuditLogger::new(None)?);
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
-    let state = Arc::new(AppState::new(config, allowed_roots, audit, rescan));
+    let state = Arc::new(AppState::new(
+        config,
+        allowed_roots,
+        audit.clone(),
+        rescan.clone(),
+    ));
+    // The watcher token is a child of the daemon-wide one so a config reload can
+    // retire this state's watcher without touching the shutdown path.
+    let watcher_cancel = cancel_token.child_token();
+    let host = host::WorkspaceHost::new(
+        state.clone(),
+        config_path,
+        &workspace_id,
+        audit,
+        rescan,
+        cancel_token.clone(),
+        watcher_cancel.clone(),
+    );
 
     // ── Initial ingestion: runs in the background, not before the IPC server
     // starts. A large workspace's first scan can take long enough that a
@@ -116,75 +152,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // call, so a filesystem event racing the initial scan can't install a
     // snapshot computed from a stale base out from under it (idempotence
     // invariant I2 — see `AppState::reload_lock`'s own doc).
+    //
     let ingest_state = state.clone();
     let ingest_base_dir = base_dir.clone();
     tokio::task::spawn_blocking(move || {
-        let _guard = ingest_state
-            .reload_lock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        tracing::info!(target: "meshd", "Starting initial workspace ingestion…");
-        // Per-workspace cache under its quota (plan 4 step 4.4); a failure to open it degrades
-        // to "parse everything" (see `AppState::open_index_cache`).
-        let index_cache = ingest_state.open_index_cache(&ingest_base_dir);
-        let snapshot = {
-            let mut vfs = ingest_state.vfs.lock().unwrap_or_else(|e| e.into_inner());
-            WorkspaceIndexer::build_snapshot(
-                &ingest_state.config,
-                &ingest_state.allowed_roots,
-                None,
-                Some(&mut vfs),
-                index_cache,
-            )
-        };
-        ingest_state.install_snapshot(snapshot);
-        tracing::info!(
-            target: "meshd",
-            "Ingestion complete: {} contract nodes indexed.",
-            ingest_state.snapshot().contract_graph.node_count()
-        );
-    });
-
-    // ── Cancellation token + signal handler ───────────────────────────────────
-    let cancel_token = CancellationToken::new();
-    let cancel_sig = cancel_token.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!(target: "meshd", "SIGINT received. Initiating graceful shutdown.");
-        cancel_sig.cancel();
+        host::ingest_blocking(&ingest_state, &ingest_base_dir);
     });
 
     // ── File watcher (single instance, shared across all clients) ─────────────
     // `FileWatcherService::spawn` does its (potentially slow, on a large workspace) setup —
     // the per-root directory walk and initial OS watch registration — synchronously before
-    // returning, by design (see its own doc: an earlier version made that setup asynchronous to
-    // avoid this exact blocking concern, which instead silently raced real filesystem events
-    // against watch registration finishing). `spawn_blocking` moves that synchronous work off
-    // this task's async worker thread instead, preserving the "socket accepts connections
-    // immediately" invariant the ingestion block above already established, without touching
-    // `FileWatcherService::spawn`'s own return-before-events-are-missed contract. Fire-and-forget
-    // (not awaited), same as the ingestion task above — nothing here needs to block startup on it.
+    // returning, by design (a non-blocking setup silently raced real filesystem events against
+    // watch registration finishing). `spawn_blocking` keeps that work off the async workers,
+    // preserving the "socket accepts connections immediately" invariant. Its trailing
+    // differential reload closes the window in which a file changed with no watcher in place
+    // (`reload`/`reload_paths` are purely event-driven); it takes `reload_lock`, so it waits
+    // for the ingestion above if that is still running.
     let watcher_state = state.clone();
-    let watcher_cancel = cancel_token.clone();
     tokio::task::spawn_blocking(move || {
-        match FileWatcherService::spawn(watcher_state.clone(), watcher_cancel) {
-            Ok(_handle) => {
-                // Watches are confirmed live from this point on — but `spawn`'s own
-                // (synchronous, possibly slow on macOS — see `MAX_WATCHED_DIRS`'s doc)
-                // registration window means a file could have changed on disk before that
-                // finished, with no watcher yet in place to observe it, and no other
-                // mechanism to ever notice afterward (`reload`/`reload_paths` are purely
-                // event-driven). One differential reload right here closes that gap: it
-                // acquires `reload_lock` the same as the ingestion task above, so it safely
-                // waits its turn if ingestion is still running, then does a cheap VFS diff
-                // against whatever changed on disk since — including during setup above —
-                // rather than leaving a possible silent divergence until the next restart.
-                FileWatcherService::execute_reload_sync(&watcher_state);
-            }
-            Err(e) => {
-                tracing::warn!(target: "meshd", "Failed to start FileWatcherService: {e}");
-            }
-        }
+        host::start_watcher_blocking(&watcher_state, watcher_cancel);
     });
 
     // ── Idle watchdog ─────────────────────────────────────────────────────────
@@ -255,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     server::run_uds_server_then(
         &sock_path,
-        state,
+        host,
         cancel_token,
         counter,
         &workspace_id,
@@ -273,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     server::run_named_pipe_server(
         &pipe_name,
-        state,
+        host,
         cancel_token,
         counter,
         &workspace_id,

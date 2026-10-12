@@ -134,33 +134,65 @@ pub struct WorkspaceIndexer;
 impl WorkspaceIndexer {
     // ── Configuration discovery ─────────────────────────────────────────────
 
+    /// The config file `discover_config` would load: the first existing among
+    /// `explicit`, `.agents/mesh-mcp.toml` and `mesh-mcp.toml` (relative ones
+    /// against the current directory), as an absolute path when it can be made
+    /// one, so a later change of cwd cannot point it elsewhere.
+    pub fn locate_config(explicit: Option<&Path>) -> Option<PathBuf> {
+        let candidates = [
+            explicit.map(Path::to_path_buf),
+            Some(PathBuf::from(".agents/mesh-mcp.toml")),
+            Some(PathBuf::from("mesh-mcp.toml")),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+            .map(|p| std::path::absolute(&p).unwrap_or(p))
+    }
+
+    /// Loads the config file at `path` the way `discover_config` does (skill
+    /// paths and workspace root resolved against its directory) and returns it
+    /// with that directory.
+    pub fn load_config_at(path: &Path) -> Result<(Config, PathBuf), Box<dyn std::error::Error>> {
+        let mut cfg = Config::load_from_file(path)?;
+        let base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        // Skill paths are written relative to the config file; the server is
+        // spawned by an IDE with an arbitrary cwd.
+        cfg.resolve_skill_paths(&base);
+        // Same reason: relative tool scopes anchor on the workspace root,
+        // not on whatever CWD the IDE launched us from.
+        cfg.resolve_workspace_root(&base);
+        Ok((cfg, base))
+    }
+
+    /// The one workspace-root guard (`mesh_core::guard_workspace_root`) for
+    /// `run`, the daemon spawn, `meshd` and `doctor`: a config file that was
+    /// found pins its roots and is always honoured; without one the workspace
+    /// is the current directory, which must not be `/`, a drive root or HOME.
+    pub fn guard_workspace(
+        explicit: Option<&Path>,
+        base_dir: &Path,
+    ) -> Result<(), mesh_core::root_guard::DegenerateRootError> {
+        mesh_core::root_guard::guard_workspace_root(
+            base_dir,
+            Self::locate_config(explicit).is_some(),
+            mesh_core::root_guard::home_dir().as_deref(),
+        )
+    }
+
     /// Loads the first config found among `explicit`, `.agents/mesh-mcp.toml`,
     /// `mesh-mcp.toml`, falling back to a single-root default. Returns the config
     /// and the directory relative roots are resolved against.
     pub fn discover_config(
         explicit: Option<&Path>,
     ) -> Result<(Config, PathBuf), Box<dyn std::error::Error>> {
-        let candidates = [
-            explicit.map(Path::to_path_buf),
-            Some(PathBuf::from(".agents/mesh-mcp.toml")),
-            Some(PathBuf::from("mesh-mcp.toml")),
-        ];
-        match candidates.into_iter().flatten().find(|p| p.exists()) {
-            Some(path) => {
-                let mut cfg = Config::load_from_file(&path)?;
-                let base = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                // Skill paths are written relative to the config file; the server is
-                // spawned by an IDE with an arbitrary cwd.
-                cfg.resolve_skill_paths(&base);
-                // Same reason: relative tool scopes anchor on the workspace root,
-                // not on whatever CWD the IDE launched us from.
-                cfg.resolve_workspace_root(&base);
-                Ok((cfg, base))
-            }
+        match Self::locate_config(explicit) {
+            Some(path) => Self::load_config_at(&path),
             None => {
                 let default = concat!(
                     "[workspace]\nname = \"default-mesh\"\nversion = \"",

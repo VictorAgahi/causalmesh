@@ -4,7 +4,7 @@ use mesh_core::{AppState, CompactStr, DependentsMatch};
 use mesh_parsers::{LanguageKind, MarkdownFormatter, MAX_OUTPUT_BYTES, NON_RESULT_RESERVE_BYTES};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -18,7 +18,7 @@ pub struct FindDependentsArgs {
     #[serde(default)]
     #[schemars(
         with = "String",
-        description = "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair — use it to see which *services* depend on the target. Any other value is a tool error, not a silent fallback to 'symbol'."
+        description = "Result granularity: 'symbol' (default) returns one result per dependent declaration (class, interface, function); 'file' one per dependent file; 'package' one per distinct (repo, package) pair, with file and symbol counts and up to 3 representative locations — use it to see which *services* depend on the target. Any other value is a tool error, not a silent fallback to 'symbol'."
     )]
     pub granularity: Option<CompactStr>,
 
@@ -79,10 +79,41 @@ const MAX_LIMIT: u32 = 200;
 /// The full, ordered answer before paging: what `run` renders and
 /// `truncation_hint` counts, computed one way for both.
 struct Resolved<'g> {
+    /// Symbol and file granularity: the listed nodes. Empty in package mode.
     dependents: Vec<&'g mesh_core::ContractNode>,
+    /// Package granularity: the listed packages. Empty otherwise.
+    packages: Vec<PackageGroup<'g>>,
+    per_package: bool,
     how: DependentsMatch,
     hidden_tests: usize,
 }
+
+impl Resolved<'_> {
+    /// Number of listed units, in the unit of the requested granularity.
+    fn total(&self) -> usize {
+        if self.per_package {
+            self.packages.len()
+        } else {
+            self.dependents.len()
+        }
+    }
+}
+
+/// One dependent package: the unit of a `granularity: "package"` answer.
+struct PackageGroup<'g> {
+    repo_id: mesh_core::RepoId,
+    package: &'g str,
+    /// Distinct files of the package that use the target.
+    files: usize,
+    /// Declarations of the package that use the target (a bare file with
+    /// imports and no declaration of its own counts as a file only).
+    symbols: usize,
+    /// Up to [`MAX_REPRESENTATIVES`] locations, each in a different file.
+    reps: Vec<&'g mesh_core::ContractNode>,
+}
+
+/// Representative locations shown per dependent package.
+const MAX_REPRESENTATIVES: usize = 3;
 
 fn resolve<'g>(
     args: &FindDependentsArgs,
@@ -98,10 +129,29 @@ fn resolve<'g>(
             .into_iter()
             .partition(|n| !mesh_core::is_test_node(n, roots))
     };
+    if granularity == Granularity::Package {
+        let packages = group_by_package(dependents, graph, roots);
+        // Packages whose every dependent is test code: a package with a test
+        // and a production dependent is listed, not "left out".
+        let listed: HashSet<(mesh_core::RepoId, &str)> =
+            packages.iter().map(|g| (g.repo_id, g.package)).collect();
+        let hidden_tests = tests
+            .iter()
+            .map(|n| (n.repo_id, n.package.as_str()))
+            .collect::<HashSet<_>>()
+            .difference(&listed)
+            .count();
+        return Resolved {
+            dependents: Vec::new(),
+            packages,
+            per_package: true,
+            how,
+            hidden_tests,
+        };
+    }
     let dedup = |nodes| match granularity {
-        Granularity::Symbol => nodes,
         Granularity::File => dedup_by_file(nodes),
-        Granularity::Package => dedup_by_package(nodes),
+        _ => nodes,
     };
     // In the unit of the listing: 7.0.6 counted test *declarations* under a
     // per-file listing ("39 left out" for 34 files).
@@ -109,6 +159,8 @@ fn resolve<'g>(
     let dependents = dedup(dependents);
     Resolved {
         dependents,
+        packages: Vec::new(),
+        per_package: false,
         how,
         hidden_tests,
     }
@@ -123,15 +175,142 @@ fn dedup_by_file(dependents: Vec<&mesh_core::ContractNode>) -> Vec<&mesh_core::C
         .collect()
 }
 
-/// One result per distinct `(repo, package)` pair, preserving the input's
-/// order (first symbol seen per package wins), so `run` and `truncation_hint`
-/// dedupe identically instead of drifting apart.
-fn dedup_by_package(dependents: Vec<&mesh_core::ContractNode>) -> Vec<&mesh_core::ContractNode> {
-    let mut seen: HashSet<(mesh_core::RepoId, &str)> = HashSet::new();
-    dependents
+/// `node`'s file path relative to its workspace root, like `is_test_node`
+/// judges it: a checkout living under a directory named `generated` or `gen`
+/// must not rank every file as generated.
+fn root_relative<'n>(
+    node: &'n mesh_core::ContractNode,
+    roots: &[std::path::PathBuf],
+) -> &'n std::path::Path {
+    roots
+        .get(node.repo_id as usize)
+        .and_then(|r| node.file_path.strip_prefix(r).ok())
+        .unwrap_or(&node.file_path)
+}
+
+/// Groups dependents by `(repo, package)`: the package is the unit, with the
+/// number of files and declarations that use the target and up to
+/// [`MAX_REPRESENTATIVES`] locations. Everything here is a total order, so the
+/// answer does not depend on hash or graph iteration order: packages by files
+/// desc, declarations desc, then `(repo, package)`; a package's locations
+/// prefer production over test code, hand-written over generated, a
+/// declaration over a bare import-only file, then the most referenced
+/// declaration (incoming graph edges), then path and line.
+fn group_by_package<'g>(
+    dependents: Vec<&'g mesh_core::ContractNode>,
+    graph: &'g mesh_core::ContractGraph,
+    roots: &[std::path::PathBuf],
+) -> Vec<PackageGroup<'g>> {
+    let mut by_package: BTreeMap<(mesh_core::RepoId, &str), Vec<&mesh_core::ContractNode>> =
+        BTreeMap::new();
+    for node in dependents {
+        by_package
+            .entry((node.repo_id, node.package.as_str()))
+            .or_default()
+            .push(node);
+    }
+    // Incoming edges of the candidate declarations, in one pass over the graph.
+    let candidates: HashSet<mesh_core::NodeId> = by_package
+        .values()
+        .flat_map(|nodes| nodes.iter().map(|n| n.id))
+        .collect();
+    let mut referenced: HashMap<mesh_core::NodeId, usize> = HashMap::new();
+    for edge in graph.all_edges() {
+        if candidates.contains(&edge.to) {
+            *referenced.entry(edge.to).or_default() += 1;
+        }
+    }
+    let mut groups: Vec<PackageGroup<'g>> = by_package
         .into_iter()
-        .filter(|node| seen.insert((node.repo_id, node.package.as_str())))
-        .collect()
+        .map(|((repo_id, package), mut nodes)| {
+            let files = nodes
+                .iter()
+                .map(|n| &*n.file_path)
+                .collect::<HashSet<_>>()
+                .len();
+            let symbols = nodes
+                .iter()
+                .filter(|n| n.kind != mesh_core::NodeKind::Module)
+                .count();
+            let rank = |n: &&mesh_core::ContractNode| {
+                let rel = root_relative(n, roots);
+                (
+                    mesh_core::is_test_path(rel),
+                    mesh_core::is_generated_path(rel),
+                    n.kind == mesh_core::NodeKind::Module,
+                    std::cmp::Reverse(referenced.get(&n.id).copied().unwrap_or(0)),
+                )
+            };
+            nodes.sort_by(|a, b| {
+                rank(a)
+                    .cmp(&rank(b))
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+                    .then_with(|| a.line_start.cmp(&b.line_start))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            let mut seen_files: HashSet<&std::path::Path> = HashSet::new();
+            let reps = nodes
+                .into_iter()
+                .filter(|n| seen_files.insert(&n.file_path))
+                .take(MAX_REPRESENTATIVES)
+                .collect();
+            PackageGroup {
+                repo_id,
+                package,
+                files,
+                symbols,
+                reps,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| {
+        b.files
+            .cmp(&a.files)
+            .then_with(|| b.symbols.cmp(&a.symbols))
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
+            .then_with(|| a.package.cmp(b.package))
+    });
+    groups
+}
+
+/// Renders one page of dependent packages: the package (with its root) is the
+/// unit, then how many files and declarations use the target, then a few
+/// representative `file:line` locations each with the declaration's own kind.
+fn format_packages(
+    target: &str,
+    page: &[PackageGroup<'_>],
+    first_index: usize,
+    roots: &[std::path::PathBuf],
+) -> String {
+    let mut out = format!("## Dependent packages of `{target}`\n\n");
+    for (i, group) in page.iter().enumerate() {
+        let root = roots
+            .get(group.repo_id as usize)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown root)".to_string());
+        out.push_str(&format!(
+            "[{}] `{}` (root `{root}`): {} file(s), {} symbol(s) use it\n",
+            first_index + i,
+            group.package,
+            group.files,
+            group.symbols
+        ));
+        for node in &group.reps {
+            out.push_str(&format!(
+                "- `{}` ({}) `{}:{}`\n",
+                node.name,
+                mesh_parsers::declaration_label(node),
+                root_relative(node, roots).display(),
+                node.line_start
+            ));
+        }
+        let more = group.files.saturating_sub(group.reps.len());
+        if more > 0 {
+            out.push_str(&format!("- ... and {more} more file(s)\n"));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 pub struct FindDependentsTool;
@@ -158,8 +337,7 @@ impl McpTool for FindDependentsTool {
             granularity,
             &state.allowed_roots,
         )
-        .dependents
-        .len();
+        .total();
         Some(format!(
             "Target '{}' has {} dependent(s). Page with a smaller `limit`, or use granularity: \"file\" / \"package\".",
             args.target,
@@ -185,7 +363,7 @@ impl McpTool for FindDependentsTool {
             granularity,
             &state.allowed_roots,
         );
-        let total = resolved.dependents.len();
+        let total = resolved.total();
         let files: HashSet<&std::path::Path> =
             resolved.dependents.iter().map(|n| &*n.file_path).collect();
         let file_count = files.len();
@@ -209,7 +387,16 @@ impl McpTool for FindDependentsTool {
                 (node, label)
             })
             .collect();
-        let dependent_count = labeled.len();
+        let package_page: &[PackageGroup<'_>] = resolved
+            .packages
+            .get(offset..)
+            .map(|rest| &rest[..rest.len().min(limit)])
+            .unwrap_or(&[]);
+        let dependent_count = if resolved.per_package {
+            package_page.len()
+        } else {
+            labeled.len()
+        };
         let mut text = String::new();
         if resolved.how == DependentsMatch::Substring {
             text.push_str(&format!(
@@ -217,12 +404,22 @@ impl McpTool for FindDependentsTool {
                 args.target
             ));
         }
-        if labeled.is_empty() && total > 0 {
+        if dependent_count == 0 && total > 0 {
             // Past the last page: there *are* dependents, just not here
             // (7.0.6 said "No dependents found" at `offset: 180` of 167).
             text.push_str(&format!("## Reverse dependencies of `{}`\n\n", args.target));
+        } else if resolved.per_package && total > 0 {
+            text.push_str(&format_packages(
+                args.target.as_str(),
+                package_page,
+                offset + 1,
+                &state.allowed_roots,
+            ));
         } else {
-            let files_scanned = snapshot.contract_graph.file_count();
+            // The files the index parsed, the figure `doctor` reports as
+            // indexed. The graph's own `file_count()` only counts files that
+            // carry a contract node and read as a contradiction next to it.
+            let files_scanned = snapshot.health.files_indexed;
             text.push_str(&MarkdownFormatter::format_dependents(
                 args.target.as_str(),
                 &labeled,

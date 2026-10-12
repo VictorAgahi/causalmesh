@@ -77,6 +77,61 @@ pub async fn run_server(
     Ok(())
 }
 
+/// Answers one request of a server that refuses to index (a degenerate
+/// workspace root): the MCP handshake succeeds so the client stays connected,
+/// `initialize.instructions` and every `tools/call` carry `message` as a tool
+/// error the agent (and the user) can read, and nothing is indexed.
+pub fn respond_refused(req: JsonRpcRequest, message: &str) -> JsonRpcResponse {
+    let req_id = req.id;
+    match req.method.as_str() {
+        "initialize" => JsonRpcResponse::success(
+            req_id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "mesh-mcp", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": message
+            }),
+        ),
+        "ping" => JsonRpcResponse::success(req_id, json!({})),
+        "tools/list" => {
+            JsonRpcResponse::success(req_id, json!({ "tools": ToolRegistry::list_tools() }))
+        }
+        "tools/call" => JsonRpcResponse::success(
+            req_id,
+            ToolRegistry::tool_result(format!("MeshMCP is not indexing: {message}"), true),
+        ),
+        unknown => {
+            JsonRpcResponse::error(req_id, -32601, format!("Method not found: {unknown}"), None)
+        }
+    }
+}
+
+/// The stdio loop of [`respond_refused`], until the client closes stdin.
+pub async fn run_refusing_server(
+    message: String,
+    cancel_token: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tx_out, mut rx_in, writer_done) = StdioFramingActor::spawn(cancel_token);
+    while let Some(line) = rx_in.recv().await {
+        let response = match protocol::classify(&line) {
+            Incoming::Request(req) => respond_refused(req, &message),
+            Incoming::Notification(_) => continue,
+            Incoming::Reject(err) => err,
+        };
+        if tx_out
+            .send(serde_json::to_string(&response)?)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    drop(tx_out);
+    let _ = writer_done.await;
+    Ok(())
+}
+
 /// `initialize.instructions`: the routing guidance MCP clients put in the agent's system prompt.
 ///
 /// Framed as a verifiable starting point, not an authority (7.0.19): agents weigh MCP server
@@ -227,6 +282,38 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("still indexing"), "{text}");
         assert_eq!(result["isError"], json!(true));
+    }
+
+    /// 7.1.7: a refused workspace root keeps the MCP session up and says why on
+    /// every tool call, instead of indexing `/` or dying silently.
+    #[test]
+    fn a_refused_workspace_answers_every_tool_call_with_the_reason() {
+        let req = |method: &str, params| JsonRpcRequest {
+            jsonrpc: Some("2.0".to_string()),
+            id: Some(json!(7)),
+            method: method.to_string(),
+            params,
+        };
+        let msg = "refusing to index `/`: pass -c <config>";
+        let init = respond_refused(req("initialize", None), msg);
+        assert_eq!(init.result.expect("initialize")["instructions"], msg);
+        let list = respond_refused(req("tools/list", None), msg);
+        assert!(list.result.expect("tools/list")["tools"].is_array());
+        let call = respond_refused(
+            req(
+                "tools/call",
+                Some(json!({ "name": "find_dependents", "arguments": { "target": "x" } })),
+            ),
+            msg,
+        );
+        let result = call
+            .result
+            .expect("tool error is a result, not a protocol error");
+        assert_eq!(result["isError"], json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains(msg), "{text}");
+        let unknown = respond_refused(req("nope", None), msg);
+        assert_eq!(unknown.error.expect("method not found").code, -32601);
     }
 
     #[test]

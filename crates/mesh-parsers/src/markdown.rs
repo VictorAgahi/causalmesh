@@ -61,6 +61,80 @@ impl SearchPage {
     }
 }
 
+/// A human label for what a node declares. `NodeKind::ServiceClass` is the
+/// indexer's generic "declaration" bucket (a TypeScript `const`, `enum` or
+/// `function`, a C++ free function and a Java class all land in it), so printing
+/// the enum variant told a reader that a constant was a service class. The label
+/// is read from the declaration's own first line (`signature`) and falls back to
+/// the neutral "declaration" rather than guessing.
+pub fn declaration_label(node: &ContractNode) -> &'static str {
+    use mesh_core::NodeKind;
+    let keyword = || declaration_keyword(node.signature.as_deref().unwrap_or(""));
+    match node.kind {
+        NodeKind::GrpcService => "gRPC service",
+        NodeKind::GrpcMethod => "gRPC method",
+        NodeKind::HttpEndpoint => "HTTP endpoint",
+        NodeKind::KafkaTopic => "Kafka topic",
+        NodeKind::EventStream => "event stream",
+        NodeKind::Queue => "queue",
+        NodeKind::ProtoMessage => "proto message",
+        NodeKind::PostProcessor => "post-processor",
+        NodeKind::Saga => "saga",
+        NodeKind::Module => "module",
+        NodeKind::Interface => match keyword() {
+            "type" => "type alias",
+            _ => "interface",
+        },
+        NodeKind::ServiceClass => match keyword() {
+            "class" | "abstract" | "@" => "class",
+            "function" | "func" | "def" | "fn" | "fun" | "sub" => "function",
+            "const" | "val" => "const",
+            "let" | "var" => "variable",
+            "enum" => "enum",
+            "type" | "typedef" => "type alias",
+            "interface" | "trait" | "protocol" => "interface",
+            "struct" | "record" => "struct",
+            "namespace" | "module" | "package" => "namespace",
+            _ => "declaration",
+        },
+    }
+}
+
+/// The first declaration keyword of a signature line, modifiers skipped; `"@"`
+/// for a decorator line (a decorated top-level declaration is a class).
+fn declaration_keyword(signature: &str) -> &str {
+    const MODIFIERS: &[&str] = &[
+        "export",
+        "default",
+        "declare",
+        "pub",
+        "public",
+        "private",
+        "protected",
+        "internal",
+        "static",
+        "async",
+        "final",
+        "sealed",
+        "unsafe",
+        "extern",
+        "open",
+        "data",
+        "partial",
+        "readonly",
+    ];
+    for token in signature.split_whitespace() {
+        if token.starts_with('@') {
+            return "@";
+        }
+        if token.starts_with("pub(") || MODIFIERS.contains(&token) {
+            continue;
+        }
+        return token.trim_end_matches(|c: char| !c.is_alphanumeric());
+    }
+    ""
+}
+
 pub struct MarkdownFormatter;
 
 impl MarkdownFormatter {
@@ -256,6 +330,9 @@ impl MarkdownFormatter {
     /// instance) — flattening those into one undifferentiated list is how a
     /// caller ends up scanning dozens of irrelevant file paths by hand to
     /// N services" up front instead.
+    /// `files_scanned` is the number of files the index actually parsed (the
+    /// figure `mesh-mcp doctor` reports as indexed), not the number of files that
+    /// carry a contract node.
     pub fn format_dependents(
         target: &str,
         dependents: &[(&ContractNode, String)],
@@ -302,9 +379,9 @@ impl MarkdownFormatter {
             for node in nodes {
                 idx += 1;
                 out.push_str(&format!(
-                    "[{idx}] `{}` ({:?})\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
+                    "[{idx}] `{}` ({})\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
                     node.name,
-                    node.kind,
+                    declaration_label(node),
                     node.file_path.display(),
                     node.line_start,
                     node.line_end,
@@ -358,7 +435,7 @@ impl MarkdownFormatter {
             out.push_str("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)\n");
             let files_note = if trace.files_scanned > 0 {
                 format!(
-                    "({} indexed source files scanned across all workspace roots)",
+                    "({} contract-bearing files scanned across all workspace roots)",
                     trace.files_scanned
                 )
             } else {
@@ -413,7 +490,7 @@ impl MarkdownFormatter {
                 "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)\n",
             );
             let files_note = if trace.files_scanned > 0 {
-                format!("({} indexed source files checked)", trace.files_scanned)
+                format!("({} contract-bearing files checked)", trace.files_scanned)
             } else {
                 "in any indexed workspace root".to_string()
             };
@@ -456,7 +533,7 @@ impl MarkdownFormatter {
         if flow.upstream_producers.is_empty() {
             let files_note = if flow.files_scanned > 0 {
                 format!(
-                    "across {} indexed source files in all workspace roots",
+                    "across {} contract-bearing files in all workspace roots",
                     flow.files_scanned
                 )
             } else {
@@ -502,7 +579,7 @@ impl MarkdownFormatter {
         if flow.downstream_consumers.is_empty() {
             let files_note = if flow.files_scanned > 0 {
                 format!(
-                    "across {} indexed source files in all workspace roots",
+                    "across {} contract-bearing files in all workspace roots",
                     flow.files_scanned
                 )
             } else {
@@ -1143,7 +1220,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("1248 indexed source files scanned across all workspace roots"),
+            out.contains("1248 contract-bearing files scanned across all workspace roots"),
             "{out}"
         );
         assert!(out.contains("Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic."), "{out}");
@@ -1153,7 +1230,39 @@ mod tests {
             ),
             "{out}"
         );
-        assert!(out.contains("1248 indexed source files checked"), "{out}");
+        assert!(out.contains("1248 contract-bearing files checked"), "{out}");
+    }
+
+    #[test]
+    fn declaration_label_reads_the_declaration_not_the_generic_kind() {
+        let node = |kind, sig: &str| ContractNode {
+            id: 0,
+            name: "X".into(),
+            kind,
+            file_path: std::path::PathBuf::from("a.ts").into(),
+            line_start: 1,
+            line_end: 1,
+            package: "p".into(),
+            repo_id: 0,
+            signature: Some(sig.into()),
+            docstring: None,
+        };
+        use mesh_core::NodeKind::{Interface, ServiceClass};
+        for (kind, sig, want) in [
+            (ServiceClass, "export const X = [1];", "const"),
+            (ServiceClass, "export default class X {", "class"),
+            (ServiceClass, "@Injectable()", "class"),
+            (ServiceClass, "export async function x() {", "function"),
+            (ServiceClass, "export enum X {", "enum"),
+            (ServiceClass, "let x = 1;", "variable"),
+            (ServiceClass, "pub fn x() {", "function"),
+            (ServiceClass, "something odd", "declaration"),
+            (ServiceClass, "", "declaration"),
+            (Interface, "export interface X {", "interface"),
+            (Interface, "export type X = string;", "type alias"),
+        ] {
+            assert_eq!(declaration_label(&node(kind, sig)), want, "{sig}");
+        }
     }
 
     #[test]
@@ -1184,7 +1293,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("across 1248 indexed source files in all workspace roots"),
+            out.contains("across 1248 contract-bearing files in all workspace roots"),
             "{out}"
         );
         assert!(

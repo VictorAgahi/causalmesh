@@ -315,6 +315,18 @@ Several IDE windows open on the *same* repo then share one index; a different re
 its own daemon and socket — they never mix, even if both happen to be running at once. The
 daemon exits on its own once idle.
 
+The daemon follows its config file: edit `mesh-mcp.toml` and the next requests (within about a
+second, checked at most every 250 ms) rebuild the workspace state in the background while the old
+one keeps serving; no restart is needed. A file that does not parse, or whose roots do not
+resolve, is refused: the old state keeps serving, a warning goes to the daemon log
+(`~/.cache/mesh-mcp/logs/meshd-<id>.log`) and `mesh-mcp doctor` shows it under "Daemon config".
+
+**Root guard.** With no config file found, the workspace is the current directory. If that is
+`/`, a drive root or your home directory (a client launched with the wrong cwd), `mesh-mcp run`
+spawns no daemon and scans nothing; the session answers every tool call with an error naming the
+resolved directory. Run it from the project, or pass `-c /path/to/mesh-mcp.toml`. A config file
+that lists its `roots` is always honoured, even when it sits in your home directory.
+
 `mesh-mcp run --standalone` keeps everything in one process — use it in containers, in CI, or
 anywhere a Unix socket isn't available.
 

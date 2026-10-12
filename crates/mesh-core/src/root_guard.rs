@@ -55,14 +55,71 @@ impl std::fmt::Display for DegenerateRootError {
 
 impl std::error::Error for DegenerateRootError {}
 
-/// The current user's home directory from the environment (`HOME`, else
-/// `USERPROFILE`); `None` when neither is set or both are empty.
+/// The current user's home directory: `HOME`, else `USERPROFILE` (ignored when
+/// empty), else the operating system's own record of it (the passwd entry on
+/// Unix, `HOMEDRIVE` + `HOMEPATH` on Windows). The last step matters for
+/// GUI-launched MCP clients, which often start the server with an empty
+/// environment: without it the home guard would be silently off.
 pub fn home_dir() -> Option<PathBuf> {
+    home_dir_with(|k| std::env::var_os(k))
+}
+
+/// [`home_dir`] with the environment lookup injected (tests).
+pub fn home_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     ["HOME", "USERPROFILE"]
         .iter()
-        .filter_map(std::env::var_os)
+        .filter_map(|k| env(k))
         .find(|v| !v.is_empty())
         .map(PathBuf::from)
+        .or_else(os_home_dir)
+}
+
+/// The home directory according to the OS, independent of the environment.
+#[cfg(unix)]
+pub fn os_home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `getpwuid_r` writes only into `pwd` and `buf`, which outlive the
+    // call; `pw_dir` points into `buf` and is copied before `buf` is dropped.
+    unsafe {
+        let uid = libc::geteuid();
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            );
+            if rc == libc::ERANGE && buf.len() < (1 << 20) {
+                buf.resize(buf.len() * 4, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+                return None;
+            }
+            break;
+        }
+        let bytes = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+}
+
+/// The home directory according to the OS, independent of the environment.
+#[cfg(windows)]
+pub fn os_home_dir() -> Option<PathBuf> {
+    let drive = std::env::var_os("HOMEDRIVE").filter(|v| !v.is_empty())?;
+    let path = std::env::var_os("HOMEPATH").filter(|v| !v.is_empty())?;
+    let mut home = drive;
+    home.push(path);
+    Some(PathBuf::from(home))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn os_home_dir() -> Option<PathBuf> {
+    None
 }
 
 /// Canonical form used for the comparison: symlinks resolved when the path
@@ -107,9 +164,12 @@ pub fn classify_workspace_root(dir: &Path, home: Option<&Path>) -> Option<Degene
 }
 
 /// Refuses `base_dir` as a workspace when it is a degenerate root and no config
-/// file pinned the roots. `config_pins_roots` is true when a config file was
-/// found (`-c`, `.agents/mesh-mcp.toml` or `mesh-mcp.toml`): its `roots` list is
-/// the user's explicit choice and is always honoured, even in a home directory.
+/// file pinned the roots. `config_pins_roots` is true only when a config file
+/// was found (`-c`, `.agents/mesh-mcp.toml` or `mesh-mcp.toml`) AND it lists at
+/// least one root: that list is the user's explicit choice and is always
+/// honoured, even in a home directory. A config with an empty `roots` pins
+/// nothing: the workspace falls back to its own directory, which is then
+/// checked like any other.
 pub fn guard_workspace_root(
     base_dir: &Path,
     config_pins_roots: bool,
@@ -187,6 +247,26 @@ mod tests {
         assert!(guard_workspace_root(home.path(), true, Some(home.path())).is_ok());
         #[cfg(unix)]
         assert!(guard_workspace_root(Path::new("/"), true, None).is_ok());
+    }
+
+    #[test]
+    fn home_falls_back_to_the_os_record_when_the_environment_is_empty() {
+        // An empty environment (a GUI-launched client): HOME and USERPROFILE
+        // unset, or set to the empty string.
+        assert_eq!(home_dir_with(|_| None), os_home_dir());
+        assert_eq!(
+            home_dir_with(|_| Some(std::ffi::OsString::new())),
+            os_home_dir()
+        );
+        // The environment still wins when it is set.
+        assert_eq!(
+            home_dir_with(|k| (k == "HOME").then(|| "/somewhere".into())),
+            Some(PathBuf::from("/somewhere"))
+        );
+        #[cfg(unix)]
+        if let Some(home) = os_home_dir() {
+            assert!(home.is_absolute(), "{}", home.display());
+        }
     }
 
     #[test]

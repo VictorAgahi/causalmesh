@@ -866,22 +866,32 @@ impl DoctorCommand {
         let Some((_, workspace_id)) = workspace else {
             return;
         };
-        let Some(status) = read_daemon_config_status(workspace_id) else {
-            return;
-        };
+        let status = read_daemon_config_status(workspace_id);
         // Only a daemon confirmed to serve this workspace's socket right now
-        // (a crash leaves the record behind).
+        // (a crash leaves the records behind).
         if !mesh_core::socket::daemon_is_reachable(workspace_id) {
             return;
         }
-        let Some(path) =
-            WorkspaceIndexer::locate_config(config_path).or(status.config_path.clone())
+        let Some(path) = WorkspaceIndexer::locate_config(config_path)
+            .or_else(|| status.as_ref().and_then(|s| s.config_path.clone()))
         else {
             return;
         };
         let pid = mesh_core::socket::read_daemon_meta(workspace_id).map(|m| m.pid);
         let pid_text = pid.map_or_else(|| "unknown pid".to_string(), |p| format!("pid {p}"));
-        match config_drift(&status, &path) {
+        let drift = match &status {
+            Some(status) => config_drift(status, &path),
+            // A daemon from before 7.1.7 records no config status. Its `.meta`
+            // file is written once, when it is ready to serve, so its mtime is
+            // when it started: a config modified after that is one it never saw.
+            None if legacy_daemon_started_before(workspace_id, &path) => ConfigDrift::Stale {
+                reason: "this daemon predates config reloading and started before the file \
+                         was last modified"
+                    .to_string(),
+            },
+            None => return,
+        };
+        match drift {
             ConfigDrift::InSync => checks.push(DoctorCheck::ok(
                 NAME,
                 format!(
@@ -1142,6 +1152,49 @@ fn seccomp_confined(daemon: &str, own: &str) -> Option<bool> {
     ) {
         (Some(daemon_filters), Some(own_filters)) => Some(daemon_filters > own_filters),
         _ => Some(true),
+    }
+}
+
+/// Whether the daemon of `workspace_id` started (its `.meta` file's mtime)
+/// before `config` was last modified. `false` whenever either time is unknown.
+fn legacy_daemon_started_before(workspace_id: &str, config: &Path) -> bool {
+    modified_after(&mesh_core::socket::daemon_meta_path(workspace_id), config)
+}
+
+/// Whether `config` was modified after `reference`; `false` if either mtime is
+/// unknown.
+fn modified_after(reference: &Path, config: &Path) -> bool {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (mtime(reference), mtime(config)) {
+        (Some(started), Some(modified)) => modified > started,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod legacy_daemon_tests {
+    use super::modified_after;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn touch(path: &std::path::Path, secs: u64) {
+        let f = std::fs::File::create(path).expect("create");
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .expect("mtime");
+    }
+
+    #[test]
+    fn a_config_newer_than_the_daemon_start_is_flagged_and_an_older_one_is_not() {
+        let dir = tempfile::tempdir().expect("dir");
+        let meta = dir.path().join("ws.meta");
+        let config = dir.path().join("mesh-mcp.toml");
+        touch(&meta, 1_700_000_000);
+        touch(&config, 1_700_000_100);
+        assert!(modified_after(&meta, &config));
+        touch(&config, 1_699_999_000);
+        assert!(!modified_after(&meta, &config));
+        // Unknown times stay silent.
+        assert!(!modified_after(&dir.path().join("absent"), &config));
+        assert!(!modified_after(&meta, &dir.path().join("absent")));
     }
 }
 

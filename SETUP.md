@@ -325,7 +325,9 @@ resolve, is refused: the old state keeps serving, a warning goes to the daemon l
 `/`, a drive root or your home directory (a client launched with the wrong cwd), `mesh-mcp run`
 spawns no daemon and scans nothing; the session answers every tool call with an error naming the
 resolved directory. Run it from the project, or pass `-c /path/to/mesh-mcp.toml`. A config file
-that lists its `roots` is always honoured, even when it sits in your home directory.
+that lists at least one of its `roots` is always honoured, even when it sits in your home
+directory; one with an empty `roots` is not (it falls back to its own directory, which is then
+checked). Home is read from `HOME`/`USERPROFILE`, else from the operating system.
 
 `mesh-mcp run --standalone` keeps everything in one process — use it in containers, in CI, or
 anywhere a Unix socket isn't available.

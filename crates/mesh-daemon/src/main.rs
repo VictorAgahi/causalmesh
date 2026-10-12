@@ -69,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Config loading ────────────────────────────────────────────────────────
     // Resolved before the socket path: the default (no `--socket`) is scoped
     // to this workspace specifically (see below), which needs `base_dir` first.
-    let (config, base_dir) = WorkspaceIndexer::discover_config(args.config.as_deref())?;
+    let (config, base_dir, config_sha) =
+        WorkspaceIndexer::discover_config_stamped(args.config.as_deref())?;
     // Same guard as `mesh-mcp run`: a daemon started with cwd = `/` or HOME and
     // no config would index the whole filesystem or home. `mesh-mcp` never
     // spawns one in that case; this covers a hand-started or older-proxy start.
@@ -132,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = host::WorkspaceHost::new(
         state.clone(),
         config_path,
+        config_sha,
         &workspace_id,
         audit,
         rescan,

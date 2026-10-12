@@ -1,10 +1,11 @@
 //! Change detection for the config file a long-lived process was built from,
 //! and the record `meshd` leaves for `doctor` about which config it serves.
 //!
-//! The check is cheap enough to run on every request: a `stat` decides whether
-//! anything may have changed (mtime or length), and only then is the file read
-//! and hashed. The hash is what decides, so a `touch` or a save without changes
-//! never rebuilds a workspace.
+//! The check is cheap enough to run on every request (at most every few hundred
+//! milliseconds): the config file is small, so it is read and hashed each time
+//! rather than trusting `(mtime, len)`, which cannot see a same-length edit made
+//! within one coarse mtime tick. The hash is what decides, so a `touch` or a
+//! save without changes never rebuilds a workspace.
 
 use crate::index_cache::sha256;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,11 @@ pub fn config_fingerprint_cheap(path: &Path) -> Option<(u128, u64)> {
     Some((mtime_ms, meta.len()))
 }
 
+/// Lowercase hex SHA-256 of `bytes`: the identity of a config's content.
+pub fn config_sha256(bytes: &[u8]) -> String {
+    hex(&sha256(bytes))
+}
+
 /// Reads and hashes `path`.
 pub fn stamp_config(path: &Path) -> std::io::Result<ConfigStamp> {
     let (mtime_ms, _) = config_fingerprint_cheap(path).unwrap_or((0, 0));
@@ -46,7 +52,7 @@ pub fn stamp_config(path: &Path) -> std::io::Result<ConfigStamp> {
     Ok(ConfigStamp {
         mtime_ms,
         len: bytes.len() as u64,
-        sha256: hex(&sha256(&bytes)),
+        sha256: config_sha256(&bytes),
     })
 }
 
@@ -65,21 +71,39 @@ pub struct DaemonConfigStatus {
     /// A newer config on disk that failed to load, with the reason; the
     /// previous state keeps serving. Cleared by the next successful load.
     pub last_error: Option<String>,
+    /// SHA-256 of the on-disk bytes `last_error` is about, so `doctor` can tell
+    /// a still-rejected file from one the user has since edited.
+    #[serde(default)]
+    pub rejected_sha256: Option<String>,
 }
 
 /// Where [`DaemonConfigStatus`] of `workspace_id` lives.
 pub fn daemon_config_status_path(workspace_id: &str) -> PathBuf {
-    crate::paths::mesh_cache_dir()
+    daemon_config_status_path_in(&crate::paths::mesh_cache_dir(), workspace_id)
+}
+
+/// [`daemon_config_status_path`] under an explicit cache directory.
+pub fn daemon_config_status_path_in(cache_dir: &Path, workspace_id: &str) -> PathBuf {
+    cache_dir
         .join("meshd")
         .join(format!("{workspace_id}.config.json"))
 }
 
 /// Best-effort write (a failure only means `doctor` cannot compare).
 pub fn write_daemon_config_status(workspace_id: &str, status: &DaemonConfigStatus) {
+    write_daemon_config_status_in(&crate::paths::mesh_cache_dir(), workspace_id, status);
+}
+
+/// [`write_daemon_config_status`] under an explicit cache directory.
+pub fn write_daemon_config_status_in(
+    cache_dir: &Path,
+    workspace_id: &str,
+    status: &DaemonConfigStatus,
+) {
     let Ok(json) = serde_json::to_string(status) else {
         return;
     };
-    let path = daemon_config_status_path(workspace_id);
+    let path = daemon_config_status_path_in(cache_dir, workspace_id);
     let Some(parent) = path.parent() else {
         return;
     };
@@ -120,17 +144,36 @@ pub enum ConfigDrift {
 }
 
 /// Compares `status` (what the daemon recorded) with `config_path` on disk.
+///
+/// The hash on disk is compared first: a recorded rejection only counts while
+/// the file still has the bytes that were rejected. Once the user edits it
+/// again the daemon will pick the new version up on its next check, so that is
+/// reported as [`ConfigDrift::Stale`], not as a rejection.
 pub fn config_drift(status: &DaemonConfigStatus, config_path: &Path) -> ConfigDrift {
+    let Ok(now) = stamp_config(config_path) else {
+        // Unreadable now: nothing to compare. A recorded rejection still stands.
+        return match &status.last_error {
+            Some(error) => ConfigDrift::Rejected {
+                error: error.clone(),
+            },
+            None => ConfigDrift::InSync,
+        };
+    };
+    if status.config_sha256.as_deref() == Some(now.sha256.as_str()) {
+        return ConfigDrift::InSync;
+    }
     if let Some(error) = &status.last_error {
-        return ConfigDrift::Rejected {
-            error: error.clone(),
+        return match status.rejected_sha256.as_deref() {
+            Some(rejected) if rejected != now.sha256 => ConfigDrift::Stale {
+                reason: "edited again since the version the daemon refused; it will reload it on its next check"
+                    .to_string(),
+            },
+            _ => ConfigDrift::Rejected {
+                error: error.clone(),
+            },
         };
     }
-    let Ok(now) = stamp_config(config_path) else {
-        return ConfigDrift::InSync;
-    };
     match &status.config_sha256 {
-        Some(built) if *built == now.sha256 => ConfigDrift::InSync,
         Some(_) => ConfigDrift::Stale {
             reason: "built from a different config hash".to_string(),
         },
@@ -168,6 +211,7 @@ mod tests {
             config_path: Some(p.clone()),
             config_sha256: Some(stamp_config(&p).expect("stamp").sha256),
             last_error: None,
+            rejected_sha256: None,
         };
         assert_eq!(config_drift(&status, &p), ConfigDrift::InSync);
         std::fs::write(&p, "a = 2\n").expect("rewrite");
@@ -182,5 +226,35 @@ mod tests {
                 error: "bad".to_string()
             }
         );
+    }
+
+    #[test]
+    fn a_rejection_is_reported_only_while_the_rejected_bytes_are_on_disk() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "a = 1\n").expect("write");
+        let served = stamp_config(&p).expect("stamp").sha256;
+        // The user breaks the file; the daemon refuses it and records the hash.
+        std::fs::write(&p, "broken").expect("write");
+        let status = DaemonConfigStatus {
+            started_ms: 0,
+            config_path: Some(p.clone()),
+            config_sha256: Some(served.clone()),
+            last_error: Some("bad".to_string()),
+            rejected_sha256: Some(stamp_config(&p).expect("stamp").sha256),
+        };
+        assert!(matches!(
+            config_drift(&status, &p),
+            ConfigDrift::Rejected { .. }
+        ));
+        // The user fixes it (new bytes): the daemon will reload, not "Rejected".
+        std::fs::write(&p, "a = 3\n").expect("fix");
+        assert!(matches!(
+            config_drift(&status, &p),
+            ConfigDrift::Stale { .. }
+        ));
+        // The user reverts to exactly what is served: in sync.
+        std::fs::write(&p, "a = 1\n").expect("revert");
+        assert_eq!(config_drift(&status, &p), ConfigDrift::InSync);
     }
 }

@@ -65,44 +65,102 @@ impl SearchPage {
 /// indexer's generic "declaration" bucket (a TypeScript `const`, `enum` or
 /// `function`, a C++ free function and a Java class all land in it), so printing
 /// the enum variant told a reader that a constant was a service class. The label
-/// is read from the declaration's own first line (`signature`) and falls back to
-/// the neutral "declaration" rather than guessing.
-pub fn declaration_label(node: &ContractNode) -> &'static str {
+/// is read from the declaration's own first line (`signature`), looking past
+/// decorators, attributes and modifiers to the real declaration keyword. A shape
+/// it does not recognise gets no kind (`None`) rather than a guess.
+pub fn declaration_label(node: &ContractNode) -> Option<&'static str> {
     use mesh_core::NodeKind;
-    let keyword = || declaration_keyword(node.signature.as_deref().unwrap_or(""));
+    let tokens = declaration_tokens(node.signature.as_deref().unwrap_or(""));
+    let keyword = tokens.first().copied().unwrap_or("");
+    // What follows `type X`: Go's `type X struct {` / `type X interface {` name
+    // their real kind, `type X = ...` is an alias.
+    let after_name = tokens.get(2).copied().unwrap_or("");
+    let type_kind = || match after_name {
+        "struct" => Some("struct"),
+        "interface" => Some("interface"),
+        "=" => Some("type alias"),
+        // `type X<T> = ...`, `type X int`, `type X func()`: a type declaration,
+        // not necessarily an alias.
+        _ => Some("type"),
+    };
     match node.kind {
-        NodeKind::GrpcService => "gRPC service",
-        NodeKind::GrpcMethod => "gRPC method",
-        NodeKind::HttpEndpoint => "HTTP endpoint",
-        NodeKind::KafkaTopic => "Kafka topic",
-        NodeKind::EventStream => "event stream",
-        NodeKind::Queue => "queue",
-        NodeKind::ProtoMessage => "proto message",
-        NodeKind::PostProcessor => "post-processor",
-        NodeKind::Saga => "saga",
-        NodeKind::Module => "module",
-        NodeKind::Interface => match keyword() {
-            "type" => "type alias",
-            _ => "interface",
+        NodeKind::GrpcService => Some("gRPC service"),
+        NodeKind::GrpcMethod => Some("gRPC method"),
+        NodeKind::HttpEndpoint => Some("HTTP endpoint"),
+        NodeKind::KafkaTopic => Some("Kafka topic"),
+        NodeKind::EventStream => Some("event stream"),
+        NodeKind::Queue => Some("queue"),
+        NodeKind::ProtoMessage => Some("proto message"),
+        NodeKind::PostProcessor => Some("post-processor"),
+        NodeKind::Saga => Some("saga"),
+        NodeKind::Module => Some("module"),
+        NodeKind::Interface => match keyword {
+            "type" => type_kind(),
+            _ => Some("interface"),
         },
-        NodeKind::ServiceClass => match keyword() {
-            "class" | "abstract" | "@" => "class",
-            "function" | "func" | "def" | "fn" | "fun" | "sub" => "function",
-            "const" | "val" => "const",
-            "let" | "var" => "variable",
-            "enum" => "enum",
-            "type" | "typedef" => "type alias",
-            "interface" | "trait" | "protocol" => "interface",
-            "struct" | "record" => "struct",
-            "namespace" | "module" | "package" => "namespace",
-            _ => "declaration",
+        NodeKind::ServiceClass => match keyword {
+            "class" => Some("class"),
+            "object" => Some("object"),
+            // Kotlin `fun interface X`.
+            "fun" if after_name_is_interface(&tokens) => Some("interface"),
+            "function" | "func" | "def" | "fn" | "fun" | "sub" => Some("function"),
+            "const" | "val" => Some("const"),
+            "let" | "var" => Some("variable"),
+            "enum" => Some("enum"),
+            "type" => type_kind(),
+            "typedef" => Some("type alias"),
+            "interface" | "trait" | "protocol" => Some("interface"),
+            "struct" | "record" => Some("struct"),
+            "namespace" | "module" | "package" => Some("namespace"),
+            // Unknown shape (nothing left after decorators, or a keyword we do
+            // not know): no kind rather than a guess.
+            _ => None,
         },
     }
 }
 
-/// The first declaration keyword of a signature line, modifiers skipped; `"@"`
-/// for a decorator line (a decorated top-level declaration is a class).
-fn declaration_keyword(signature: &str) -> &str {
+fn after_name_is_interface(tokens: &[&str]) -> bool {
+    tokens.get(1).copied() == Some("interface")
+}
+
+/// Skips one leading decorator or attribute (`@Name`, `@a.b(...)`, `#[...]`)
+/// and returns the rest; `None` when `s` does not start with one. An
+/// unterminated argument list swallows the rest (the real declaration is on a
+/// line this signature does not have).
+fn skip_decorator(s: &str) -> Option<&str> {
+    let (rest, open, close) = match s.strip_prefix("#[") {
+        Some(r) => (r, '[', ']'),
+        None => {
+            let r = s.strip_prefix('@')?;
+            let end = r
+                .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | ':')))
+                .unwrap_or(r.len());
+            let after = &r[end..];
+            match after.strip_prefix('(') {
+                Some(args) => (args, '(', ')'),
+                None => return Some(after),
+            }
+        }
+    };
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&rest[i + c.len_utf8()..]);
+            }
+        }
+    }
+    Some("")
+}
+
+/// The words of a signature that name the declaration: leading decorators,
+/// attributes and modifiers are looked past, so `@Injectable() export class X`
+/// and `@app.route("/")\ndef f():` read as `class X` and `def f():`. Each word
+/// is trimmed of trailing punctuation (`function*` is `function`, `X {` is `X`).
+fn declaration_tokens(signature: &str) -> Vec<&str> {
     const MODIFIERS: &[&str] = &[
         "export",
         "default",
@@ -120,19 +178,39 @@ fn declaration_keyword(signature: &str) -> &str {
         "extern",
         "open",
         "data",
+        "case",
         "partial",
         "readonly",
+        "abstract",
+        "override",
+        "companion",
+        "inline",
+        "suspend",
+        "value",
     ];
-    for token in signature.split_whitespace() {
-        if token.starts_with('@') {
-            return "@";
-        }
-        if token.starts_with("pub(") || MODIFIERS.contains(&token) {
+    let mut rest = signature.trim_start();
+    let mut tokens = Vec::new();
+    let mut leading = true;
+    while !rest.is_empty() {
+        if let Some(after) = skip_decorator(rest) {
+            rest = after.trim_start();
             continue;
         }
-        return token.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        rest = tail.trim_start();
+        let trimmed = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '=');
+        let trimmed = if trimmed.is_empty() { word } else { trimmed };
+        if leading && (word.starts_with("pub(") || MODIFIERS.contains(&trimmed)) {
+            continue;
+        }
+        leading = false;
+        tokens.push(trimmed);
+        if tokens.len() >= 4 {
+            break;
+        }
     }
-    ""
+    tokens
 }
 
 pub struct MarkdownFormatter;
@@ -379,9 +457,11 @@ impl MarkdownFormatter {
             for node in nodes {
                 idx += 1;
                 out.push_str(&format!(
-                    "[{idx}] `{}` ({})\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
+                    "[{idx}] `{}`{}\n- **File**: `{}:{}-{}`\n- **Package**: `{}`\n\n",
                     node.name,
-                    declaration_label(node),
+                    declaration_label(node)
+                        .map(|l| format!(" ({l})"))
+                        .unwrap_or_default(),
                     node.file_path.display(),
                     node.line_start,
                     node.line_end,
@@ -1249,19 +1329,66 @@ mod tests {
         };
         use mesh_core::NodeKind::{Interface, ServiceClass};
         for (kind, sig, want) in [
-            (ServiceClass, "export const X = [1];", "const"),
-            (ServiceClass, "export default class X {", "class"),
-            (ServiceClass, "@Injectable()", "class"),
-            (ServiceClass, "export async function x() {", "function"),
-            (ServiceClass, "export enum X {", "enum"),
-            (ServiceClass, "let x = 1;", "variable"),
-            (ServiceClass, "pub fn x() {", "function"),
-            (ServiceClass, "something odd", "declaration"),
-            (ServiceClass, "", "declaration"),
-            (Interface, "export interface X {", "interface"),
-            (Interface, "export type X = string;", "type alias"),
+            (ServiceClass, "export const X = [1];", Some("const")),
+            (ServiceClass, "export default class X {", Some("class")),
+            (
+                ServiceClass,
+                "export async function x() {",
+                Some("function"),
+            ),
+            (
+                ServiceClass,
+                "export default async function* x() {",
+                Some("function"),
+            ),
+            (ServiceClass, "export enum X {", Some("enum")),
+            (ServiceClass, "let x = 1;", Some("variable")),
+            (ServiceClass, "pub fn x() {", Some("function")),
+            (ServiceClass, "object Registry {", Some("object")),
+            (ServiceClass, "companion object {", Some("object")),
+            (ServiceClass, "fun interface Handler {", Some("interface")),
+            (ServiceClass, "data class User(val id: Int)", Some("class")),
+            // Decorators and attributes are looked past, never called a class.
+            (
+                ServiceClass,
+                "@Injectable()\nexport class X {",
+                Some("class"),
+            ),
+            (
+                ServiceClass,
+                "@Injectable() export class X {",
+                Some("class"),
+            ),
+            (
+                ServiceClass,
+                "@app.route(\"/a b\")\ndef handler():",
+                Some("function"),
+            ),
+            (
+                ServiceClass,
+                "@Get(':id')\nexport async function load() {",
+                Some("function"),
+            ),
+            (
+                ServiceClass,
+                "#[derive(Debug)]\npub struct S {",
+                Some("struct"),
+            ),
+            // Only a decorator on the signature line: the keyword is not known.
+            (ServiceClass, "@Injectable()", None),
+            (ServiceClass, "@app.route(\"/x\")", None),
+            (ServiceClass, "@Component({", None),
+            (ServiceClass, "something odd", None),
+            (ServiceClass, "", None),
+            // Go.
+            (ServiceClass, "type User struct {", Some("struct")),
+            (Interface, "type Repo interface {", Some("interface")),
+            (ServiceClass, "type ID int", Some("type")),
+            (ServiceClass, "type Alias = string", Some("type alias")),
+            (Interface, "export interface X {", Some("interface")),
+            (Interface, "export type X = string;", Some("type alias")),
         ] {
-            assert_eq!(declaration_label(&node(kind, sig)), want, "{sig}");
+            assert_eq!(declaration_label(&node(kind, sig)), want, "{sig:?}");
         }
     }
 

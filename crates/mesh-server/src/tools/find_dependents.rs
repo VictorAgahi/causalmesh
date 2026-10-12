@@ -108,13 +108,20 @@ struct PackageGroup<'g> {
     /// Declarations of the package that use the target (a bare file with
     /// imports and no declaration of its own counts as a file only).
     symbols: usize,
-    /// Up to [`MAX_REPRESENTATIVES`] locations, each in a different file.
+    /// Every dependent declaration of the package, unordered.
+    nodes: Vec<&'g mesh_core::ContractNode>,
+    /// Up to [`MAX_REPRESENTATIVES`] locations, each in a different file. Empty
+    /// until [`pick_representatives`] ran: only the packages on the requested
+    /// page pay for it.
     reps: Vec<&'g mesh_core::ContractNode>,
 }
 
 /// Representative locations shown per dependent package.
 const MAX_REPRESENTATIVES: usize = 3;
 
+/// Resolving is the same cheap computation `truncation_hint` repeats for its
+/// count (the tool trait gives it no access to `run`'s result): no graph-wide
+/// scan happens here, ranking waits for the page ([`pick_representatives`]).
 fn resolve<'g>(
     args: &FindDependentsArgs,
     graph: &'g mesh_core::ContractGraph,
@@ -130,7 +137,7 @@ fn resolve<'g>(
             .partition(|n| !mesh_core::is_test_node(n, roots))
     };
     if granularity == Granularity::Package {
-        let packages = group_by_package(dependents, graph, roots);
+        let packages = group_by_package(dependents);
         // Packages whose every dependent is test code: a package with a test
         // and a production dependent is listed, not "left out".
         let listed: HashSet<(mesh_core::RepoId, &str)> =
@@ -189,18 +196,13 @@ fn root_relative<'n>(
 }
 
 /// Groups dependents by `(repo, package)`: the package is the unit, with the
-/// number of files and declarations that use the target and up to
-/// [`MAX_REPRESENTATIVES`] locations. Everything here is a total order, so the
-/// answer does not depend on hash or graph iteration order: packages by files
-/// desc, declarations desc, then `(repo, package)`; a package's locations
-/// prefer production over test code, hand-written over generated, a
-/// declaration over a bare import-only file, then the most referenced
-/// declaration (incoming graph edges), then path and line.
-fn group_by_package<'g>(
-    dependents: Vec<&'g mesh_core::ContractNode>,
-    graph: &'g mesh_core::ContractGraph,
-    roots: &[std::path::PathBuf],
-) -> Vec<PackageGroup<'g>> {
+/// number of files and declarations that use the target. Cheap (one pass over
+/// the dependents, no graph scan), so the count of packages is too. Everything
+/// here is a total order, so the answer does not depend on hash or graph
+/// iteration order: packages by files desc, declarations desc, then
+/// `(repo, package)`. Their locations come later, for the listed page only
+/// ([`pick_representatives`]).
+fn group_by_package<'g>(dependents: Vec<&'g mesh_core::ContractNode>) -> Vec<PackageGroup<'g>> {
     let mut by_package: BTreeMap<(mesh_core::RepoId, &str), Vec<&mesh_core::ContractNode>> =
         BTreeMap::new();
     for node in dependents {
@@ -209,20 +211,9 @@ fn group_by_package<'g>(
             .or_default()
             .push(node);
     }
-    // Incoming edges of the candidate declarations, in one pass over the graph.
-    let candidates: HashSet<mesh_core::NodeId> = by_package
-        .values()
-        .flat_map(|nodes| nodes.iter().map(|n| n.id))
-        .collect();
-    let mut referenced: HashMap<mesh_core::NodeId, usize> = HashMap::new();
-    for edge in graph.all_edges() {
-        if candidates.contains(&edge.to) {
-            *referenced.entry(edge.to).or_default() += 1;
-        }
-    }
     let mut groups: Vec<PackageGroup<'g>> = by_package
         .into_iter()
-        .map(|((repo_id, package), mut nodes)| {
+        .map(|((repo_id, package), nodes)| {
             let files = nodes
                 .iter()
                 .map(|n| &*n.file_path)
@@ -232,34 +223,13 @@ fn group_by_package<'g>(
                 .iter()
                 .filter(|n| n.kind != mesh_core::NodeKind::Module)
                 .count();
-            let rank = |n: &&mesh_core::ContractNode| {
-                let rel = root_relative(n, roots);
-                (
-                    mesh_core::is_test_path(rel),
-                    mesh_core::is_generated_path(rel),
-                    n.kind == mesh_core::NodeKind::Module,
-                    std::cmp::Reverse(referenced.get(&n.id).copied().unwrap_or(0)),
-                )
-            };
-            nodes.sort_by(|a, b| {
-                rank(a)
-                    .cmp(&rank(b))
-                    .then_with(|| a.file_path.cmp(&b.file_path))
-                    .then_with(|| a.line_start.cmp(&b.line_start))
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            let mut seen_files: HashSet<&std::path::Path> = HashSet::new();
-            let reps = nodes
-                .into_iter()
-                .filter(|n| seen_files.insert(&n.file_path))
-                .take(MAX_REPRESENTATIVES)
-                .collect();
             PackageGroup {
                 repo_id,
                 package,
                 files,
                 symbols,
-                reps,
+                nodes,
+                reps: Vec::new(),
             }
         })
         .collect();
@@ -271,6 +241,57 @@ fn group_by_package<'g>(
             .then_with(|| a.package.cmp(b.package))
     });
     groups
+}
+
+/// Fills `reps` of `page`: up to [`MAX_REPRESENTATIVES`] locations per package,
+/// each in a different file, preferring production over test code,
+/// hand-written over generated, a declaration over a bare import-only file,
+/// then the most referenced declaration (incoming graph edges, counted in one
+/// pass over the edges and only for the declarations of these packages), then
+/// path and line.
+fn pick_representatives<'g>(
+    page: &mut [PackageGroup<'g>],
+    graph: &'g mesh_core::ContractGraph,
+    roots: &[std::path::PathBuf],
+) {
+    if page.is_empty() {
+        return;
+    }
+    let candidates: HashSet<mesh_core::NodeId> = page
+        .iter()
+        .flat_map(|g| g.nodes.iter().map(|n| n.id))
+        .collect();
+    let mut referenced: HashMap<mesh_core::NodeId, usize> = HashMap::new();
+    for edge in graph.all_edges() {
+        if candidates.contains(&edge.to) {
+            *referenced.entry(edge.to).or_default() += 1;
+        }
+    }
+    for group in page {
+        let mut nodes = std::mem::take(&mut group.nodes);
+        let rank = |n: &&mesh_core::ContractNode| {
+            let rel = root_relative(n, roots);
+            (
+                mesh_core::is_test_path(rel),
+                mesh_core::is_generated_path(rel),
+                n.kind == mesh_core::NodeKind::Module,
+                std::cmp::Reverse(referenced.get(&n.id).copied().unwrap_or(0)),
+            )
+        };
+        nodes.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let mut seen_files: HashSet<&std::path::Path> = HashSet::new();
+        group.reps = nodes
+            .into_iter()
+            .filter(|n| seen_files.insert(&n.file_path))
+            .take(MAX_REPRESENTATIVES)
+            .collect();
+    }
 }
 
 /// Renders one page of dependent packages: the package (with its root) is the
@@ -297,9 +318,11 @@ fn format_packages(
         ));
         for node in &group.reps {
             out.push_str(&format!(
-                "- `{}` ({}) `{}:{}`\n",
+                "- `{}`{} `{}:{}`\n",
                 node.name,
-                mesh_parsers::declaration_label(node),
+                mesh_parsers::declaration_label(node)
+                    .map(|l| format!(" ({l})"))
+                    .unwrap_or_default(),
                 root_relative(node, roots)
                     .display()
                     .to_string()
@@ -360,13 +383,23 @@ impl McpTool for FindDependentsTool {
             .unwrap_or(DEFAULT_LIMIT) as usize;
         let offset = args.offset.unwrap_or(0) as usize;
         let snapshot = state.snapshot();
-        let resolved = resolve(
+        let mut resolved = resolve(
             args,
             &snapshot.contract_graph,
             granularity,
             &state.allowed_roots,
         );
         let total = resolved.total();
+        // Locations only for the packages on this page.
+        let page_start = offset.min(resolved.packages.len());
+        let page_end = page_start
+            .saturating_add(limit)
+            .min(resolved.packages.len());
+        pick_representatives(
+            &mut resolved.packages[page_start..page_end],
+            &snapshot.contract_graph,
+            &state.allowed_roots,
+        );
         let files: HashSet<&std::path::Path> =
             resolved.dependents.iter().map(|n| &*n.file_path).collect();
         let file_count = files.len();
@@ -390,11 +423,7 @@ impl McpTool for FindDependentsTool {
                 (node, label)
             })
             .collect();
-        let package_page: &[PackageGroup<'_>] = resolved
-            .packages
-            .get(offset..)
-            .map(|rest| &rest[..rest.len().min(limit)])
-            .unwrap_or(&[]);
+        let package_page: &[PackageGroup<'_>] = &resolved.packages[page_start..page_end];
         let dependent_count = if resolved.per_package {
             package_page.len()
         } else {

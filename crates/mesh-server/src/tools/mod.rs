@@ -281,6 +281,7 @@ impl ToolRegistry {
         trace_id: Option<String>,
         args_json: &str,
         started: std::time::Instant,
+        error: mesh_core::ErrorDetail,
     ) {
         if !state.audit_enabled() {
             return;
@@ -289,7 +290,7 @@ impl ToolRegistry {
         let args_json = args_json.to_string();
         let duration_us = micros_since(started);
         let _ = tokio::task::spawn_blocking(move || {
-            match state.audit.record_entry(
+            match state.audit.record_entry_with_error(
                 &session,
                 trace_id.as_deref(),
                 tool,
@@ -297,6 +298,7 @@ impl ToolRegistry {
                 "ERROR",
                 Vec::new(),
                 0,
+                Some(&error),
             ) {
                 Ok(entry) => record_latency(&state, entry.entry_seq, duration_us),
                 Err(e) => {
@@ -330,6 +332,11 @@ impl ToolRegistry {
                     None,
                     &arguments.to_string(),
                     started,
+                    mesh_core::ErrorDetail::sanitized(
+                        error_class(-32602),
+                        -32602,
+                        &format!("Invalid arguments: {e}"),
+                    ),
                 )
                 .await;
                 return Ok(Err((
@@ -364,6 +371,11 @@ impl ToolRegistry {
                             trace_id,
                             &args_json,
                             started,
+                            mesh_core::ErrorDetail::sanitized(
+                                error_class(GOVERNANCE_BLOCKED_CODE),
+                                GOVERNANCE_BLOCKED_CODE,
+                                &payload,
+                            ),
                         )
                         .await;
                         return Ok(Err((GOVERNANCE_BLOCKED_CODE, payload)));
@@ -423,6 +435,12 @@ impl ToolRegistry {
                 Ok(out) => ("SUCCESS", out.files_accessed.clone(), out.secrets_redacted),
                 Err(_) => ("ERROR", Vec::new(), 0),
             };
+            // Sanitized cause of a failed call: class, code and a short redacted
+            // message, never the arguments (they stay a digest in the audit row).
+            let error_detail = result
+                .as_ref()
+                .err()
+                .map(|(code, msg)| mesh_core::ErrorDetail::sanitized(error_class(*code), *code, msg));
 
             // Audit is best-effort and off the executor; the SQLite write never
             // gates the response but always happens on the same blocking thread —
@@ -431,7 +449,7 @@ impl ToolRegistry {
             if state.audit_enabled() {
                 let duration_us = micros_since(started);
                 let trace_id = T::meta(&args).and_then(|m| m.extract_trace_id());
-                match state.audit.record_entry(
+                match state.audit.record_entry_with_error(
                     &session,
                     trace_id.as_deref(),
                     T::NAME,
@@ -439,6 +457,7 @@ impl ToolRegistry {
                     status,
                     files,
                     redacted,
+                    error_detail.as_ref(),
                 ) {
                     Ok(entry) => record_latency(&state, entry.entry_seq, duration_us),
                     Err(e) => {
@@ -451,6 +470,18 @@ impl ToolRegistry {
         })
         .await
         .map_err(|e| (-32603, format!("Tool task failed: {e}")))
+    }
+}
+
+/// Error class recorded in the audit trail for a JSON-RPC code.
+fn error_class(code: i32) -> &'static str {
+    match code {
+        -32602 => "invalid_params",
+        -32603 => "internal_error",
+        -32601 => "method_not_found",
+        -32600 => "invalid_request",
+        GOVERNANCE_BLOCKED_CODE => "governance_refusal",
+        _ => "tool_error",
     }
 }
 
@@ -729,6 +760,27 @@ mod tests {
             vec!["ERROR".to_string(), "ERROR".to_string()],
             "both the invalid-args call and the governance refusal must be audited: {statuses:?}"
         );
+
+        // 7.1.8: each ERROR row carries a sanitized class/code/message, never the
+        // raw arguments.
+        let dest = tempfile::NamedTempFile::new().expect("tmp file");
+        state.audit.export_to_jsonl(dest.path()).expect("export");
+        let details: Vec<mesh_core::ErrorDetail> = std::fs::read_to_string(dest.path())
+            .expect("read export")
+            .lines()
+            .map(|line| {
+                let v: Value = serde_json::from_str(line).expect("valid jsonl entry");
+                mesh_core::ErrorDetail::from_stored(v["error_detail"].as_str().unwrap_or(""))
+                    .expect("ERROR rows carry an error_detail")
+            })
+            .collect();
+        assert_eq!(details[0].class, "invalid_params");
+        assert_eq!(details[0].code, -32602);
+        assert!(details[0].message.starts_with("Invalid arguments"));
+        assert!(!details[0].message.contains("12345"), "{details:?}");
+        assert_eq!(details[1].class, "governance_refusal");
+        assert_eq!(details[1].code, GOVERNANCE_BLOCKED_CODE);
+        assert!(details.iter().all(|d| d.message.chars().count() <= 200));
     }
 
     /// Test-only stand-in for a future mutating tool. It carries a fixed

@@ -5,6 +5,85 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.8] — 2026-10-12
+
+Generic fixes from a field report. One behaviour change (declarative pattern confidence) is
+called out first.
+
+### Changed (behaviour)
+- Declarative `[[engines.contracts.patterns]]` of kind `topic_producer` / `topic_consumer` now
+  produce `heuristic` Produces / Consumes edges by default (they were `exact`). A regex cannot tell
+  a literal topic from an emission routed through a mapping table, so a match is a lead to verify.
+  A new optional per-pattern key `confidence = "exact" | "heuristic"` opts a pattern back in to
+  `exact` when it captures the literal topic. The key is strict (any other value or a misspelt key
+  fails config loading), is documented in SETUP.md and the annotated `mesh-mcp.toml`, and
+  `mesh-mcp doctor` validates the patterns (a regex that does not compile, `confidence` on a
+  `saga` / `rpc` pattern where it has no effect). `analyze_impact` rows built from such patterns
+  now read `heuristic` unless the pattern says `exact`; the polyglot-shop example sets `exact`
+  because its regexes capture literal topic strings.
+
+### Fixed
+- `search_docs` returned a SKILL.md-style file's YAML frontmatter (about 60 lines of metadata) as
+  a hit. A leading `---` ... `---` (YAML) or `+++` ... `+++` (TOML) block is no longer indexed as
+  section body (line numbers still count it). `name` becomes the title of the section before the
+  first heading, and a capped `description` is kept as one searchable line of the first real
+  section; a file that is only frontmatter yields no section. Frontmatter must start on line 1
+  and every line of the block must look like metadata (`key: value`, `key:`, `- item`, an
+  indented continuation or a `#` comment), so prose between two horizontal rules (an ADR) stays
+  fully indexed; an unterminated `---` is a thematic break. Only column-0 keys count: a nested
+  `name:` / `description:` never overrides the top-level one.
+- The audit trail stored only an argument digest, so an `ERROR` row could not be diagnosed. An
+  `ERROR` row now also stores a short sanitized error (`{"class","code","message"}`: class from
+  the JSON-RPC code, the message cut to 200 characters). Raw arguments are still never stored.
+  Sanitizing is structural first: serde-style messages (`invalid type`, `invalid value`,
+  `unknown variant`, `unknown field`) keep their schema text and lose the quoted user value
+  wholesale; then secrets are masked as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` (key/value
+  pairs, URL userinfo, bearer / basic credentials, JWTs, long base64 / base64url runs), and
+  absolute home directories collapse to `~`. Hash chain: every row stays chain version 2 with the
+  v2 hash input byte for byte, so an older binary (a stale `meshd`, a rollback) still verifies the
+  whole chain; it just neither sees nor verifies the detail. The detail is bound by its own
+  nullable column `error_detail_sig = SHA-256(entry_hash || error_detail)`. The current
+  verifier rejects a detail with no valid signature (on any row, including v1 / v2 rows that
+  predate the column), a signature with no detail, and an edited detail or signature; a mixed
+  old / new chain verifies. Both columns are added in place. `mesh-mcp stats` lists the three most
+  frequent error messages per tool (also in `--json` as `top_errors`), with control characters
+  and ANSI escapes removed from the stored text at render time.
+- Audit timestamps: current binaries have always written ISO 8601 for new rows (an earlier
+  version wrote `<epoch-secs>.<millis>Z`); old rows are tolerated and normalised by `stats` and by
+  verification without being rewritten (rewriting would break the chain). A mixed-format chain is
+  now covered by a test.
+- `mesh-mcp doctor` warns once when topic patterns rely on the default confidence ("N pattern(s)
+  have no explicit confidence; since 7.1.8 the default is heuristic (it was exact) ...").
+- `analyze_grpc` with a relative `.proto` path that omits the root prefix
+  (`proto/foo/bar.proto` for `proto-registry/proto/foo/bar.proto`) failed with "Path not found".
+  A missing relative path is now matched by trailing path components against the `.proto` files
+  of the current index (its file list, no I/O; a crawl of the roots only when no index is built).
+  The target needs at least one directory component: a bare file name (`user.proto`) is never
+  guessed, its candidates are listed. One match is used and named in a "Resolved path" heading at
+  the top of the result; several are listed (`-32602` with an explicit `base`, a skipped check
+  otherwise); none lists the closest files by name. The `.proto` extension test is case
+  insensitive. `..`, absolute paths and anything
+  outside the roots never reach the suffix search: the jail and its `-32602` are unchanged.
+- `doctor` named a rejected file's reason as "binary/long line/deep nesting". Each file now
+  reports the one guard that fired with its measurement: `binary (null byte)`,
+  `long line (longest 4.1 KB)`, `deep nesting (depth 80)`, `oversized, 1.2 MB`. The per-reason
+  counts use the same four labels. Office documents (docx, xlsx, pptx, doc, xls, ppt, odt, ods,
+  odp, epub, pages, numbers) and rar / dmg / iso are now skipped silently like images, PDFs and
+  archives already were, and counted in the "non-source file(s) skipped" summary line instead of
+  being listed as failures.
+- gRPC handler resolution: for a package-qualified service constant (`demo.user.UserService`)
+  the uniqueness of `Service.Method` was checked before the package qualifier was applied, so two
+  packages declaring the same `Service.Method` left a fully-qualified handler unresolved. The
+  package filter now comes first, then uniqueness. An unqualified name declared in two packages
+  stays ambiguous.
+
+### Reviewed, no change
+- A review claim that TypeScript string constants and enum members are only recorded when a
+  contract node of the same name already exists was checked and does not hold: every top-level
+  `const` / `enum` is itself a declaration node, so `export const X = 'Y'`,
+  `export enum M { A = 'A' }` and `export const M = { A: 'A' } as const` are recorded even alone in
+  a file. A test now pins it.
+
 ## [7.1.7] — 2026-10-12
 
 ### Fixed

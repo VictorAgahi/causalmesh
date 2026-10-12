@@ -4061,6 +4061,72 @@ export class C {
         );
     }
 
+    /// 7.1.8 review claim: string constants and enum members are only recorded
+    /// when another contract node already covers them. Disproved: every top-level
+    /// `const` / `enum` is itself a declaration node (7.0.1), so each of these
+    /// forms is recorded even alone in a file.
+    #[test]
+    fn string_constants_are_recorded_in_a_file_with_no_other_contract_nodes() {
+        let records = |code: &str| -> Vec<String> {
+            let (_, rpc_calls) = extract_rpc_with(
+                "consts.ts",
+                code,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            );
+            let mut v: Vec<String> = rpc_calls
+                .iter()
+                .filter_map(|(_, t)| t.strip_prefix(CONST_VALUE_PREFIX).map(str::to_string))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            records("export const USER_SERVICE_NAME = 'UserService';\n"),
+            ["USER_SERVICE_NAME=UserService"]
+        );
+        assert_eq!(records("export enum M { A = 'A' }\n"), ["M.A=A"]);
+        assert_eq!(
+            records("export const M = { A: 'A' } as const;\n"),
+            ["M.A=A"]
+        );
+        // Non-exported forms are declarations too.
+        assert_eq!(
+            records("const K = 'v';\nenum E { X = 'x' }\n"),
+            ["E.X=x", "K=v"]
+        );
+    }
+
+    /// 7.1.8: two packages declaring the same `UserService.AddBadgeToUser` must not
+    /// leave a fully-qualified handler unresolved (the uniqueness count used to be
+    /// taken before the package qualifier was applied).
+    #[test]
+    fn qualified_service_resolves_when_two_packages_declare_the_same_method() {
+        let names = "export const SVC = 'demo.user.UserService';\n";
+        let other = "export const SVC = 'other.pkg.UserService';\n";
+        let bare = "export const SVC = 'UserService';\n";
+        let resolved = |consts: &str| {
+            let graph = grpc_graph(
+                &[("other.pkg", "pb/other.proto")],
+                &[("src/n.ts", consts), ("src/c.ts", QUALIFIED_CONTROLLER)],
+            );
+            graph
+                .analyze_grpc("UserService.AddBadgeToUser")
+                .handler_rpc_names
+                .len()
+        };
+        assert_eq!(
+            resolved(names),
+            1,
+            "demo.user qualifier picks one declaration"
+        );
+        assert_eq!(resolved(other), 1, "other.pkg qualifier picks the other");
+        assert_eq!(
+            resolved(bare),
+            0,
+            "an unqualified name declared in two packages stays ambiguous"
+        );
+    }
+
     #[test]
     fn trace_carries_only_its_own_handler_names() {
         let graph = grpc_graph(

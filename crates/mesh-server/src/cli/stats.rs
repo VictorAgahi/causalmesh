@@ -22,6 +22,65 @@ pub struct ToolStats {
     pub p50_us: Option<u64>,
     /// `None` below [`MIN_P95_SAMPLES`] timed calls.
     pub p95_us: Option<u64>,
+    /// Most frequent sanitized error messages of this tool (at most
+    /// [`TOP_ERRORS_PER_TOOL`]); empty when its errors predate error recording.
+    pub top_errors: Vec<ErrorCount>,
+}
+
+/// Stored text made safe to print: ANSI escape sequences are dropped and any other
+/// control character becomes a space, so a database edited by hand cannot repaint
+/// the terminal (the text report) or smuggle escapes through `--json` consumers.
+fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                // CSI: parameters, then one final byte in 0x40..=0x7e.
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+        } else if c.is_control() {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Number of distinct error messages listed per tool.
+pub const TOP_ERRORS_PER_TOOL: usize = 3;
+
+/// One distinct stored error of a tool and how often it occurred.
+#[derive(serde::Serialize)]
+pub struct ErrorCount {
+    pub class: String,
+    pub code: i32,
+    pub message: String,
+    pub count: usize,
 }
 
 /// Calls audited under one session id (one agent session: see
@@ -207,6 +266,8 @@ impl StatsCommand {
     pub fn summarize(entries: &[AuditEntry], metrics: &AuditMetrics) -> StatsSummary {
         let mut per_tool: HashMap<String, (usize, usize)> = HashMap::new();
         let mut per_target: HashMap<String, usize> = HashMap::new();
+        let mut per_tool_errors: HashMap<&str, HashMap<(String, i32, String), usize>> =
+            HashMap::new();
         let mut per_session: HashMap<&str, SessionStats> = HashMap::new();
 
         for entry in entries {
@@ -231,6 +292,19 @@ impl StatsCommand {
             if entry.status != "SUCCESS" {
                 counter.1 += 1;
             }
+            if entry.status != "SUCCESS" {
+                if let Some(detail) = entry
+                    .error_detail
+                    .as_deref()
+                    .and_then(mesh_core::ErrorDetail::from_stored)
+                {
+                    *per_tool_errors
+                        .entry(entry.tool.as_str())
+                        .or_default()
+                        .entry((detail.class, detail.code, detail.message))
+                        .or_insert(0) += 1;
+                }
+            }
             for file in &entry.files_accessed {
                 *per_target.entry(file.clone()).or_insert(0) += 1;
             }
@@ -251,7 +325,25 @@ impl StatsCommand {
                 } else {
                     None
                 };
+                let mut top_errors: Vec<ErrorCount> = per_tool_errors
+                    .remove(tool.as_str())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|((class, code, message), count)| ErrorCount {
+                        class: terminal_safe(&class),
+                        code,
+                        message: terminal_safe(&message),
+                        count,
+                    })
+                    .collect();
+                top_errors.sort_by(|a, b| {
+                    b.count
+                        .cmp(&a.count)
+                        .then_with(|| a.message.cmp(&b.message))
+                });
+                top_errors.truncate(TOP_ERRORS_PER_TOOL);
                 ToolStats {
+                    top_errors,
                     latency_samples: sample.len(),
                     p50_us: percentile_nearest_rank(&sample, 50),
                     p95_us,
@@ -342,6 +434,28 @@ impl StatsCommand {
                 millis(t.p50_us),
                 millis(t.p95_us)
             );
+        }
+        for t in summary.per_tool.iter().filter(|t| t.errors > 0) {
+            let _ = writeln!(o);
+            let recorded: usize = t.top_errors.iter().map(|e| e.count).sum();
+            let _ = writeln!(
+                o,
+                "Top errors, {} ({} of {} isError with a recorded message):",
+                t.tool, recorded, t.errors
+            );
+            for e in &t.top_errors {
+                let _ = writeln!(
+                    o,
+                    "  {:>4}x [{} {}] {}",
+                    e.count, e.class, e.code, e.message
+                );
+            }
+            if t.top_errors.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "  (none recorded: these errors predate MeshMCP 7.1.8 or were audited without a message)"
+                );
+            }
         }
         if !summary.latency_recorded {
             let _ = writeln!(
@@ -514,6 +628,8 @@ mod tests {
                 secrets_redacted_count: 0,
                 entry_hash: "h0".to_string(),
                 chain_version: 2,
+                error_detail: None,
+                error_detail_sig: None,
             },
             AuditEntry {
                 entry_seq: 1,
@@ -528,6 +644,8 @@ mod tests {
                 secrets_redacted_count: 0,
                 entry_hash: "h1".to_string(),
                 chain_version: 2,
+                error_detail: None,
+                error_detail_sig: None,
             },
             AuditEntry {
                 entry_seq: 2,
@@ -542,6 +660,8 @@ mod tests {
                 secrets_redacted_count: 0,
                 entry_hash: "h2".to_string(),
                 chain_version: 2,
+                error_detail: None,
+                error_detail_sig: None,
             },
         ];
 
@@ -573,6 +693,80 @@ mod tests {
                 .find(|(t, _)| t == "src/main.rs")
                 .map(|(_, c)| *c),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn stored_error_text_cannot_inject_terminal_escapes() {
+        assert_eq!(
+            terminal_safe("a\u{1b}[31mred\u{1b}[0m b\u{7}c\u{1b}]0;title\u{7}d\ne"),
+            "ared b cd e"
+        );
+        let mut entry = AuditEntry {
+            entry_seq: 0,
+            prev_hash: AuditLogger::GENESIS_HASH.to_string(),
+            timestamp: "2026-10-12T00:00:00.000Z".to_string(),
+            session_id: "s".to_string(),
+            trace_id: None,
+            tool: "smart_search".to_string(),
+            args_digest: "d".to_string(),
+            status: "ERROR".to_string(),
+            files_accessed: vec![],
+            secrets_redacted_count: 0,
+            entry_hash: "h".to_string(),
+            chain_version: 2,
+            error_detail: None,
+            error_detail_sig: None,
+        };
+        entry.error_detail = Some(
+            serde_json::json!({"class": "x", "code": 1, "message": "bad \u{1b}[2Jclear"})
+                .to_string(),
+        );
+        let summary = StatsCommand::summarize(&[entry], &AuditMetrics::default());
+        let text = StatsCommand::render(Path::new("db"), "all", &summary);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("bad clear"), "{text}");
+        assert!(!serde_json::to_string(&summary)
+            .expect("json")
+            .contains("\\u001b"));
+    }
+
+    #[test]
+    fn test_top_errors_per_tool_are_counted_and_rendered() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("stats_errors.db");
+        let logger = AuditLogger::new(Some(db_file.clone())).expect("init logger");
+        let err = |msg: &str| mesh_core::ErrorDetail::sanitized("invalid_params", -32602, msg);
+        for msg in ["Path not found: a", "Path not found: a", "Scope escape"] {
+            logger
+                .record_entry_with_error(
+                    "s",
+                    None,
+                    "smart_search",
+                    "{}",
+                    "ERROR",
+                    vec![],
+                    0,
+                    Some(&err(msg)),
+                )
+                .expect("seed error");
+        }
+        // An error audited without a message (older binary) is counted, not listed.
+        logger
+            .record_entry("s", None, "smart_search", "{}", "ERROR", vec![], 0)
+            .expect("seed bare error");
+        let entries = AuditLogger::read_entries(&db_file, None).expect("read");
+        let summary = StatsCommand::summarize(&entries, &AuditMetrics::default());
+        let tool = &summary.per_tool[0];
+        assert_eq!(tool.errors, 4);
+        assert_eq!(tool.top_errors.len(), 2);
+        assert_eq!(tool.top_errors[0].message, "Path not found: a");
+        assert_eq!(tool.top_errors[0].count, 2);
+        let text = StatsCommand::render(&db_file, "all", &summary);
+        assert!(text.contains("Top errors, smart_search (3 of 4"), "{text}");
+        assert!(
+            text.contains("2x [invalid_params -32602] Path not found: a"),
+            "{text}"
         );
     }
 

@@ -386,6 +386,18 @@ compliance control, and a user with access to the file can delete it.
   in the same row — meaning those three fields could be altered without breaking chain
   verification. v2 closes that.
 
+  Error detail (7.1.8). Every row stays chain v2 with the v2 input above, so an older binary
+  still verifies the whole chain (it neither sees nor verifies the detail). An `ERROR` row also
+  stores a short sanitized `error_detail` (`{"class","code","message"}`: message cut to 200
+  characters; serde-echoed user values dropped, secrets masked, home directories collapsed to
+  `~`; never the arguments) in a nullable column, bound to its row by
+  `error_detail_sig = SHA-256(entry_hash || error_detail)`. The current verifier rejects a detail
+  without a valid signature (on any row, v1 / v2 included), a signature without a detail, and an
+  edited detail or signature. The columns are added in place to an older database. Timestamps of
+  new rows are ISO 8601; early rows hold `<epoch-secs>.<millis>Z`, which `stats` and
+  verification accept and normalise without rewriting them. `mesh-mcp stats` lists the three
+  most frequent error messages per tool.
+
 - **What is recorded**: successful calls, and also calls refused before running (invalid
   arguments, RSAH refusals), with status `ERROR`. Arguments are stored and committed to the chain
   through their SHA-256 digest. The whole trail can be turned off with

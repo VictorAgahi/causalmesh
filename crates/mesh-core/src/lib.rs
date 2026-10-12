@@ -26,13 +26,13 @@ pub mod yaml_stream;
 
 // Re-export common types
 pub use audit::{
-    normalize_audit_timestamp, parse_timestamp_to_epoch_secs, AuditEntry, AuditError, AuditLogger,
-    AuditMetrics, IndexCacheTotals,
+    normalize_audit_timestamp, parse_timestamp_to_epoch_secs, sanitize_error_message, AuditEntry,
+    AuditError, AuditLogger, AuditMetrics, ErrorDetail, IndexCacheTotals,
 };
 pub use config::{
     expand_roots, strip_workspace_root_prefix, AsyncApiConfig, Config, ConfigError,
-    ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternKind,
-    ReadGovernanceMode, WorkspaceConfig,
+    ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternConfidence,
+    PatternKind, ReadGovernanceMode, WorkspaceConfig,
 };
 pub use contracts::{
     fold_rpc_name, normalize_topic_key, service_from_client_field_name, ContractGraph,

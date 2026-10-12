@@ -323,6 +323,9 @@ pub struct ContractGraph {
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
     topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
     rpc_calls: Vec<(NodeId, CompactStr)>,
+    /// Producer / consumer nodes registered by a heuristic source (declarative
+    /// patterns by default): their topic edges are `heuristic`, not `exact`.
+    heuristic_topic_nodes: HashSet<NodeId>,
     /// Handlers whose `@GrpcMethod(...)` arguments resolved to exactly one RPC
     /// of a declared proto service (`Service.Method`). Derived by
     /// `reconcile_edges`, never stored incrementally.
@@ -474,6 +477,20 @@ impl ContractGraph {
             .push(consumer_node_id);
     }
 
+    /// Marks a producer / consumer node whose topic link is heuristic.
+    pub fn mark_heuristic_topic_node(&mut self, node_id: NodeId) {
+        self.heuristic_topic_nodes.insert(node_id);
+    }
+
+    /// Edge confidence of a registered producer / consumer node.
+    fn topic_confidence(&self, node_id: NodeId) -> EdgeConfidence {
+        if self.heuristic_topic_nodes.contains(&node_id) {
+            EdgeConfidence::Heuristic
+        } else {
+            EdgeConfidence::Exact
+        }
+    }
+
     pub fn add_rpc_call(&mut self, caller_node_id: NodeId, target_rpc: &str) {
         self.rpc_calls
             .push((caller_node_id, CompactStr::new(target_rpc)));
@@ -510,6 +527,8 @@ impl ContractGraph {
             });
         }
         self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
+        self.heuristic_topic_nodes
+            .retain(|id| !stale_set.contains(id));
         self.edges
             .retain(|e| !stale_set.contains(&e.from) && !stale_set.contains(&e.to));
     }
@@ -1033,8 +1052,8 @@ impl ContractGraph {
                         kind: EdgeKind::Produces,
                         metadata: Some(topic_key.clone()),
                         // Structural: derived directly from producer registration,
-                        // not a name-matching heuristic.
-                        confidence: EdgeConfidence::Exact,
+                        // unless the registering source is itself heuristic.
+                        confidence: self.topic_confidence(prod_id),
                     });
                 }
             }
@@ -1046,8 +1065,9 @@ impl ContractGraph {
                         to: cons_id,
                         kind: EdgeKind::Consumes,
                         metadata: Some(topic_key.clone()),
-                        // Structural: derived directly from consumer registration.
-                        confidence: EdgeConfidence::Exact,
+                        // Structural: derived directly from consumer registration,
+                        // unless the registering source is itself heuristic.
+                        confidence: self.topic_confidence(cons_id),
                     });
                 }
             }
@@ -1884,10 +1904,6 @@ impl ContractGraph {
         if refs.is_empty() {
             return out;
         }
-        let mut declared: HashMap<&str, usize> = HashMap::new();
-        for (_, name) in proto_methods {
-            *declared.entry(name.as_str()).or_default() += 1;
-        }
         for (id, recorded) in refs {
             let (Some(node), Some((service_expr, method_expr))) =
                 (self.nodes.get(&id), recorded.split_once('|'))
@@ -1907,17 +1923,21 @@ impl ContractGraph {
                 None => (None, service),
             };
             let name = format!("{service}.{method}");
-            if declared.get(name.as_str()) != Some(&1) {
-                continue;
-            }
-            if let Some(q) = qualifier {
-                let in_package = proto_methods.iter().any(|(pid, n)| {
+            // The package qualifier narrows the candidates first; only then must
+            // the name be unique. Counting before filtering left a fully-qualified
+            // handler unresolved whenever two packages declare the same
+            // `Service.Method`.
+            let declared_here = proto_methods
+                .iter()
+                .filter(|(pid, n)| {
                     n.as_str() == name
-                        && self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
-                });
-                if !in_package {
-                    continue;
-                }
+                        && qualifier.is_none_or(|q| {
+                            self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
+                        })
+                })
+                .count();
+            if declared_here != 1 {
+                continue;
             }
             out.insert(id, CompactStr::new(name));
         }
@@ -2704,7 +2724,8 @@ impl ContractGraph {
         )
     }
 
-    /// Exact when `node` is registered on exactly the target topic, or its
+    /// Exact (or heuristic, for a node registered by a heuristic source) when
+    /// `node` is registered on exactly the target topic, or its
     /// name (minus a `produce:`/`consume:` prefix) is the target; otherwise the
     /// row came from a substring match or a transitive hop: heuristic.
     fn async_match_confidence(&self, node: &ContractNode, target_lc: &str) -> EdgeConfidence {
@@ -2722,7 +2743,9 @@ impl ContractGraph {
             || registered(&self.topic_consumers)
             || bare.eq_ignore_ascii_case(target_lc)
         {
-            EdgeConfidence::Exact
+            // A registration made by a heuristic source (declarative patterns by
+            // default) stays heuristic in the matrix as it does on the edge.
+            self.topic_confidence(node.id)
         } else {
             EdgeConfidence::Heuristic
         }

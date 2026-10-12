@@ -118,6 +118,8 @@ Checklist, in this order:
   regex = 'createEvent<\w+\.(\w+)>'
   target_group = 1                 # capture group holding the topic
   # consumer_group = 1             # topic_consumer only: capture group naming the consumer
+  # confidence = "exact"           # exact | heuristic (default heuristic): "exact" only if the
+  #                                # regex captures a literal topic, not a mapping-table lookup
   ```
 - **Governance** (optional): `[engines.policy.stop_rules]` maps a path fragment to a message
   returned instead of letting an agent modify it, e.g. a contract registry that generates code

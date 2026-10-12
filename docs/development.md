@@ -191,8 +191,12 @@ What it actually checks:
   must not follow it (the probe reports `info` where symlinks cannot be created).
 - **Host event subsystem**: an FSEvents / ReadDirectoryChangesW watcher can be created.
 - **Index health**: a full scan of the workspace, then the count of files rejected per reason and
-  the first 10 paths. Non-source files (images, fonts, archives, lockfiles, minified bundles:
-  `mesh_core::health::is_non_source`) are only counted as skipped, never listed.
+  the first 10 paths. Each path carries the one guard that fired and its measurement
+  (`binary (null byte)`, `long line (longest 4.1 KB)`, `deep nesting (depth 80)`, `oversized, 1.2 MB`;
+  `AstGuard::check_path`). Non-source files (images, fonts, archives, office documents, PDFs,
+  lockfiles, minified bundles: `mesh_core::health::is_non_source`) are only counted as skipped,
+  never listed. `[[engines.contracts.patterns]]` are validated too: an invalid regex, or
+  `confidence` on a `saga` / `rpc` pattern (no effect there).
 - **Memory**: peak RSS before the index-health scan, `warn` above 50 MiB.
 - **Repairable checks** (also in `--json`, acted on by `--fix`): socket and socket-directory
   permissions, orphaned socket, daemon version drift, daemon seccomp confinement (Linux),

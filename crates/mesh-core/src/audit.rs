@@ -38,6 +38,389 @@ pub struct AuditEntry {
     /// Hash-chain formula version this row was written (and must be verified) under.
     /// See `AuditLogger::CHAIN_VERSION`.
     pub chain_version: i64,
+    /// Sanitized error of an `ERROR` row, as a JSON object
+    /// `{"class","code","message"}`; `None` for successful calls and for rows
+    /// written before this column existed. Never raw arguments: see [`ErrorDetail`].
+    #[serde(default)]
+    pub error_detail: Option<String>,
+    /// `SHA-256(entry_hash || error_detail)` binding the detail to its row; present
+    /// exactly when `error_detail` is. See `AuditLogger::error_detail_sig`.
+    #[serde(default)]
+    pub error_detail_sig: Option<String>,
+}
+
+/// Longest stored error message, in characters.
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// Short, sanitized account of why a tool call failed, stored with its audit row
+/// so field errors can be diagnosed without keeping the call's arguments.
+///
+/// The message has secrets masked (`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`),
+/// absolute home directories collapsed to `~`, control characters flattened and
+/// is cut to [`MAX_ERROR_MESSAGE_CHARS`] characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    pub class: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl ErrorDetail {
+    pub fn sanitized(class: &str, code: i32, raw_message: &str) -> Self {
+        let home = crate::root_guard::home_dir().map(|h| h.to_string_lossy().into_owned());
+        Self::sanitized_with_home(class, code, raw_message, home.as_deref())
+    }
+
+    /// [`Self::sanitized`] with the home directory injected (tests).
+    pub fn sanitized_with_home(
+        class: &str,
+        code: i32,
+        raw_message: &str,
+        home: Option<&str>,
+    ) -> Self {
+        Self {
+            class: class.chars().take(40).collect(),
+            code,
+            message: sanitize_error_message(raw_message, home),
+        }
+    }
+
+    /// The canonical stored form (the exact text bound by `error_detail_sig`).
+    pub fn to_stored(&self) -> String {
+        serde_json::json!({"class": self.class, "code": self.code, "message": self.message})
+            .to_string()
+    }
+
+    /// Parses a stored `error_detail` value.
+    pub fn from_stored(stored: &str) -> Option<Self> {
+        serde_json::from_str(stored).ok()
+    }
+}
+
+const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "passphrase",
+    "private",
+    "jwt",
+    "cert",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "signing_key",
+    "authorization",
+];
+const SECRET_PREFIXES: &[&str] = &["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA"];
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Characters of a base64 / base64url / JWT-like run (`.` separates JWT segments).
+fn is_blob_char(c: char) -> bool {
+    is_token_char(c) || matches!(c, '.' | '+' | '=')
+}
+
+/// A long run that looks like key material: 32+ letters and digits, or (with
+/// `-` / `_` / `+` / `=`, as base64url and base64 use) 32+ characters mixing digits
+/// with upper and lower case. All-lowercase hyphenated names (UUID directories,
+/// slugs) are not.
+fn looks_like_secret_blob(run: &str) -> bool {
+    if run.len() < 32 {
+        return false;
+    }
+    let digit = run.chars().any(|c| c.is_ascii_digit());
+    let upper = run.chars().any(|c| c.is_ascii_uppercase());
+    let lower = run.chars().any(|c| c.is_ascii_lowercase());
+    if run.chars().all(|c| c.is_ascii_alphanumeric()) {
+        digit && (upper || lower)
+    } else {
+        digit && upper && lower
+    }
+}
+
+/// Byte ranges of secret values in `s` (key/value pairs, bearer tokens, well
+/// known token prefixes, long mixed alphanumeric blobs), merged and ordered.
+fn secret_ranges(s: &str) -> Vec<(usize, usize)> {
+    let lower = s.to_ascii_lowercase();
+    let bytes = s.as_bytes();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    let value_end = |start: usize| -> usize {
+        let mut end = start;
+        for (off, c) in s[start..].char_indices() {
+            if c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '&' | '}' | ')' | '>') {
+                return start + off;
+            }
+            end = start + off + c.len_utf8();
+        }
+        end
+    };
+
+    // `key = value`, `key: value`, `"key": "value"`.
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let key_start = from + pos;
+            let mut i = key_start + key.len();
+            from = i;
+            while i < bytes.len() && is_token_char(bytes[i] as char) {
+                i += 1;
+            }
+            while i < bytes.len() && matches!(bytes[i], b'"' | b'\'' | b' ') {
+                i += 1;
+            }
+            if i < bytes.len() && matches!(bytes[i], b'=' | b':') {
+                i += 1;
+                while i < bytes.len() && matches!(bytes[i], b' ' | b'"' | b'\'') {
+                    i += 1;
+                }
+                let end = value_end(i);
+                if end > i {
+                    ranges.push((i, end));
+                }
+            }
+        }
+    }
+
+    // `Bearer <token>`: only a token-looking word follows (prose such as "bearer of"
+    // is kept); `Basic <token>`: a base64-looking credential, not an ordinary word.
+    for (scheme, min_len) in [("bearer ", 16usize), ("basic ", 8)] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(scheme) {
+            let start = from + pos + scheme.len();
+            from = start;
+            let end = value_end(start);
+            let word = &s[start..end];
+            let credential_shaped = word.len() >= min_len
+                && word.chars().all(|c| is_blob_char(c) || c == '/')
+                && (word.chars().any(|c| c.is_ascii_digit())
+                    || (word.chars().any(|c| c.is_ascii_uppercase())
+                        && word.chars().any(|c| c.is_ascii_lowercase())));
+            if credential_shaped {
+                ranges.push((start, end));
+            }
+        }
+    }
+
+    // `scheme://user:password@host`: the whole userinfo goes.
+    let mut from = 0;
+    while let Some(pos) = s[from..].find("://") {
+        let start = from + pos + 3;
+        from = start;
+        let authority_end = s[start..]
+            .find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'' | ')') || c.is_whitespace())
+            .map_or(s.len(), |o| start + o);
+        if let Some(at) = s[start..authority_end].rfind('@') {
+            if at > 0 {
+                ranges.push((start, start + at));
+            }
+        }
+    }
+
+    // `user:password@host` whose `://` was lost (a path normalised to `https:/u:p@h`).
+    for (at, _) in s.match_indices('@') {
+        let token_start = s[..at]
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '(' | '<'))
+            .map_or(0, |i| i + 1);
+        if s[token_start..at].contains(':') {
+            ranges.push((token_start, at));
+        }
+    }
+
+    // Well known token prefixes, JWTs and long mixed blobs, blob by blob.
+    let mut idx = 0;
+    while idx < s.len() {
+        let rest = &s[idx..];
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        if !is_blob_char(first) {
+            idx += first.len_utf8();
+            continue;
+        }
+        let len = rest
+            .char_indices()
+            .find(|(_, c)| !is_blob_char(*c))
+            .map_or(rest.len(), |(o, _)| o);
+        let blob = &rest[..len];
+        let segments: Vec<&str> = blob.split('.').collect();
+        let b64url = |t: &str| {
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        let jwt = segments.len() == 3
+            && blob.len() >= 20
+            && segments.iter().all(|t| !t.is_empty() && b64url(t))
+            && (segments[0].starts_with("eyJ") || segments.iter().all(|t| t.len() >= 10));
+        if jwt || (blob.len() >= 16 && SECRET_PREFIXES.iter().any(|p| blob.starts_with(p))) {
+            ranges.push((idx, idx + len));
+        } else {
+            let mut off = 0;
+            for part in &segments {
+                if looks_like_secret_blob(part) {
+                    ranges.push((idx + off, idx + off + part.len()));
+                }
+                off += part.len() + 1;
+            }
+        }
+        idx += len;
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+/// Collapses absolute home directories (`/Users/x`, `/home/x`, `C:\Users\x`, and
+/// the current user's own home) to `~`.
+fn collapse_home(s: &str, home: Option<&str>) -> String {
+    let mut out = match home {
+        Some(h) if h.len() > 1 => s.replace(h, "~"),
+        _ => s.to_string(),
+    };
+    for marker in ["/Users/", "/home/", "\\Users\\"] {
+        let windows = marker.starts_with('\\');
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(pos) = rest.find(marker) {
+            let before = &rest[..pos];
+            let at_token_start = before.chars().next_back().is_none_or(|c| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '(' | '=' | ':' | '`')
+            });
+            // A Windows drive prefix (`C:`) belongs to the collapsed part.
+            let drive = windows
+                && before.len() >= 2
+                && before.as_bytes()[before.len() - 1] == b':'
+                && before.as_bytes()[before.len() - 2].is_ascii_alphabetic();
+            if !(at_token_start || drive) {
+                result.push_str(&rest[..pos + marker.len()]);
+                rest = &rest[pos + marker.len()..];
+                continue;
+            }
+            result.push_str(if drive {
+                &before[..before.len() - 2]
+            } else {
+                before
+            });
+            let after = &rest[pos + marker.len()..];
+            let seg_end = after
+                .find(|c: char| matches!(c, '/' | '\\' | '"' | '\'') || c.is_whitespace())
+                .unwrap_or(after.len());
+            result.push('~');
+            rest = &after[seg_end..];
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
+/// Removes the user-supplied value serde and friends echo into their messages:
+/// `invalid type: string "x", expected u32`, `invalid value: integer `5`, ...`,
+/// `unknown variant `x`, expected one of ...`, `unknown field `x`, ...`. The quoted
+/// value is dropped wholesale (a value containing `, expected` cannot leak its
+/// remainder); the schema-side text (the type, the expected variants) is kept. An
+/// unterminated quote drops the rest of the message.
+fn strip_serde_values(raw: &str) -> String {
+    const MARKERS: [&str; 4] = [
+        "invalid type: ",
+        "invalid value: ",
+        "unknown variant ",
+        "unknown field ",
+    ];
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some((pos, marker)) = MARKERS
+        .iter()
+        .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+        .min_by_key(|(i, _)| *i)
+    {
+        let after = pos + marker.len();
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        // The value opens at the first quote, unless serde's own ", expected" comes
+        // first (`invalid type: null, expected a string` echoes no value).
+        let first_quote = tail.find(['"', '`']);
+        let expected_at = tail.find(", expected");
+        let quote = match (first_quote, expected_at) {
+            (Some(q), Some(e)) if e < q => None,
+            (q, _) => q,
+        };
+        let Some(q) = quote else {
+            rest = tail;
+            if expected_at.is_none() && first_quote.is_none() {
+                break;
+            }
+            // Keep scanning past this marker.
+            let keep = expected_at.unwrap_or(tail.len());
+            out.push_str(&tail[..keep]);
+            rest = &tail[keep..];
+            continue;
+        };
+        out.push_str(&tail[..q]);
+        out.push_str("<value>");
+        let open = tail.as_bytes()[q];
+        let body = &tail[q + 1..];
+        let mut close = None;
+        let mut escaped = false;
+        for (off, c) in body.char_indices() {
+            if open == b'"' && escaped {
+                escaped = false;
+            } else if open == b'"' && c == '\\' {
+                escaped = true;
+            } else if c as u32 == u32::from(open) {
+                close = Some(off);
+                break;
+            }
+        }
+        match close {
+            Some(c) => rest = &body[c + 1..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Sanitizes a free-form error message for storage: redact, collapse home
+/// directories, flatten whitespace, truncate to [`MAX_ERROR_MESSAGE_CHARS`].
+pub fn sanitize_error_message(raw: &str, home: Option<&str>) -> String {
+    let text = strip_serde_values(raw);
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (a, b) in secret_ranges(&text) {
+        redacted.push_str(&text[cursor..a]);
+        redacted.push_str(REDACTED);
+        cursor = b;
+    }
+    redacted.push_str(&text[cursor..]);
+
+    let collapsed = collapse_home(&redacted, home);
+    let flat: String = collapsed
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > MAX_ERROR_MESSAGE_CHARS {
+        let mut cut: String = flat.chars().take(MAX_ERROR_MESSAGE_CHARS - 3).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        flat
+    }
 }
 
 /// Summed persistent index cache lookups over the recorded indexing passes.
@@ -79,7 +462,19 @@ impl AuditLogger {
     /// Rows carry their own `chain_version` so pre-existing databases keep verifying under
     /// the formula they were written with (`verify_db` dispatches per row) instead of having
     /// every historical entry rejected as tampered the moment this binary is upgraded.
+    ///
+    /// Every row, with or without an error detail, is written as v2 with the v2 hash
+    /// input byte for byte, so an older binary (a stale `meshd`, a rollback) still
+    /// verifies the whole chain. The sanitized `error_detail` is bound separately by
+    /// `error_detail_sig` (see [`Self::error_detail_sig`]): an older binary neither
+    /// sees nor verifies the detail, a current one rejects a forged or unsigned one.
     pub const CHAIN_VERSION: i64 = 2;
+
+    /// `SHA-256(entry_hash || error_detail)`: binds a row's stored error text to the
+    /// row it belongs to (and, through `entry_hash`, to the whole chain before it).
+    pub fn error_detail_sig(entry_hash: &str, error_detail: &str) -> String {
+        Self::compute_sha256(format!("{entry_hash}{error_detail}").as_bytes())
+    }
 
     /// Environment variable overriding [`Self::default_db_path`]: benchmarks, test
     /// harnesses and pilot runs point it at their own file so they never mix their
@@ -145,7 +540,9 @@ impl AuditLogger {
                  files_accessed TEXT NOT NULL,
                  secrets_redacted_count INTEGER NOT NULL,
                  entry_hash TEXT NOT NULL,
-                 chain_version INTEGER NOT NULL DEFAULT 1
+                 chain_version INTEGER NOT NULL DEFAULT 1,
+                 error_detail TEXT,
+                 error_detail_sig TEXT
              );
              -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
              -- table's B-tree key. The secondary index earlier versions created on it
@@ -201,6 +598,27 @@ impl AuditLogger {
             }
         }
 
+        // Same migration for `error_detail` and `error_detail_sig` (7.1.8): rows written
+        // before them keep NULL in both and keep verifying under their chain version.
+        for column in ["error_detail", "error_detail_sig"] {
+            if Self::has_column(&conn, column)? {
+                continue;
+            }
+            if let Err(err) = conn.execute(
+                &format!("ALTER TABLE audit_entries ADD COLUMN {column} TEXT"),
+                [],
+            ) {
+                let is_duplicate_column = matches!(
+                    &err,
+                    rusqlite::Error::SqliteFailure(_, Some(msg))
+                        if msg.contains("duplicate column name")
+                );
+                if !is_duplicate_column {
+                    return Err(err.into());
+                }
+            }
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -211,6 +629,34 @@ impl AuditLogger {
             conn: Mutex::new(conn),
             db_path,
         })
+    }
+
+    fn has_column(conn: &Connection, column: &str) -> Result<bool, AuditError> {
+        Ok(conn
+            .prepare("PRAGMA table_info(audit_entries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|name| name.ok())
+            .any(|name| name == column))
+    }
+
+    /// The `SELECT` for every audit row. A database written before `error_detail`
+    /// existed (opened read-only, so not migrated) yields `NULL` for it.
+    fn select_entries_sql(conn: &Connection) -> Result<String, AuditError> {
+        let error_columns = if Self::has_column(conn, "error_detail")?
+            && Self::has_column(conn, "error_detail_sig")?
+        {
+            "error_detail, error_detail_sig"
+        } else if Self::has_column(conn, "error_detail")? {
+            "error_detail, NULL"
+        } else {
+            "NULL, NULL"
+        };
+        Ok(format!(
+            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version, {error_columns}
+             FROM audit_entries ORDER BY entry_seq ASC"
+        ))
     }
 
     #[inline]
@@ -235,6 +681,32 @@ impl AuditLogger {
         status: &str,
         files_accessed: Vec<String>,
         secrets_redacted_count: usize,
+    ) -> Result<AuditEntry, AuditError> {
+        self.record_entry_with_error(
+            session_id,
+            trace_id,
+            tool,
+            args_json,
+            status,
+            files_accessed,
+            secrets_redacted_count,
+            None,
+        )
+    }
+
+    /// [`Self::record_entry`] with the sanitized error of a failed call. The row keeps
+    /// the v2 hash input; the detail is stored with its own `error_detail_sig`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_entry_with_error(
+        &self,
+        session_id: &str,
+        trace_id: Option<&str>,
+        tool: &str,
+        args_json: &str,
+        status: &str,
+        files_accessed: Vec<String>,
+        secrets_redacted_count: usize,
+        error: Option<&ErrorDetail>,
     ) -> Result<AuditEntry, AuditError> {
         let mut conn = self
             .conn
@@ -270,17 +742,22 @@ impl AuditLogger {
         // v1 covered only the first five fields, which let `status`, `files_accessed`
         // and `secrets_redacted_count` be tampered with in the row without breaking the
         // chain. All new writes use v2; see `CHAIN_VERSION`.
+        let error_detail = error.map(ErrorDetail::to_stored);
+        let chain_version = Self::CHAIN_VERSION;
         let hash_input = format!(
             "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
         );
         let entry_hash = Self::compute_sha256(hash_input.as_bytes());
+        let error_detail_sig = error_detail
+            .as_deref()
+            .map(|d| Self::error_detail_sig(&entry_hash, d));
 
         tx.prepare_cached(
             "INSERT INTO audit_entries (
                 entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
                 args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                chain_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                chain_version, error_detail, error_detail_sig
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?
         .execute(params![
             seq,
@@ -294,7 +771,9 @@ impl AuditLogger {
             files_json,
             secrets_redacted_count as i64,
             entry_hash,
-            Self::CHAIN_VERSION,
+            chain_version,
+            error_detail,
+            error_detail_sig,
         ])?;
 
         tx.commit()?;
@@ -311,7 +790,9 @@ impl AuditLogger {
             files_accessed,
             secrets_redacted_count,
             entry_hash,
-            chain_version: Self::CHAIN_VERSION,
+            chain_version,
+            error_detail,
+            error_detail_sig,
         })
     }
 
@@ -322,12 +803,7 @@ impl AuditLogger {
         }
 
         let conn = Connection::open(path)?;
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let mut expected_prev_hash = Self::GENESIS_HASH.to_string();
 
@@ -353,6 +829,8 @@ impl AuditLogger {
                     secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                     entry_hash: row.get(10)?,
                     chain_version,
+                    error_detail: row.get(12)?,
+                    error_detail_sig: row.get(13)?,
                 },
                 files_str,
             ))
@@ -389,6 +867,8 @@ impl AuditLogger {
                     entry.tool,
                     entry.args_digest
                 ),
+                // v2 and any later version: the v2 input (the error detail is not part
+                // of it, see `error_detail_sig`).
                 _ => format!(
                     "{}{}{}{}{}{}{}{}",
                     entry.prev_hash,
@@ -408,6 +888,38 @@ impl AuditLogger {
                     calculated_hash,
                     entry.entry_hash,
                 ));
+            }
+
+            // The error detail is outside the hash input (so older binaries keep
+            // verifying) and bound by its own signature instead. A detail with no
+            // valid signature, or a signature with no detail, is tampering: this
+            // applies to every row, including v1 / v2 rows that predate the column.
+            match (&entry.error_detail, &entry.error_detail_sig) {
+                (None, None) => {}
+                (Some(detail), Some(sig)) => {
+                    let expected = Self::error_detail_sig(&entry.entry_hash, detail);
+                    if &expected != sig {
+                        return Err(AuditError::BrokenChain(
+                            entry.entry_seq,
+                            format!("error_detail_sig {expected}"),
+                            format!("error_detail_sig {sig}"),
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(AuditError::BrokenChain(
+                        entry.entry_seq,
+                        "signed error_detail".to_string(),
+                        "unsigned error_detail".to_string(),
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(AuditError::BrokenChain(
+                        entry.entry_seq,
+                        "no error_detail_sig".to_string(),
+                        "error_detail_sig without error_detail".to_string(),
+                    ))
+                }
             }
 
             expected_prev_hash = entry.entry_hash;
@@ -438,12 +950,7 @@ impl AuditLogger {
         }
 
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let rows = stmt.query_map([], |row| {
             let files_str: String = row.get(8)?;
@@ -461,6 +968,8 @@ impl AuditLogger {
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
+                error_detail: row.get(12)?,
+                error_detail_sig: row.get(13)?,
             })
         })?;
 
@@ -664,12 +1173,7 @@ impl AuditLogger {
             .lock()
             .map_err(|_| std::io::Error::other("AuditLogger db mutex poisoned"))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let mut file = File::create(dest)?;
         let mut count = 0;
@@ -690,6 +1194,8 @@ impl AuditLogger {
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
+                error_detail: row.get(12)?,
+                error_detail_sig: row.get(13)?,
             })
         })?;
 
@@ -990,6 +1496,338 @@ mod tests {
         assert!(
             AuditLogger::verify_db(&db_file).expect("verify legacy chain"),
             "legacy v1 row must still verify under its original formula"
+        );
+    }
+
+    /// What a 7.1.7 binary does: v1 / v2 formulas over the original twelve columns,
+    /// knowing nothing of `error_detail` / `error_detail_sig`.
+    fn old_binary_verifies(path: &Path) -> bool {
+        let conn = Connection::open(path).expect("open");
+        let mut stmt = conn
+            .prepare(
+                "SELECT entry_seq, prev_hash, timestamp, session_id, tool, args_digest, status,
+                        files_accessed, secrets_redacted_count, entry_hash, chain_version
+                 FROM audit_entries ORDER BY entry_seq ASC",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, i64>(10)?,
+                ))
+            })
+            .expect("rows");
+        let mut prev = AuditLogger::GENESIS_HASH.to_string();
+        for row in rows {
+            let (p, ts, sess, tool, dig, status, files, red, hash, ver) = row.expect("row");
+            if p != prev {
+                return false;
+            }
+            let input = if ver == 1 {
+                format!("{p}{ts}{sess}{tool}{dig}")
+            } else {
+                format!("{p}{ts}{sess}{tool}{dig}{status}{files}{red}")
+            };
+            if AuditLogger::compute_sha256(input.as_bytes()) != hash {
+                return false;
+            }
+            prev = hash;
+        }
+        true
+    }
+
+    /// A legacy v1 database (epoch-style timestamp, no `error_detail` columns) opened by
+    /// this binary is migrated in place; new rows chain onto it as v2, the whole mixed
+    /// chain verifies (also under the 7.1.7 formulas), and a forged, unsigned or
+    /// re-signed-wrong detail breaks the current verifier.
+    #[test]
+    fn test_mixed_legacy_and_new_chain_verifies_and_detects_error_tampering() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("mixed.db");
+
+        let conn = Connection::open(&db_file).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                 entry_seq INTEGER PRIMARY KEY,
+                 prev_hash TEXT NOT NULL,
+                 timestamp TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 trace_id TEXT,
+                 tool TEXT NOT NULL,
+                 args_digest TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 files_accessed TEXT NOT NULL,
+                 secrets_redacted_count INTEGER NOT NULL,
+                 entry_hash TEXT NOT NULL,
+                 chain_version INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .expect("legacy schema");
+        let digest = AuditLogger::compute_sha256(b"{}");
+        let legacy_hash = AuditLogger::compute_sha256(
+            format!(
+                "{}{}{}{}{}",
+                AuditLogger::GENESIS_HASH,
+                "1789974857.459Z",
+                "old",
+                "smart_search",
+                digest
+            )
+            .as_bytes(),
+        );
+        conn.execute(
+            "INSERT INTO audit_entries VALUES (0, ?1, '1789974857.459Z', 'old', NULL,
+                'smart_search', ?2, 'ERROR', '[]', 0, ?3, 1)",
+            params![AuditLogger::GENESIS_HASH, digest, legacy_hash],
+        )
+        .expect("legacy row");
+        drop(conn);
+
+        // Read-only access to the not yet migrated database works.
+        let before = AuditLogger::read_entries(&db_file, None).expect("read legacy");
+        assert_eq!(before.len(), 1);
+        assert!(before[0].error_detail.is_none());
+
+        let logger = AuditLogger::new(Some(db_file.clone())).expect("migrating open");
+        let ok = logger
+            .record_entry("s", None, "smart_search", "{}", "SUCCESS", vec![], 0)
+            .expect("v2 row");
+        assert_eq!(ok.chain_version, AuditLogger::CHAIN_VERSION);
+        assert!(ok.error_detail.is_none());
+        let detail = ErrorDetail::sanitized("invalid_params", -32602, "Path not found: src/x");
+        let err = logger
+            .record_entry_with_error(
+                "s",
+                None,
+                "smart_search",
+                "{\"query\":\"secret-arg\"}",
+                "ERROR",
+                vec![],
+                0,
+                Some(&detail),
+            )
+            .expect("error row");
+        assert_eq!(err.chain_version, AuditLogger::CHAIN_VERSION);
+        assert!(err.error_detail_sig.is_some());
+        assert!(
+            ISO_TS.is_match_prefix(&err.timestamp),
+            "new rows are ISO 8601: {}",
+            err.timestamp
+        );
+        drop(logger);
+
+        assert!(AuditLogger::verify_db(&db_file).expect("mixed chain verifies"));
+        let rows = AuditLogger::read_entries(&db_file, None).expect("read");
+        assert_eq!(rows.len(), 3);
+        let stored = rows[2].error_detail.as_deref().expect("stored detail");
+        assert_eq!(ErrorDetail::from_stored(stored), Some(detail));
+        assert!(
+            !stored.contains("secret-arg"),
+            "raw arguments are never stored"
+        );
+        // The legacy epoch-style stamp is tolerated and normalised on read, not rewritten.
+        assert_eq!(rows[0].timestamp, "1789974857.459Z");
+        assert_eq!(
+            normalize_audit_timestamp(&rows[0].timestamp),
+            "2026-09-21T07:14:17.459Z"
+        );
+
+        // An older verifier passes over the same database: the detail is invisible to it.
+        assert!(old_binary_verifies(&db_file), "7.1.7 formulas still verify");
+
+        let forged = r#"{"class":"x","code":0,"message":"edited"}"#;
+        let run = |sql: &str, args: &[&dyn rusqlite::ToSql]| {
+            let conn = Connection::open(&db_file).expect("open");
+            conn.execute(sql, args).expect("tamper");
+        };
+        // (a) edited detail on a signed row.
+        run(
+            "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = 2",
+            &[&forged],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "edited detail");
+        assert!(old_binary_verifies(&db_file), "old verifier cannot see it");
+        // (b) edited signature (restore the detail first).
+        run(
+            "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = 2",
+            &[&stored],
+        );
+        assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 2",
+            &[&"0".repeat(64)],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "edited sig");
+        // (c) forged detail on a legacy v1 row and on a v2 row, signed or not.
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 2",
+            &[&rows[2].error_detail_sig],
+        );
+        assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        for seq in [0i64, 1] {
+            run(
+                "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = ?2",
+                &[&forged, &seq],
+            );
+            assert!(
+                AuditLogger::verify_db(&db_file).is_err(),
+                "unsigned on {seq}"
+            );
+            run(
+                "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = ?2",
+                &[&"1".repeat(64), &seq],
+            );
+            assert!(
+                AuditLogger::verify_db(&db_file).is_err(),
+                "bad sig on {seq}"
+            );
+            run(
+                "UPDATE audit_entries SET error_detail = NULL, error_detail_sig = NULL
+                 WHERE entry_seq = ?1",
+                &[&seq],
+            );
+            assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        }
+        // (d) a signature with no detail.
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 1",
+            &[&"2".repeat(64)],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "orphan sig");
+    }
+
+    struct IsoShape;
+    const ISO_TS: IsoShape = IsoShape;
+    impl IsoShape {
+        /// `YYYY-MM-DDTHH:MM:SS.mmmZ`
+        fn is_match_prefix(&self, ts: &str) -> bool {
+            let b = ts.as_bytes();
+            b.len() == 24
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b[10] == b'T'
+                && b[13] == b':'
+                && b[16] == b':'
+                && b[19] == b'.'
+                && b[23] == b'Z'
+        }
+    }
+
+    #[test]
+    fn sanitizer_covers_urls_jwts_serde_values_and_prose() {
+        let s = |m: &str| sanitize_error_message(m, None);
+        let hidden = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
+
+        // URL userinfo, in a connection string and in a git error.
+        let m = s("connect postgres://app:hunter2pw@db.internal:5432/orders failed");
+        assert_eq!(
+            m,
+            format!("connect postgres://{hidden}@db.internal:5432/orders failed")
+        );
+        let m = s("fatal: unable to access 'https://bob:ghp_abcdef@github.com/o/r.git/'");
+        assert!(!m.contains("bob") && !m.contains("ghp_abcdef"), "{m}");
+        assert!(m.contains("@github.com/o/r.git"), "{m}");
+
+        let m = s("Path not found: /w/https:/u:pw12345@host.example/x");
+        assert!(
+            !m.contains("pw12345") && m.contains("@host.example/x"),
+            "{m}"
+        );
+        assert_eq!(
+            s("contact dev@example.com now"),
+            "contact dev@example.com now"
+        );
+
+        // A JWT, whole.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJlLXBhcnQ";
+        let m = s(&format!("rejected {jwt} today"));
+        assert_eq!(m, format!("rejected {hidden} today"));
+        // Base64url key material with `-` and `_`.
+        let m = s("key Ab3dEf-Gh1jKl_Mn2pQr-St4uVw_Xy5zAb6cDe7 end");
+        assert!(!m.contains("Ab3dEf"), "{m}");
+
+        // serde-style errors keep the schema, never the user's value.
+        let m = s("unknown variant `rm -rf /secret`, expected one of `a`, `b`");
+        assert_eq!(m, "unknown variant <value>, expected one of `a`, `b`");
+        let m = s("unknown field `my_password_field`, expected `query`");
+        assert!(!m.contains("my_password_field"), "{m}");
+        let m = s("invalid value: string \"top, expected leak\", expected a number");
+        assert_eq!(m, "invalid value: string <value>, expected a number");
+        let m = s("invalid type: null, expected a string");
+        assert_eq!(m, "invalid type: null, expected a string");
+        let m = s("invalid type: string \"unterminated");
+        assert_eq!(m, "invalid type: string <value>");
+
+        // Ordinary prose after `basic` / `bearer` is kept.
+        assert_eq!(s("basic usage is documented"), "basic usage is documented");
+        assert_eq!(s("the bearer of bad news"), "the bearer of bad news");
+        let m = s("Authorization: Basic dXNlcjpwYXNzd29yZDE=");
+        assert!(!m.contains("dXNlcjpw"), "{m}");
+    }
+
+    #[test]
+    fn error_messages_are_redacted_collapsed_and_truncated() {
+        let home = Some("/Users/alice");
+        let m = sanitize_error_message(
+            "Path not found: /Users/alice/work/repo/src/a.rs (token=abc123def, password: \"hunter2\")",
+            home,
+        );
+        assert!(m.contains("~/work/repo/src/a.rs"), "{m}");
+        assert!(
+            !m.contains("alice") && !m.contains("abc123def") && !m.contains("hunter2"),
+            "{m}"
+        );
+        assert!(
+            m.contains("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]"),
+            "{m}"
+        );
+
+        // Another user's home and a Windows home collapse too.
+        let m = sanitize_error_message("a /home/bob/x b C:\\Users\\carol\\y c", None);
+        assert_eq!(m, "a ~/x b ~\\y c");
+
+        // Bearer tokens, prefixed tokens and long mixed blobs.
+        let m = sanitize_error_message(
+            "Authorization: Bearer abcdef0123456789 ghp_0123456789abcdefghij 0123456789abcdef0123456789abcdef0123",
+            None,
+        );
+        assert!(
+            !m.contains("abcdef0123456789") && !m.contains("ghp_0123"),
+            "{m}"
+        );
+
+        // serde echoes of offending string values are cut.
+        let m = sanitize_error_message(
+            "invalid type: string \"my-private-value\", expected u32",
+            None,
+        );
+        assert!(!m.contains("my-private-value"), "{m}");
+        assert_eq!(m, "invalid type: string <value>, expected u32");
+
+        // Truncation to 200 chars, newlines flattened.
+        let long = format!("line1\nline2 {}", "word ".repeat(100));
+        let m = sanitize_error_message(&long, None);
+        assert_eq!(m.chars().count(), MAX_ERROR_MESSAGE_CHARS);
+        assert!(m.ends_with("...") && !m.contains('\n'));
+
+        // A long hyphenated directory name is not a token.
+        let path =
+            "x/-Users-victoragahi-Developer-causalmesh/c758ea9a-eb19-4085-b418-b0d8bdef0e98/s";
+        assert_eq!(sanitize_error_message(path, None), path);
+
+        // Plain text is left alone.
+        assert_eq!(
+            sanitize_error_message("Scope escapes the workspace roots", None),
+            "Scope escapes the workspace roots"
         );
     }
 

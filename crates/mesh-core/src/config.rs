@@ -221,6 +221,25 @@ pub struct CustomPatternConfig {
     pub target_group: usize,
     #[serde(default)]
     pub consumer_group: Option<usize>,
+    /// Confidence of the topic edges this pattern produces (`topic_producer` /
+    /// `topic_consumer` only). Absent means `heuristic`: a regex cannot tell a
+    /// literal topic from an emission routed through a mapping table.
+    #[serde(default)]
+    pub confidence: Option<PatternConfidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternConfidence {
+    Exact,
+    Heuristic,
+}
+
+impl CustomPatternConfig {
+    /// Whether the topic edges of this pattern are reported as `exact`.
+    pub fn is_exact(&self) -> bool {
+        self.confidence == Some(PatternConfidence::Exact)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +531,20 @@ mod tests {
             .expect("[cache] max_size_mb");
         assert_eq!(cfg.cache.max_size_mb, 10);
         assert!(Config::load_from_str(&format!("{base}[cache]\nmax_size = 10\n")).is_err());
+    }
+
+    #[test]
+    fn pattern_confidence_key_is_strict() {
+        let base = "[workspace]\nname = \"w\"\nroots = [\".\"]\n[engines.contracts]\n[[engines.contracts.patterns]]\nname = \"p\"\nkind = \"topic_producer\"\nregex = 'x(.)'\n";
+        let pats = |extra: &str| {
+            Config::load_from_str(&format!("{base}{extra}"))
+                .map(|c| c.engines.contracts.expect("contracts").patterns[0].is_exact())
+        };
+        assert!(!pats("").expect("default"));
+        assert!(pats("confidence = \"exact\"\n").expect("exact"));
+        assert!(!pats("confidence = \"heuristic\"\n").expect("heuristic"));
+        assert!(pats("confidence = \"certain\"\n").is_err());
+        assert!(pats("confidance = \"exact\"\n").is_err());
     }
 
     #[test]

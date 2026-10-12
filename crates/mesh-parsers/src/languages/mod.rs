@@ -179,6 +179,11 @@ pub struct FileIndex {
     pub consumers: Vec<(usize, CompactStr)>,
     /// (local node index, target rpc)
     pub rpc_calls: Vec<(usize, CompactStr)>,
+    /// Local indices of producer / consumer nodes whose topic link is only a
+    /// heuristic (declarative patterns default to it). Their topic edges are
+    /// reported `heuristic`, not `exact`.
+    #[serde(default)]
+    pub heuristic_topic_nodes: Vec<usize>,
     /// Set when this file's tree-sitter parse itself failed or exceeded its budget
     /// (`AstGuard::ParseOutcome::ParseFailed`) — as opposed to `nodes` legitimately
     /// being empty (a blank file, one with no top-level declarations, ...). Callers
@@ -207,6 +212,8 @@ impl FileIndex {
             .extend(other.consumers.into_iter().map(|(i, t)| (i + offset, t)));
         self.rpc_calls
             .extend(other.rpc_calls.into_iter().map(|(i, t)| (i + offset, t)));
+        self.heuristic_topic_nodes
+            .extend(other.heuristic_topic_nodes.into_iter().map(|i| i + offset));
         self.parse_failed |= other.parse_failed;
     }
 
@@ -225,6 +232,9 @@ impl FileIndex {
         for (i, target) in self.rpc_calls {
             graph.add_rpc_call(ids[i], &target);
         }
+        for i in self.heuristic_topic_nodes {
+            graph.mark_heuristic_topic_node(ids[i]);
+        }
     }
 }
 
@@ -237,6 +247,8 @@ pub struct CompiledPattern {
     regex: regex::Regex,
     target_group: usize,
     consumer_group: Option<usize>,
+    /// `confidence = "exact"` was set; otherwise topic edges are heuristic.
+    exact: bool,
 }
 
 impl CompiledPattern {
@@ -251,6 +263,7 @@ impl CompiledPattern {
             regex: regex::Regex::new(&cfg.regex)?,
             target_group: cfg.target_group,
             consumer_group: cfg.consumer_group,
+            exact: cfg.is_exact(),
         })
     }
 
@@ -878,10 +891,16 @@ impl PolyglotIndexer {
 
                 match pat.kind {
                     PatternKind::TopicProducer => {
-                        out.producers.push((idx, CompactStr::new(target)))
+                        out.producers.push((idx, CompactStr::new(target)));
+                        if !pat.exact {
+                            out.heuristic_topic_nodes.push(idx);
+                        }
                     }
                     PatternKind::TopicConsumer => {
-                        out.consumers.push((idx, CompactStr::new(target)))
+                        out.consumers.push((idx, CompactStr::new(target)));
+                        if !pat.exact {
+                            out.heuristic_topic_nodes.push(idx);
+                        }
                     }
                     PatternKind::Rpc => out.rpc_calls.push((idx, CompactStr::new(target))),
                     PatternKind::Saga => {}
@@ -1250,6 +1269,7 @@ export class BillingController {
                 regex: r"createEvent<([A-Za-z0-9_.]+)>".into(),
                 target_group: 1,
                 consumer_group: None,
+                confidence: None,
             },
             CustomPatternConfig {
                 name: "stream".into(),
@@ -1258,6 +1278,7 @@ export class BillingController {
                 regex: r"targetServices:\s*\[\s*(\w+\.\w+)".into(),
                 target_group: 1,
                 consumer_group: None,
+                confidence: None,
             },
             CustomPatternConfig {
                 name: "options".into(),
@@ -1266,6 +1287,7 @@ export class BillingController {
                 regex: r"streamName:\s*get\w*StreamName\((\w+\.\w+)\)".into(),
                 target_group: 1,
                 consumer_group: None,
+                confidence: None,
             },
             CustomPatternConfig {
                 name: "consumer".into(),
@@ -1274,6 +1296,7 @@ export class BillingController {
                 regex: r"class\s+(\w+)\s+extends\s+BatchPostProcessor<([^>]+)>".into(),
                 target_group: 2,
                 consumer_group: Some(1),
+                confidence: None,
             },
         ]);
         let mut graph = ContractGraph::new();
@@ -1543,6 +1566,7 @@ channels:
                 regex: r#"createEvent<([^>]+)>"#.to_string(),
                 target_group: 1,
                 consumer_group: None,
+                confidence: None,
             },
             CustomPatternConfig {
                 name: "post_processor_consumer".to_string(),
@@ -1551,6 +1575,7 @@ channels:
                 regex: r#"class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>"#.to_string(),
                 target_group: 2,
                 consumer_group: Some(1),
+                confidence: None,
             },
         ];
 
@@ -1726,6 +1751,86 @@ topics:
         assert!(!cfg.infer_string_topics);
     }
 
+    /// 7.1.8: declarative topic patterns default to heuristic edges (a regex can
+    /// match an emission routed through a mapping table); `confidence = "exact"`
+    /// opts a pattern back in, per pattern.
+    #[test]
+    fn declarative_topic_patterns_default_to_heuristic_confidence() {
+        use mesh_core::{EdgeConfidence, EdgeKind, PatternConfidence};
+        let mk = |name: &str, kind, regex: &str, confidence| CustomPatternConfig {
+            name: name.into(),
+            kind,
+            file_pattern: None,
+            regex: regex.into(),
+            target_group: 1,
+            consumer_group: None,
+            confidence,
+        };
+        let patterns = CompiledPattern::compile_all(&[
+            mk(
+                "p-default",
+                PatternKind::TopicProducer,
+                r#"emit\("([^"]+)"\)"#,
+                None,
+            ),
+            mk(
+                "p-exact",
+                PatternKind::TopicProducer,
+                r#"literal\("([^"]+)"\)"#,
+                Some(PatternConfidence::Exact),
+            ),
+            mk(
+                "c-default",
+                PatternKind::TopicConsumer,
+                r#"on\("([^"]+)"\)"#,
+                None,
+            ),
+        ]);
+        let mut graph = ContractGraph::new();
+        let src = "emit(\"t.mapped\")\nliteral(\"t.direct\")\non(\"t.mapped\")\non(\"t.direct\")\n";
+        PolyglotIndexer::extract_custom_patterns(Path::new("x.ts"), src, 0, &patterns)
+            .apply(&mut graph);
+        graph.reconcile_edges();
+        let conf = |topic: &str, kind: EdgeKind| -> Vec<EdgeConfidence> {
+            let mut v: Vec<_> = graph
+                .all_edges()
+                .iter()
+                .filter(|e| e.kind == kind && e.metadata.as_deref() == Some(topic))
+                .map(|e| e.confidence)
+                .collect();
+            v.sort_by_key(|c| *c as u8);
+            v
+        };
+        assert_eq!(
+            conf("t.mapped", EdgeKind::Produces),
+            [EdgeConfidence::Heuristic]
+        );
+        assert_eq!(
+            conf("t.direct", EdgeKind::Produces),
+            [EdgeConfidence::Exact]
+        );
+        // The impact matrix reports the same confidence per producer row.
+        let producer_row = |topic: &str| {
+            graph
+                .impact_matrix(topic, 1)
+                .rows
+                .iter()
+                .find(|r| r.role == mesh_core::ImpactRole::Producer)
+                .map(|r| r.confidence)
+        };
+        assert_eq!(producer_row("t.mapped"), Some(EdgeConfidence::Heuristic));
+        assert_eq!(producer_row("t.direct"), Some(EdgeConfidence::Exact));
+        // The default-confidence consumer stays heuristic on both topics.
+        assert_eq!(
+            conf("t.mapped", EdgeKind::Consumes),
+            [EdgeConfidence::Heuristic]
+        );
+        assert_eq!(
+            conf("t.direct", EdgeKind::Consumes),
+            [EdgeConfidence::Heuristic]
+        );
+    }
+
     /// Pattern / AsyncAPI / OpenAPI nodes carry their real declaration line, not
     /// a placeholder `1` (smart_search anchors snippets on it).
     #[test]
@@ -1737,6 +1842,7 @@ topics:
             regex: r#"send\("([^"]+)"\)"#.to_string(),
             target_group: 1,
             consumer_group: None,
+            confidence: None,
         }]);
         let src = "a\nb\nsend(\"t.one\")\nc\n\nsend(\"t.two\")\n";
         let out = PolyglotIndexer::extract_custom_patterns(Path::new("x.java"), src, 0, &patterns);

@@ -9,6 +9,7 @@
 //! accepted with or without.
 
 use crate::contracts::ContractGraph;
+use crate::test_paths::is_test_node;
 use crate::types::{ContractNode, NodeKind};
 use std::path::{Path, PathBuf};
 
@@ -57,32 +58,80 @@ pub struct RouteQuery {
     pub verb_and_slash: bool,
 }
 
-/// Whether the WHOLE segment is a parameter: `:name` (with an optional `?`,
-/// `*`, `+` or `(regex)` tail), `{name}`, `<name>`, `[name]`, `${name}` or `*`.
-/// A mixed segment (`{name}.json`, `[id]-details`, `$metadata`) is a literal.
-fn is_param(seg: &str) -> bool {
-    fn wrapped(seg: &str, open: &str, close: char) -> bool {
-        seg.strip_prefix(open)
-            .and_then(|r| r.strip_suffix(close))
-            .is_some_and(|inner| !inner.contains(['{', '}', '<', '>', '[', ']']))
+/// Whether `seg` is `open ... close` with the opening delimiter closing exactly at
+/// the last character (balanced; the inner text is free, nested delimiters included).
+fn wrapped(seg: &str, open: char, close: char) -> bool {
+    if !seg.starts_with(open) || !seg.ends_with(close) || seg.len() < 3 {
+        return false;
     }
+    let mut depth = 0usize;
+    for (i, c) in seg.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return i + c.len_utf8() == seg.len();
+            }
+        }
+    }
+    false
+}
+
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether the WHOLE segment is a parameter: Express `:name` with an optional
+/// `(regex)` then an optional `?` / `*` / `+`; `*` or a splat `*name`;
+/// `{name}` (also `{id:\d{2}}`), `<name>`, `[name]` (also `[...slug]` and
+/// `[[...slug]]`), `${name}`; and `$name` (Remix / React Router file routes).
+/// A mixed segment (`{name}.json`, `[id]-details`) is a literal.
+///
+/// Choice: `$name` is a parameter, so an OData-style literal `$metadata` is
+/// treated as one too; file-route parameters are far more common in route paths.
+fn is_param(seg: &str) -> bool {
     if seg == "*" {
         return true;
+    }
+    if let Some(rest) = seg.strip_prefix('*') {
+        return is_ident(rest);
     }
     if let Some(rest) = seg.strip_prefix(':') {
         let name_len = rest
             .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        let (name, tail) = rest.split_at(name_len);
-        return !name.is_empty()
-            && (tail.is_empty()
-                || matches!(tail, "?" | "*" | "+")
-                || (tail.starts_with('(') && tail.ends_with(')')));
+        let (name, mut tail) = rest.split_at(name_len);
+        if name.is_empty() {
+            return false;
+        }
+        if tail.starts_with('(') {
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in tail.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(n) => tail = &tail[n..],
+                None => return false,
+            }
+        }
+        return matches!(tail, "" | "?" | "*" | "+");
     }
-    wrapped(seg, "${", '}')
-        || wrapped(seg, "{", '}')
-        || wrapped(seg, "<", '>')
-        || wrapped(seg, "[", ']')
+    if let Some(rest) = seg.strip_prefix('$') {
+        return is_ident(rest) || wrapped(rest, '{', '}');
+    }
+    wrapped(seg, '{', '}') || wrapped(seg, '<', '>') || wrapped(seg, '[', ']')
 }
 
 /// Splits `path` into segments. Query string, fragment and trailing slashes are dropped.
@@ -272,23 +321,6 @@ pub fn display_label(label: &str, prefix: Option<&str>) -> Option<String> {
         let tail = if path.starts_with('/') { "" } else { "/" };
         Some(format!("{verb} {lead}{prefix}{tail}{path}"))
     }
-}
-
-/// Whether `node` is declared in test code. The path is judged RELATIVE to its
-/// workspace root: a checkout that itself lives under `~/testing/` or `/work/e2e/`
-/// must not hide every route. A node under no known root keeps its full path.
-pub fn is_test_node(node: &ContractNode, roots: &[PathBuf]) -> bool {
-    let rel = roots
-        .get(node.repo_id as usize)
-        .and_then(|r| node.file_path.strip_prefix(r).ok())
-        .or_else(|| {
-            roots
-                .iter()
-                .filter_map(|r| node.file_path.strip_prefix(r).ok())
-                .min_by_key(|rel| rel.components().count())
-        })
-        .unwrap_or(&node.file_path);
-    crate::is_test_path(rel)
 }
 
 /// Every route of `graph` matching `query`, best first, then by file and line.
@@ -532,7 +564,9 @@ mod tests {
         for s in [
             "{name}.json",
             "[id]-details",
-            "$metadata",
+            "[a][b]",
+            "$",
+            "{}",
             ":",
             "{a}{b}",
             "id:x",

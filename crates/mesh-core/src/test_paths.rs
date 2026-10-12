@@ -62,6 +62,24 @@ pub fn is_test_path(path: &Path) -> bool {
             && stem.chars().next().is_some_and(char::is_uppercase))
 }
 
+/// Whether `node` is declared in test code. The path is judged RELATIVE to its
+/// workspace root: a checkout that itself lives under `~/testing/` or `/work/e2e/`
+/// must not classify every node as test code. A node under no known root keeps
+/// its full path. Every call site that classifies graph nodes uses this.
+pub fn is_test_node(node: &crate::types::ContractNode, roots: &[std::path::PathBuf]) -> bool {
+    let rel = roots
+        .get(node.repo_id as usize)
+        .and_then(|r| node.file_path.strip_prefix(r).ok())
+        .or_else(|| {
+            roots
+                .iter()
+                .filter_map(|r| node.file_path.strip_prefix(r).ok())
+                .min_by_key(|rel| rel.components().count())
+        })
+        .unwrap_or(&node.file_path);
+    is_test_path(rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

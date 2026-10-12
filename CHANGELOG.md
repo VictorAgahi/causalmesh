@@ -29,6 +29,23 @@ Review fixes for the HTTP route tools of 7.1.5:
   and per-kind counts are part of the Mermaid text only; json and html do not include them. The
   footer is built once per shrink iteration.
 
+- Parameter detection is balanced and complete: the outer delimiters define the parameter and the
+  inner text is free (`[[...slug]]`, `[...slug]`, `{id:\d{2}}`), Express `:id(\d+)?`, `:id(\d+)+`,
+  `:id(\d+)*` and splats `*splat` are parameters. `$name` (Remix / React Router file routes) is a
+  parameter again. Choice: an OData-style literal `$metadata` is therefore also a parameter, since
+  file-route parameters are the more common case.
+- Test classification is root-relative everywhere a node path is judged: `find_dependents`,
+  `analyze_grpc`, `analyze_impact` (matrix and route views), `smart_search` and `visualize_mesh`
+  share `mesh_core::is_test_node`. A workspace under `/work/e2e/gw` or `~/testing/app` no longer
+  has every node classified as test code.
+- API change: `Aggregate::build` takes the workspace roots (`Topology::build` reads
+  `TopologyOptions::roots`); `Aggregate::with_route_context` is deprecated in favour of
+  `with_http_prefix`, `is_test_node` moved from `mesh_core::routes` to `mesh_core::test_paths`.
+- The `visualize_mesh` size check keeps its original `<=` comparison for json and html.
+- The "route(s) match only in test files" note is given whenever a route-shaped query has test-only
+  route matches, whatever the symbol search found.
+- `analyze_impact` builds route entries only for the handlers it lists (the total is still stated).
+
 ### Known follow-ups
 - `display_label` treats a route as already prefixed when its first segments equal `http_prefix`
   (a `/api` prefix and a controller literally starting with `api`).

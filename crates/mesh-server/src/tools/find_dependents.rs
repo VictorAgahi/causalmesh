@@ -88,6 +88,7 @@ fn resolve<'g>(
     args: &FindDependentsArgs,
     graph: &'g mesh_core::ContractGraph,
     granularity: Granularity,
+    roots: &[std::path::PathBuf],
 ) -> Resolved<'g> {
     let (dependents, how) = graph.find_dependents_matched(args.target.as_str());
     let (dependents, tests): (Vec<_>, Vec<_>) = if args.include_tests.unwrap_or(false) {
@@ -95,7 +96,7 @@ fn resolve<'g>(
     } else {
         dependents
             .into_iter()
-            .partition(|n| !mesh_core::is_test_path(&n.file_path))
+            .partition(|n| !mesh_core::is_test_node(n, roots))
     };
     let dedup = |nodes| match granularity {
         Granularity::Symbol => nodes,
@@ -151,9 +152,14 @@ impl McpTool for FindDependentsTool {
         // "package"` request whose caller never saw that many results.
         let granularity = validate_granularity(args).ok()?;
         let snapshot = state.snapshot();
-        let count = resolve(args, &snapshot.contract_graph, granularity)
-            .dependents
-            .len();
+        let count = resolve(
+            args,
+            &snapshot.contract_graph,
+            granularity,
+            &state.allowed_roots,
+        )
+        .dependents
+        .len();
         Some(format!(
             "Target '{}' has {} dependent(s). Page with a smaller `limit`, or use granularity: \"file\" / \"package\".",
             args.target,
@@ -173,7 +179,12 @@ impl McpTool for FindDependentsTool {
             .unwrap_or(DEFAULT_LIMIT) as usize;
         let offset = args.offset.unwrap_or(0) as usize;
         let snapshot = state.snapshot();
-        let resolved = resolve(args, &snapshot.contract_graph, granularity);
+        let resolved = resolve(
+            args,
+            &snapshot.contract_graph,
+            granularity,
+            &state.allowed_roots,
+        );
         let total = resolved.dependents.len();
         let files: HashSet<&std::path::Path> =
             resolved.dependents.iter().map(|n| &*n.file_path).collect();

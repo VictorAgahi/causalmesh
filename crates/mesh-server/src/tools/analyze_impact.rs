@@ -96,7 +96,7 @@ impl McpTool for AnalyzeImpactTool {
         if !args.include_tests.unwrap_or(false) {
             matrix
                 .rows
-                .retain(|r| !mesh_core::is_test_path(&r.node.file_path));
+                .retain(|r| !mesh_core::is_test_node(r.node, &state.allowed_roots));
         }
         let hidden_tests = before - matrix.rows.len();
         let mut text =
@@ -148,6 +148,7 @@ impl AnalyzeImpactTool {
             return MarkdownFormatter::format_route_impact(
                 args.target.as_str(),
                 &[],
+                0,
                 &near,
                 hidden_tests,
                 &state.allowed_roots,
@@ -160,8 +161,10 @@ impl AnalyzeImpactTool {
             .map(|h| h.node)
             .collect();
         let mut edges = Self::edges_on(graph, &shown, &state.allowed_roots);
+        let total = hits.len();
         let entries: Vec<RouteImpactEntry> = hits
             .iter()
+            .take(MarkdownFormatter::MAX_ROUTE_ENTRIES)
             .map(|h| RouteImpactEntry {
                 route: display_route(h.node, prefix_text)
                     .unwrap_or_else(|| h.node.name.to_string()),
@@ -172,6 +175,7 @@ impl AnalyzeImpactTool {
         MarkdownFormatter::format_route_impact(
             args.target.as_str(),
             &entries,
+            total,
             &[],
             hidden_tests,
             &state.allowed_roots,

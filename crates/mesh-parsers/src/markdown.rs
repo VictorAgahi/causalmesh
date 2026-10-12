@@ -702,6 +702,7 @@ impl MarkdownFormatter {
     pub fn format_route_impact(
         target: &str,
         entries: &[RouteImpactEntry],
+        total_handlers: usize,
         nearest: &[(String, &ContractNode)],
         hidden_tests: usize,
         roots: &[PathBuf],
@@ -745,7 +746,7 @@ impl MarkdownFormatter {
         }
         out.push_str(&format!(
             "*Handlers: {} (route matched on path structure, parameter names ignored).*\n\n",
-            entries.len()
+            total_handlers
         ));
         out.push_str("| # | Route | Handler | Root | Location |\n|---|---|---|---|---|\n");
         for (idx, e) in entries.iter().take(MAX_ENTRIES).enumerate() {
@@ -758,10 +759,10 @@ impl MarkdownFormatter {
                 Self::code_cell(&Self::location(e.node, roots)),
             ));
         }
-        if entries.len() > MAX_ENTRIES {
+        if total_handlers > entries.len() {
             out.push_str(&format!(
                 "\n*{} more handler(s) not listed.*\n",
-                entries.len() - MAX_ENTRIES
+                total_handlers - entries.len()
             ));
         }
         for e in entries.iter().take(MAX_ENTRIES) {

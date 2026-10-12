@@ -348,12 +348,15 @@ impl McpTool for SmartSearchTool {
         } else {
             None
         };
-        if let (Some(rq), false, true) = (&route_query, use_routes, ranked.is_empty()) {
-            // A route-shaped query that found nothing at all: say what is near.
+        if let (Some(rq), false, true) = (&route_query, use_routes, route_hits.is_empty()) {
+            // A route-shaped query with no route hit: test-only matches are said
+            // whatever the symbol search found; "what is near" only when nothing was.
             route_note = if hidden_tests > 0 {
                 Some(format!(
                     "*{hidden_tests} route(s) match only in test files (`include_tests: true` to list them).*\n"
                 ))
+            } else if !ranked.is_empty() {
+                None
             } else {
                 Self::nearest_routes_note(
                     &snapshot.contract_graph,

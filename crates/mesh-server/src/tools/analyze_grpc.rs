@@ -85,7 +85,7 @@ fn run_with_git(
             &mut trace.service_level_clients,
         ] {
             let before = list.len();
-            list.retain(|(n, _)| !mesh_core::is_test_path(&n.file_path));
+            list.retain(|(n, _)| !mesh_core::is_test_node(n, &state.allowed_roots));
             hidden_tests += before - list.len();
         }
     }

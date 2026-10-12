@@ -297,13 +297,13 @@ async fn a_symbol_match_wins_over_a_fragment_only_route_hit() {
     )
     .expect("write");
     let state = state_for(&root, &["."], None);
+    // The symbol exists: a bare `state` finds the topic node indexed as `/state`.
+    let symbol = call(&state, "smart_search", json!({"query": "state"})).await;
+    assert!(symbol.contains("b.consumer.ts"), "{symbol}");
     let text = call(&state, "smart_search", json!({"query": "/state"})).await;
-    let symbol_hit = text.contains("b.consumer.ts");
-    let route_header = text.contains("-> stateOf") || text.contains("->  stateOf");
-    // Whatever the indexer names that topic, the two must not be mixed up: either
-    // the symbol is shown (and the weak route fragment is not), or no symbol
-    // exists and the fragment route is shown.
-    assert!(symbol_hit != route_header, "{text}");
+    assert!(text.contains("b.consumer.ts"), "{text}");
+    assert!(!text.contains("stateOf"), "{text}");
+    assert!(!text.contains("->  stateOf"), "{text}");
     let strong = call(
         &state,
         "smart_search",
@@ -352,4 +352,63 @@ async fn a_root_under_a_test_named_directory_keeps_its_routes() {
         .await;
         assert!(text.contains("realThing"), "{outer}\n{text}");
     }
+}
+
+fn testing_root(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dunce::canonicalize(dir.path())
+        .expect("canonical")
+        .join("testing")
+        .join("app");
+    for (rel, body) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+    (dir, root)
+}
+
+#[tokio::test]
+async fn find_dependents_and_analyze_grpc_ignore_test_named_ancestors_of_the_root() {
+    let (_guard, root) = testing_root(&[
+        ("proto/foo.proto", "syntax = \"proto3\";\npackage shop.v1;\nservice FooService { rpc Bar(Req) returns (Req); }\nmessage Req {}\n"),
+        (
+            "src/foo.handler.ts",
+            "import { Controller } from '@nestjs/common';\nimport { GrpcMethod } from '@nestjs/microservices';\nimport { x } from 'left-pad';\n@Controller()\nexport class FooHandler {\n  @GrpcMethod('FooService', 'Bar')\n  bar() { return x; }\n}\n",
+        ),
+        (
+            "src/__tests__/foo.spec.ts",
+            "import { y } from 'left-pad';\nexport class FooSpec { run() { return y; } }\n",
+        ),
+    ]);
+    let state = state_for(&root, &["."], None);
+    let deps = call(&state, "find_dependents", json!({"target": "left-pad"})).await;
+    assert!(deps.contains("foo.handler.ts"), "{deps}");
+    assert!(!deps.contains("foo.spec.ts"), "{deps}");
+    assert!(deps.contains("in test files left out"), "{deps}");
+    let grpc = call(&state, "analyze_grpc", json!({"target": "FooService.Bar"})).await;
+    assert!(
+        grpc.contains("foo.handler.ts") || grpc.contains("FooHandler") || grpc.contains("bar"),
+        "{grpc}"
+    );
+    assert!(!grpc.contains("left out"), "{grpc}");
+}
+
+#[tokio::test]
+async fn test_only_route_note_survives_symbol_hits() {
+    let (_guard, root) = testing_root(&[
+        (
+            "src/__test-utils__/fake.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n@Controller('zeta')\nexport class Fake {\n  @Get('only')\n  fakeOnly() { return 1; }\n}\n",
+        ),
+        // A symbol whose name contains the route text.
+        (
+            "src/odd.ts",
+            "export const odd = 1;\n// GET /zeta/only\nexport class OddGetZetaOnly {}\n",
+        ),
+    ]);
+    let state = state_for(&root, &["."], None);
+    let text = call(&state, "smart_search", json!({"query": "GET /zeta/only"})).await;
+    assert!(text.contains("match only in test files"), "{text}");
+    assert!(!text.contains("fakeOnly"), "{text}");
 }

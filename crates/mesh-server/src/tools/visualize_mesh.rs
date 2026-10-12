@@ -97,12 +97,13 @@ impl McpTool for VisualizeMeshTool {
                 .unwrap_or(DEFAULT_MAX_SERVICES)
                 .clamp(1, MAX_SERVICES_CAP) as usize,
             focus: args.service.as_ref().map(|s| s.to_string()),
+            roots: state.allowed_roots.to_vec(),
             ..TopologyOptions::default()
         };
 
         // The O(contracts + edges) fold runs once; the shrink loop below only
         // re-selects over the (small) aggregated groups and links.
-        let aggregate = Aggregate::build_with_roots(
+        let aggregate = Aggregate::build(
             graph,
             &repo_names,
             opts.focus.as_deref(),
@@ -145,7 +146,13 @@ impl McpTool for VisualizeMeshTool {
             } else {
                 String::new()
             };
-            if body.len() + footer.len() < RENDER_BUDGET {
+            // The mermaid footer follows the body after one newline.
+            let footer_cost = if footer.is_empty() {
+                0
+            } else {
+                footer.len() + 1
+            };
+            if body.len() + footer_cost <= RENDER_BUDGET {
                 let text = match format_choice.as_str() {
                     // The page / document must stay parseable: no appended prose.
                     "html" | "json" => body,

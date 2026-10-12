@@ -5,6 +5,35 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.6] — 2026-10-12
+
+### Fixed
+Review fixes for the HTTP route tools of 7.1.5:
+- Test code is judged on the path relative to its workspace root. A checkout living under a
+  directory named `test`, `testing`, `e2e`, `spec` or `fixtures` no longer hides every route
+  (`find_routes`, `smart_search`, `analyze_impact` and the `visualize_mesh` zoom).
+- A query is a route only when it starts with `/` or is a verb followed by a path starting with
+  `/`. `get user`, `delete account` and `post message` are ordinary symbol queries again, with no
+  bogus "Nearest routes" note. A fragment-only route hit (`/state`) never replaces the symbol
+  results of the same query; it is shown only when no symbol matches.
+- `smart_search` reads and decapitates each file once per page instead of once per route hit.
+- `analyze_impact` looks up the graph edges of the listed handlers in one pass, only for the
+  handlers it displays, instead of scanning every edge per hit.
+- Only whole segments are path parameters (`:name`, `{name}`, `<name>`, `[name]`, `${name}`,
+  `*`). Mixed segments such as `{name}.json`, `[id]-details` or `$metadata` are literals compared
+  exactly, so `/files/{name}.json` and `/files/{name}.xml` stay distinct.
+- `analyze_impact` counts only the ranks it accepts (exact and concrete-value matches) among the
+  routes hidden in test files; fragment matches no longer produce a false "match only in test
+  files" note.
+- `visualize_mesh` states in its description and in `docs/mcp-tools.md` that the zoom route list
+  and per-kind counts are part of the Mermaid text only; json and html do not include them. The
+  footer is built once per shrink iteration.
+
+### Known follow-ups
+- `display_label` treats a route as already prefixed when its first segments equal `http_prefix`
+  (a `/api` prefix and a controller literally starting with `api`).
+- The zoom per-kind counts exclude test-file route nodes while other kinds are counted as is.
+
 ## [7.1.5] — 2026-10-12
 
 ### Added

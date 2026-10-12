@@ -693,6 +693,9 @@ impl MarkdownFormatter {
         header
     }
 
+    /// Most handlers [`Self::format_route_impact`] lists.
+    pub const MAX_ROUTE_ENTRIES: usize = 25;
+
     /// `analyze_impact` answer for a `VERB /path` target: the handler(s) the route
     /// resolves to and the edges the graph holds on them. When nothing matched, the
     /// nearest routes instead of the generic proto/event hint.
@@ -703,7 +706,7 @@ impl MarkdownFormatter {
         hidden_tests: usize,
         roots: &[PathBuf],
     ) -> String {
-        const MAX_ENTRIES: usize = 25;
+        const MAX_ENTRIES: usize = MarkdownFormatter::MAX_ROUTE_ENTRIES;
         const MAX_EDGES: usize = 12;
         let labels = Self::root_labels(roots);
         let label_of = |repo: RepoId| -> &str {

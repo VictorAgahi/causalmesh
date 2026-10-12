@@ -122,18 +122,29 @@ impl AnalyzeImpactTool {
         let include_tests = args.include_tests.unwrap_or(false);
         let prefix_text = state.config.workspace.http_prefix.as_deref();
         let prefix = prefix_segments(prefix_text);
-        let (hits, hidden_tests) = find_routes(graph, route, &prefix, None, include_tests);
-        // Impact is about the declared route: a fragment of one is not it.
-        let hits: Vec<_> = hits
-            .into_iter()
-            .filter(|h| h.rank <= mesh_core::routes::RouteRank::Value)
-            .collect();
+        // Impact is about the declared route: a fragment of one is not it, so
+        // neither is it counted among the hidden test routes.
+        let (hits, hidden_tests) = find_routes(
+            graph,
+            route,
+            &prefix,
+            None,
+            include_tests,
+            &state.allowed_roots,
+            mesh_core::routes::RouteRank::Value,
+        );
         if hits.is_empty() {
-            let near: Vec<(String, &mesh_core::ContractNode)> =
-                nearest_routes(graph, route, &prefix, include_tests, 8)
-                    .into_iter()
-                    .filter_map(|n| display_route(n, prefix_text).map(|r| (r, n)))
-                    .collect();
+            let near: Vec<(String, &mesh_core::ContractNode)> = nearest_routes(
+                graph,
+                route,
+                &prefix,
+                include_tests,
+                &state.allowed_roots,
+                8,
+            )
+            .into_iter()
+            .filter_map(|n| display_route(n, prefix_text).map(|r| (r, n)))
+            .collect();
             return MarkdownFormatter::format_route_impact(
                 args.target.as_str(),
                 &[],
@@ -142,13 +153,20 @@ impl AnalyzeImpactTool {
                 &state.allowed_roots,
             );
         }
+        // Edges are looked up in one pass, only for the handlers the table lists.
+        let shown: Vec<&mesh_core::ContractNode> = hits
+            .iter()
+            .take(MarkdownFormatter::MAX_ROUTE_ENTRIES)
+            .map(|h| h.node)
+            .collect();
+        let mut edges = Self::edges_on(graph, &shown, &state.allowed_roots);
         let entries: Vec<RouteImpactEntry> = hits
             .iter()
             .map(|h| RouteImpactEntry {
                 route: display_route(h.node, prefix_text)
                     .unwrap_or_else(|| h.node.name.to_string()),
                 node: h.node,
-                edges: Self::edges_on(graph, h.node, &state.allowed_roots),
+                edges: edges.remove(&h.node.id).unwrap_or_default(),
             })
             .collect();
         MarkdownFormatter::format_route_impact(
@@ -164,38 +182,44 @@ impl AnalyzeImpactTool {
     /// it calls), one rendered line each. Import edges are left to `find_dependents`.
     fn edges_on(
         graph: &mesh_core::ContractGraph,
-        node: &mesh_core::ContractNode,
+        nodes: &[&mesh_core::ContractNode],
         roots: &[std::path::PathBuf],
-    ) -> Vec<String> {
-        let mut lines: Vec<String> = Vec::new();
+    ) -> std::collections::HashMap<mesh_core::NodeId, Vec<String>> {
+        let wanted: std::collections::HashSet<mesh_core::NodeId> =
+            nodes.iter().map(|n| n.id).collect();
+        let mut by_node: std::collections::HashMap<mesh_core::NodeId, Vec<String>> =
+            std::collections::HashMap::new();
         for e in graph.all_edges() {
-            if e.kind == EdgeKind::Imports || (e.from != node.id && e.to != node.id) {
+            if e.kind == EdgeKind::Imports || !(wanted.contains(&e.from) || wanted.contains(&e.to))
+            {
                 continue;
             }
-            let (arrow, other_id) = if e.from == node.id {
-                ("->", e.to)
-            } else {
-                ("<-", e.from)
-            };
-            let Some(other) = graph.get_node(other_id) else {
-                continue;
-            };
-            let place = roots
-                .get(other.repo_id as usize)
-                .and_then(|r| other.file_path.strip_prefix(r).ok())
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| other.file_path.display().to_string());
-            lines.push(format!(
-                "{arrow} {:?} `{}` (`{}:{}`, {})",
-                e.kind,
-                other.name.replace('`', "'"),
-                place,
-                other.line_start,
-                e.confidence.label()
-            ));
+            for (own, arrow, other_id) in [(e.from, "->", e.to), (e.to, "<-", e.from)] {
+                if !wanted.contains(&own) {
+                    continue;
+                }
+                let Some(other) = graph.get_node(other_id) else {
+                    continue;
+                };
+                let place = roots
+                    .get(other.repo_id as usize)
+                    .and_then(|r| other.file_path.strip_prefix(r).ok())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| other.file_path.display().to_string());
+                by_node.entry(own).or_default().push(format!(
+                    "{arrow} {:?} `{}` (`{}:{}`, {})",
+                    e.kind,
+                    other.name.replace('`', "'"),
+                    place,
+                    other.line_start,
+                    e.confidence.label()
+                ));
+            }
         }
-        lines.sort();
-        lines.dedup();
-        lines
+        for lines in by_node.values_mut() {
+            lines.sort();
+            lines.dedup();
+        }
+        by_node
     }
 }

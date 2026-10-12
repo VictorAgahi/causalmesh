@@ -10,7 +10,7 @@
 
 use crate::contracts::ContractGraph;
 use crate::types::{ContractNode, NodeKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// HTTP verbs a route query or an impact target may start with.
 pub const HTTP_VERBS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -57,9 +57,32 @@ pub struct RouteQuery {
     pub verb_and_slash: bool,
 }
 
+/// Whether the WHOLE segment is a parameter: `:name` (with an optional `?`,
+/// `*`, `+` or `(regex)` tail), `{name}`, `<name>`, `[name]`, `${name}` or `*`.
+/// A mixed segment (`{name}.json`, `[id]-details`, `$metadata`) is a literal.
 fn is_param(seg: &str) -> bool {
-    let first = seg.chars().next();
-    matches!(first, Some(':' | '{' | '<' | '[' | '$')) || seg == "*"
+    fn wrapped(seg: &str, open: &str, close: char) -> bool {
+        seg.strip_prefix(open)
+            .and_then(|r| r.strip_suffix(close))
+            .is_some_and(|inner| !inner.contains(['{', '}', '<', '>', '[', ']']))
+    }
+    if seg == "*" {
+        return true;
+    }
+    if let Some(rest) = seg.strip_prefix(':') {
+        let name_len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (name, tail) = rest.split_at(name_len);
+        return !name.is_empty()
+            && (tail.is_empty()
+                || matches!(tail, "?" | "*" | "+")
+                || (tail.starts_with('(') && tail.ends_with(')')));
+    }
+    wrapped(seg, "${", '}')
+        || wrapped(seg, "{", '}')
+        || wrapped(seg, "<", '>')
+        || wrapped(seg, "[", ']')
 }
 
 /// Splits `path` into segments. Query string, fragment and trailing slashes are dropped.
@@ -119,7 +142,9 @@ impl RouteQuery {
             Some((verb, rest)) if !rest.is_empty() => (Some(verb), rest),
             _ => (None, query),
         };
-        if verb.is_none() && !path.starts_with('/') {
+        // A route is `/path` or `VERB /path`: a verb followed by a bare word
+        // (`get user`, `delete account`) is an ordinary symbol query.
+        if !path.starts_with('/') {
             return None;
         }
         if path.contains(char::is_whitespace) {
@@ -249,6 +274,23 @@ pub fn display_label(label: &str, prefix: Option<&str>) -> Option<String> {
     }
 }
 
+/// Whether `node` is declared in test code. The path is judged RELATIVE to its
+/// workspace root: a checkout that itself lives under `~/testing/` or `/work/e2e/`
+/// must not hide every route. A node under no known root keeps its full path.
+pub fn is_test_node(node: &ContractNode, roots: &[PathBuf]) -> bool {
+    let rel = roots
+        .get(node.repo_id as usize)
+        .and_then(|r| node.file_path.strip_prefix(r).ok())
+        .or_else(|| {
+            roots
+                .iter()
+                .filter_map(|r| node.file_path.strip_prefix(r).ok())
+                .min_by_key(|rel| rel.components().count())
+        })
+        .unwrap_or(&node.file_path);
+    crate::is_test_path(rel)
+}
+
 /// Every route of `graph` matching `query`, best first, then by file and line.
 /// Routes in test files are left out unless `include_tests`; their count is
 /// returned alongside so a caller can say so.
@@ -258,6 +300,8 @@ pub fn find_routes<'g>(
     prefix: &[Seg],
     scope: Option<&Path>,
     include_tests: bool,
+    roots: &[PathBuf],
+    worst_rank: RouteRank,
 ) -> (Vec<RouteHit<'g>>, usize) {
     let mut hits = Vec::new();
     let mut hidden_tests = 0usize;
@@ -268,10 +312,10 @@ pub fn find_routes<'g>(
         let Some(route) = node_route(node) else {
             continue;
         };
-        let Some(rank) = match_route(query, &route, prefix) else {
+        let Some(rank) = match_route(query, &route, prefix).filter(|r| *r <= worst_rank) else {
             continue;
         };
-        if !include_tests && crate::is_test_path(&node.file_path) {
+        if !include_tests && is_test_node(node, roots) {
             hidden_tests += 1;
             continue;
         }
@@ -294,6 +338,7 @@ pub fn nearest_routes<'g>(
     query: &RouteQuery,
     prefix: &[Seg],
     include_tests: bool,
+    roots: &[PathBuf],
     max: usize,
 ) -> Vec<&'g ContractNode> {
     let mut scored: Vec<(usize, bool, &'g ContractNode)> = Vec::new();
@@ -301,7 +346,7 @@ pub fn nearest_routes<'g>(
         let Some(route) = node_route(node) else {
             continue;
         };
-        if !include_tests && crate::is_test_path(&node.file_path) {
+        if !include_tests && is_test_node(node, roots) {
             continue;
         }
         let same_verb = query.verb.is_none_or(|v| v == route.verb);
@@ -415,7 +460,7 @@ mod tests {
             Some(RouteRank::Fragment)
         );
         assert_eq!(
-            match_route(&q("GET events/:id"), &route, &[]),
+            match_route(&q("GET /events/:id"), &route, &[]),
             Some(RouteRank::Leading)
         );
         assert_eq!(match_route(&q("/"), &route, &[]), None);
@@ -446,12 +491,98 @@ mod tests {
 
     #[test]
     fn non_route_queries_are_not_routes() {
-        for s in ["createEvent", "GET", "UserService.GetUser", ""] {
+        for s in [
+            "createEvent",
+            "GET",
+            "UserService.GetUser",
+            "",
+            "get user",
+            "delete account",
+            "post message",
+            "GET events/:id",
+        ] {
             assert!(RouteQuery::parse(s).is_none(), "{s}");
         }
         assert!(RouteQuery::parse_target("/events").is_none());
         assert!(RouteQuery::parse_target("GET /events").is_some());
         assert!(RouteQuery::parse_target("GET events").is_none());
+        assert!(RouteQuery::parse("get user").is_none());
+    }
+
+    #[test]
+    fn only_whole_segment_parameters_are_parameters() {
+        for s in [
+            ":id",
+            ":id?",
+            ":id(\\d+)",
+            "{id}",
+            "{id:int}",
+            "<id>",
+            "[id]",
+            "[...slug]",
+            "${id}",
+            "*",
+        ] {
+            assert_eq!(
+                path_segments(&format!("/x/{s}")).last(),
+                Some(&Seg::Param),
+                "{s}"
+            );
+        }
+        for s in [
+            "{name}.json",
+            "[id]-details",
+            "$metadata",
+            ":",
+            "{a}{b}",
+            "id:x",
+        ] {
+            assert!(
+                matches!(path_segments(&format!("/x/{s}")).last(), Some(Seg::Lit(_))),
+                "{s}"
+            );
+        }
+        let json = r("GET /files/{name}.json");
+        assert_eq!(match_route(&q("GET /files/{name}.xml"), &json, &[]), None);
+        assert_eq!(
+            match_route(&q("GET /files/{name}.json"), &json, &[]),
+            Some(RouteRank::Exact)
+        );
+        // Mixed segments are literals: compared exactly, parameter name included.
+        assert_eq!(match_route(&q("GET /files/{other}.json"), &json, &[]), None);
+        assert_eq!(match_route(&q("GET /files/{name}"), &json, &[]), None);
+    }
+
+    #[test]
+    fn test_nodes_are_judged_relative_to_their_root() {
+        use crate::types::{CompactStr, ContractNode, NodeKind};
+        let node = |path: &str| ContractNode {
+            id: 0,
+            name: CompactStr::new("h"),
+            kind: NodeKind::HttpEndpoint,
+            file_path: Path::new(path).into(),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new("p"),
+            repo_id: 0,
+            signature: Some(CompactStr::new("GET /x")),
+            docstring: None,
+        };
+        let roots = vec![PathBuf::from("/work/e2e/testing/gw")];
+        assert!(!is_test_node(
+            &node("/work/e2e/testing/gw/src/a.controller.ts"),
+            &roots
+        ));
+        assert!(is_test_node(
+            &node("/work/e2e/testing/gw/src/__test-utils__/a.controller.ts"),
+            &roots
+        ));
+        assert!(is_test_node(
+            &node("/work/e2e/testing/gw/src/a.spec.ts"),
+            &roots
+        ));
+        // No known root: the full path is all there is.
+        assert!(is_test_node(&node("/work/e2e/gw/a.ts"), &[]));
     }
 
     #[test]

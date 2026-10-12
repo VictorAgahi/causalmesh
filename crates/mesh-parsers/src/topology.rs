@@ -15,10 +15,8 @@
 //! hidden groups and the exact call to zoom into one of them.
 
 use crate::graph::{WebEdge, WebGraphPayload, WebNode};
-use mesh_core::routes::{display_label, route_label};
-use mesh_core::{
-    is_test_path, ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId,
-};
+use mesh_core::routes::{display_label, is_test_node, route_label};
+use mesh_core::{ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId};
 use std::collections::{BTreeMap, HashMap};
 
 /// What a topology node stands for.
@@ -232,15 +230,9 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
-    /// Displays routes with the configured global prefix (`http_prefix`), their
-    /// files relative to the workspace `roots` (indexed by `repo_id`).
-    pub fn with_route_context(
-        mut self,
-        prefix: Option<&str>,
-        roots: &[std::path::PathBuf],
-    ) -> Self {
+    /// Displays routes with the configured global prefix (`http_prefix`).
+    pub fn with_http_prefix(mut self, prefix: Option<&str>) -> Self {
         self.http_prefix = prefix.map(str::to_string);
-        self.roots = roots.to_vec();
         self
     }
 
@@ -249,6 +241,18 @@ impl Aggregate {
     /// case-insensitive one (the first in byte order if several differ only by
     /// case). An unknown `focus` leaves `focus()` at `None`.
     pub fn build(graph: &ContractGraph, repo_names: &[String], focus: Option<&str>) -> Self {
+        Self::build_with_roots(graph, repo_names, focus, &[])
+    }
+
+    /// [`Self::build`] knowing the workspace `roots` (indexed by `RepoId`): route
+    /// files are shown relative to their root, and judged test code relative to it
+    /// too, so a checkout living under `~/testing/` does not hide its routes.
+    pub fn build_with_roots(
+        graph: &ContractGraph,
+        repo_names: &[String],
+        focus: Option<&str>,
+        roots: &[std::path::PathBuf],
+    ) -> Self {
         // One root → grouping by root would draw a single box; use packages.
         // Stops at the second distinct root instead of collecting every id.
         let by_root = {
@@ -289,7 +293,7 @@ impl Aggregate {
             let (name, kind) = group_of(node, repo_names, by_root);
             let gi = if kind == GroupKind::Service && focus.as_deref() == Some(name) {
                 match route_label(node) {
-                    Some(_) if is_test_path(&node.file_path) => routes_in_tests += 1,
+                    Some(_) if is_test_node(node, roots) => routes_in_tests += 1,
                     label => {
                         *focus_kinds.entry(kind_label(node.kind)).or_default() += 1;
                         if let Some(label) = label {
@@ -435,7 +439,7 @@ impl Aggregate {
             routes,
             routes_in_tests,
             http_prefix: None,
-            roots: Vec::new(),
+            roots: roots.to_vec(),
         };
         agg.routes.sort_by(|a, b| {
             a.label
@@ -1232,7 +1236,7 @@ mod tests {
         );
 
         let zoom = Aggregate::build(&g, &repos, Some("a"))
-            .with_route_context(Some("/api"), &[])
+            .with_http_prefix(Some("/api"))
             .select(&TopologyOptions {
                 focus: Some("a".into()),
                 ..Default::default()

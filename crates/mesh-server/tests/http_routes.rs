@@ -16,11 +16,26 @@ fn fixture(prefix: Option<&str>) -> Arc<AppState> {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/http-routes-fixture"),
     )
     .expect("canonicalize fixture");
-    let mut config = Config::load_from_file(&dir.join("mesh-mcp.toml")).expect("fixture config");
+    let config = Config::load_from_file(&dir.join("mesh-mcp.toml")).expect("fixture config");
+    build_state(config, &dir, prefix)
+}
+
+/// A one-off workspace rooted at `dir` (roots relative to it).
+fn state_for(dir: &std::path::Path, roots: &[&str], prefix: Option<&str>) -> Arc<AppState> {
+    let list: Vec<String> = roots.iter().map(|r| format!("\"{r}\"")).collect();
+    let config = Config::load_from_str(&format!(
+        "[workspace]\nname = \"tmp\"\nroots = [{}]\n",
+        list.join(", ")
+    ))
+    .expect("config");
+    build_state(config, dir, prefix)
+}
+
+fn build_state(mut config: Config, dir: &std::path::Path, prefix: Option<&str>) -> Arc<AppState> {
     config.workspace.http_prefix = prefix.map(str::to_string);
     let roots = expand_roots(
         &config.workspace.roots,
-        &dir,
+        dir,
         &config.workspace.workspace_root,
     )
     .expect("expand roots");
@@ -120,7 +135,7 @@ async fn two_routes_differing_only_in_verb_are_told_apart() {
 #[tokio::test]
 async fn partial_paths_and_method_plus_fragment_match() {
     let state = fixture(None);
-    let text = call(&state, "smart_search", json!({"query": "GET attendees"})).await;
+    let text = call(&state, "smart_search", json!({"query": "GET /attendees"})).await;
     assert!(text.contains("listAttendees"), "{text}");
     assert!(!text.contains("getEvent"), "{text}");
     let text = call(&state, "smart_search", json!({"query": "/invoices"})).await;
@@ -248,4 +263,93 @@ async fn visualize_mesh_whole_mesh_keeps_http_in_the_service_caption() {
     let state = fixture(None);
     let text = call(&state, "visualize_mesh", json!({})).await;
     assert!(text.contains("HTTP"), "{text}");
+}
+
+#[tokio::test]
+async fn plain_verb_word_queries_are_symbol_queries() {
+    let state = fixture(None);
+    for query in ["get user", "delete account", "post message"] {
+        let text = call(&state, "smart_search", json!({"query": query})).await;
+        assert!(!text.contains("Nearest routes"), "{query}\n{text}");
+        assert!(!text.contains("No route matches"), "{query}\n{text}");
+    }
+    // Still a route shape without a verb or with a slash.
+    let text = call(&state, "smart_search", json!({"query": "get /invoices"})).await;
+    assert!(text.contains("getInvoice"), "{text}");
+}
+
+#[tokio::test]
+async fn a_symbol_match_wins_over_a_fragment_only_route_hit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dunce::canonicalize(dir.path())
+        .expect("canonical")
+        .join("svc");
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    std::fs::write(
+        root.join("src/a.controller.ts"),
+        "import { Controller, Get } from '@nestjs/common';\n@Controller('events')\nexport class A {\n  @Get(':id/state')\n  stateOf() { return 1; }\n}\n",
+    )
+    .expect("write");
+    // A queue named like a route fragment.
+    std::fs::write(
+        root.join("src/b.consumer.ts"),
+        "import { EventPattern } from '@nestjs/microservices';\nexport class B {\n  @EventPattern('/state')\n  onState() { return 2; }\n}\n",
+    )
+    .expect("write");
+    let state = state_for(&root, &["."], None);
+    let text = call(&state, "smart_search", json!({"query": "/state"})).await;
+    let symbol_hit = text.contains("b.consumer.ts");
+    let route_header = text.contains("-> stateOf") || text.contains("->  stateOf");
+    // Whatever the indexer names that topic, the two must not be mixed up: either
+    // the symbol is shown (and the weak route fragment is not), or no symbol
+    // exists and the fragment route is shown.
+    assert!(symbol_hit != route_header, "{text}");
+    let strong = call(
+        &state,
+        "smart_search",
+        json!({"query": "GET /events/:id/state"}),
+    )
+    .await;
+    assert!(strong.contains("stateOf"), "{strong}");
+}
+
+#[tokio::test]
+async fn a_root_under_a_test_named_directory_keeps_its_routes() {
+    for outer in ["testing", "e2e"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(dir.path())
+            .expect("canonical")
+            .join(outer)
+            .join("gw");
+        std::fs::create_dir_all(root.join("src/__test-utils__")).expect("mkdir");
+        std::fs::write(
+            root.join("src/real.controller.ts"),
+            "import { Controller, Get } from '@nestjs/common';\n@Controller('things')\nexport class Real {\n  @Get(':id')\n  realThing() { return 1; }\n}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("src/__test-utils__/fake.controller.ts"),
+            "import { Controller, Get } from '@nestjs/common';\n@Controller('things')\nexport class Fake {\n  @Get('fake')\n  fakeThing() { return 1; }\n}\n",
+        )
+        .expect("write");
+        let state = state_for(&root, &["."], None);
+        let text = call(&state, "smart_search", json!({"query": "GET /things/:id"})).await;
+        assert!(text.contains("realThing"), "{outer}\n{text}");
+        let text = call(&state, "smart_search", json!({"query": "GET /things/fake"})).await;
+        assert!(!text.contains("fakeThing"), "{outer}\n{text}");
+        let text = call(
+            &state,
+            "smart_search",
+            json!({"query": "GET /things/fake", "include_tests": true}),
+        )
+        .await;
+        assert!(text.contains("fakeThing"), "{outer}\n{text}");
+        let text = call(
+            &state,
+            "analyze_impact",
+            json!({"target": "GET /things/:id"}),
+        )
+        .await;
+        assert!(text.contains("realThing"), "{outer}\n{text}");
+    }
 }

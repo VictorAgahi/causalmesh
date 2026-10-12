@@ -20,7 +20,7 @@ pub struct VisualizeMeshArgs {
     #[serde(default)]
     #[schemars(
         with = "Option<String>",
-        description = "Zoom into one service (a name shown in the default view or listed as hidden in its footer): draws that service's contracts and the services they talk to, and lists its HTTP routes (bounded). Omit for the whole-mesh service view."
+        description = "Zoom into one service (a name shown in the default view or listed as hidden in its footer): draws that service's contracts and the services they talk to, and, in the mermaid format only, lists its HTTP routes (bounded; json and html do not carry the route list). Omit for the whole-mesh service view."
     )]
     pub service: Option<CompactStr>,
 
@@ -50,7 +50,7 @@ pub struct VisualizeMeshTool;
 
 impl McpTool for VisualizeMeshTool {
     const NAME: &'static str = "visualize_mesh";
-    const DESCRIPTION: &'static str = "Generate a per-service architecture topology of the polyglot mesh (services, gRPC/HTTP contracts, topics, weighted cross-service links) in Mermaid, JSON or HTML. Zoom into one service with `service`: it then also lists the service's HTTP routes (verb, path, handler, file:line) and its contract counts by kind. DO NOT USE for a targeted question about one symbol (use find_dependents / analyze_grpc).";
+    const DESCRIPTION: &'static str = "Generate a per-service architecture topology of the polyglot mesh (services, gRPC/HTTP contracts, topics, weighted cross-service links) in Mermaid, JSON or HTML. Zoom into one service with `service`: in the mermaid format it then also lists the service's HTTP routes (verb, path, handler, file:line) and its contract counts by kind; json and html do NOT include them. DO NOT USE for a targeted question about one symbol (use find_dependents / analyze_grpc).";
     type Args = VisualizeMeshArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -102,11 +102,13 @@ impl McpTool for VisualizeMeshTool {
 
         // The O(contracts + edges) fold runs once; the shrink loop below only
         // re-selects over the (small) aggregated groups and links.
-        let aggregate = Aggregate::build(graph, &repo_names, opts.focus.as_deref())
-            .with_route_context(
-                state.config.workspace.http_prefix.as_deref(),
-                &state.allowed_roots,
-            );
+        let aggregate = Aggregate::build_with_roots(
+            graph,
+            &repo_names,
+            opts.focus.as_deref(),
+            &state.allowed_roots,
+        )
+        .with_http_prefix(state.config.workspace.http_prefix.as_deref());
         if let (Some(asked), None) = (&opts.focus, aggregate.focus()) {
             return Err((
                 -32602,
@@ -138,16 +140,16 @@ impl McpTool for VisualizeMeshTool {
             };
             // The footer (folded groups, zoom hint, HTTP routes of a zoomed service)
             // is part of the answer: it counts against the budget for Mermaid.
-            let footer_len = if format_choice == "mermaid" {
-                topology.footer().len() + 1
+            let footer = if format_choice == "mermaid" {
+                topology.footer()
             } else {
-                0
+                String::new()
             };
-            if body.len() + footer_len <= RENDER_BUDGET {
+            if body.len() + footer.len() < RENDER_BUDGET {
                 let text = match format_choice.as_str() {
                     // The page / document must stay parseable: no appended prose.
                     "html" | "json" => body,
-                    _ => format!("{body}\n{}", topology.footer()),
+                    _ => format!("{body}\n{footer}"),
                 };
                 return Ok(ToolOutput::text(text));
             }

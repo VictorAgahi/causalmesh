@@ -1537,15 +1537,17 @@ message User {
             "/home/me/proto-work/repo/gen/registry-proto/user.proto",
             &["registry-proto"]
         ));
-        // An absolute dir is a path prefix.
-        assert!(under(
-            "/home/me/proto-work/repo/registry/user.proto",
-            &["/home/me/proto-work/repo/registry"]
-        ));
-        assert!(!under(
-            "/home/me/proto-work/repo/registry-x/user.proto",
-            &["/home/me/proto-work/repo/registry"]
-        ));
+        // An absolute dir is a path prefix (the sample paths are POSIX).
+        if cfg!(unix) {
+            assert!(under(
+                "/home/me/proto-work/repo/registry/user.proto",
+                &["/home/me/proto-work/repo/registry"]
+            ));
+            assert!(!under(
+                "/home/me/proto-work/repo/registry-x/user.proto",
+                &["/home/me/proto-work/repo/registry"]
+            ));
+        }
     }
 
     #[test]

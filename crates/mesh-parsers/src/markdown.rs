@@ -21,6 +21,16 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+/// One HTTP route handler resolved by `analyze_impact` for a `VERB /path` target.
+#[derive(Debug, Clone)]
+pub struct RouteImpactEntry<'g> {
+    /// The route as displayed (`PATCH /api/v1/events/:id/state`).
+    pub route: String,
+    pub node: &'g ContractNode,
+    /// Edges the graph holds on the handler node, one rendered line each.
+    pub edges: Vec<String>,
+}
+
 /// Position of one page of `smart_search` results within the full ranked set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchPage {
@@ -681,6 +691,100 @@ impl MarkdownFormatter {
             ));
         }
         header
+    }
+
+    /// `analyze_impact` answer for a `VERB /path` target: the handler(s) the route
+    /// resolves to and the edges the graph holds on them. When nothing matched, the
+    /// nearest routes instead of the generic proto/event hint.
+    pub fn format_route_impact(
+        target: &str,
+        entries: &[RouteImpactEntry],
+        nearest: &[(String, &ContractNode)],
+        hidden_tests: usize,
+        roots: &[PathBuf],
+    ) -> String {
+        const MAX_ENTRIES: usize = 25;
+        const MAX_EDGES: usize = 12;
+        let labels = Self::root_labels(roots);
+        let label_of = |repo: RepoId| -> &str {
+            labels.get(repo as usize).map(String::as_str).unwrap_or("—")
+        };
+        let mut out = format!(
+            "## Impact for HTTP route `{}`\n",
+            target.replace(['\n', '\r', '`'], " ")
+        );
+        if entries.is_empty() {
+            out.push_str(&format!(
+                "\n*No HTTP route matches this target across {} indexed workspace roots (0 matches). Verb is case-insensitive and path parameter names are ignored (`:id`, `{{id}}`, `<id>`, `[id]` are the same); a configured `http_prefix` is optional.*\n",
+                roots.len()
+            ));
+            if hidden_tests > 0 {
+                out.push_str(&format!(
+                    "*{hidden_tests} route(s) match only in test files (`include_tests: true` to list them).*\n"
+                ));
+            }
+            if nearest.is_empty() {
+                out.push_str("*The graph holds no other HTTP routes.*\n");
+            } else {
+                out.push_str("\nNearest routes (same prefix or same verb):\n\n");
+                out.push_str("| Route | Handler | Root | Location |\n|---|---|---|---|\n");
+                for (route, node) in nearest {
+                    out.push_str(&format!(
+                        "| {} | {} | {} | {} |\n",
+                        Self::code_cell(route),
+                        Self::code_cell(&node.name),
+                        Self::code_cell(label_of(node.repo_id)),
+                        Self::code_cell(&Self::location(node, roots)),
+                    ));
+                }
+            }
+            return out;
+        }
+        out.push_str(&format!(
+            "*Handlers: {} (route matched on path structure, parameter names ignored).*\n\n",
+            entries.len()
+        ));
+        out.push_str("| # | Route | Handler | Root | Location |\n|---|---|---|---|---|\n");
+        for (idx, e) in entries.iter().take(MAX_ENTRIES).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                idx + 1,
+                Self::code_cell(&e.route),
+                Self::code_cell(&e.node.name),
+                Self::code_cell(label_of(e.node.repo_id)),
+                Self::code_cell(&Self::location(e.node, roots)),
+            ));
+        }
+        if entries.len() > MAX_ENTRIES {
+            out.push_str(&format!(
+                "\n*{} more handler(s) not listed.*\n",
+                entries.len() - MAX_ENTRIES
+            ));
+        }
+        for e in entries.iter().take(MAX_ENTRIES) {
+            if e.edges.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "\nGraph edges on `{}`:\n",
+                e.node.name.replace('`', "'")
+            ));
+            for line in e.edges.iter().take(MAX_EDGES) {
+                out.push_str(&format!("- {line}\n"));
+            }
+            if e.edges.len() > MAX_EDGES {
+                out.push_str(&format!("- ... {} more\n", e.edges.len() - MAX_EDGES));
+            }
+        }
+        out.push_str(
+            "\n*Scope: the handler only. The graph models no cross-repo edge for HTTP clients (a `fetch`, `axios` or `HttpService` call to this route is not linked), so callers of the route are NOT listed; search the consuming repos for the path with your usual tools.*\n",
+        );
+        if hidden_tests > 0 {
+            out.push_str(&format!(
+                "*{hidden_tests} route(s) in test files left out (`include_tests: true` to list them).*\n"
+            ));
+        }
+        out
     }
 
     /// Display label of each root, indexed like `roots`: its path relative to

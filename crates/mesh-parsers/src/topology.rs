@@ -15,7 +15,10 @@
 //! hidden groups and the exact call to zoom into one of them.
 
 use crate::graph::{WebEdge, WebGraphPayload, WebNode};
-use mesh_core::{ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId};
+use mesh_core::routes::{display_label, route_label};
+use mesh_core::{
+    is_test_path, ContractGraph, ContractNode, EdgeConfidence, EdgeKind, NodeId, NodeKind, RepoId,
+};
 use std::collections::{BTreeMap, HashMap};
 
 /// What a topology node stands for.
@@ -45,6 +48,22 @@ pub struct Group {
     pub location: Option<(String, usize, usize)>,
 }
 
+/// One HTTP route of the focused service (zoom view only).
+#[derive(Debug, Clone)]
+pub struct RouteLine {
+    /// The route as declared: `PATCH /events/:id/state`.
+    pub label: String,
+    pub handler: String,
+    /// Absolute file the handler is declared in.
+    pub file: std::path::PathBuf,
+    pub line: usize,
+    /// Index of the workspace root it was scanned from.
+    pub repo_id: RepoId,
+}
+
+/// Most routes listed under a zoomed service.
+pub const MAX_ROUTES_LISTED: usize = 15;
+
 #[derive(Debug, Clone)]
 pub struct Link {
     pub from: usize,
@@ -71,6 +90,16 @@ pub struct Topology {
     pub grouping: &'static str,
     /// The zoomed-in service, when one was requested and found.
     pub focus: Option<String>,
+    /// Zoom only: contract count per kind label, every kind of the service.
+    pub focus_kinds: BTreeMap<&'static str, usize>,
+    /// Zoom only: the service's HTTP routes outside test files, sorted.
+    pub routes: Vec<RouteLine>,
+    /// Zoom only: HTTP routes left out because they sit in test files.
+    pub routes_in_tests: usize,
+    /// Global route prefix to display routes with.
+    pub http_prefix: Option<String>,
+    /// Workspace roots, indexed by `RepoId`, to show route files relative to.
+    pub roots: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,9 +224,26 @@ pub struct Aggregate {
     ambiguous_omitted: usize,
     by_root: bool,
     focus: Option<String>,
+    focus_kinds: BTreeMap<&'static str, usize>,
+    routes: Vec<RouteLine>,
+    routes_in_tests: usize,
+    http_prefix: Option<String>,
+    roots: Vec<std::path::PathBuf>,
 }
 
 impl Aggregate {
+    /// Displays routes with the configured global prefix (`http_prefix`), their
+    /// files relative to the workspace `roots` (indexed by `repo_id`).
+    pub fn with_route_context(
+        mut self,
+        prefix: Option<&str>,
+        roots: &[std::path::PathBuf],
+    ) -> Self {
+        self.http_prefix = prefix.map(str::to_string);
+        self.roots = roots.to_vec();
+        self
+    }
+
     /// Folds the graph into services and topics. `focus` names a service to
     /// explode into its own contracts: an exact match wins, otherwise the
     /// case-insensitive one (the first in byte order if several differ only by
@@ -236,9 +282,27 @@ impl Aggregate {
         let mut node_ids: Vec<NodeId> = Vec::new();
         let mut interned: HashMap<(GroupKind, &str), u32> = HashMap::new();
         let mut node_group: HashMap<NodeId, u32> = HashMap::with_capacity(graph.node_count());
+        let mut focus_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut routes: Vec<RouteLine> = Vec::new();
+        let mut routes_in_tests = 0usize;
         for node in graph.all_nodes() {
             let (name, kind) = group_of(node, repo_names, by_root);
             let gi = if kind == GroupKind::Service && focus.as_deref() == Some(name) {
+                match route_label(node) {
+                    Some(_) if is_test_path(&node.file_path) => routes_in_tests += 1,
+                    label => {
+                        *focus_kinds.entry(kind_label(node.kind)).or_default() += 1;
+                        if let Some(label) = label {
+                            routes.push(RouteLine {
+                                label: label.to_string(),
+                                handler: node.name.to_string(),
+                                file: node.file_path.to_path_buf(),
+                                line: node.line_start,
+                                repo_id: node.repo_id,
+                            });
+                        }
+                    }
+                }
                 groups.push(Group {
                     name: format!("{} [{}]", node.name, kind_label(node.kind)),
                     kind: GroupKind::Contract,
@@ -367,7 +431,18 @@ impl Aggregate {
             ambiguous_omitted,
             by_root,
             focus,
+            focus_kinds,
+            routes,
+            routes_in_tests,
+            http_prefix: None,
+            roots: Vec::new(),
         };
+        agg.routes.sort_by(|a, b| {
+            a.label
+                .cmp(&b.label)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+        });
         let mut ranked: Vec<u32> = (0..agg.groups.len() as u32).collect();
         ranked.sort_unstable_by(|&a, &b| agg.rank_cmp(a, b));
         agg.ranked = ranked;
@@ -504,6 +579,11 @@ impl Aggregate {
             hidden,
             grouping: if self.by_root { "root" } else { "package" },
             focus: self.focus.clone(),
+            focus_kinds: self.focus_kinds.clone(),
+            routes: self.routes.clone(),
+            routes_in_tests: self.routes_in_tests,
+            http_prefix: self.http_prefix.clone(),
+            roots: self.roots.clone(),
         }
     }
 }
@@ -577,6 +657,14 @@ impl Topology {
             .rev()
             .map(|(k, n)| format!("{n} {k}"))
             .collect();
+        // `HTTP` sorts first, so the reversed order used to drop it: a gateway
+        // showed "module, interface, class" and no endpoints. Keep it.
+        if let Some(n) = g.by_kind.get("HTTP") {
+            if parts.len() > 3 {
+                parts.truncate(2);
+                parts.push(format!("{n} HTTP"));
+            }
+        }
         parts.truncate(3);
         let detail = (!parts.is_empty()).then(|| parts.join(" · "));
         (display_name(&g.name).into_owned(), detail)
@@ -675,6 +763,72 @@ impl Topology {
         }
     }
 
+    /// Zoom only: the service's contract counts by kind and its HTTP routes
+    /// (bounded), so a gateway shows its endpoints even though they have no
+    /// cross-service edge to rank them into the drawn contracts.
+    fn focus_section(&self, focus: &str) -> String {
+        let mut out = String::new();
+        if !self.focus_kinds.is_empty() {
+            let kinds: Vec<String> = self
+                .focus_kinds
+                .iter()
+                .rev()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect();
+            out.push_str(&format!(
+                "\n*Service `{}` by kind: {}.*\n",
+                inline_code_text(focus),
+                kinds.join(", ")
+            ));
+        }
+        if self.routes.is_empty() && self.routes_in_tests == 0 {
+            return out;
+        }
+        if !self.routes.is_empty() {
+            out.push_str(&format!(
+                "\nHTTP routes ({}{}):\n",
+                self.routes.len(),
+                if self.routes.len() > MAX_ROUTES_LISTED {
+                    format!(", first {MAX_ROUTES_LISTED} shown")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        for r in self.routes.iter().take(MAX_ROUTES_LISTED) {
+            let route = display_label(&r.label, self.http_prefix.as_deref())
+                .unwrap_or_else(|| r.label.clone());
+            let place = self
+                .roots
+                .get(r.repo_id as usize)
+                .and_then(|root| r.file.strip_prefix(root).ok())
+                .unwrap_or(&r.file)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push_str(&format!(
+                "  - `{}` -> `{}` (`{}`)\n",
+                inline_code_text(&route),
+                inline_code_text(&r.handler),
+                inline_code_text(&format!("{place}:{}", r.line))
+            ));
+        }
+        if self.routes.len() > MAX_ROUTES_LISTED {
+            out.push_str(&format!(
+                "  - ... {} more: `smart_search` with `METHOD /path` finds one.\n",
+                self.routes.len() - MAX_ROUTES_LISTED
+            ));
+        }
+        if self.routes_in_tests > 0 {
+            out.push_str(&format!(
+                "*{} route(s) in test files not listed.*\n",
+                self.routes_in_tests
+            ));
+        }
+        out
+    }
+
     /// Footer: what was folded and how to zoom, following the
     /// `smart_search` truncation affordance.
     pub fn footer(&self) -> String {
@@ -708,6 +862,9 @@ impl Topology {
                     inline_code_text(name)
                 ));
             }
+        }
+        if let Some(focus) = &self.focus {
+            out.push_str(&self.focus_section(focus));
         }
         if self.focus.is_none() {
             // Only a *service* can be zoomed into: never suggest a topic.
@@ -1044,6 +1201,51 @@ mod tests {
         assert!(json.len() < 4096, "{}", json.len());
         // A shortened name is never offered as a zoom target (it would not match).
         assert!(!t.footer().contains("xxx…\""), "{}", t.footer());
+    }
+
+    /// 7.1.5: the caption keeps the HTTP count when four kinds compete for three
+    /// slots (it used to be the one dropped), and a zoom lists the routes.
+    #[test]
+    fn http_endpoints_show_in_the_caption_and_the_zoom_route_list() {
+        let mut g = ContractGraph::new();
+        for (name, kind) in [
+            ("M", NodeKind::Module),
+            ("I", NodeKind::Interface),
+            ("C", NodeKind::ServiceClass),
+        ] {
+            g.add_node(node(name, "gw", 0, kind));
+        }
+        let mut route = node("changeState", "gw", 0, NodeKind::HttpEndpoint);
+        route.signature = Some("PATCH /events/:id/state".into());
+        g.add_node(route);
+        let mut test_route = node("fake", "gw", 0, NodeKind::HttpEndpoint);
+        test_route.signature = Some("GET /fake".into());
+        test_route.file_path = FilePath::from(Path::new("gw/src/__test-utils__/fake.ts"));
+        g.add_node(test_route);
+        g.add_node(node("Other", "other", 1, NodeKind::ServiceClass));
+        let repos = ["a".to_string(), "b".to_string()];
+        let t = Topology::build(&g, &repos, &TopologyOptions::default());
+        assert!(
+            t.to_mermaid("ws").contains("2 HTTP"),
+            "{}",
+            t.to_mermaid("ws")
+        );
+
+        let zoom = Aggregate::build(&g, &repos, Some("a"))
+            .with_route_context(Some("/api"), &[])
+            .select(&TopologyOptions {
+                focus: Some("a".into()),
+                ..Default::default()
+            });
+        let footer = zoom.footer();
+        assert!(footer.contains("HTTP routes (1)"), "{footer}");
+        assert!(
+            footer.contains("PATCH /api/events/:id/state` -> `changeState`"),
+            "{footer}"
+        );
+        assert!(footer.contains("1 HTTP"), "{footer}");
+        assert!(footer.contains("1 route(s) in test files"), "{footer}");
+        assert!(!footer.contains("/fake"), "{footer}");
     }
 
     #[test]

@@ -5,6 +5,45 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.5] — 2026-10-12
+
+### Added
+- HTTP routes are reachable by route. The graph already held an `HttpEndpoint` node per route
+  (name = handler, signature = `PATCH /events/:id/state`), but no tool could find one by its route.
+  - `smart_search` accepts `METHOD /path`, a bare `/path` fragment and a verb with a partial path
+    (`GET attendees`). Matching compares path structure: `:id`, `{id}`, `<id>`, `[id]` and
+    `:eventId` vs `:id` are the same parameter, the verb is case-insensitive, a trailing slash and
+    `?query` are ignored. Each hit shows verb and path, handler, `file:line` and root, then the
+    handler's decapitated declaration (only that declaration, within the 8 KB page budget). Whole
+    path matches rank first, then a concrete value for a parameter (`/events/42/state`), then
+    leading segments, then fragments. A literal never stands for a parameter in a fragment. A
+    route-shaped query without any route hit falls back to the ordinary symbol search, then lists
+    the nearest routes.
+  - `analyze_impact` accepts a `VERB /path` target (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS),
+    resolves it with the same matching, and reports the handler, its location and the graph edges
+    on the handler node. It states that the analysis covers the handler only: the graph models no
+    cross-repo edge for HTTP clients, so callers of a route are not listed. With no match it says
+    so and lists the nearest routes (same prefix, then same verb) instead of the proto/event hint.
+  - `visualize_mesh(service: ...)` prints the service's contract counts by kind and its HTTP
+    routes (at most 15, the rest counted); a route has no cross-service edge, so it used to fold
+    into "other contracts". The whole-mesh service caption keeps its HTTP count when more than
+    three kinds compete for the three caption slots (it was the one dropped).
+  - New optional workspace key `http_prefix` (`"/api/v1"`): prepended when routes are displayed
+    and accepted with or without when matching. Never auto-detected from `setGlobalPrefix`.
+    Documented in `SETUP.md` and the annotated `mesh-mcp.toml`.
+  - `smart_search` gains `include_tests` (route queries only, default false) with the other tools'
+    meaning; route hits in test files are left out and counted. `__test-utils__`,
+    `__test_utils__`, `__testutils__`, `__specs__`, `__e2e__` and `__testing__` directories are
+    now test directories (`__tests__`, `__mocks__`, `__fixtures__` and a `.test.` / `.spec.`
+    anywhere in the file name already were).
+
+### Known limits
+- Routes assembled at runtime (a path built from variables, a prefix read from the environment) and
+  API versioning (`@Controller({ version })` URI prefixes beyond what the parser states) are not
+  resolved; set `http_prefix` for a constant global prefix.
+- `visualize_mesh` lists routes in the Mermaid view only; the JSON and HTML documents stay the
+  per-group view.
+
 ## [7.1.4] — 2026-10-12
 
 ### Fixed

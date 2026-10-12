@@ -1,7 +1,8 @@
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
-use mesh_core::{AppState, CompactStr};
-use mesh_parsers::MarkdownFormatter;
+use mesh_core::routes::{display_route, find_routes, nearest_routes, prefix_segments, RouteQuery};
+use mesh_core::{AppState, CompactStr, EdgeKind};
+use mesh_parsers::{MarkdownFormatter, RouteImpactEntry};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct AnalyzeImpactArgs {
     #[schemars(
         with = "String",
-        description = "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, consumer handler class, or saga."
+        description = "What is changing: a proto/gRPC method (ex: 'ProcessPayment', 'PaymentService.ProcessPayment') or service, or an event (ex: 'EVENT_CREATED', 'event.created'), Kafka topic, queue, stream, consumer handler class, or saga; or an HTTP route written 'VERB /path' (ex: 'PATCH /events/:id/state'; verb in GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS, case-insensitive; ':id', '{id}', '<id>', '[id]' are the same parameter). A route target needs both the verb and a leading '/'."
     )]
     pub target: CompactStr,
 
@@ -54,7 +55,7 @@ pub struct AnalyzeImpactTool;
 
 impl McpTool for AnalyzeImpactTool {
     const NAME: &'static str = "analyze_impact";
-    const DESCRIPTION: &'static str = "Authoritative causal impact matrix: for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue, stream or saga, who publishes it (producers, outbox writes) and who consumes or subscribes to it (consumer handlers, message broker and event bus listeners) (direct by default, or through `depth` causal hops of real Produces/Consumes edges). A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage.";
+    const DESCRIPTION: &'static str = "Authoritative causal impact matrix: for an HTTP route (`VERB /path`), its handler (file:line, root) and the graph edges on it, covering the handler only (HTTP clients are not linked across repos); for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue, stream or saga, who publishes it (producers, outbox writes) and who consumes or subscribes to it (consumer handlers, message broker and event bus listeners) (direct by default, or through `depth` causal hops of real Produces/Consumes edges). A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage, and does NOT find the callers of an HTTP route.";
     type Args = AnalyzeImpactArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -80,6 +81,14 @@ impl McpTool for AnalyzeImpactTool {
             .map(|l| l.clamp(1, MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT) as usize;
         let offset = args.offset.unwrap_or(0) as usize;
+        if let Some(route) = RouteQuery::parse_target(args.target.as_str()) {
+            return Ok(ToolOutput::text(Self::route_impact(
+                args,
+                &route,
+                state,
+                &snapshot.contract_graph,
+            )));
+        }
         let mut matrix = snapshot
             .contract_graph
             .impact_matrix(args.target.as_str(), depth);
@@ -98,5 +107,95 @@ impl McpTool for AnalyzeImpactTool {
             ));
         }
         Ok(ToolOutput::text(text))
+    }
+}
+
+impl AnalyzeImpactTool {
+    /// `VERB /path` target: the handler(s) the route resolves to, then the
+    /// edges the graph holds on those nodes. Nothing is inferred beyond them.
+    fn route_impact(
+        args: &AnalyzeImpactArgs,
+        route: &RouteQuery,
+        state: &AppState,
+        graph: &mesh_core::ContractGraph,
+    ) -> String {
+        let include_tests = args.include_tests.unwrap_or(false);
+        let prefix_text = state.config.workspace.http_prefix.as_deref();
+        let prefix = prefix_segments(prefix_text);
+        let (hits, hidden_tests) = find_routes(graph, route, &prefix, None, include_tests);
+        // Impact is about the declared route: a fragment of one is not it.
+        let hits: Vec<_> = hits
+            .into_iter()
+            .filter(|h| h.rank <= mesh_core::routes::RouteRank::Value)
+            .collect();
+        if hits.is_empty() {
+            let near: Vec<(String, &mesh_core::ContractNode)> =
+                nearest_routes(graph, route, &prefix, include_tests, 8)
+                    .into_iter()
+                    .filter_map(|n| display_route(n, prefix_text).map(|r| (r, n)))
+                    .collect();
+            return MarkdownFormatter::format_route_impact(
+                args.target.as_str(),
+                &[],
+                &near,
+                hidden_tests,
+                &state.allowed_roots,
+            );
+        }
+        let entries: Vec<RouteImpactEntry> = hits
+            .iter()
+            .map(|h| RouteImpactEntry {
+                route: display_route(h.node, prefix_text)
+                    .unwrap_or_else(|| h.node.name.to_string()),
+                node: h.node,
+                edges: Self::edges_on(graph, h.node, &state.allowed_roots),
+            })
+            .collect();
+        MarkdownFormatter::format_route_impact(
+            args.target.as_str(),
+            &entries,
+            &[],
+            hidden_tests,
+            &state.allowed_roots,
+        )
+    }
+
+    /// Edges of the graph touching `node` (events it produces or consumes, RPCs
+    /// it calls), one rendered line each. Import edges are left to `find_dependents`.
+    fn edges_on(
+        graph: &mesh_core::ContractGraph,
+        node: &mesh_core::ContractNode,
+        roots: &[std::path::PathBuf],
+    ) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for e in graph.all_edges() {
+            if e.kind == EdgeKind::Imports || (e.from != node.id && e.to != node.id) {
+                continue;
+            }
+            let (arrow, other_id) = if e.from == node.id {
+                ("->", e.to)
+            } else {
+                ("<-", e.from)
+            };
+            let Some(other) = graph.get_node(other_id) else {
+                continue;
+            };
+            let place = roots
+                .get(other.repo_id as usize)
+                .and_then(|r| other.file_path.strip_prefix(r).ok())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| other.file_path.display().to_string());
+            lines.push(format!(
+                "{arrow} {:?} `{}` (`{}:{}`, {})",
+                e.kind,
+                other.name.replace('`', "'"),
+                place,
+                other.line_start,
+                e.confidence.label()
+            ));
+        }
+        lines.sort();
+        lines.dedup();
+        lines
     }
 }

@@ -1,6 +1,10 @@
+use crate::indexer::WorkspaceIndexer;
 use crate::protocol::RequestMeta;
 use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::{McpTool, ToolError, ToolOutput};
+use mesh_core::routes::{
+    display_route, find_routes, nearest_routes, prefix_segments, RouteHit, RouteQuery,
+};
 use mesh_core::{
     file_stamp, AppState, CachedSearch, CompactStr, ContractNode, FileStamp, FilesystemCrawler,
     NodeKind, PropertyRegistry, SearchCacheKey, ValidatedScope,
@@ -19,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub struct SmartSearchArgs {
     #[schemars(
         with = "String",
-        description = "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent')"
+        description = "Symbol, class, or method declaration to search for across scoped repositories (ex: 'UserAuthRequest', 'createEvent'), or an HTTP route: 'PATCH /events/:id/state', a bare '/events/:id' fragment, or 'PATCH events/state'. Routes match on path structure: ':id', '{id}', '<id>', '[id]' and ':eventId' are the same parameter, the verb is case-insensitive."
     )]
     pub query: CompactStr,
 
@@ -53,6 +57,12 @@ pub struct SmartSearchArgs {
         description = "Number of ranked files to skip (default 0). Use the `offset` value given in a previous page's 'More results' footer."
     )]
     pub offset: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Route queries only: also list HTTP routes declared in test files and test-only directories (*.spec.ts, __tests__/, __test-utils__/, ...). Default false: they are left out and counted. Has no effect on symbol-name queries."
+    )]
+    pub include_tests: Option<bool>,
 
     #[serde(default)]
     // Accepted for W3C trace propagation, hidden from `tools/list`: the model
@@ -189,7 +199,7 @@ pub struct SmartSearchTool;
 
 impl McpTool for SmartSearchTool {
     const NAME: &'static str = "smart_search";
-    const DESCRIPTION: &'static str = "Scans scoped repositories for symbol declarations and decapitated AST signatures. Results are ranked and paginated (`limit`/`offset`); line numbers are original source coordinates. DO NOT USE to map package import hierarchies (use find_dependents).";
+    const DESCRIPTION: &'static str = "Scans scoped repositories for symbol declarations and decapitated AST signatures. Also finds HTTP routes by `METHOD /path` (verb-insensitive, path parameter names ignored, optional configured prefix), listing verb, path, handler, file:line and root. Results are ranked and paginated (`limit`/`offset`); line numbers are original source coordinates. DO NOT USE to map package import hierarchies (use find_dependents).";
     type Args = SmartSearchArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -246,6 +256,7 @@ impl McpTool for SmartSearchTool {
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = args.offset.unwrap_or(0);
         let fuzzy = args.fuzzy.unwrap_or(false);
+        let include_tests = args.include_tests.unwrap_or(false);
         let snapshot = state.snapshot();
         let generation = snapshot.generation;
         let secrets_redacted = snapshot.property_registry.redacted_count();
@@ -257,6 +268,7 @@ impl McpTool for SmartSearchTool {
             raw_scope: scope_label.into(),
             include_body: args.include_body,
             fuzzy,
+            include_tests,
             limit,
             offset,
         };
@@ -285,12 +297,67 @@ impl McpTool for SmartSearchTool {
         let budget = MarkdownFormatter::search_page_entry_budget(query, scope_label)
             .saturating_sub(gap_note.as_ref().map_or(0, String::len))
             .min(DEFAULT_PAGE_BUDGET_BYTES);
-        let ranked = Self::rank_indexed_files(
-            snapshot.contract_graph.search_symbols(query, scope_path),
-            query,
-        );
+        // A query shaped like a route (`PATCH /events/:id/state`, `/events/:id`)
+        // is answered from the `HttpEndpoint` nodes' signatures when any matches;
+        // otherwise it is an ordinary symbol query (a route-named node, a path).
+        let route_query = RouteQuery::parse(query);
+        let prefix_text = state.config.workspace.http_prefix.as_deref();
+        let prefix = prefix_segments(prefix_text);
+        let mut route_note: Option<String> = None;
+        let route_page = route_query.as_ref().and_then(|rq| {
+            let (hits, hidden_tests) = find_routes(
+                &snapshot.contract_graph,
+                rq,
+                &prefix,
+                scope_path,
+                include_tests,
+            );
+            if hits.is_empty() {
+                if hidden_tests > 0 {
+                    route_note = Some(format!(
+                        "*{hidden_tests} route(s) match only in test files (`include_tests: true` to list them).*\n"
+                    ));
+                } else {
+                    route_note = Self::nearest_routes_note(
+                        &snapshot.contract_graph,
+                        rq,
+                        &prefix,
+                        prefix_text,
+                        include_tests,
+                    );
+                }
+                return None;
+            }
+            if hidden_tests > 0 {
+                route_note = Some(format!(
+                    "*{hidden_tests} route(s) in test files left out (`include_tests: true` to list them).*\n"
+                ));
+            }
+            Some(Self::collect_route_page(
+                &hits,
+                &RouteRender {
+                    repo_names: &WorkspaceIndexer::repo_names(&state.allowed_roots),
+                    prefix: prefix_text,
+                    include_body: args.include_body,
+                },
+                offset,
+                limit,
+                budget,
+            ))
+        });
+        let ranked = if route_page.is_some() {
+            Vec::new()
+        } else {
+            Self::rank_indexed_files(
+                snapshot.contract_graph.search_symbols(query, scope_path),
+                query,
+            )
+        };
 
-        let (matches, page, file_stamps) = if !ranked.is_empty() {
+        let routes_used = route_page.is_some();
+        let (matches, page, file_stamps) = if let Some(found) = route_page {
+            found
+        } else if !ranked.is_empty() {
             Self::collect_indexed_page(&ranked, &matcher, args.include_body, offset, limit, budget)
         } else if fuzzy {
             let files = match &target {
@@ -313,7 +380,7 @@ impl McpTool for SmartSearchTool {
         } else {
             (Vec::new(), SearchPage::single(0), Vec::new())
         };
-        let indexed = !ranked.is_empty();
+        let indexed = !ranked.is_empty() || routes_used;
         // `smart_search` is a substring search, but a page mixing exact
         // declarations of the query with names that merely contain it read as
         // one list of equals (7.0.6: `SocialEventCreatedPostProcessor` among
@@ -331,6 +398,14 @@ impl McpTool for SmartSearchTool {
         let files_accessed: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
         let mut text = MarkdownFormatter::format_search_page(query, scope_label, &matches, &page);
         if let Some(note) = &partial_note {
+            text.push_str(note);
+        }
+        if routes_used {
+            text.push_str(
+                "*Route match: verb case-insensitive, path parameters compared by position (names ignored). Each entry starts with the route line, then the handler declaration.*\n",
+            );
+        }
+        if let Some(note) = &route_note {
             text.push_str(note);
         }
         if let Some(note) = &gap_note {
@@ -357,6 +432,13 @@ impl McpTool for SmartSearchTool {
             secrets_redacted,
         })
     }
+}
+
+/// What rendering a route hit needs besides the hit itself.
+struct RouteRender<'a> {
+    repo_names: &'a [String],
+    prefix: Option<&'a str>,
+    include_body: bool,
 }
 
 /// One file of the ranked result set: its best symbol's rank and the exact
@@ -505,6 +587,150 @@ impl SmartSearchTool {
             .collect();
         ranked.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.path.cmp(b.path)));
         ranked
+    }
+
+    /// Nearest routes (same prefix, then same verb) for a route query that
+    /// matched nothing, as a short list; `None` when the graph has no routes.
+    fn nearest_routes_note(
+        graph: &mesh_core::ContractGraph,
+        query: &RouteQuery,
+        prefix: &[mesh_core::routes::Seg],
+        prefix_text: Option<&str>,
+        include_tests: bool,
+    ) -> Option<String> {
+        let near = nearest_routes(graph, query, prefix, include_tests, 5);
+        if near.is_empty() {
+            return None;
+        }
+        let mut out = String::from("\n*No route matches. Nearest routes:*\n");
+        for node in near {
+            if let Some(route) = display_route(node, prefix_text) {
+                out.push_str(&format!(
+                    "- `{route}` -> `{}` (`{}:{}`)\n",
+                    node.name,
+                    node.file_path.display(),
+                    node.line_start
+                ));
+            }
+        }
+        Some(out)
+    }
+
+    /// One page of route hits, each rendered as a route line plus the handler's
+    /// decapitated declaration. Same budget rule as [`Self::collect_indexed_page`].
+    fn collect_route_page(
+        hits: &[RouteHit],
+        render: &RouteRender,
+        offset: u32,
+        limit: u32,
+        budget: usize,
+    ) -> (Vec<SearchResult>, SearchPage, Vec<FileStamp>) {
+        let start = (offset as usize).min(hits.len());
+        let end = start.saturating_add(limit as usize).min(hits.len());
+        let mut matches = Vec::new();
+        let mut stamps = Vec::new();
+        let mut bytes = 0usize;
+        let mut consumed = start;
+        for hit in &hits[start..end] {
+            let result = Self::route_result(hit, render);
+            let size = MarkdownFormatter::format_search_entry(matches.len(), &result).len();
+            if bytes + size > budget && !matches.is_empty() {
+                break;
+            }
+            stamps.push(file_stamp(&hit.node.file_path));
+            bytes += size;
+            matches.push(result);
+            consumed += 1;
+        }
+        let page = SearchPage {
+            total: hits.len(),
+            total_is_lower_bound: false,
+            offset: offset as usize,
+            end: consumed.max(offset as usize),
+            next_offset: (consumed < hits.len()).then_some(consumed),
+        };
+        (matches, page, stamps)
+    }
+
+    fn route_result(hit: &RouteHit, render: &RouteRender) -> SearchResult {
+        let node = hit.node;
+        let route = display_route(node, render.prefix)
+            .unwrap_or_else(|| format!("{} (route)", hit.route.verb));
+        let repo = render
+            .repo_names
+            .get(node.repo_id as usize)
+            .map(String::as_str)
+            .unwrap_or("-");
+        let header = format!("// {route}  ->  {}  [root: {repo}]", node.name);
+        let path_string = node.file_path.to_string_lossy().into_owned();
+        let language = LanguageKind::from_path(&path_string).as_str().to_string();
+        let declaration = ReadFile::load(&node.file_path)
+            .and_then(|file| Self::route_declaration(&file, node, render.include_body));
+        match declaration {
+            Some((line_start, line_end, snippet)) => SearchResult {
+                file_path: path_string,
+                line_start,
+                line_end,
+                language,
+                snippet: format!("{header}\n{snippet}"),
+            },
+            // File changed since indexing: the route line still carries the coordinates.
+            None => SearchResult {
+                file_path: path_string,
+                line_start: node.line_start,
+                line_end: node.line_end,
+                language,
+                snippet: header,
+            },
+        }
+    }
+
+    /// The decapitated declaration of a route handler alone: the output lines
+    /// whose original span overlaps the node's `line_start..=line_end`, with the
+    /// same redaction and width cap as any snippet. `None` when the file cannot be
+    /// parsed under the AstGuard budget (the caller then keeps the route line).
+    fn route_declaration(
+        file: &ReadFile,
+        node: &ContractNode,
+        include_body: bool,
+    ) -> Option<(usize, usize, String)> {
+        if !AstGuard::should_parse_path(&node.file_path, &file.metadata, file.text.as_bytes()) {
+            return None;
+        }
+        let path_string = node.file_path.to_string_lossy();
+        let lang_kind = LanguageKind::from_path(&path_string);
+        let decap = AstDecapitator::decapitate_auto_mapped(&file.text, lang_kind, include_body);
+        if decap.bounded {
+            return None;
+        }
+        let lines: Vec<&str> = decap.text.lines().collect();
+        let picked: Vec<usize> = (0..lines.len().min(decap.line_map.len()))
+            .filter(|&i| {
+                let (first, last) = decap.line_map[i];
+                first as usize <= node.line_end && last as usize >= node.line_start
+            })
+            .take(SNIPPET_LINES)
+            .collect();
+        let (first, last) = (*picked.first()?, *picked.last()?);
+        let is_code = lang_kind.language().is_some();
+        let snippet = picked
+            .iter()
+            .map(|&i| {
+                let redacted = Self::redact_sensitive_line(lines[i], is_code);
+                if redacted.len() > MAX_SNIPPET_LINE_BYTES {
+                    let cut = Self::floor_char_boundary(&redacted, MAX_SNIPPET_LINE_BYTES - 3);
+                    format!("{}...", &redacted[..cut])
+                } else {
+                    redacted
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((
+            decap.line_map[first].0 as usize,
+            decap.line_map[last].1 as usize,
+            snippet,
+        ))
     }
 
     /// Reads only the files of the requested page. Each result's rendered size is
@@ -1045,6 +1271,7 @@ mod tests {
             fuzzy: Some(true),
             limit: None,
             offset: None,
+            include_tests: None,
             _meta: None,
         }
     }
@@ -1104,6 +1331,7 @@ mod tests {
             fuzzy: Some(fuzzy),
             limit: None,
             offset: None,
+            include_tests: None,
             _meta: None,
         }
     }
@@ -1771,6 +1999,7 @@ mod tests {
             fuzzy: Some(fuzzy),
             limit: None,
             offset: None,
+            include_tests: None,
             _meta: None,
         }
     }

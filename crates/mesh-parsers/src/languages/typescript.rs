@@ -171,10 +171,32 @@ impl TypeScriptExtractor {
             0,
         );
         let fields = Self::client_fields(root, source_bytes);
+        let declared = Self::declared_fields(root, source_bytes);
+        let aliases = Self::type_aliases(root, source_bytes);
         let handlers = ctx.handlers.take();
-        Self::collect_method_rpc_calls(root, source_bytes, &fields, &mut raw_rpc_calls);
+        Self::collect_method_rpc_calls(
+            root,
+            source_bytes,
+            &fields,
+            &declared,
+            &aliases,
+            &mut raw_rpc_calls,
+        );
         Self::resolve_rpc_calls(&nodes, raw_rpc_calls, rpc_calls, root, source_bytes);
-        Self::record_client_field_bindings(root, source_bytes, &fields, &nodes, rpc_calls);
+        // A field declared with a plain application type is recorded like a
+        // binding with no service, so a subclass in another file does not
+        // guess a client from its name either.
+        let mut bound = fields.clone();
+        for (key, type_text) in &declared {
+            if !bound.contains_key(key)
+                && type_text
+                    .as_deref()
+                    .is_some_and(|t| Self::type_rules_out_grpc_client(t, &aliases))
+            {
+                bound.insert(key.clone(), String::new());
+            }
+        }
+        Self::record_client_field_bindings(root, source_bytes, &bound, &nodes, rpc_calls);
         for handler in &handlers {
             rpc_calls.push((
                 handler.node_idx,
@@ -743,6 +765,9 @@ impl TypeScriptExtractor {
                         }
                     }
                 }
+                // Only the decorators attached to the method, never its
+                // signature: where `@Annotation(...)` arguments are read.
+                let decorator_text = full_text.clone();
                 let signature_end = node
                     .child_by_field_name("body")
                     .map_or(node.end_byte(), |b| b.start_byte());
@@ -811,7 +836,7 @@ impl TypeScriptExtractor {
 
                 if kind == NodeKind::GrpcMethod {
                     if let Some(annotation) = matched_annotation {
-                        let args = Self::decorator_args(&full_text, annotation);
+                        let args = Self::decorator_args(&decorator_text, annotation);
                         ctx.handlers.borrow_mut().push(HandlerSite {
                             node_idx: nodes.len(),
                             reference: Self::handler_reference(&args, method_name),
@@ -1381,10 +1406,10 @@ impl TypeScriptExtractor {
         root: Node,
         source: &[u8],
         fields: &HashMap<(Option<usize>, String), String>,
+        declared: &HashMap<(Option<usize>, String), Option<String>>,
+        aliases: &HashMap<String, String>,
         raw: &mut Vec<RawRpcCall>,
     ) {
-        let declared = Self::declared_fields(root, source);
-        let aliases = Self::type_aliases(root, source);
         Self::walk(root, &mut |node| {
             if node.kind() != "call_expression" {
                 return;
@@ -1428,7 +1453,7 @@ impl TypeScriptExtractor {
                     if declared
                         .get(&key)
                         .and_then(|t| t.as_deref())
-                        .is_some_and(|t| Self::type_rules_out_grpc_client(t, &aliases))
+                        .is_some_and(|t| Self::type_rules_out_grpc_client(t, aliases))
                     {
                         return;
                     }
@@ -1636,7 +1661,17 @@ impl TypeScriptExtractor {
             .unwrap_or_default();
         let method = match args.get(1) {
             Some(a) => Self::reference_part(a),
-            None => format!("'{}'", method_name.replace(['\'', '|'], "")),
+            // NestJS serves the PascalCase form of the method's own name.
+            None => {
+                let mut chars = method_name
+                    .replace(['\'', '|'], "")
+                    .chars()
+                    .collect::<Vec<_>>();
+                if let Some(first) = chars.first_mut() {
+                    *first = first.to_ascii_uppercase();
+                }
+                format!("'{}'", chars.into_iter().collect::<String>())
+            }
         };
         format!("{service}|{method}")
     }
@@ -3569,6 +3604,18 @@ export const Ads = () => ({
                 "pb/user.proto",
             );
         }
+        declare(
+            "AuthService",
+            NodeKind::GrpcService,
+            "demo.auth",
+            "pb/auth.proto",
+        );
+        declare(
+            "AuthService.SignUp",
+            NodeKind::GrpcMethod,
+            "demo.auth",
+            "pb/auth.proto",
+        );
         for (package, file) in extra_protos {
             declare("UserService", NodeKind::GrpcService, package, file);
             declare(
@@ -4084,5 +4131,117 @@ export class Gw {
             1,
             "wrapped"
         );
+    }
+
+    // ---- 7.1.4 second review round -----------------------------------------
+
+    /// Same method name, different service: a real cross-service call made
+    /// from a handler stays a (heuristic) client.
+    #[test]
+    fn delegation_drop_requires_the_same_service() {
+        let code = r#"
+export class C {
+  private authService;
+  private userService;
+  @GrpcMethod('UserService', 'SignUp')
+  signUp(id: string) {
+    this.userService.signUp(id);
+    return this.authService.signUp(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        // (`analyze_grpc` anchors on bare method names too, so look at the edges.)
+        let mut called: Vec<String> = graph
+            .all_edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::CallsRpc)
+            .filter_map(|e| graph.get_node(e.to).map(|n| n.name.to_string()))
+            .collect();
+        called.sort();
+        assert_eq!(called, vec!["AuthService.SignUp".to_string()]);
+        assert_eq!(
+            client_stubs(&graph, "AuthService.SignUp"),
+            vec![("UserService.SignUp".to_string(), EdgeConfidence::Heuristic)]
+        );
+    }
+
+    /// `@GrpcMethod('UserService')` serves the PascalCase form of the method's name.
+    #[test]
+    fn default_method_name_is_pascal_cased() {
+        let code = r#"
+export class C {
+  private userService;
+  @GrpcMethod('UserService')
+  addBadgeToUser(id: string) {
+    return this.userService.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        let found = implements_of(&graph, "UserService.AddBadgeToUser");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, EdgeConfidence::Exact);
+        assert!(client_stubs(&graph, "UserService.AddBadgeToUser").is_empty());
+    }
+
+    /// `@GrpcMethod()` names no service: nothing is guessed, nothing is dropped.
+    #[test]
+    fn bare_grpc_method_decorator_stays_heuristic() {
+        let code = r#"
+export class C {
+  private userService;
+  @GrpcMethod()
+  addBadgeToUser(id: string) {
+    return this.userService.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        let found = implements_of(&graph, "UserService.AddBadgeToUser");
+        assert!(
+            found.iter().all(|(_, c)| *c != EdgeConfidence::Exact),
+            "{found:?}"
+        );
+    }
+
+    /// A domain-typed field declared in a base class is not a client of its
+    /// subclasses either, whatever its name.
+    #[test]
+    fn domain_typed_base_class_field_is_not_a_client() {
+        let base = r#"
+export class Base {
+  protected userService: UserService;
+}
+"#;
+        let sub = r#"
+import { Base } from './base';
+export class Sub extends Base {
+  run(id: string) {
+    return this.userService.addBadgeToUser(id);
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/base.ts", base), ("src/sub.ts", sub)]);
+        assert!(client_stubs(&graph, "UserService.AddBadgeToUser").is_empty());
+    }
+
+    /// Only the decorators of the method are read: a body or a parameter
+    /// mentioning the annotation does not change the arguments.
+    #[test]
+    fn annotation_text_outside_the_method_decorators_is_ignored() {
+        let code = r#"
+export class C {
+  @GrpcMethod('UserService', 'SignUp')
+  signUp(@Body() body: string) {
+    const x = '@GrpcMethod("Wrong", "Wrong")';
+    return x;
+  }
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        let found = implements_of(&graph, "UserService.SignUp");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, EdgeConfidence::Exact);
     }
 }

@@ -1333,10 +1333,18 @@ impl ContractGraph {
             // A name-based guess made inside the handler of the RPC it names is
             // delegation to an application service, not a client call.
             if inferred && method_level {
-                let called = target_str.rsplit('.').next().unwrap_or(target_str);
+                let (called_service, called) =
+                    target_str.rsplit_once('.').unwrap_or(("", target_str));
                 if handler_methods
                     .get(caller_id)
-                    .is_some_and(|served| *served == fold_rpc_name(called))
+                    .is_some_and(|(service, method)| {
+                        *method == fold_rpc_name(called)
+                            && service.as_deref().is_some_and(|s| {
+                                s.eq_ignore_ascii_case(
+                                    called_service.rsplit('.').next().unwrap_or(called_service),
+                                )
+                            })
+                    })
                 {
                     continue;
                 }
@@ -1814,30 +1822,39 @@ impl ContractGraph {
         }
     }
 
-    /// The RPC method each handler serves, folded (see [`fold_rpc_name`]):
-    /// the resolved proto RPC when known, else the method argument as written
-    /// (a literal, or the last segment of the constant's name).
-    fn handler_served_methods(&self) -> HashMap<NodeId, String> {
+    /// The (service, method) each handler serves: the resolved proto RPC when
+    /// known, else what the decorator spells (a literal service, and the method
+    /// literal or the last segment of the constant's name). The service is
+    /// `None` when it is not a literal (the delegation drop then keeps the
+    /// call); the method is folded (see [`fold_rpc_name`]).
+    fn handler_served_methods(&self) -> HashMap<NodeId, (Option<String>, String)> {
+        let unquote = |part: &str| {
+            part.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '?'))
+                .to_string()
+        };
         let mut out = HashMap::new();
         for (id, recorded) in &self.rpc_calls {
             let Some(reference) = recorded.strip_prefix(HANDLER_REF_PREFIX) else {
                 continue;
             };
             let served = match self.handler_rpc_names.get(id) {
-                Some(rpc) => rpc.rsplit('.').next().unwrap_or(rpc.as_str()).to_string(),
-                None => {
-                    let Some((_, method)) = reference.split_once('|') else {
-                        continue;
-                    };
-                    method
-                        .trim_matches(|c| matches!(c, '\'' | '"' | '`' | '?'))
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(method)
-                        .to_string()
-                }
+                Some(rpc) => rpc
+                    .rsplit_once('.')
+                    .map(|(service, method)| (Some(service.to_string()), method.to_string())),
+                None => reference.split_once('|').map(|(service, method)| {
+                    let literal_service = service
+                        .starts_with(['\'', '"', '`'])
+                        .then(|| unquote(service))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string());
+                    let method = unquote(method);
+                    let method = method.rsplit('.').next().unwrap_or(&method).to_string();
+                    (literal_service, method)
+                }),
             };
-            out.insert(*id, fold_rpc_name(&served));
+            if let Some((service, method)) = served {
+                out.insert(*id, (service, fold_rpc_name(&method)));
+            }
         }
         out
     }
@@ -2013,7 +2030,14 @@ impl ContractGraph {
             } else {
                 same_repo
             };
-            if let [service] = services.into_iter().collect::<Vec<_>>()[..] {
+            let services: Vec<&str> = services.into_iter().collect();
+            // `#field=` (no service): the base class declares the field with a
+            // plain application type, so it is not a client at all.
+            let real: Vec<&str> = services.iter().copied().filter(|s| !s.is_empty()).collect();
+            if real.is_empty() && !services.is_empty() {
+                return None;
+            }
+            if let [service] = real[..] {
                 return Some((format!("{service}.{method}"), false));
             }
         }

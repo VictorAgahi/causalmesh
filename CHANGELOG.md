@@ -31,6 +31,13 @@ at 3.0.0 — there is no reconstructed history before it.
   RPC is known, so it also works when the constant's name differs from the RPC name; only
   name-based guesses are dropped, never a field bound or typed as a generated client (including a
   base-class field bound in another file).
+- The delegation drop also requires the called service to be the handler's own service (the
+  resolved proto service, else the literal one): a handler calling another service's same-named
+  method stays a client. A handler with no method argument serves the PascalCase form of its
+  method name (`@GrpcMethod('UserService') addBadgeToUser()`); a bare `@GrpcMethod()` names no
+  service, so nothing is guessed or dropped.
+- A field declared with a plain application type in a base class is not a client of its
+  subclasses either. `@GrpcMethod(...)` arguments are read from the method's decorators only.
 - Inherited client fields were not recorded for an undecorated, non-abstract `class Base {}`
   (the `class` keyword token was found instead of the declaration).
 - `@GrpcMethod(...)` arguments are read from a decorator at code level (comments, strings and

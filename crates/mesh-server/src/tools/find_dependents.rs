@@ -300,7 +300,10 @@ fn format_packages(
                 "- `{}` ({}) `{}:{}`\n",
                 node.name,
                 mesh_parsers::declaration_label(node),
-                root_relative(node, roots).display(),
+                root_relative(node, roots)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
                 node.line_start
             ));
         }

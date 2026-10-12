@@ -218,7 +218,10 @@ impl DocIndex {
     ///
     /// Returns the number of lines the block occupies (delimiters included) and
     /// the searchable `name` / `description` fields. A block without a closing
-    /// delimiter is not frontmatter (a lone `---` is a thematic break).
+    /// delimiter is not frontmatter (a lone `---` is a thematic break), nor is a
+    /// block whose lines are not all metadata-shaped (see
+    /// [`Self::looks_like_metadata`]): prose between two horizontal rules stays
+    /// ordinary, fully indexed markdown. Only column-0 keys count.
     fn split_frontmatter(content: &str) -> Option<(usize, Option<String>, Option<String>)> {
         let mut lines = content.lines();
         let first = lines.next()?.trim_start_matches('\u{feff}').trim_end();
@@ -259,10 +262,17 @@ impl DocIndex {
             if closing {
                 return Some((consumed, name, description));
             }
+            if !Self::looks_like_metadata(line, sep) {
+                return None;
+            }
+            // Nested (indented) keys never override the top-level ones.
+            if line.starts_with([' ', '\t']) {
+                continue;
+            }
             let Some((k, v)) = line.split_once(sep) else {
                 continue;
             };
-            let key: &'static str = match k.trim() {
+            let key: &'static str = match k.trim_end() {
                 "name" => "name",
                 "description" => "description",
                 _ => continue,
@@ -283,6 +293,28 @@ impl DocIndex {
             }
         }
         None
+    }
+
+    /// Whether `line` can belong to a metadata block: blank, a `#` comment, an
+    /// indented continuation, `key: value` / `key:` (`key = value`, `[table]` for
+    /// TOML) or a `- item` list entry (YAML).
+    fn looks_like_metadata(line: &str, sep: char) -> bool {
+        let t = line.trim_end();
+        if t.is_empty() || t.starts_with([' ', '\t', '#']) {
+            return true;
+        }
+        if sep == ':' && (t == "-" || t.starts_with("- ")) {
+            return true;
+        }
+        if sep == '=' && t.starts_with('[') {
+            return true;
+        }
+        t.split_once(sep).is_some_and(|(k, _)| {
+            let k = k.trim_end();
+            !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
     }
 
     /// Characters of a frontmatter `description` kept as searchable metadata.
@@ -814,6 +846,40 @@ We deploy microservices onto kubernetes using Helm and ArgoCD.
         idx.extend_sections(sections);
         assert!(idx.search("dlq-config", 5).is_empty());
         assert!(!idx.search("dead letter", 5).is_empty());
+    }
+
+    #[test]
+    fn prose_between_two_horizontal_rules_is_not_frontmatter() {
+        let index = DocIndex::default();
+        let adr =
+            "---\nWe decided to use a queue.\nIt retries failed work.\n---\n# Context\nbody\n";
+        let sections = index.parse_sections(Path::new("adr.md"), adr);
+        let all: String = sections.iter().map(|s| s.content.clone()).collect();
+        assert!(all.contains("We decided to use a queue."), "{sections:?}");
+        assert!(all.contains("It retries failed work."), "{sections:?}");
+
+        // Not at the very start of the file: never frontmatter.
+        let late = "# Title\n---\nname: x\n---\ntext\n";
+        let sections = index.parse_sections(Path::new("a.md"), late);
+        assert!(sections.iter().any(|s| s.content.contains("name: x")));
+        let blank_first = "\n---\nname: x\n---\ntext\n";
+        let sections = index.parse_sections(Path::new("a.md"), blank_first);
+        assert!(sections.iter().any(|s| s.content.contains("name: x")));
+    }
+
+    #[test]
+    fn only_top_level_frontmatter_keys_count() {
+        let index = DocIndex::default();
+        let raw = "---\nmetadata:\n  name: nested\n  description: nested desc\nname: top\ndescription: top desc\n---\nIntro.\n";
+        let sections = index.parse_sections(Path::new("SKILL.md"), raw);
+        assert_eq!(sections[0].title.as_str(), "top");
+        assert!(sections[0].content.contains("description: top desc"));
+        assert!(!sections[0].content.contains("nested"));
+
+        // Nested keys alone give neither title nor description.
+        let raw = "---\nmetadata:\n  name: nested\n---\nIntro.\n";
+        let sections = index.parse_sections(Path::new("SKILL.md"), raw);
+        assert_eq!(sections[0].title.as_str(), "SKILL");
     }
 
     #[test]

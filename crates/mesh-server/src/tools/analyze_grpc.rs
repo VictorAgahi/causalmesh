@@ -99,7 +99,7 @@ fn run_with_git(
     // The `.proto` whose wire format is checked: the target itself when it is a
     // `.proto` path, else the file of the resolved proto definition.
     let target = args.target.as_str().trim();
-    let proto_file: Option<PathBuf> = if target.ends_with(".proto") {
+    let proto_file: Option<PathBuf> = if is_proto_path(target) {
         Some(PathBuf::from(target))
     } else {
         trace
@@ -131,14 +131,29 @@ fn run_with_git(
     // roots: `proto/foo/bar.proto` finds `proto-registry/proto/foo/bar.proto`.
     // Only taken for a missing path: a jail escape never reaches this.
     let mut resolution_note = String::new();
-    if matches!(resolved, Err(mesh_core::SecurityError::PathNotFound(_)))
-        && target.ends_with(".proto")
-    {
+    if matches!(resolved, Err(mesh_core::SecurityError::PathNotFound(_))) && is_proto_path(target) {
         match resolve_proto_suffix(target, state) {
             ProtoSuffixMatch::Unique(found) => {
                 let shown = display_proto_path(&found, &state.allowed_roots);
-                resolution_note = format!("*Resolved `{target}` to `{shown}`.*\n");
+                resolution_note = format!(
+                    "### Resolved path\n`{target}` did not exist as written; the unique `.proto` ending in that path is `{shown}`. The wire-format check targets `{shown}`.\n\n"
+                );
                 resolved = resolve(&found.to_string_lossy());
+            }
+            ProtoSuffixMatch::Bare(found) => {
+                let list = if found.is_empty() {
+                    "no `.proto` file with that name exists under the workspace roots".to_string()
+                } else {
+                    format!("candidates:\n{}", list_paths(&found, &state.allowed_roots))
+                };
+                let msg = format!(
+                    "`{target}` is a bare file name and is never guessed (it could be another repository's contract); pass a path with at least one directory, for example `<dir>/{target}`. {list}"
+                );
+                if explicit_base.is_some() {
+                    return Err((-32602, format!("Wire-format check: {msg}")));
+                }
+                text.push_str(&format!("\n### Wire-format check\n*Skipped: {msg}*\n"));
+                return Ok(ToolOutput::text(text));
             }
             ProtoSuffixMatch::Several(found) => {
                 let list = list_paths(&found, &state.allowed_roots);
@@ -201,8 +216,7 @@ fn run_with_git(
 
     let files_accessed = vec![file.to_string_lossy().into_owned()];
     if !resolution_note.is_empty() {
-        text.push('\n');
-        text.push_str(&resolution_note);
+        text.insert_str(0, &resolution_note);
     }
     match check_wire_format(&file, explicit_base, git) {
         Ok(report) => text.push_str(&render_report(&report)),
@@ -229,8 +243,18 @@ fn run_with_git(
 /// Most candidates listed in a "several matches" / "closest files" answer.
 const MAX_LISTED_PROTOS: usize = 8;
 
+/// Case-insensitive `.proto` extension test (`Foo.PROTO` is one too).
+fn is_proto_path(path: &str) -> bool {
+    path.len() >= ".proto".len()
+        && path
+            .get(path.len() - ".proto".len()..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".proto"))
+}
+
 enum ProtoSuffixMatch {
     Unique(PathBuf),
+    /// The target is a bare file name: candidates are listed, none is chosen.
+    Bare(Vec<PathBuf>),
     Several(Vec<PathBuf>),
     /// No file ends with the target; files sharing its name, nearest first.
     None(Vec<PathBuf>),
@@ -251,13 +275,28 @@ fn plain_components(target: &str) -> Option<Vec<std::ffi::OsString>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Matches `target` by trailing path components against the `.proto` files under
-/// the jailed roots (`follow_links(false)`, `exclude_patterns` honoured; this
-/// covers the configured `proto_dirs`, which live under the roots).
-fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
-    let Some(wanted) = plain_components(target) else {
-        return ProtoSuffixMatch::None(Vec::new());
+/// Every `.proto` file the current index knows (its file list, no I/O); when the
+/// index has not been built yet, a crawl of the jailed roots instead
+/// (`follow_links(false)`, `exclude_patterns` honoured).
+fn indexed_proto_files(state: &AppState) -> Vec<PathBuf> {
+    let is_proto = |p: &Path| p.to_str().is_some_and(is_proto_path);
+    let mut all: Vec<PathBuf> = match state.vfs.lock() {
+        Ok(vfs) => vfs
+            .tracked_paths()
+            .filter(|p| is_proto(p))
+            .map(Path::to_path_buf)
+            .collect(),
+        Err(_) => Vec::new(),
     };
+    if all.is_empty() {
+        all = crawl_proto_files(state);
+    }
+    all.sort();
+    all.dedup();
+    all
+}
+
+fn crawl_proto_files(state: &AppState) -> Vec<PathBuf> {
     let mut all: Vec<PathBuf> = Vec::new();
     for root in state.allowed_roots.iter() {
         let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &state.allowed_roots)
@@ -271,11 +310,29 @@ fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
                 None,
             )
             .into_iter()
-            .filter(|f| f.extension().is_some_and(|e| e == "proto")),
+            .filter(|f| f.to_str().is_some_and(is_proto_path)),
         );
     }
-    all.sort();
-    all.dedup();
+    all
+}
+
+/// Matches `target` by trailing path components against the indexed `.proto`
+/// files. A bare file name (no directory component) is never auto-resolved: it
+/// could name another repository's contract.
+fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
+    let Some(wanted) = plain_components(target) else {
+        return ProtoSuffixMatch::None(Vec::new());
+    };
+    let all = indexed_proto_files(state);
+    if wanted.len() < 2 {
+        let name = wanted.last().map(|n| n.to_ascii_lowercase());
+        let mut same_name: Vec<PathBuf> = all
+            .into_iter()
+            .filter(|f| f.file_name().map(|n| n.to_ascii_lowercase()) == name)
+            .collect();
+        same_name.truncate(MAX_LISTED_PROTOS);
+        return ProtoSuffixMatch::Bare(same_name);
+    }
 
     let ends_with_target = |f: &PathBuf| {
         let comps: Vec<_> = f
@@ -1243,8 +1300,9 @@ message User {
         .expect("resolved by suffix");
         assert!(
             out.text
-                .contains("Resolved `proto/foo/bar.proto` to `repo/registry/proto/foo/bar.proto`"),
-            "{}",
+                .starts_with("### Resolved path\n`proto/foo/bar.proto`")
+                && out.text.contains("is `repo/registry/proto/foo/bar.proto`"),
+            "the resolution leads the main result: {}",
             out.text
         );
         assert!(
@@ -1253,6 +1311,65 @@ message User {
             out.text
         );
         assert_eq!(out.files_accessed.len(), 1);
+    }
+
+    /// A bare file name is never guessed: it could be another repository's contract.
+    #[test]
+    fn bare_proto_file_name_lists_candidates_and_is_never_auto_resolved() {
+        let repo = TempRepo::new();
+        repo.write("only/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_for(&repo.root);
+
+        // A single candidate is still not used: the check would run on a guess.
+        let err = run_with_git(
+            &proto_args("user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("bare name refused");
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("bare file name"), "{}", err.1);
+        assert!(err.1.contains("repo/only/proto/user.proto"), "{}", err.1);
+
+        let out = run_with_git(&proto_args("user.proto", None), &state, &repo.runner())
+            .expect("trace survives");
+        assert!(out.text.contains("bare file name"), "{}", out.text);
+        assert!(!out.text.contains("Resolved path"), "{}", out.text);
+        assert!(out.files_accessed.is_empty());
+    }
+
+    /// The `.proto` extension is matched case-insensitively and the suffix search
+    /// answers from the indexed file list, with no crawl.
+    #[test]
+    fn suffix_search_uses_the_index_and_accepts_an_upper_case_extension() {
+        let repo = TempRepo::new();
+        let file = repo.write("registry/proto/foo/Bar.PROTO", BASE_PROTO);
+        // A file the crawler would find, but the index does not know about.
+        repo.write("other/proto/foo/Bar.PROTO", BASE_PROTO);
+        repo.commit("base");
+        let state = state_for(&repo.root);
+        {
+            let content = std::fs::read(&file).expect("read");
+            let meta = std::fs::metadata(&file).expect("meta");
+            state.vfs.lock().expect("vfs").upsert(
+                &file,
+                mesh_core::vfs::DifferentialVfs::compute_signature(&meta, &content),
+            );
+        }
+        let out = run_with_git(
+            &proto_args("foo/Bar.PROTO", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .expect("index has exactly one match");
+        assert!(out.text.starts_with("### Resolved path\n"), "{}", out.text);
+        assert!(
+            out.text.contains("is `repo/registry/proto/foo/Bar.PROTO`"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

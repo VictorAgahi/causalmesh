@@ -38,11 +38,15 @@ pub struct AuditEntry {
     /// Hash-chain formula version this row was written (and must be verified) under.
     /// See `AuditLogger::CHAIN_VERSION`.
     pub chain_version: i64,
-    /// Sanitized error of an `ERROR` row (chain v3), as a JSON object
+    /// Sanitized error of an `ERROR` row, as a JSON object
     /// `{"class","code","message"}`; `None` for successful calls and for rows
     /// written before this column existed. Never raw arguments: see [`ErrorDetail`].
     #[serde(default)]
     pub error_detail: Option<String>,
+    /// `SHA-256(entry_hash || error_detail)` binding the detail to its row; present
+    /// exactly when `error_detail` is. See `AuditLogger::error_detail_sig`.
+    #[serde(default)]
+    pub error_detail_sig: Option<String>,
 }
 
 /// Longest stored error message, in characters.
@@ -81,7 +85,7 @@ impl ErrorDetail {
         }
     }
 
-    /// The canonical stored form (the exact text folded into the v3 hash).
+    /// The canonical stored form (the exact text bound by `error_detail_sig`).
     pub fn to_stored(&self) -> String {
         serde_json::json!({"class": self.class, "code": self.code, "message": self.message})
             .to_string()
@@ -115,6 +119,29 @@ const SECRET_PREFIXES: &[&str] = &["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp
 
 fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Characters of a base64 / base64url / JWT-like run (`.` separates JWT segments).
+fn is_blob_char(c: char) -> bool {
+    is_token_char(c) || matches!(c, '.' | '+' | '=')
+}
+
+/// A long run that looks like key material: 32+ letters and digits, or (with
+/// `-` / `_` / `+` / `=`, as base64url and base64 use) 32+ characters mixing digits
+/// with upper and lower case. All-lowercase hyphenated names (UUID directories,
+/// slugs) are not.
+fn looks_like_secret_blob(run: &str) -> bool {
+    if run.len() < 32 {
+        return false;
+    }
+    let digit = run.chars().any(|c| c.is_ascii_digit());
+    let upper = run.chars().any(|c| c.is_ascii_uppercase());
+    let lower = run.chars().any(|c| c.is_ascii_lowercase());
+    if run.chars().all(|c| c.is_ascii_alphanumeric()) {
+        digit && (upper || lower)
+    } else {
+        digit && upper && lower
+    }
 }
 
 /// Byte ranges of secret values in `s` (key/value pairs, bearer tokens, well
@@ -161,49 +188,85 @@ fn secret_ranges(s: &str) -> Vec<(usize, usize)> {
         }
     }
 
-    // `Bearer <token>` / `Basic <token>`.
-    for scheme in ["bearer ", "basic "] {
+    // `Bearer <token>`: only a token-looking word follows (prose such as "bearer of"
+    // is kept); `Basic <token>`: a base64-looking credential, not an ordinary word.
+    for (scheme, min_len) in [("bearer ", 16usize), ("basic ", 8)] {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(scheme) {
             let start = from + pos + scheme.len();
             from = start;
             let end = value_end(start);
-            if end > start {
+            let word = &s[start..end];
+            let credential_shaped = word.len() >= min_len
+                && word.chars().all(|c| is_blob_char(c) || c == '/')
+                && (word.chars().any(|c| c.is_ascii_digit())
+                    || (word.chars().any(|c| c.is_ascii_uppercase())
+                        && word.chars().any(|c| c.is_ascii_lowercase())));
+            if credential_shaped {
                 ranges.push((start, end));
             }
         }
     }
 
-    // Well known token prefixes and long mixed blobs, token by token.
+    // `scheme://user:password@host`: the whole userinfo goes.
+    let mut from = 0;
+    while let Some(pos) = s[from..].find("://") {
+        let start = from + pos + 3;
+        from = start;
+        let authority_end = s[start..]
+            .find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'' | ')') || c.is_whitespace())
+            .map_or(s.len(), |o| start + o);
+        if let Some(at) = s[start..authority_end].rfind('@') {
+            if at > 0 {
+                ranges.push((start, start + at));
+            }
+        }
+    }
+
+    // `user:password@host` whose `://` was lost (a path normalised to `https:/u:p@h`).
+    for (at, _) in s.match_indices('@') {
+        let token_start = s[..at]
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '(' | '<'))
+            .map_or(0, |i| i + 1);
+        if s[token_start..at].contains(':') {
+            ranges.push((token_start, at));
+        }
+    }
+
+    // Well known token prefixes, JWTs and long mixed blobs, blob by blob.
     let mut idx = 0;
     while idx < s.len() {
         let rest = &s[idx..];
         let Some(first) = rest.chars().next() else {
             break;
         };
-        if !is_token_char(first) {
+        if !is_blob_char(first) {
             idx += first.len_utf8();
             continue;
         }
         let len = rest
             .char_indices()
-            .find(|(_, c)| !is_token_char(*c))
+            .find(|(_, c)| !is_blob_char(*c))
             .map_or(rest.len(), |(o, _)| o);
-        let tok = &rest[..len];
-        if tok.len() >= 16 && SECRET_PREFIXES.iter().any(|p| tok.starts_with(p)) {
+        let blob = &rest[..len];
+        let segments: Vec<&str> = blob.split('.').collect();
+        let b64url = |t: &str| {
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        let jwt = segments.len() == 3
+            && blob.len() >= 20
+            && segments.iter().all(|t| !t.is_empty() && b64url(t))
+            && (segments[0].starts_with("eyJ") || segments.iter().all(|t| t.len() >= 10));
+        if jwt || (blob.len() >= 16 && SECRET_PREFIXES.iter().any(|p| blob.starts_with(p))) {
             ranges.push((idx, idx + len));
         } else {
-            // A long mixed letter/digit blob (hex digest, base64 token). Runs are
-            // split at `-` / `_` so a hyphenated directory name is not one.
             let mut off = 0;
-            for run in tok.split(['-', '_']) {
-                if run.len() >= 32
-                    && run.chars().any(|c| c.is_ascii_digit())
-                    && run.chars().any(|c| c.is_ascii_alphabetic())
-                {
-                    ranges.push((idx + off, idx + off + run.len()));
+            for part in &segments {
+                if looks_like_secret_blob(part) {
+                    ranges.push((idx + off, idx + off + part.len()));
                 }
-                off += run.len() + 1;
+                off += part.len() + 1;
             }
         }
         idx += len;
@@ -264,49 +327,77 @@ fn collapse_home(s: &str, home: Option<&str>) -> String {
     out
 }
 
-/// Sanitizes a free-form error message for storage: redact, collapse home
-/// directories, flatten whitespace, truncate to [`MAX_ERROR_MESSAGE_CHARS`].
-pub fn sanitize_error_message(raw: &str, home: Option<&str>) -> String {
-    // serde echoes offending values (`invalid type: integer `5`, expected ...`): the
-    // value is argument content, so it is replaced before anything else.
-    let mut echoed = String::with_capacity(raw.len());
+/// Removes the user-supplied value serde and friends echo into their messages:
+/// `invalid type: string "x", expected u32`, `invalid value: integer `5`, ...`,
+/// `unknown variant `x`, expected one of ...`, `unknown field `x`, ...`. The quoted
+/// value is dropped wholesale (a value containing `, expected` cannot leak its
+/// remainder); the schema-side text (the type, the expected variants) is kept. An
+/// unterminated quote drops the rest of the message.
+fn strip_serde_values(raw: &str) -> String {
+    const MARKERS: [&str; 4] = [
+        "invalid type: ",
+        "invalid value: ",
+        "unknown variant ",
+        "unknown field ",
+    ];
+    let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
-    while let Some((pos, prefix)) = ["invalid type: ", "invalid value: "]
+    while let Some((pos, marker)) = MARKERS
         .iter()
-        .filter_map(|p| rest.find(p).map(|i| (i, *p)))
+        .filter_map(|m| rest.find(m).map(|i| (i, *m)))
         .min_by_key(|(i, _)| *i)
     {
-        let value_start = pos + prefix.len();
-        echoed.push_str(&rest[..value_start]);
-        match rest[value_start..].find(", expected") {
-            Some(end) => {
-                echoed.push_str("<value>");
-                rest = &rest[value_start + end..];
+        let after = pos + marker.len();
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        // The value opens at the first quote, unless serde's own ", expected" comes
+        // first (`invalid type: null, expected a string` echoes no value).
+        let first_quote = tail.find(['"', '`']);
+        let expected_at = tail.find(", expected");
+        let quote = match (first_quote, expected_at) {
+            (Some(q), Some(e)) if e < q => None,
+            (q, _) => q,
+        };
+        let Some(q) = quote else {
+            rest = tail;
+            if expected_at.is_none() && first_quote.is_none() {
+                break;
             }
-            None => {
-                rest = &rest[value_start..];
+            // Keep scanning past this marker.
+            let keep = expected_at.unwrap_or(tail.len());
+            out.push_str(&tail[..keep]);
+            rest = &tail[keep..];
+            continue;
+        };
+        out.push_str(&tail[..q]);
+        out.push_str("<value>");
+        let open = tail.as_bytes()[q];
+        let body = &tail[q + 1..];
+        let mut close = None;
+        let mut escaped = false;
+        for (off, c) in body.char_indices() {
+            if open == b'"' && escaped {
+                escaped = false;
+            } else if open == b'"' && c == '\\' {
+                escaped = true;
+            } else if c as u32 == u32::from(open) {
+                close = Some(off);
                 break;
             }
         }
-    }
-    echoed.push_str(rest);
-    let raw = echoed.as_str();
-
-    // Other quoted string echoes (`string "x"`) are cut as well.
-    let mut text = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(pos) = rest.find("string \"") {
-        let open = pos + "string \"".len();
-        text.push_str(&rest[..open]);
-        match rest[open..].find('"') {
-            Some(close) => {
-                text.push_str("...");
-                rest = &rest[open + close..];
-            }
-            None => rest = "",
+        match close {
+            Some(c) => rest = &body[c + 1..],
+            None => return out,
         }
     }
-    text.push_str(rest);
+    out.push_str(rest);
+    out
+}
+
+/// Sanitizes a free-form error message for storage: redact, collapse home
+/// directories, flatten whitespace, truncate to [`MAX_ERROR_MESSAGE_CHARS`].
+pub fn sanitize_error_message(raw: &str, home: Option<&str>) -> String {
+    let text = strip_serde_values(raw);
 
     let mut redacted = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -372,12 +463,18 @@ impl AuditLogger {
     /// the formula they were written with (`verify_db` dispatches per row) instead of having
     /// every historical entry rejected as tampered the moment this binary is upgraded.
     ///
-    /// v3 (additive) appends the row's `error_detail` to the v2 input. Only `ERROR` rows
-    /// that carry a detail are written as v3; every other row is still written as v2,
-    /// byte for byte what earlier binaries produce and verify.
+    /// Every row, with or without an error detail, is written as v2 with the v2 hash
+    /// input byte for byte, so an older binary (a stale `meshd`, a rollback) still
+    /// verifies the whole chain. The sanitized `error_detail` is bound separately by
+    /// `error_detail_sig` (see [`Self::error_detail_sig`]): an older binary neither
+    /// sees nor verifies the detail, a current one rejects a forged or unsigned one.
     pub const CHAIN_VERSION: i64 = 2;
-    /// Chain version of rows that carry an `error_detail`.
-    pub const CHAIN_VERSION_ERROR_DETAIL: i64 = 3;
+
+    /// `SHA-256(entry_hash || error_detail)`: binds a row's stored error text to the
+    /// row it belongs to (and, through `entry_hash`, to the whole chain before it).
+    pub fn error_detail_sig(entry_hash: &str, error_detail: &str) -> String {
+        Self::compute_sha256(format!("{entry_hash}{error_detail}").as_bytes())
+    }
 
     /// Environment variable overriding [`Self::default_db_path`]: benchmarks, test
     /// harnesses and pilot runs point it at their own file so they never mix their
@@ -444,7 +541,8 @@ impl AuditLogger {
                  secrets_redacted_count INTEGER NOT NULL,
                  entry_hash TEXT NOT NULL,
                  chain_version INTEGER NOT NULL DEFAULT 1,
-                 error_detail TEXT
+                 error_detail TEXT,
+                 error_detail_sig TEXT
              );
              -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
              -- table's B-tree key. The secondary index earlier versions created on it
@@ -500,12 +598,16 @@ impl AuditLogger {
             }
         }
 
-        // Same migration for `error_detail` (7.1.8): rows written before it keep a NULL
-        // there and keep verifying under their own chain version.
-        if !Self::has_column(&conn, "error_detail")? {
-            if let Err(err) =
-                conn.execute("ALTER TABLE audit_entries ADD COLUMN error_detail TEXT", [])
-            {
+        // Same migration for `error_detail` and `error_detail_sig` (7.1.8): rows written
+        // before them keep NULL in both and keep verifying under their chain version.
+        for column in ["error_detail", "error_detail_sig"] {
+            if Self::has_column(&conn, column)? {
+                continue;
+            }
+            if let Err(err) = conn.execute(
+                &format!("ALTER TABLE audit_entries ADD COLUMN {column} TEXT"),
+                [],
+            ) {
                 let is_duplicate_column = matches!(
                     &err,
                     rusqlite::Error::SqliteFailure(_, Some(msg))
@@ -540,15 +642,19 @@ impl AuditLogger {
     /// The `SELECT` for every audit row. A database written before `error_detail`
     /// existed (opened read-only, so not migrated) yields `NULL` for it.
     fn select_entries_sql(conn: &Connection) -> Result<String, AuditError> {
-        let error_detail = if Self::has_column(conn, "error_detail")? {
-            "error_detail"
+        let error_columns = if Self::has_column(conn, "error_detail")?
+            && Self::has_column(conn, "error_detail_sig")?
+        {
+            "error_detail, error_detail_sig"
+        } else if Self::has_column(conn, "error_detail")? {
+            "error_detail, NULL"
         } else {
-            "NULL"
+            "NULL, NULL"
         };
         Ok(format!(
             "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
                     args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version, {error_detail}
+                    chain_version, {error_columns}
              FROM audit_entries ORDER BY entry_seq ASC"
         ))
     }
@@ -588,8 +694,8 @@ impl AuditLogger {
         )
     }
 
-    /// [`Self::record_entry`] with the sanitized error of a failed call. A row with
-    /// an `error` is written as chain v3 (its stored detail is part of the hash).
+    /// [`Self::record_entry`] with the sanitized error of a failed call. The row keeps
+    /// the v2 hash input; the detail is stored with its own `error_detail_sig`.
     #[allow(clippy::too_many_arguments)]
     pub fn record_entry_with_error(
         &self,
@@ -637,23 +743,21 @@ impl AuditLogger {
         // and `secrets_redacted_count` be tampered with in the row without breaking the
         // chain. All new writes use v2; see `CHAIN_VERSION`.
         let error_detail = error.map(ErrorDetail::to_stored);
-        let chain_version = if error_detail.is_some() {
-            Self::CHAIN_VERSION_ERROR_DETAIL
-        } else {
-            Self::CHAIN_VERSION
-        };
+        let chain_version = Self::CHAIN_VERSION;
         let hash_input = format!(
-            "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}{}",
-            error_detail.as_deref().unwrap_or("")
+            "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
         );
         let entry_hash = Self::compute_sha256(hash_input.as_bytes());
+        let error_detail_sig = error_detail
+            .as_deref()
+            .map(|d| Self::error_detail_sig(&entry_hash, d));
 
         tx.prepare_cached(
             "INSERT INTO audit_entries (
                 entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
                 args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                chain_version, error_detail
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                chain_version, error_detail, error_detail_sig
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?
         .execute(params![
             seq,
@@ -669,6 +773,7 @@ impl AuditLogger {
             entry_hash,
             chain_version,
             error_detail,
+            error_detail_sig,
         ])?;
 
         tx.commit()?;
@@ -687,6 +792,7 @@ impl AuditLogger {
             entry_hash,
             chain_version,
             error_detail,
+            error_detail_sig,
         })
     }
 
@@ -724,6 +830,7 @@ impl AuditLogger {
                     entry_hash: row.get(10)?,
                     chain_version,
                     error_detail: row.get(12)?,
+                    error_detail_sig: row.get(13)?,
                 },
                 files_str,
             ))
@@ -760,7 +867,9 @@ impl AuditLogger {
                     entry.tool,
                     entry.args_digest
                 ),
-                2 => format!(
+                // v2 and any later version: the v2 input (the error detail is not part
+                // of it, see `error_detail_sig`).
+                _ => format!(
                     "{}{}{}{}{}{}{}{}",
                     entry.prev_hash,
                     entry.timestamp,
@@ -771,20 +880,6 @@ impl AuditLogger {
                     files_str,
                     entry.secrets_redacted_count
                 ),
-                // v3 and later: the v2 input plus the stored error detail, so the
-                // error text cannot be edited without breaking the chain.
-                _ => format!(
-                    "{}{}{}{}{}{}{}{}{}",
-                    entry.prev_hash,
-                    entry.timestamp,
-                    entry.session_id,
-                    entry.tool,
-                    entry.args_digest,
-                    entry.status,
-                    files_str,
-                    entry.secrets_redacted_count,
-                    entry.error_detail.as_deref().unwrap_or("")
-                ),
             };
             let calculated_hash = Self::compute_sha256(hash_input.as_bytes());
             if calculated_hash != entry.entry_hash {
@@ -793,6 +888,38 @@ impl AuditLogger {
                     calculated_hash,
                     entry.entry_hash,
                 ));
+            }
+
+            // The error detail is outside the hash input (so older binaries keep
+            // verifying) and bound by its own signature instead. A detail with no
+            // valid signature, or a signature with no detail, is tampering: this
+            // applies to every row, including v1 / v2 rows that predate the column.
+            match (&entry.error_detail, &entry.error_detail_sig) {
+                (None, None) => {}
+                (Some(detail), Some(sig)) => {
+                    let expected = Self::error_detail_sig(&entry.entry_hash, detail);
+                    if &expected != sig {
+                        return Err(AuditError::BrokenChain(
+                            entry.entry_seq,
+                            format!("error_detail_sig {expected}"),
+                            format!("error_detail_sig {sig}"),
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(AuditError::BrokenChain(
+                        entry.entry_seq,
+                        "signed error_detail".to_string(),
+                        "unsigned error_detail".to_string(),
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(AuditError::BrokenChain(
+                        entry.entry_seq,
+                        "no error_detail_sig".to_string(),
+                        "error_detail_sig without error_detail".to_string(),
+                    ))
+                }
             }
 
             expected_prev_hash = entry.entry_hash;
@@ -842,6 +969,7 @@ impl AuditLogger {
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
                 error_detail: row.get(12)?,
+                error_detail_sig: row.get(13)?,
             })
         })?;
 
@@ -1067,6 +1195,7 @@ impl AuditLogger {
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
                 error_detail: row.get(12)?,
+                error_detail_sig: row.get(13)?,
             })
         })?;
 
@@ -1370,11 +1499,58 @@ mod tests {
         );
     }
 
-    /// A legacy v1 database (epoch-style timestamp, no `error_detail` column) opened by
-    /// this binary is migrated in place; new v2 rows and v3 error rows chain onto it and
-    /// the whole mixed chain verifies, while editing a stored error breaks it.
+    /// What a 7.1.7 binary does: v1 / v2 formulas over the original twelve columns,
+    /// knowing nothing of `error_detail` / `error_detail_sig`.
+    fn old_binary_verifies(path: &Path) -> bool {
+        let conn = Connection::open(path).expect("open");
+        let mut stmt = conn
+            .prepare(
+                "SELECT entry_seq, prev_hash, timestamp, session_id, tool, args_digest, status,
+                        files_accessed, secrets_redacted_count, entry_hash, chain_version
+                 FROM audit_entries ORDER BY entry_seq ASC",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, i64>(10)?,
+                ))
+            })
+            .expect("rows");
+        let mut prev = AuditLogger::GENESIS_HASH.to_string();
+        for row in rows {
+            let (p, ts, sess, tool, dig, status, files, red, hash, ver) = row.expect("row");
+            if p != prev {
+                return false;
+            }
+            let input = if ver == 1 {
+                format!("{p}{ts}{sess}{tool}{dig}")
+            } else {
+                format!("{p}{ts}{sess}{tool}{dig}{status}{files}{red}")
+            };
+            if AuditLogger::compute_sha256(input.as_bytes()) != hash {
+                return false;
+            }
+            prev = hash;
+        }
+        true
+    }
+
+    /// A legacy v1 database (epoch-style timestamp, no `error_detail` columns) opened by
+    /// this binary is migrated in place; new rows chain onto it as v2, the whole mixed
+    /// chain verifies (also under the 7.1.7 formulas), and a forged, unsigned or
+    /// re-signed-wrong detail breaks the current verifier.
     #[test]
-    fn test_mixed_legacy_v2_v3_chain_verifies_and_detects_error_tampering() {
+    fn test_mixed_legacy_and_new_chain_verifies_and_detects_error_tampering() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let db_file = temp_dir.path().join("mixed.db");
 
@@ -1439,8 +1615,9 @@ mod tests {
                 0,
                 Some(&detail),
             )
-            .expect("v3 row");
-        assert_eq!(err.chain_version, AuditLogger::CHAIN_VERSION_ERROR_DETAIL);
+            .expect("error row");
+        assert_eq!(err.chain_version, AuditLogger::CHAIN_VERSION);
+        assert!(err.error_detail_sig.is_some());
         assert!(
             ISO_TS.is_match_prefix(&err.timestamp),
             "new rows are ISO 8601: {}",
@@ -1464,15 +1641,68 @@ mod tests {
             "2026-09-21T07:14:17.459Z"
         );
 
-        let conn = Connection::open(&db_file).expect("open");
-        conn.execute(
-            "UPDATE audit_entries SET error_detail = '{\"class\":\"x\",\"code\":0,\"message\":\"edited\"}'
-             WHERE entry_seq = 2",
-            [],
-        )
-        .expect("tamper");
-        drop(conn);
-        assert!(AuditLogger::verify_db(&db_file).is_err());
+        // An older verifier passes over the same database: the detail is invisible to it.
+        assert!(old_binary_verifies(&db_file), "7.1.7 formulas still verify");
+
+        let forged = r#"{"class":"x","code":0,"message":"edited"}"#;
+        let run = |sql: &str, args: &[&dyn rusqlite::ToSql]| {
+            let conn = Connection::open(&db_file).expect("open");
+            conn.execute(sql, args).expect("tamper");
+        };
+        // (a) edited detail on a signed row.
+        run(
+            "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = 2",
+            &[&forged],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "edited detail");
+        assert!(old_binary_verifies(&db_file), "old verifier cannot see it");
+        // (b) edited signature (restore the detail first).
+        run(
+            "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = 2",
+            &[&stored],
+        );
+        assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 2",
+            &[&"0".repeat(64)],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "edited sig");
+        // (c) forged detail on a legacy v1 row and on a v2 row, signed or not.
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 2",
+            &[&rows[2].error_detail_sig],
+        );
+        assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        for seq in [0i64, 1] {
+            run(
+                "UPDATE audit_entries SET error_detail = ?1 WHERE entry_seq = ?2",
+                &[&forged, &seq],
+            );
+            assert!(
+                AuditLogger::verify_db(&db_file).is_err(),
+                "unsigned on {seq}"
+            );
+            run(
+                "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = ?2",
+                &[&"1".repeat(64), &seq],
+            );
+            assert!(
+                AuditLogger::verify_db(&db_file).is_err(),
+                "bad sig on {seq}"
+            );
+            run(
+                "UPDATE audit_entries SET error_detail = NULL, error_detail_sig = NULL
+                 WHERE entry_seq = ?1",
+                &[&seq],
+            );
+            assert!(AuditLogger::verify_db(&db_file).expect("restored"));
+        }
+        // (d) a signature with no detail.
+        run(
+            "UPDATE audit_entries SET error_detail_sig = ?1 WHERE entry_seq = 1",
+            &[&"2".repeat(64)],
+        );
+        assert!(AuditLogger::verify_db(&db_file).is_err(), "orphan sig");
     }
 
     struct IsoShape;
@@ -1490,6 +1720,58 @@ mod tests {
                 && b[19] == b'.'
                 && b[23] == b'Z'
         }
+    }
+
+    #[test]
+    fn sanitizer_covers_urls_jwts_serde_values_and_prose() {
+        let s = |m: &str| sanitize_error_message(m, None);
+        let hidden = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
+
+        // URL userinfo, in a connection string and in a git error.
+        let m = s("connect postgres://app:hunter2pw@db.internal:5432/orders failed");
+        assert_eq!(
+            m,
+            format!("connect postgres://{hidden}@db.internal:5432/orders failed")
+        );
+        let m = s("fatal: unable to access 'https://bob:ghp_abcdef@github.com/o/r.git/'");
+        assert!(!m.contains("bob") && !m.contains("ghp_abcdef"), "{m}");
+        assert!(m.contains("@github.com/o/r.git"), "{m}");
+
+        let m = s("Path not found: /w/https:/u:pw12345@host.example/x");
+        assert!(
+            !m.contains("pw12345") && m.contains("@host.example/x"),
+            "{m}"
+        );
+        assert_eq!(
+            s("contact dev@example.com now"),
+            "contact dev@example.com now"
+        );
+
+        // A JWT, whole.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJlLXBhcnQ";
+        let m = s(&format!("rejected {jwt} today"));
+        assert_eq!(m, format!("rejected {hidden} today"));
+        // Base64url key material with `-` and `_`.
+        let m = s("key Ab3dEf-Gh1jKl_Mn2pQr-St4uVw_Xy5zAb6cDe7 end");
+        assert!(!m.contains("Ab3dEf"), "{m}");
+
+        // serde-style errors keep the schema, never the user's value.
+        let m = s("unknown variant `rm -rf /secret`, expected one of `a`, `b`");
+        assert_eq!(m, "unknown variant <value>, expected one of `a`, `b`");
+        let m = s("unknown field `my_password_field`, expected `query`");
+        assert!(!m.contains("my_password_field"), "{m}");
+        let m = s("invalid value: string \"top, expected leak\", expected a number");
+        assert_eq!(m, "invalid value: string <value>, expected a number");
+        let m = s("invalid type: null, expected a string");
+        assert_eq!(m, "invalid type: null, expected a string");
+        let m = s("invalid type: string \"unterminated");
+        assert_eq!(m, "invalid type: string <value>");
+
+        // Ordinary prose after `basic` / `bearer` is kept.
+        assert_eq!(s("basic usage is documented"), "basic usage is documented");
+        assert_eq!(s("the bearer of bad news"), "the bearer of bad news");
+        let m = s("Authorization: Basic dXNlcjpwYXNzd29yZDE=");
+        assert!(!m.contains("dXNlcjpw"), "{m}");
     }
 
     #[test]
@@ -1529,7 +1811,7 @@ mod tests {
             None,
         );
         assert!(!m.contains("my-private-value"), "{m}");
-        assert_eq!(m, "invalid type: <value>, expected u32");
+        assert_eq!(m, "invalid type: string <value>, expected u32");
 
         // Truncation to 200 chars, newlines flattened.
         let long = format!("line1\nline2 {}", "word ".repeat(100));

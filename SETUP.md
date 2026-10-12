@@ -397,7 +397,8 @@ topic from an emission that goes through a mapping table (`EVENTS[kind]`, a cons
 by type), so a declarative match is a lead to verify, not a fact. Set `confidence = "exact"`
 on a pattern only when it captures the literal topic string. Any other value, or an unknown
 key, is rejected when the config is loaded, and `mesh-mcp doctor` flags a `confidence` set on a
-`saga` or `rpc` pattern (it has no effect there). Before 7.1.8 every pattern edge was `exact`.
+`saga` or `rpc` pattern (it has no effect there) and warns once while any topic pattern has no
+explicit `confidence`. Before 7.1.8 every pattern edge was `exact`.
 
 Producers and consumers naming the same topic get linked automatically, which is what makes
 `analyze_impact` able to trace an event end to end.

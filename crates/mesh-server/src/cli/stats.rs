@@ -27,6 +27,50 @@ pub struct ToolStats {
     pub top_errors: Vec<ErrorCount>,
 }
 
+/// Stored text made safe to print: ANSI escape sequences are dropped and any other
+/// control character becomes a space, so a database edited by hand cannot repaint
+/// the terminal (the text report) or smuggle escapes through `--json` consumers.
+fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                // CSI: parameters, then one final byte in 0x40..=0x7e.
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+        } else if c.is_control() {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Number of distinct error messages listed per tool.
 pub const TOP_ERRORS_PER_TOOL: usize = 3;
 
@@ -286,9 +330,9 @@ impl StatsCommand {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|((class, code, message), count)| ErrorCount {
-                        class,
+                        class: terminal_safe(&class),
                         code,
-                        message,
+                        message: terminal_safe(&message),
                         count,
                     })
                     .collect();
@@ -585,6 +629,7 @@ mod tests {
                 entry_hash: "h0".to_string(),
                 chain_version: 2,
                 error_detail: None,
+                error_detail_sig: None,
             },
             AuditEntry {
                 entry_seq: 1,
@@ -600,6 +645,7 @@ mod tests {
                 entry_hash: "h1".to_string(),
                 chain_version: 2,
                 error_detail: None,
+                error_detail_sig: None,
             },
             AuditEntry {
                 entry_seq: 2,
@@ -615,6 +661,7 @@ mod tests {
                 entry_hash: "h2".to_string(),
                 chain_version: 2,
                 error_detail: None,
+                error_detail_sig: None,
             },
         ];
 
@@ -647,6 +694,41 @@ mod tests {
                 .map(|(_, c)| *c),
             Some(2)
         );
+    }
+
+    #[test]
+    fn stored_error_text_cannot_inject_terminal_escapes() {
+        assert_eq!(
+            terminal_safe("a\u{1b}[31mred\u{1b}[0m b\u{7}c\u{1b}]0;title\u{7}d\ne"),
+            "ared b cd e"
+        );
+        let mut entry = AuditEntry {
+            entry_seq: 0,
+            prev_hash: AuditLogger::GENESIS_HASH.to_string(),
+            timestamp: "2026-10-12T00:00:00.000Z".to_string(),
+            session_id: "s".to_string(),
+            trace_id: None,
+            tool: "smart_search".to_string(),
+            args_digest: "d".to_string(),
+            status: "ERROR".to_string(),
+            files_accessed: vec![],
+            secrets_redacted_count: 0,
+            entry_hash: "h".to_string(),
+            chain_version: 2,
+            error_detail: None,
+            error_detail_sig: None,
+        };
+        entry.error_detail = Some(
+            serde_json::json!({"class": "x", "code": 1, "message": "bad \u{1b}[2Jclear"})
+                .to_string(),
+        );
+        let summary = StatsCommand::summarize(&[entry], &AuditMetrics::default());
+        let text = StatsCommand::render(Path::new("db"), "all", &summary);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("bad clear"), "{text}");
+        assert!(!serde_json::to_string(&summary)
+            .expect("json")
+            .contains("\\u001b"));
     }
 
     #[test]

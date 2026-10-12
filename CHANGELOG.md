@@ -27,28 +27,42 @@ called out first.
   a hit. A leading `---` ... `---` (YAML) or `+++` ... `+++` (TOML) block is no longer indexed as
   section body (line numbers still count it). `name` becomes the title of the section before the
   first heading, and a capped `description` is kept as one searchable line of the first real
-  section; a file that is only frontmatter yields no section. An unterminated `---` is a
-  thematic break, not frontmatter.
+  section; a file that is only frontmatter yields no section. Frontmatter must start on line 1
+  and every line of the block must look like metadata (`key: value`, `key:`, `- item`, an
+  indented continuation or a `#` comment), so prose between two horizontal rules (an ADR) stays
+  fully indexed; an unterminated `---` is a thematic break. Only column-0 keys count: a nested
+  `name:` / `description:` never overrides the top-level one.
 - The audit trail stored only an argument digest, so an `ERROR` row could not be diagnosed. An
   `ERROR` row now also stores a short sanitized error (`{"class","code","message"}`: class from
-  the JSON-RPC code, the message cut to 200 characters, secrets masked as
-  `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`, serde-echoed argument values removed, absolute
-  home directories collapsed to `~`); raw arguments are still never stored. New nullable
-  `error_detail` column, added in place by a migration. Chain: rows with a detail are written as
-  chain version 3 (the v2 input plus the stored detail); every other row is still version 2, byte
-  for byte as before, and v1 / v2 rows keep verifying, so a mixed chain verifies (tested, including
-  tampering with a stored error). `mesh-mcp stats` lists the three most frequent error messages per
-  tool (also in `--json` as `top_errors`). Older binaries cannot verify a version 3 row.
+  the JSON-RPC code, the message cut to 200 characters). Raw arguments are still never stored.
+  Sanitizing is structural first: serde-style messages (`invalid type`, `invalid value`,
+  `unknown variant`, `unknown field`) keep their schema text and lose the quoted user value
+  wholesale; then secrets are masked as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` (key/value
+  pairs, URL userinfo, bearer / basic credentials, JWTs, long base64 / base64url runs), and
+  absolute home directories collapse to `~`. Hash chain: every row stays chain version 2 with the
+  v2 hash input byte for byte, so an older binary (a stale `meshd`, a rollback) still verifies the
+  whole chain; it just neither sees nor verifies the detail. The detail is bound by its own
+  nullable column `error_detail_sig = SHA-256(entry_hash || error_detail)`. The current
+  verifier rejects a detail with no valid signature (on any row, including v1 / v2 rows that
+  predate the column), a signature with no detail, and an edited detail or signature; a mixed
+  old / new chain verifies. Both columns are added in place. `mesh-mcp stats` lists the three most
+  frequent error messages per tool (also in `--json` as `top_errors`), with control characters
+  and ANSI escapes removed from the stored text at render time.
 - Audit timestamps: current binaries have always written ISO 8601 for new rows (an earlier
   version wrote `<epoch-secs>.<millis>Z`); old rows are tolerated and normalised by `stats` and by
   verification without being rewritten (rewriting would break the chain). A mixed-format chain is
   now covered by a test.
+- `mesh-mcp doctor` warns once when topic patterns rely on the default confidence ("N pattern(s)
+  have no explicit confidence; since 7.1.8 the default is heuristic (it was exact) ...").
 - `analyze_grpc` with a relative `.proto` path that omits the root prefix
   (`proto/foo/bar.proto` for `proto-registry/proto/foo/bar.proto`) failed with "Path not found".
   A missing relative path is now matched by trailing path components against the `.proto` files
-  under the roots (honouring `exclude_patterns`, no symlinks). One match is used and named in the
-  output ("Resolved ... to ..."); several are listed (`-32602` with an explicit `base`, a skipped
-  check otherwise); none lists the closest files by name. `..`, absolute paths and anything
+  of the current index (its file list, no I/O; a crawl of the roots only when no index is built).
+  The target needs at least one directory component: a bare file name (`user.proto`) is never
+  guessed, its candidates are listed. One match is used and named in a "Resolved path" heading at
+  the top of the result; several are listed (`-32602` with an explicit `base`, a skipped check
+  otherwise); none lists the closest files by name. The `.proto` extension test is case
+  insensitive. `..`, absolute paths and anything
   outside the roots never reach the suffix search: the jail and its `-32602` are unchanged.
 - `doctor` named a rejected file's reason as "binary/long line/deep nesting". Each file now
   reports the one guard that fired with its measurement: `binary (null byte)`,

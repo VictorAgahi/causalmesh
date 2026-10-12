@@ -370,9 +370,11 @@ The file checked is the `.proto` of the resolved proto definition, or `target` i
 
 **Relative `.proto` paths (7.1.8).** A relative `.proto` target that does not exist as written
 (for example `proto/foo/bar.proto` when the file is `proto-registry/proto/foo/bar.proto`) is matched
-by trailing path components against the `.proto` files under the roots (`exclude_patterns`
-honoured, symlinks not followed). A single match is used and the output says
-`Resolved <target> to <root-name>/<path>`. Several matches are listed: with an explicit `base` the
+by trailing path components against the `.proto` files of the current index (no I/O; a crawl
+of the roots only while no index exists). The target needs at least one directory component: a
+bare file name such as `user.proto` is never auto-used (it could be another repository's
+contract), its candidates are listed. A single match is used and a `### Resolved path` heading at
+the top of the result names the file. Several matches are listed: with an explicit `base` the
 call fails with `-32602` and the list, without one the trace is kept and the check is skipped with
 the list. No match lists the closest files by name. A path with `..`, an absolute path and anything
 outside the roots never reaches this search: the jail and its `-32602` are unchanged.
@@ -580,6 +582,9 @@ Search architecture decision records (ADRs), RFCs, and markdown documentation wi
 metadata, not prose, and is never indexed as section body (line numbers still count it). Its
 `name` titles the section before the first heading and a capped `description` is kept as one
 searchable line of the first real section; a file that is only frontmatter yields no section.
+The block must start on line 1 and every line must look like metadata (`key: value`, `key:`,
+`- item`, indented continuation, `# comment`); prose between two horizontal rules stays indexed,
+and only column-0 keys count.
 
 #### JSON Schema
 ```json

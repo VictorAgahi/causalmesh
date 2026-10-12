@@ -164,6 +164,27 @@ impl DoctorCommand {
         } else {
             checks.push(DoctorCheck::warn("Contract patterns", problems.join("; ")));
         }
+        // The default changed in 7.1.8 (it was exact): say so once, for the topic
+        // patterns that never chose a confidence.
+        let relying = patterns
+            .iter()
+            .filter(|p| {
+                p.confidence.is_none()
+                    && matches!(
+                        p.kind,
+                        mesh_core::PatternKind::TopicProducer
+                            | mesh_core::PatternKind::TopicConsumer
+                    )
+            })
+            .count();
+        if relying > 0 {
+            checks.push(DoctorCheck::warn(
+                "Pattern confidence",
+                format!(
+                    "{relying} pattern(s) have no explicit confidence; since 7.1.8 the default is heuristic (it was exact); set confidence = \"exact\" on patterns that capture literal topics"
+                ),
+            ));
+        }
     }
 
     /// Config-derived checks (sections 1-1d): syntax, jailed roots, skill files,
@@ -1266,6 +1287,44 @@ mod sandbox_check_tests {
         // Pre-5.9 kernel: no filter count, the mode is all there is.
         assert_eq!(seccomp_confined("Seccomp:\t2\n", ""), Some(true));
         assert_eq!(seccomp_confined("Name:\tmeshd\n", own_bare), None);
+    }
+}
+
+#[cfg(test)]
+mod pattern_confidence_tests {
+    use super::DoctorCommand;
+
+    fn cfg(extra: &str) -> mesh_core::Config {
+        mesh_core::Config::load_from_str(&format!(
+            "[workspace]\nname = \"w\"\nroots = [\".\"]\n[engines.contracts]\n\
+             [[engines.contracts.patterns]]\nname = \"a\"\nkind = \"topic_producer\"\nregex = 'x(.)'\n{extra}\
+             [[engines.contracts.patterns]]\nname = \"b\"\nkind = \"topic_consumer\"\nregex = 'y(.)'\n"
+        ))
+        .expect("config")
+    }
+
+    #[test]
+    fn patterns_relying_on_the_default_confidence_warn_once() {
+        let mut checks = Vec::new();
+        DoctorCommand::pattern_checks(&cfg(""), &mut checks);
+        let warns: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name == "Pattern confidence")
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].status, "warn");
+        assert!(warns[0]
+            .message
+            .starts_with("2 pattern(s) have no explicit confidence"));
+        assert!(warns[0].message.contains("it was exact"));
+
+        let mut checks = Vec::new();
+        DoctorCommand::pattern_checks(&cfg("confidence = \"exact\"\n"), &mut checks);
+        let warns: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name == "Pattern confidence")
+            .collect();
+        assert!(warns[0].message.starts_with("1 pattern(s)"));
     }
 }
 

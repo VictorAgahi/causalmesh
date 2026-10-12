@@ -5,6 +5,32 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.4] — 2026-10-12
+
+### Fixed
+- `analyze_grpc` listed a server handler under "Client Stubs" when its body delegated to an
+  application service of the same name (`this.userService.addBadgeToUser(...)` inside the
+  `AddBadgeToUser` handler). Client detection through a field NAME (`userService`, `userClient`
+  with a `UserService` declared in a proto) was a documented heuristic; it is now tightened:
+  - A field whose declared type is a plain application class (`private userService: UserService`,
+    a domain service that merely shares the proto service's name) is never a client. The name
+    decides only when the field has no type information, and the match stays labelled `heuristic`.
+  - A name-based call located in the body of a handler serving the RPC of the same name is not a
+    client call. Calls through a field typed or bound as a generated client (`XClient`,
+    `getService<XClient>(...)`) stay exact, including inside a handler that really forwards.
+- Handlers declared with `@GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`
+  were all `heuristic` and shown with the raw expression. `Enum.MEMBER`, `OBJ.KEY` (also
+  `as const` / `Object.freeze`) and imported string constants are now resolved to their literal
+  across files (same repository first); when the result names exactly one proto RPC the handler
+  is matched `exact` and shown as that RPC (`declared as` the raw expression). An unresolved or
+  ambiguous expression (two different values, or an RPC declared by two protos) keeps its raw
+  name and `heuristic`.
+
+### Tests
+- Delegating handler, domain service named like the proto, untyped name-only client, typed
+  clients under arbitrary field names, typed client inside a handler, enum / const-object /
+  imported-const resolution, unresolved and ambiguous expressions.
+
 ## [7.1.3] — 2026-10-12
 
 ### Changed

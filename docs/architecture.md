@@ -386,6 +386,15 @@ compliance control, and a user with access to the file can delete it.
   in the same row — meaning those three fields could be altered without breaking chain
   verification. v2 closes that.
 
+  Chain v3 (7.1.8) is additive: an `ERROR` row also stores a short sanitized `error_detail`
+  (`{"class","code","message"}`: message cut to 200 characters, secrets masked, serde-echoed
+  argument values removed, home directories collapsed to `~`; never the arguments) and its hash
+  input is the v2 input followed by that stored text. Only rows that carry a detail are written as
+  v3; every other row is still v2, so a mixed v1 / v2 / v3 chain verifies, and the `error_detail`
+  column is added in place to an older database. Timestamps of new rows are ISO 8601; early rows
+  hold `<epoch-secs>.<millis>Z`, which `stats` and verification accept and normalise without
+  rewriting them. `mesh-mcp stats` lists the three most frequent error messages per tool.
+
 - **What is recorded**: successful calls, and also calls refused before running (invalid
   arguments, RSAH refusals), with status `ERROR`. Arguments are stored and committed to the chain
   through their SHA-256 digest. The whole trail can be turned off with

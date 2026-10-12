@@ -100,6 +100,9 @@ infer_string_topics = true
 # file_pattern = "*.ts"
 # regex = 'createEvent<([^>]+)>'
 # target_group = 1
+# confidence = "heuristic" # optional, topic patterns only: exact | heuristic (default heuristic).
+#                          # "exact" only when the regex captures a literal topic string, not an
+#                          # emission routed through a mapping table.
 
 # [[engines.contracts.patterns]]
 # name = "event-post-processor"

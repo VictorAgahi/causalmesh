@@ -214,6 +214,80 @@ impl DocIndex {
             .then_some(hashes)
     }
 
+    /// Detects a leading YAML (`---`) or TOML (`+++`) frontmatter block.
+    ///
+    /// Returns the number of lines the block occupies (delimiters included) and
+    /// the searchable `name` / `description` fields. A block without a closing
+    /// delimiter is not frontmatter (a lone `---` is a thematic break).
+    fn split_frontmatter(content: &str) -> Option<(usize, Option<String>, Option<String>)> {
+        let mut lines = content.lines();
+        let first = lines.next()?.trim_start_matches('\u{feff}').trim_end();
+        let (delim, sep) = match first {
+            "---" => ("---", ':'),
+            "+++" => ("+++", '='),
+            _ => return None,
+        };
+        let mut name: Option<String> = None;
+        let mut description: Option<String> = None;
+        // A folded / literal scalar (`description: >`) continues on indented lines.
+        let mut block_key: Option<&'static str> = None;
+        let mut block_buf = String::new();
+        let mut consumed = 1usize;
+        for line in lines {
+            consumed += 1;
+            let closing = line.trim_end() == delim;
+            let continuation =
+                block_key.is_some() && (line.starts_with(' ') || line.starts_with('\t'));
+            if continuation {
+                if !block_buf.is_empty() {
+                    block_buf.push(' ');
+                }
+                block_buf.push_str(line.trim());
+                continue;
+            }
+            if let Some(k) = block_key.take() {
+                let v = block_buf.trim().to_string();
+                block_buf.clear();
+                if !v.is_empty() {
+                    if k == "name" {
+                        name = Some(v);
+                    } else {
+                        description = Some(v);
+                    }
+                }
+            }
+            if closing {
+                return Some((consumed, name, description));
+            }
+            let Some((k, v)) = line.split_once(sep) else {
+                continue;
+            };
+            let key: &'static str = match k.trim() {
+                "name" => "name",
+                "description" => "description",
+                _ => continue,
+            };
+            let v = v.trim();
+            if matches!(v, "" | ">" | "|" | ">-" | "|-") {
+                block_key = Some(key);
+                continue;
+            }
+            let v = v.trim_matches(|c| c == '"' || c == '\'').trim();
+            if v.is_empty() {
+                continue;
+            }
+            if key == "name" {
+                name = Some(v.to_string());
+            } else {
+                description = Some(v.to_string());
+            }
+        }
+        None
+    }
+
+    /// Characters of a frontmatter `description` kept as searchable metadata.
+    const FRONTMATTER_DESCRIPTION_CAP: usize = 240;
+
     /// Splits a markdown document into sections without touching the index —
     /// pure, so it can run on the Rayon pool during a workspace scan.
     ///
@@ -245,18 +319,26 @@ impl DocIndex {
         // +2: the section that crosses the budget and the final one.
         let max_sections = budget / std::mem::size_of::<DocSection>() + 2;
         let mut sections = Vec::with_capacity((headings + 1).min(max_sections));
-        let mut current_title = CompactStr::new(
+        // Leading frontmatter is metadata, not prose: it never becomes section
+        // body. `name` titles the preamble section, `description` rides along
+        // as one capped line of the first real section (searchable, cheap).
+        let (fm_lines, fm_name, fm_description) =
+            Self::split_frontmatter(&content).unwrap_or((0, None, None));
+        let mut current_title = CompactStr::new(fm_name.as_deref().unwrap_or_else(|| {
             path.file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("Document"),
-        );
+                .unwrap_or("Document")
+        }));
         let mut current_level = 1usize;
-        let mut current_start_line = 1usize;
+        let mut current_start_line = fm_lines + 1;
         let mut section_lines: Vec<&str> = Vec::new();
         let mut line_num = 0usize;
 
         for line in content.lines() {
             line_num += 1;
+            if line_num <= fm_lines {
+                continue;
+            }
             if !coalescing {
                 if let Some(hashes) = Self::heading_level(line) {
                     if !section_lines.is_empty() {
@@ -297,6 +379,22 @@ impl DocIndex {
                 line_num.max(current_start_line),
                 section_lines.join("\n"),
             ));
+        }
+
+        if let (Some(desc), Some(first)) = (fm_description, sections.first_mut()) {
+            let desc: String = desc
+                .chars()
+                .take(Self::FRONTMATTER_DESCRIPTION_CAP)
+                .collect();
+            let merged = format!("description: {desc}\n{}", first.content);
+            *first = DocSection::new(
+                &file_path,
+                first.title.clone(),
+                first.level,
+                first.start_line,
+                first.end_line,
+                merged,
+            );
         }
 
         sections
@@ -694,6 +792,60 @@ We deploy microservices onto kubernetes using Helm and ArgoCD.
             results.is_empty(),
             "fuzzy_fallback = false must not fall back to fuzzy matching"
         );
+    }
+
+    #[test]
+    fn yaml_frontmatter_is_not_a_section_body() {
+        let index = DocIndex::default();
+        let raw = "---\nname: queue-skill\ndescription: Handles dead letter handling\nallowed-tools: Read, Grep\nmetadata:\n  a: dlq-config\n  b: dlq-more\n---\n# Usage\n\nRun the worker.\n";
+        let sections = index.parse_sections(Path::new("SKILL.md"), raw);
+        assert_eq!(sections.len(), 1, "{sections:?}");
+        let s = &sections[0];
+        assert_eq!(s.title.as_str(), "Usage");
+        assert_eq!(
+            s.start_line, 9,
+            "line numbers still count frontmatter lines"
+        );
+        assert!(!s.content.contains("dlq-config"));
+        assert!(!s.content.contains("allowed-tools"));
+        assert!(s.content.contains("Handles dead letter handling"));
+
+        let mut idx = DocIndex::default();
+        idx.extend_sections(sections);
+        assert!(idx.search("dlq-config", 5).is_empty());
+        assert!(!idx.search("dead letter", 5).is_empty());
+    }
+
+    #[test]
+    fn frontmatter_only_file_yields_no_section() {
+        let index = DocIndex::default();
+        let raw = "---\nname: x\ndescription: >\n  folded text\n  more\nkey: dlq\n---\n";
+        assert!(index.parse_sections(Path::new("SKILL.md"), raw).is_empty());
+    }
+
+    #[test]
+    fn frontmatter_name_titles_the_preamble_and_folded_description_is_kept() {
+        let index = DocIndex::default();
+        let raw = "---\nname: my-skill\ndescription: >\n  folded\n  text\n---\nIntro prose.\n\n# Next\nbody\n";
+        let sections = index.parse_sections(Path::new("SKILL.md"), raw);
+        assert_eq!(sections[0].title.as_str(), "my-skill");
+        assert!(sections[0]
+            .content
+            .starts_with("description: folded text\n"));
+        assert_eq!(sections[1].title.as_str(), "Next");
+    }
+
+    #[test]
+    fn toml_frontmatter_is_skipped_and_lone_rule_is_not_frontmatter() {
+        let index = DocIndex::default();
+        let toml = "+++\ntitle = \"x\"\nname = \"tomlname\"\n+++\n# H\nbody\n";
+        let sections = index.parse_sections(Path::new("a.md"), toml);
+        assert_eq!(sections.len(), 1);
+        assert!(!sections[0].content.contains("tomlname"));
+
+        let rule = "---\n# H\nbody text\n";
+        let sections = index.parse_sections(Path::new("a.md"), rule);
+        assert!(sections.iter().any(|s| s.content.contains("---")));
     }
 
     #[test]

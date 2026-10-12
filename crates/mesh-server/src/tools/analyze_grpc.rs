@@ -117,12 +117,63 @@ fn run_with_git(
         return Ok(ToolOutput::text(text));
     };
 
-    let resolved = ValidatedScope::resolve_with_aliases(
-        &proto_file.to_string_lossy(),
-        &state.allowed_roots,
-        &state.config.workspace.mount_aliases,
-        state.config.workspace.resolved_workspace_root.as_deref(),
-    );
+    let resolve = |raw: &str| {
+        ValidatedScope::resolve_with_aliases(
+            raw,
+            &state.allowed_roots,
+            &state.config.workspace.mount_aliases,
+            state.config.workspace.resolved_workspace_root.as_deref(),
+        )
+    };
+    let mut resolved = resolve(&proto_file.to_string_lossy());
+    // A caller-supplied relative `.proto` path that does not exist as written is
+    // matched, by trailing path components, against the `.proto` files under the
+    // roots: `proto/foo/bar.proto` finds `proto-registry/proto/foo/bar.proto`.
+    // Only taken for a missing path: a jail escape never reaches this.
+    let mut resolution_note = String::new();
+    if matches!(resolved, Err(mesh_core::SecurityError::PathNotFound(_)))
+        && target.ends_with(".proto")
+    {
+        match resolve_proto_suffix(target, state) {
+            ProtoSuffixMatch::Unique(found) => {
+                let shown = display_proto_path(&found, &state.allowed_roots);
+                resolution_note = format!("*Resolved `{target}` to `{shown}`.*\n");
+                resolved = resolve(&found.to_string_lossy());
+            }
+            ProtoSuffixMatch::Several(found) => {
+                let list = list_paths(&found, &state.allowed_roots);
+                let msg = format!(
+                    "`{target}` matches {} `.proto` files; pass a longer path:\n{list}",
+                    found.len()
+                );
+                if explicit_base.is_some() {
+                    return Err((-32602, format!("Wire-format check: {msg}")));
+                }
+                text.push_str(&format!("\n### Wire-format check\n*Skipped: {msg}*\n"));
+                return Ok(ToolOutput::text(text));
+            }
+            ProtoSuffixMatch::None(closest) => {
+                let hint = if closest.is_empty() {
+                    "no `.proto` file with that name exists under the workspace roots".to_string()
+                } else {
+                    format!(
+                        "closest `.proto` files:\n{}",
+                        list_paths(&closest, &state.allowed_roots)
+                    )
+                };
+                if explicit_base.is_some() {
+                    return Err((
+                        -32602,
+                        format!("Wire-format check: `{target}` was not found; {hint}"),
+                    ));
+                }
+                text.push_str(&format!(
+                    "\n### Wire-format check\n*Skipped: `{target}` is not present in the working tree; {hint}*\n"
+                ));
+                return Ok(ToolOutput::text(text));
+            }
+        }
+    }
     let file = match resolved {
         Ok(scope) => scope.into_path_buf(),
         // A path outside the jail is refused outright (commandment 4), whether it
@@ -149,6 +200,10 @@ fn run_with_git(
     };
 
     let files_accessed = vec![file.to_string_lossy().into_owned()];
+    if !resolution_note.is_empty() {
+        text.push('\n');
+        text.push_str(&resolution_note);
+    }
     match check_wire_format(&file, explicit_base, git) {
         Ok(report) => text.push_str(&render_report(&report)),
         // Explicit base: every failure is the tool's answer (`isError`). Implicit
@@ -165,6 +220,128 @@ fn run_with_git(
         files_accessed,
         secrets_redacted: 0,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Relative `.proto` path resolution
+// ---------------------------------------------------------------------------
+
+/// Most candidates listed in a "several matches" / "closest files" answer.
+const MAX_LISTED_PROTOS: usize = 8;
+
+enum ProtoSuffixMatch {
+    Unique(PathBuf),
+    Several(Vec<PathBuf>),
+    /// No file ends with the target; files sharing its name, nearest first.
+    None(Vec<PathBuf>),
+}
+
+/// The plain components of a relative target, or `None` when it is absolute or
+/// could climb out of the roots (`..`): those never get a fuzzy second chance.
+fn plain_components(target: &str) -> Option<Vec<std::ffi::OsString>> {
+    let cleaned = path_clean::clean(target);
+    let mut out = Vec::new();
+    for c in cleaned.components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n.to_os_string()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Matches `target` by trailing path components against the `.proto` files under
+/// the jailed roots (`follow_links(false)`, `exclude_patterns` honoured; this
+/// covers the configured `proto_dirs`, which live under the roots).
+fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
+    let Some(wanted) = plain_components(target) else {
+        return ProtoSuffixMatch::None(Vec::new());
+    };
+    let mut all: Vec<PathBuf> = Vec::new();
+    for root in state.allowed_roots.iter() {
+        let Ok(scope) = ValidatedScope::resolve(&root.to_string_lossy(), &state.allowed_roots)
+        else {
+            continue;
+        };
+        all.extend(
+            mesh_core::FilesystemCrawler::crawl_scope(
+                &scope,
+                &state.config.workspace.exclude_patterns,
+                None,
+            )
+            .into_iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "proto")),
+        );
+    }
+    all.sort();
+    all.dedup();
+
+    let ends_with_target = |f: &PathBuf| {
+        let comps: Vec<_> = f
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        comps.len() >= wanted.len()
+            && comps[comps.len() - wanted.len()..]
+                .iter()
+                .zip(&wanted)
+                .all(|(a, b)| *a == b.as_os_str())
+    };
+    let mut found: Vec<PathBuf> = all
+        .iter()
+        .filter(|f| ends_with_target(f))
+        .cloned()
+        .collect();
+    match found.len() {
+        1 => ProtoSuffixMatch::Unique(found.remove(0)),
+        0 => {
+            let name = wanted.last().map(std::ffi::OsString::as_os_str);
+            let mut closest: Vec<PathBuf> =
+                all.into_iter().filter(|f| f.file_name() == name).collect();
+            closest.truncate(MAX_LISTED_PROTOS);
+            ProtoSuffixMatch::None(closest)
+        }
+        _ => ProtoSuffixMatch::Several(found),
+    }
+}
+
+/// `<root dir name>/<path under the root>`, forward slashes: the spelling a user
+/// types for a file of a multi-root workspace.
+fn display_proto_path(path: &Path, roots: &[PathBuf]) -> String {
+    let root = roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count());
+    let base = root
+        .and_then(|r| r.parent())
+        .filter(|p| p.parent().is_some());
+    let rel = match base {
+        Some(b) => path.strip_prefix(b).unwrap_or(path),
+        None => root.and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path),
+    };
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn list_paths(paths: &[PathBuf], roots: &[PathBuf]) -> String {
+    let mut out: Vec<String> = paths
+        .iter()
+        .take(MAX_LISTED_PROTOS)
+        .map(|p| format!("- `{}`", display_proto_path(p, roots)))
+        .collect();
+    if paths.len() > MAX_LISTED_PROTOS {
+        out.push(format!(
+            "- ... and {} more",
+            paths.len() - MAX_LISTED_PROTOS
+        ));
+    }
+    out.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1215,119 @@ message User {
         let audit = std::sync::Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
         let rescan = std::sync::Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
         AppState::new(config, vec![root.to_path_buf()], audit, rescan)
+    }
+
+    fn proto_args(target: &str, base: Option<&str>) -> AnalyzeGrpcArgs {
+        AnalyzeGrpcArgs {
+            target: CompactStr::new(target),
+            base: base.map(Into::into),
+            include_tests: None,
+            _meta: None,
+        }
+    }
+
+    /// A target missing its root-directory prefix resolves by unique suffix.
+    #[test]
+    fn relative_proto_path_missing_its_root_prefix_resolves_by_unique_suffix() {
+        let repo = TempRepo::new();
+        repo.write("registry/proto/foo/bar.proto", BASE_PROTO);
+        repo.write("registry/proto/baz/other.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_for(&repo.root);
+
+        let out = run_with_git(
+            &proto_args("proto/foo/bar.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .expect("resolved by suffix");
+        assert!(
+            out.text
+                .contains("Resolved `proto/foo/bar.proto` to `repo/registry/proto/foo/bar.proto`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("no wire-format breaking change"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.files_accessed.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_relative_proto_path_lists_every_match() {
+        let repo = TempRepo::new();
+        repo.write("a/proto/user.proto", BASE_PROTO);
+        repo.write("b/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_for(&repo.root);
+
+        let err = run_with_git(
+            &proto_args("proto/user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("ambiguous");
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("matches 2 `.proto` files"), "{}", err.1);
+        assert!(err.1.contains("repo/a/proto/user.proto"), "{}", err.1);
+        assert!(err.1.contains("repo/b/proto/user.proto"), "{}", err.1);
+
+        // Implicit base: the trace stays valid, the check is skipped with the list.
+        let out = run_with_git(
+            &proto_args("proto/user.proto", None),
+            &state,
+            &repo.runner(),
+        )
+        .expect("trace survives");
+        assert!(out.text.contains("Skipped"), "{}", out.text);
+        assert!(out.text.contains("repo/b/proto/user.proto"), "{}", out.text);
+    }
+
+    #[test]
+    fn unmatched_relative_proto_path_lists_closest_candidates_and_never_escapes() {
+        let repo = TempRepo::new();
+        repo.write("a/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_for(&repo.root);
+
+        let err = run_with_git(
+            &proto_args("wrong/dir/user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("not found");
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("closest"), "{}", err.1);
+        assert!(err.1.contains("repo/a/proto/user.proto"), "{}", err.1);
+
+        let err = run_with_git(
+            &proto_args("nothing.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("not found");
+        assert!(
+            err.1.contains("no `.proto` file with that name"),
+            "{}",
+            err.1
+        );
+
+        // `..` never gets the suffix search: the plain miss path applies.
+        std::fs::write(repo.home.join("up.proto"), "syntax = \"proto3\";\n").expect("write");
+        let err = run_with_git(
+            &proto_args("../home/up.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("escape or miss");
+        assert_eq!(err.0, -32602, "{}", err.1);
+        assert!(!err.1.contains("Resolved"), "{}", err.1);
     }
 
     #[test]

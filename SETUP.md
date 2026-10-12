@@ -76,7 +76,8 @@ with `mesh-mcp doctor --json` and fails loudly on any `error` check. It never do
 During the pilot, `mesh-mcp stats --since all` reports calls per session (one per agent
 connection; `--session <id>` keeps one), per-tool latency p50/p95 (p95 from 20 timed calls on),
 the `isError` rate, the index cache hit rate and `meshd` restarts from the local audit database;
-`--json` prints the same summary on stdout. Point `MESH_AUDIT_DB` (or `stats --db`) at a
+`--json` prints the same summary on stdout. Failed calls are listed with their three most frequent
+sanitized error messages per tool (since 7.1.8; older rows have none). Point `MESH_AUDIT_DB` (or `stats --db`) at a
 dedicated file to keep pilot calls apart from any other use of MeshMCP on the machine. The A/B
 measurement protocol is in [`docs/pilot-scorecard.md`](docs/pilot-scorecard.md).
 
@@ -387,7 +388,16 @@ file_pattern = "*.ts"
 regex = 'class\s+(\w+)\s+extends\s+\w*PostProcessor<([^>]+)>'
 target_group = 2               # the event name
 consumer_group = 1             # the class consuming it
+confidence = "heuristic"       # optional: exact | heuristic (default heuristic)
 ```
+
+`confidence` (topic patterns only) is the confidence `analyze_impact` reports for the Produces /
+Consumes edges the pattern creates. It defaults to `heuristic`: a regex cannot tell a literal
+topic from an emission that goes through a mapping table (`EVENTS[kind]`, a constant looked up
+by type), so a declarative match is a lead to verify, not a fact. Set `confidence = "exact"`
+on a pattern only when it captures the literal topic string. Any other value, or an unknown
+key, is rejected when the config is loaded, and `mesh-mcp doctor` flags a `confidence` set on a
+`saga` or `rpc` pattern (it has no effect there). Before 7.1.8 every pattern edge was `exact`.
 
 Producers and consumers naming the same topic get linked automatically, which is what makes
 `analyze_impact` able to trace an event end to end.

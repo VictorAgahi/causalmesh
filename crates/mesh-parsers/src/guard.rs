@@ -58,6 +58,19 @@ impl<R> ParseOutcome<R> {
     }
 }
 
+/// The single guard that rejected a file, with the measurement that tripped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardRejection {
+    /// Over the size budget.
+    Oversized { size: u64, budget: u64 },
+    /// A null byte in the first [`AstGuard::BINARY_SNIFF_LEN`] bytes.
+    Binary,
+    /// A line over [`AstGuard::MAX_LINE_LEN_BYTES`]; `len` is the longest line.
+    LongLine { len: usize },
+    /// Nesting over [`AstGuard::MAX_NESTING_DEPTH`]; `depth` is the deepest.
+    DeepNesting { depth: usize },
+}
+
 /// Hardened Tree-sitter C-FFI bounded guards and lexical pre-checks per CLAUDE.md Commandment 2
 pub struct AstGuard;
 
@@ -152,6 +165,26 @@ impl AstGuard {
         content: &[u8],
         max_bytes: u64,
     ) -> bool {
+        Self::check_with_budget(metadata, content, max_bytes).is_ok()
+    }
+
+    /// [`Self::should_parse_path`] naming the one guard that fired.
+    pub fn check_path(
+        path: &std::path::Path,
+        metadata: &fs::Metadata,
+        content: &[u8],
+    ) -> Result<(), GuardRejection> {
+        Self::check_with_budget(metadata, content, Self::size_budget(path))
+    }
+
+    /// The lexical pre-check, reporting the first guard that rejects the file
+    /// (size, then binary sniff, then line length, then nesting depth) with the
+    /// measurement that tripped it.
+    pub fn check_with_budget(
+        metadata: &fs::Metadata,
+        content: &[u8],
+        max_bytes: u64,
+    ) -> Result<(), GuardRejection> {
         if metadata.len() > max_bytes {
             tracing::debug!(
                 target: "mesh::parser",
@@ -159,28 +192,34 @@ impl AstGuard {
                 metadata.len(),
                 max_bytes
             );
-            return false;
+            return Err(GuardRejection::Oversized {
+                size: metadata.len(),
+                budget: max_bytes,
+            });
         }
 
         if Self::looks_binary(content) {
             tracing::debug!(target: "mesh::parser", "Rejected file: binary null byte detected");
-            return false;
+            return Err(GuardRejection::Binary);
         }
 
-        if content
+        let longest_line = content
             .split(|&b| b == b'\n')
-            .any(|line| line.len() > Self::MAX_LINE_LEN_BYTES)
-        {
+            .map(<[u8]>::len)
+            .max()
+            .unwrap_or(0);
+        if longest_line > Self::MAX_LINE_LEN_BYTES {
             tracing::debug!(target: "mesh::parser", "Rejected file: line exceeds 1024 bytes");
-            return false;
+            return Err(GuardRejection::LongLine { len: longest_line });
         }
 
-        if Self::max_nesting_depth(content) > Self::MAX_NESTING_DEPTH {
+        let depth = Self::max_nesting_depth(content);
+        if depth > Self::MAX_NESTING_DEPTH {
             tracing::warn!(target: "mesh::parser", "Rejected file: excessive syntactic nesting depth (> 64)");
-            return false;
+            return Err(GuardRejection::DeepNesting { depth });
         }
 
-        true
+        Ok(())
     }
 
     /// Fast, context-aware lexical depth scanner ignoring brackets inside comments and string literals
@@ -459,6 +498,42 @@ impl AstGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each rejected file reports the one guard that fired, with its measurement.
+    #[test]
+    fn check_names_the_single_guard_that_fired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let check = |name: &str, content: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).expect("write");
+            let meta = std::fs::metadata(&path).expect("meta");
+            AstGuard::check_path(&path, &meta, content)
+        };
+
+        assert_eq!(check("ok.rs", b"fn main() {}\n"), Ok(()));
+        assert_eq!(check("bin.rs", b"fn\0main"), Err(GuardRejection::Binary));
+
+        let long = format!("let x = \"{}\";\n", "a".repeat(2000));
+        assert_eq!(
+            check("long.rs", long.as_bytes()),
+            Err(GuardRejection::LongLine {
+                len: long.len() - 1
+            })
+        );
+
+        let mut deep = vec![b'('; 70];
+        deep.extend(vec![b')'; 70]);
+        assert_eq!(
+            check("deep.rs", &deep),
+            Err(GuardRejection::DeepNesting { depth: 70 })
+        );
+
+        let big = vec![b'a'; AstGuard::MAX_FILE_SIZE_BYTES as usize + 1];
+        assert!(matches!(
+            check("big.rs", &big),
+            Err(GuardRejection::Oversized { .. })
+        ));
+    }
 
     #[test]
     fn test_nesting_depth_guard() {

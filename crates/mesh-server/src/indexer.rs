@@ -13,8 +13,8 @@ use mesh_core::{
     RepoId, ValidatedScope,
 };
 use mesh_parsers::{
-    AstGuard, CompiledPattern, ExtractConfig, FileIndex, LanguageKind, PolyglotIndexer,
-    TsAliasIndex,
+    AstGuard, CompiledPattern, ExtractConfig, FileIndex, GuardRejection, LanguageKind,
+    PolyglotIndexer, TsAliasIndex,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -31,8 +31,12 @@ pub const SCAN_DEPTH: usize = 10;
 enum RejectKind {
     /// Over the 384KB/1.5MB size budget — rejected before the file was even read.
     Oversized,
-    /// Failed a lexical pre-check (binary sniff, line length, nesting depth).
-    GuardRejected,
+    /// Failed the binary sniff (a null byte in the first 4KB).
+    Binary,
+    /// A line over the 1024-byte cap; carries the longest line.
+    LongLine(usize),
+    /// Syntactic nesting over the cap; carries the deepest level.
+    DeepNesting(usize),
     /// Could not be read (permissions, vanished mid-scan) or was not valid UTF-8.
     ReadError,
 }
@@ -525,14 +529,25 @@ impl WorkspaceIndexer {
             health.record_skipped_non_source();
             return;
         }
+        let mut detail: Option<u64> = None;
         let reason = match reason {
             RejectKind::Oversized => {
                 health.record_oversized();
                 RejectReason::Oversized
             }
-            RejectKind::GuardRejected => {
+            RejectKind::Binary => {
                 health.record_guard_rejected();
-                RejectReason::Guard
+                RejectReason::Binary
+            }
+            RejectKind::LongLine(len) => {
+                health.record_guard_rejected();
+                detail = Some(len as u64);
+                RejectReason::LongLine
+            }
+            RejectKind::DeepNesting(depth) => {
+                health.record_guard_rejected();
+                detail = Some(depth as u64);
+                RejectReason::DeepNesting
             }
             RejectKind::ReadError => {
                 health.record_read_error();
@@ -540,7 +555,7 @@ impl WorkspaceIndexer {
             }
         };
         let size = Self::file_size(&path);
-        health.record_rejected_file(path, reason, size);
+        health.record_rejected_file_detail(path, reason, size, detail);
     }
 
     /// Size on disk for a rejection record; 0 when the file can no longer be stat'ed.
@@ -1206,13 +1221,21 @@ impl WorkspaceIndexer {
         // Tree-sitter inputs get the full lexical guard (null bytes, line length,
         // nesting). Markdown / YAML / properties only get the binary sniff — prose
         // legitimately has >1 KB lines.
-        let passes = if lang.language().is_some() {
-            AstGuard::should_parse_path(path, &metadata, &bytes)
+        let verdict = if lang.language().is_some() {
+            AstGuard::check_path(path, &metadata, &bytes)
+        } else if AstGuard::looks_binary(&bytes) {
+            Err(GuardRejection::Binary)
         } else {
-            !AstGuard::looks_binary(&bytes)
+            Ok(())
         };
-        if !passes {
-            return Err(RejectKind::GuardRejected);
+        match verdict {
+            Ok(()) => {}
+            Err(GuardRejection::Oversized { .. }) => return Err(RejectKind::Oversized),
+            Err(GuardRejection::Binary) => return Err(RejectKind::Binary),
+            Err(GuardRejection::LongLine { len }) => return Err(RejectKind::LongLine(len)),
+            Err(GuardRejection::DeepNesting { depth }) => {
+                return Err(RejectKind::DeepNesting(depth))
+            }
         }
         let content = std::str::from_utf8(&bytes).map_err(|_| RejectKind::ReadError)?;
         let signature = DifferentialVfs::compute_signature(&metadata, &bytes);

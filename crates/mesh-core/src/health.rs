@@ -18,8 +18,12 @@ pub const NOTE_MAX_BYTES: usize = 2 * 1024;
 pub enum RejectReason {
     /// Over the 384KB/1.5MB size budget.
     Oversized,
-    /// Failed a lexical pre-check (binary sniff, long line, deep nesting).
-    Guard,
+    /// A null byte in the first 4KB: binary content.
+    Binary,
+    /// A line over 1024 bytes (minified or generated code, data blob).
+    LongLine,
+    /// Syntactic nesting deeper than 64 levels.
+    DeepNesting,
     /// Unreadable or not valid UTF-8.
     ReadError,
     /// Passed every guard, but tree-sitter failed twice: indexed with no facts
@@ -28,9 +32,11 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
-    pub const ALL: [RejectReason; 4] = [
+    pub const ALL: [RejectReason; 6] = [
         RejectReason::Oversized,
-        RejectReason::Guard,
+        RejectReason::Binary,
+        RejectReason::LongLine,
+        RejectReason::DeepNesting,
         RejectReason::ReadError,
         RejectReason::ParseFailed,
     ];
@@ -38,7 +44,9 @@ impl RejectReason {
     pub fn label(self) -> &'static str {
         match self {
             RejectReason::Oversized => "oversized",
-            RejectReason::Guard => "binary/long line/deep nesting",
+            RejectReason::Binary => "binary",
+            RejectReason::LongLine => "long line",
+            RejectReason::DeepNesting => "deep nesting",
             RejectReason::ReadError => "unreadable",
             RejectReason::ParseFailed => "parse failed",
         }
@@ -51,6 +59,29 @@ pub struct RejectedFile {
     pub path: PathBuf,
     pub reason: RejectReason,
     pub size_bytes: u64,
+    /// The measurement that tripped the guard: the longest line in bytes
+    /// ([`RejectReason::LongLine`]) or the deepest nesting level
+    /// ([`RejectReason::DeepNesting`]); `None` for the other reasons.
+    #[serde(default)]
+    pub detail: Option<u64>,
+}
+
+impl RejectedFile {
+    /// One-line reason with its measurement, e.g. `long line (longest 4.2KB)`,
+    /// `deep nesting (depth 80)`, `oversized, 1.2 MB`, `binary (null byte)`.
+    pub fn describe(&self) -> String {
+        match (self.reason, self.detail) {
+            (RejectReason::Oversized, _) => {
+                format!("oversized, {}", human_size(self.size_bytes))
+            }
+            (RejectReason::Binary, _) => "binary (null byte)".to_string(),
+            (RejectReason::LongLine, Some(len)) => {
+                format!("long line (longest {})", human_size(len))
+            }
+            (RejectReason::DeepNesting, Some(depth)) => format!("deep nesting (depth {depth})"),
+            (reason, _) => format!("{}, {}", reason.label(), human_size(self.size_bytes)),
+        }
+    }
 }
 
 /// Counts of what happened to every file the indexer looked at, since the last
@@ -134,7 +165,10 @@ pub fn is_non_source(path: &Path) -> bool {
         "ttf", "otf", "woff", "woff2", "eot", // archives and packages
         "zip", "gz", "tgz", "bz2", "xz", "7z", "tar", "jar", "war", "aar", "apk", "ipa",
         // media and documents
-        "mp3", "mp4", "mov", "wav", "ogg", "webm", "pdf", // compiled artifacts
+        "mp3", "mp4", "mov", "wav", "ogg", "webm", "pdf", // office documents
+        "doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pptm", "odt", "ods", "odp",
+        "epub", "pages", "numbers", // more archives
+        "rar", "dmg", "iso", // compiled artifacts
         "so", "dylib", "dll", "exe", "wasm", "class", "pyc", "o", "a", "lockb",
         // generated
         "map",
@@ -189,10 +223,22 @@ impl IndexHealth {
     /// Remembers one rejected file. Call [`Self::normalize_rejected`] once the
     /// pass is done to restore the sorted, deduplicated, bounded invariant.
     pub fn record_rejected_file(&mut self, path: PathBuf, reason: RejectReason, size_bytes: u64) {
+        self.record_rejected_file_detail(path, reason, size_bytes, None);
+    }
+
+    /// [`Self::record_rejected_file`] with the guard's own measurement.
+    pub fn record_rejected_file_detail(
+        &mut self,
+        path: PathBuf,
+        reason: RejectReason,
+        size_bytes: u64,
+        detail: Option<u64>,
+    ) {
         self.rejected.push(RejectedFile {
             path,
             reason,
             size_bytes,
+            detail,
         });
     }
 
@@ -266,12 +312,7 @@ impl IndexHealth {
         const TAIL_RESERVE: usize = 160;
         let mut shown = 0;
         for r in hits.iter().take(NOTE_MAX_FILES) {
-            let line = format!(
-                "> - `{}`: {}, {}\n",
-                sanitize_path(&r.path),
-                r.reason.label(),
-                human_size(r.size_bytes)
-            );
+            let line = format!("> - `{}`: {}\n", sanitize_path(&r.path), r.describe());
             if note.len() + line.len() + TAIL_RESERVE > NOTE_MAX_BYTES {
                 break;
             }
@@ -304,7 +345,7 @@ impl IndexHealth {
         if self.files_skipped_non_source > 0 {
             let _ = writeln!(
                 out,
-                "    ({} non-source file(s) skipped: images, fonts, archives, lockfiles, bundles)",
+                "    ({} non-source file(s) skipped silently: images, fonts, archives, office documents, PDFs, lockfiles, bundles)",
                 self.files_skipped_non_source
             );
         }
@@ -326,13 +367,7 @@ impl IndexHealth {
             );
         }
         for r in self.rejected.iter().take(max_paths) {
-            let _ = writeln!(
-                out,
-                "    - {} ({}, {})",
-                r.path.display(),
-                r.reason.label(),
-                human_size(r.size_bytes)
-            );
+            let _ = writeln!(out, "    - {} ({})", r.path.display(), r.describe());
         }
         if self.rejected.len() > max_paths {
             let _ = writeln!(out, "    - …and {} more", self.rejected.len() - max_paths);
@@ -397,6 +432,11 @@ mod tests {
             "a/app.min.js",
             "a/bundle.js.map",
             "go.sum",
+            "docs/spec.DOCX",
+            "docs/budget.xlsx",
+            "docs/deck.pptx",
+            "docs/paper.pdf",
+            "dist/backup.rar",
         ] {
             assert!(is_non_source(Path::new(p)), "{p}");
         }
@@ -410,6 +450,38 @@ mod tests {
         ] {
             assert!(!is_non_source(Path::new(p)), "{p}");
         }
+    }
+
+    #[test]
+    fn rejected_files_describe_the_single_guard_that_fired() {
+        let f = |reason, size, detail| RejectedFile {
+            path: PathBuf::from("/r/x"),
+            reason,
+            size_bytes: size,
+            detail,
+        };
+        assert_eq!(
+            f(RejectReason::Binary, 10, None).describe(),
+            "binary (null byte)"
+        );
+        assert_eq!(
+            f(RejectReason::LongLine, 5000, Some(4200)).describe(),
+            "long line (longest 4.1 KB)"
+        );
+        assert_eq!(
+            f(RejectReason::DeepNesting, 10, Some(80)).describe(),
+            "deep nesting (depth 80)"
+        );
+        assert!(f(RejectReason::Oversized, 600_000, None)
+            .describe()
+            .starts_with("oversized, "));
+        // The old combined label is gone from every summary line.
+        let mut h = IndexHealth::default();
+        h.record_rejected_file_detail("/r/a.js".into(), RejectReason::LongLine, 9000, Some(8000));
+        h.normalize_rejected();
+        let summary = h.render_summary(10);
+        assert!(summary.contains("long line: 1"), "{summary}");
+        assert!(!summary.contains("binary/long line"), "{summary}");
     }
 
     #[test]
@@ -463,6 +535,7 @@ mod tests {
             path: PathBuf::from(path),
             reason,
             size_bytes: size,
+            detail: None,
         }
     }
 
@@ -470,13 +543,13 @@ mod tests {
     fn rejected_list_is_sorted_deduplicated_and_capped() {
         let mut h = IndexHealth::default();
         h.record_rejected_file("/r/b.ts".into(), RejectReason::Oversized, 1);
-        h.record_rejected_file("/r/a.ts".into(), RejectReason::Guard, 2);
+        h.record_rejected_file("/r/a.ts".into(), RejectReason::Binary, 2);
         h.record_rejected_file("/r/b.ts".into(), RejectReason::ParseFailed, 3);
         h.normalize_rejected();
         assert_eq!(
             h.rejected,
             vec![
-                rej("/r/a.ts", RejectReason::Guard, 2),
+                rej("/r/a.ts", RejectReason::Binary, 2),
                 rej("/r/b.ts", RejectReason::ParseFailed, 3)
             ]
         );
@@ -526,7 +599,7 @@ mod tests {
     fn replace_rejected_drops_fixed_files_and_adds_new_ones() {
         let mut h = IndexHealth::default();
         h.record_rejected_file("/r/fixed.ts".into(), RejectReason::Oversized, 500_000);
-        h.record_rejected_file("/r/untouched.ts".into(), RejectReason::Guard, 10);
+        h.record_rejected_file("/r/untouched.ts".into(), RejectReason::Binary, 10);
         h.normalize_rejected();
         let fixed = PathBuf::from("/r/fixed.ts");
         let new = PathBuf::from("/r/new.ts");
@@ -552,7 +625,7 @@ mod tests {
                 450 * 1024,
             );
         }
-        h.record_rejected_file("/out/a.ts".into(), RejectReason::Guard, 5);
+        h.record_rejected_file("/out/a.ts".into(), RejectReason::Binary, 5);
         h.normalize_rejected();
         let note = h.scope_note(|p| p.starts_with("/in")).expect("note");
         assert!(note.len() <= NOTE_MAX_BYTES, "{}", note.len());

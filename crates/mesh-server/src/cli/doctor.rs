@@ -123,6 +123,49 @@ impl DoctorCommand {
             .map(|refusal| DoctorCheck::error("Workspace root", refusal.to_string()))
     }
 
+    /// Validates `[[engines.contracts.patterns]]`: regexes compile, and the
+    /// per-pattern `confidence` key is only used where it has an effect.
+    /// (An unknown `confidence` value already fails config parsing.)
+    fn pattern_checks(cfg: &Config, checks: &mut Vec<DoctorCheck>) {
+        let Some(patterns) = cfg.engines.contracts.as_ref().map(|c| &c.patterns) else {
+            return;
+        };
+        if patterns.is_empty() {
+            return;
+        }
+        let mut problems: Vec<String> = Vec::new();
+        for p in patterns {
+            if let Err(e) = mesh_parsers::CompiledPattern::compile(p) {
+                problems.push(format!(
+                    "'{}': invalid regex ({e}); pattern is skipped",
+                    p.name
+                ));
+            }
+            let topic = matches!(
+                p.kind,
+                mesh_core::PatternKind::TopicProducer | mesh_core::PatternKind::TopicConsumer
+            );
+            if p.confidence.is_some() && !topic {
+                problems.push(format!(
+                    "'{}': `confidence` only applies to topic_producer / topic_consumer; ignored",
+                    p.name
+                ));
+            }
+        }
+        let exact = patterns.iter().filter(|p| p.is_exact()).count();
+        if problems.is_empty() {
+            checks.push(DoctorCheck::ok(
+                "Contract patterns",
+                format!(
+                    "{} configured ({exact} exact, topic patterns default to heuristic)",
+                    patterns.len()
+                ),
+            ));
+        } else {
+            checks.push(DoctorCheck::warn("Contract patterns", problems.join("; ")));
+        }
+    }
+
     /// Config-derived checks (sections 1-1d): syntax, jailed roots, skill files,
     /// dead path patterns, overlapping roots.
     fn config_checks(cfg_path: Option<&Path>, checks: &mut Vec<DoctorCheck>) {
@@ -186,6 +229,8 @@ impl DoctorCommand {
                 ));
             }
         }
+
+        Self::pattern_checks(&cfg, checks);
 
         let Ok(roots) = expand_roots(
             &cfg.workspace.roots,

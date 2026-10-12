@@ -38,6 +38,298 @@ pub struct AuditEntry {
     /// Hash-chain formula version this row was written (and must be verified) under.
     /// See `AuditLogger::CHAIN_VERSION`.
     pub chain_version: i64,
+    /// Sanitized error of an `ERROR` row (chain v3), as a JSON object
+    /// `{"class","code","message"}`; `None` for successful calls and for rows
+    /// written before this column existed. Never raw arguments: see [`ErrorDetail`].
+    #[serde(default)]
+    pub error_detail: Option<String>,
+}
+
+/// Longest stored error message, in characters.
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// Short, sanitized account of why a tool call failed, stored with its audit row
+/// so field errors can be diagnosed without keeping the call's arguments.
+///
+/// The message has secrets masked (`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`),
+/// absolute home directories collapsed to `~`, control characters flattened and
+/// is cut to [`MAX_ERROR_MESSAGE_CHARS`] characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    pub class: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl ErrorDetail {
+    pub fn sanitized(class: &str, code: i32, raw_message: &str) -> Self {
+        let home = crate::root_guard::home_dir().map(|h| h.to_string_lossy().into_owned());
+        Self::sanitized_with_home(class, code, raw_message, home.as_deref())
+    }
+
+    /// [`Self::sanitized`] with the home directory injected (tests).
+    pub fn sanitized_with_home(
+        class: &str,
+        code: i32,
+        raw_message: &str,
+        home: Option<&str>,
+    ) -> Self {
+        Self {
+            class: class.chars().take(40).collect(),
+            code,
+            message: sanitize_error_message(raw_message, home),
+        }
+    }
+
+    /// The canonical stored form (the exact text folded into the v3 hash).
+    pub fn to_stored(&self) -> String {
+        serde_json::json!({"class": self.class, "code": self.code, "message": self.message})
+            .to_string()
+    }
+
+    /// Parses a stored `error_detail` value.
+    pub fn from_stored(stored: &str) -> Option<Self> {
+        serde_json::from_str(stored).ok()
+    }
+}
+
+const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "passphrase",
+    "private",
+    "jwt",
+    "cert",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "signing_key",
+    "authorization",
+];
+const SECRET_PREFIXES: &[&str] = &["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA"];
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Byte ranges of secret values in `s` (key/value pairs, bearer tokens, well
+/// known token prefixes, long mixed alphanumeric blobs), merged and ordered.
+fn secret_ranges(s: &str) -> Vec<(usize, usize)> {
+    let lower = s.to_ascii_lowercase();
+    let bytes = s.as_bytes();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    let value_end = |start: usize| -> usize {
+        let mut end = start;
+        for (off, c) in s[start..].char_indices() {
+            if c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '&' | '}' | ')' | '>') {
+                return start + off;
+            }
+            end = start + off + c.len_utf8();
+        }
+        end
+    };
+
+    // `key = value`, `key: value`, `"key": "value"`.
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let key_start = from + pos;
+            let mut i = key_start + key.len();
+            from = i;
+            while i < bytes.len() && is_token_char(bytes[i] as char) {
+                i += 1;
+            }
+            while i < bytes.len() && matches!(bytes[i], b'"' | b'\'' | b' ') {
+                i += 1;
+            }
+            if i < bytes.len() && matches!(bytes[i], b'=' | b':') {
+                i += 1;
+                while i < bytes.len() && matches!(bytes[i], b' ' | b'"' | b'\'') {
+                    i += 1;
+                }
+                let end = value_end(i);
+                if end > i {
+                    ranges.push((i, end));
+                }
+            }
+        }
+    }
+
+    // `Bearer <token>` / `Basic <token>`.
+    for scheme in ["bearer ", "basic "] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(scheme) {
+            let start = from + pos + scheme.len();
+            from = start;
+            let end = value_end(start);
+            if end > start {
+                ranges.push((start, end));
+            }
+        }
+    }
+
+    // Well known token prefixes and long mixed blobs, token by token.
+    let mut idx = 0;
+    while idx < s.len() {
+        let rest = &s[idx..];
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        if !is_token_char(first) {
+            idx += first.len_utf8();
+            continue;
+        }
+        let len = rest
+            .char_indices()
+            .find(|(_, c)| !is_token_char(*c))
+            .map_or(rest.len(), |(o, _)| o);
+        let tok = &rest[..len];
+        if tok.len() >= 16 && SECRET_PREFIXES.iter().any(|p| tok.starts_with(p)) {
+            ranges.push((idx, idx + len));
+        } else {
+            // A long mixed letter/digit blob (hex digest, base64 token). Runs are
+            // split at `-` / `_` so a hyphenated directory name is not one.
+            let mut off = 0;
+            for run in tok.split(['-', '_']) {
+                if run.len() >= 32
+                    && run.chars().any(|c| c.is_ascii_digit())
+                    && run.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    ranges.push((idx + off, idx + off + run.len()));
+                }
+                off += run.len() + 1;
+            }
+        }
+        idx += len;
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+/// Collapses absolute home directories (`/Users/x`, `/home/x`, `C:\Users\x`, and
+/// the current user's own home) to `~`.
+fn collapse_home(s: &str, home: Option<&str>) -> String {
+    let mut out = match home {
+        Some(h) if h.len() > 1 => s.replace(h, "~"),
+        _ => s.to_string(),
+    };
+    for marker in ["/Users/", "/home/", "\\Users\\"] {
+        let windows = marker.starts_with('\\');
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(pos) = rest.find(marker) {
+            let before = &rest[..pos];
+            let at_token_start = before.chars().next_back().is_none_or(|c| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '(' | '=' | ':' | '`')
+            });
+            // A Windows drive prefix (`C:`) belongs to the collapsed part.
+            let drive = windows
+                && before.len() >= 2
+                && before.as_bytes()[before.len() - 1] == b':'
+                && before.as_bytes()[before.len() - 2].is_ascii_alphabetic();
+            if !(at_token_start || drive) {
+                result.push_str(&rest[..pos + marker.len()]);
+                rest = &rest[pos + marker.len()..];
+                continue;
+            }
+            result.push_str(if drive {
+                &before[..before.len() - 2]
+            } else {
+                before
+            });
+            let after = &rest[pos + marker.len()..];
+            let seg_end = after
+                .find(|c: char| matches!(c, '/' | '\\' | '"' | '\'') || c.is_whitespace())
+                .unwrap_or(after.len());
+            result.push('~');
+            rest = &after[seg_end..];
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
+/// Sanitizes a free-form error message for storage: redact, collapse home
+/// directories, flatten whitespace, truncate to [`MAX_ERROR_MESSAGE_CHARS`].
+pub fn sanitize_error_message(raw: &str, home: Option<&str>) -> String {
+    // serde echoes offending values (`invalid type: integer `5`, expected ...`): the
+    // value is argument content, so it is replaced before anything else.
+    let mut echoed = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some((pos, prefix)) = ["invalid type: ", "invalid value: "]
+        .iter()
+        .filter_map(|p| rest.find(p).map(|i| (i, *p)))
+        .min_by_key(|(i, _)| *i)
+    {
+        let value_start = pos + prefix.len();
+        echoed.push_str(&rest[..value_start]);
+        match rest[value_start..].find(", expected") {
+            Some(end) => {
+                echoed.push_str("<value>");
+                rest = &rest[value_start + end..];
+            }
+            None => {
+                rest = &rest[value_start..];
+                break;
+            }
+        }
+    }
+    echoed.push_str(rest);
+    let raw = echoed.as_str();
+
+    // Other quoted string echoes (`string "x"`) are cut as well.
+    let mut text = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("string \"") {
+        let open = pos + "string \"".len();
+        text.push_str(&rest[..open]);
+        match rest[open..].find('"') {
+            Some(close) => {
+                text.push_str("...");
+                rest = &rest[open + close..];
+            }
+            None => rest = "",
+        }
+    }
+    text.push_str(rest);
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (a, b) in secret_ranges(&text) {
+        redacted.push_str(&text[cursor..a]);
+        redacted.push_str(REDACTED);
+        cursor = b;
+    }
+    redacted.push_str(&text[cursor..]);
+
+    let collapsed = collapse_home(&redacted, home);
+    let flat: String = collapsed
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > MAX_ERROR_MESSAGE_CHARS {
+        let mut cut: String = flat.chars().take(MAX_ERROR_MESSAGE_CHARS - 3).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        flat
+    }
 }
 
 /// Summed persistent index cache lookups over the recorded indexing passes.
@@ -79,7 +371,13 @@ impl AuditLogger {
     /// Rows carry their own `chain_version` so pre-existing databases keep verifying under
     /// the formula they were written with (`verify_db` dispatches per row) instead of having
     /// every historical entry rejected as tampered the moment this binary is upgraded.
+    ///
+    /// v3 (additive) appends the row's `error_detail` to the v2 input. Only `ERROR` rows
+    /// that carry a detail are written as v3; every other row is still written as v2,
+    /// byte for byte what earlier binaries produce and verify.
     pub const CHAIN_VERSION: i64 = 2;
+    /// Chain version of rows that carry an `error_detail`.
+    pub const CHAIN_VERSION_ERROR_DETAIL: i64 = 3;
 
     /// Environment variable overriding [`Self::default_db_path`]: benchmarks, test
     /// harnesses and pilot runs point it at their own file so they never mix their
@@ -145,7 +443,8 @@ impl AuditLogger {
                  files_accessed TEXT NOT NULL,
                  secrets_redacted_count INTEGER NOT NULL,
                  entry_hash TEXT NOT NULL,
-                 chain_version INTEGER NOT NULL DEFAULT 1
+                 chain_version INTEGER NOT NULL DEFAULT 1,
+                 error_detail TEXT
              );
              -- `entry_seq` is INTEGER PRIMARY KEY, i.e. the rowid: it is already the
              -- table's B-tree key. The secondary index earlier versions created on it
@@ -201,6 +500,23 @@ impl AuditLogger {
             }
         }
 
+        // Same migration for `error_detail` (7.1.8): rows written before it keep a NULL
+        // there and keep verifying under their own chain version.
+        if !Self::has_column(&conn, "error_detail")? {
+            if let Err(err) =
+                conn.execute("ALTER TABLE audit_entries ADD COLUMN error_detail TEXT", [])
+            {
+                let is_duplicate_column = matches!(
+                    &err,
+                    rusqlite::Error::SqliteFailure(_, Some(msg))
+                        if msg.contains("duplicate column name")
+                );
+                if !is_duplicate_column {
+                    return Err(err.into());
+                }
+            }
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -211,6 +527,30 @@ impl AuditLogger {
             conn: Mutex::new(conn),
             db_path,
         })
+    }
+
+    fn has_column(conn: &Connection, column: &str) -> Result<bool, AuditError> {
+        Ok(conn
+            .prepare("PRAGMA table_info(audit_entries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|name| name.ok())
+            .any(|name| name == column))
+    }
+
+    /// The `SELECT` for every audit row. A database written before `error_detail`
+    /// existed (opened read-only, so not migrated) yields `NULL` for it.
+    fn select_entries_sql(conn: &Connection) -> Result<String, AuditError> {
+        let error_detail = if Self::has_column(conn, "error_detail")? {
+            "error_detail"
+        } else {
+            "NULL"
+        };
+        Ok(format!(
+            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
+                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
+                    chain_version, {error_detail}
+             FROM audit_entries ORDER BY entry_seq ASC"
+        ))
     }
 
     #[inline]
@@ -235,6 +575,32 @@ impl AuditLogger {
         status: &str,
         files_accessed: Vec<String>,
         secrets_redacted_count: usize,
+    ) -> Result<AuditEntry, AuditError> {
+        self.record_entry_with_error(
+            session_id,
+            trace_id,
+            tool,
+            args_json,
+            status,
+            files_accessed,
+            secrets_redacted_count,
+            None,
+        )
+    }
+
+    /// [`Self::record_entry`] with the sanitized error of a failed call. A row with
+    /// an `error` is written as chain v3 (its stored detail is part of the hash).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_entry_with_error(
+        &self,
+        session_id: &str,
+        trace_id: Option<&str>,
+        tool: &str,
+        args_json: &str,
+        status: &str,
+        files_accessed: Vec<String>,
+        secrets_redacted_count: usize,
+        error: Option<&ErrorDetail>,
     ) -> Result<AuditEntry, AuditError> {
         let mut conn = self
             .conn
@@ -270,8 +636,15 @@ impl AuditLogger {
         // v1 covered only the first five fields, which let `status`, `files_accessed`
         // and `secrets_redacted_count` be tampered with in the row without breaking the
         // chain. All new writes use v2; see `CHAIN_VERSION`.
+        let error_detail = error.map(ErrorDetail::to_stored);
+        let chain_version = if error_detail.is_some() {
+            Self::CHAIN_VERSION_ERROR_DETAIL
+        } else {
+            Self::CHAIN_VERSION
+        };
         let hash_input = format!(
-            "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}"
+            "{prev_hash}{timestamp}{session_id}{tool}{args_digest}{status}{files_json}{secrets_redacted_count}{}",
+            error_detail.as_deref().unwrap_or("")
         );
         let entry_hash = Self::compute_sha256(hash_input.as_bytes());
 
@@ -279,8 +652,8 @@ impl AuditLogger {
             "INSERT INTO audit_entries (
                 entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
                 args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                chain_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                chain_version, error_detail
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?
         .execute(params![
             seq,
@@ -294,7 +667,8 @@ impl AuditLogger {
             files_json,
             secrets_redacted_count as i64,
             entry_hash,
-            Self::CHAIN_VERSION,
+            chain_version,
+            error_detail,
         ])?;
 
         tx.commit()?;
@@ -311,7 +685,8 @@ impl AuditLogger {
             files_accessed,
             secrets_redacted_count,
             entry_hash,
-            chain_version: Self::CHAIN_VERSION,
+            chain_version,
+            error_detail,
         })
     }
 
@@ -322,12 +697,7 @@ impl AuditLogger {
         }
 
         let conn = Connection::open(path)?;
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let mut expected_prev_hash = Self::GENESIS_HASH.to_string();
 
@@ -353,6 +723,7 @@ impl AuditLogger {
                     secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                     entry_hash: row.get(10)?,
                     chain_version,
+                    error_detail: row.get(12)?,
                 },
                 files_str,
             ))
@@ -389,7 +760,7 @@ impl AuditLogger {
                     entry.tool,
                     entry.args_digest
                 ),
-                _ => format!(
+                2 => format!(
                     "{}{}{}{}{}{}{}{}",
                     entry.prev_hash,
                     entry.timestamp,
@@ -399,6 +770,20 @@ impl AuditLogger {
                     entry.status,
                     files_str,
                     entry.secrets_redacted_count
+                ),
+                // v3 and later: the v2 input plus the stored error detail, so the
+                // error text cannot be edited without breaking the chain.
+                _ => format!(
+                    "{}{}{}{}{}{}{}{}{}",
+                    entry.prev_hash,
+                    entry.timestamp,
+                    entry.session_id,
+                    entry.tool,
+                    entry.args_digest,
+                    entry.status,
+                    files_str,
+                    entry.secrets_redacted_count,
+                    entry.error_detail.as_deref().unwrap_or("")
                 ),
             };
             let calculated_hash = Self::compute_sha256(hash_input.as_bytes());
@@ -438,12 +823,7 @@ impl AuditLogger {
         }
 
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let rows = stmt.query_map([], |row| {
             let files_str: String = row.get(8)?;
@@ -461,6 +841,7 @@ impl AuditLogger {
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
+                error_detail: row.get(12)?,
             })
         })?;
 
@@ -664,12 +1045,7 @@ impl AuditLogger {
             .lock()
             .map_err(|_| std::io::Error::other("AuditLogger db mutex poisoned"))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT entry_seq, prev_hash, timestamp, session_id, trace_id, tool,
-                    args_digest, status, files_accessed, secrets_redacted_count, entry_hash,
-                    chain_version
-             FROM audit_entries ORDER BY entry_seq ASC",
-        )?;
+        let mut stmt = conn.prepare(&Self::select_entries_sql(&conn)?)?;
 
         let mut file = File::create(dest)?;
         let mut count = 0;
@@ -690,6 +1066,7 @@ impl AuditLogger {
                 secrets_redacted_count: row.get::<_, i64>(9)? as usize,
                 entry_hash: row.get(10)?,
                 chain_version: row.get(11)?,
+                error_detail: row.get(12)?,
             })
         })?;
 
@@ -990,6 +1367,185 @@ mod tests {
         assert!(
             AuditLogger::verify_db(&db_file).expect("verify legacy chain"),
             "legacy v1 row must still verify under its original formula"
+        );
+    }
+
+    /// A legacy v1 database (epoch-style timestamp, no `error_detail` column) opened by
+    /// this binary is migrated in place; new v2 rows and v3 error rows chain onto it and
+    /// the whole mixed chain verifies, while editing a stored error breaks it.
+    #[test]
+    fn test_mixed_legacy_v2_v3_chain_verifies_and_detects_error_tampering() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = temp_dir.path().join("mixed.db");
+
+        let conn = Connection::open(&db_file).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                 entry_seq INTEGER PRIMARY KEY,
+                 prev_hash TEXT NOT NULL,
+                 timestamp TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 trace_id TEXT,
+                 tool TEXT NOT NULL,
+                 args_digest TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 files_accessed TEXT NOT NULL,
+                 secrets_redacted_count INTEGER NOT NULL,
+                 entry_hash TEXT NOT NULL,
+                 chain_version INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .expect("legacy schema");
+        let digest = AuditLogger::compute_sha256(b"{}");
+        let legacy_hash = AuditLogger::compute_sha256(
+            format!(
+                "{}{}{}{}{}",
+                AuditLogger::GENESIS_HASH,
+                "1789974857.459Z",
+                "old",
+                "smart_search",
+                digest
+            )
+            .as_bytes(),
+        );
+        conn.execute(
+            "INSERT INTO audit_entries VALUES (0, ?1, '1789974857.459Z', 'old', NULL,
+                'smart_search', ?2, 'ERROR', '[]', 0, ?3, 1)",
+            params![AuditLogger::GENESIS_HASH, digest, legacy_hash],
+        )
+        .expect("legacy row");
+        drop(conn);
+
+        // Read-only access to the not yet migrated database works.
+        let before = AuditLogger::read_entries(&db_file, None).expect("read legacy");
+        assert_eq!(before.len(), 1);
+        assert!(before[0].error_detail.is_none());
+
+        let logger = AuditLogger::new(Some(db_file.clone())).expect("migrating open");
+        let ok = logger
+            .record_entry("s", None, "smart_search", "{}", "SUCCESS", vec![], 0)
+            .expect("v2 row");
+        assert_eq!(ok.chain_version, AuditLogger::CHAIN_VERSION);
+        assert!(ok.error_detail.is_none());
+        let detail = ErrorDetail::sanitized("invalid_params", -32602, "Path not found: src/x");
+        let err = logger
+            .record_entry_with_error(
+                "s",
+                None,
+                "smart_search",
+                "{\"query\":\"secret-arg\"}",
+                "ERROR",
+                vec![],
+                0,
+                Some(&detail),
+            )
+            .expect("v3 row");
+        assert_eq!(err.chain_version, AuditLogger::CHAIN_VERSION_ERROR_DETAIL);
+        assert!(
+            ISO_TS.is_match_prefix(&err.timestamp),
+            "new rows are ISO 8601: {}",
+            err.timestamp
+        );
+        drop(logger);
+
+        assert!(AuditLogger::verify_db(&db_file).expect("mixed chain verifies"));
+        let rows = AuditLogger::read_entries(&db_file, None).expect("read");
+        assert_eq!(rows.len(), 3);
+        let stored = rows[2].error_detail.as_deref().expect("stored detail");
+        assert_eq!(ErrorDetail::from_stored(stored), Some(detail));
+        assert!(
+            !stored.contains("secret-arg"),
+            "raw arguments are never stored"
+        );
+        // The legacy epoch-style stamp is tolerated and normalised on read, not rewritten.
+        assert_eq!(rows[0].timestamp, "1789974857.459Z");
+        assert_eq!(
+            normalize_audit_timestamp(&rows[0].timestamp),
+            "2026-09-21T07:14:17.459Z"
+        );
+
+        let conn = Connection::open(&db_file).expect("open");
+        conn.execute(
+            "UPDATE audit_entries SET error_detail = '{\"class\":\"x\",\"code\":0,\"message\":\"edited\"}'
+             WHERE entry_seq = 2",
+            [],
+        )
+        .expect("tamper");
+        drop(conn);
+        assert!(AuditLogger::verify_db(&db_file).is_err());
+    }
+
+    struct IsoShape;
+    const ISO_TS: IsoShape = IsoShape;
+    impl IsoShape {
+        /// `YYYY-MM-DDTHH:MM:SS.mmmZ`
+        fn is_match_prefix(&self, ts: &str) -> bool {
+            let b = ts.as_bytes();
+            b.len() == 24
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b[10] == b'T'
+                && b[13] == b':'
+                && b[16] == b':'
+                && b[19] == b'.'
+                && b[23] == b'Z'
+        }
+    }
+
+    #[test]
+    fn error_messages_are_redacted_collapsed_and_truncated() {
+        let home = Some("/Users/alice");
+        let m = sanitize_error_message(
+            "Path not found: /Users/alice/work/repo/src/a.rs (token=abc123def, password: \"hunter2\")",
+            home,
+        );
+        assert!(m.contains("~/work/repo/src/a.rs"), "{m}");
+        assert!(
+            !m.contains("alice") && !m.contains("abc123def") && !m.contains("hunter2"),
+            "{m}"
+        );
+        assert!(
+            m.contains("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]"),
+            "{m}"
+        );
+
+        // Another user's home and a Windows home collapse too.
+        let m = sanitize_error_message("a /home/bob/x b C:\\Users\\carol\\y c", None);
+        assert_eq!(m, "a ~/x b ~\\y c");
+
+        // Bearer tokens, prefixed tokens and long mixed blobs.
+        let m = sanitize_error_message(
+            "Authorization: Bearer abcdef0123456789 ghp_0123456789abcdefghij 0123456789abcdef0123456789abcdef0123",
+            None,
+        );
+        assert!(
+            !m.contains("abcdef0123456789") && !m.contains("ghp_0123"),
+            "{m}"
+        );
+
+        // serde echoes of offending string values are cut.
+        let m = sanitize_error_message(
+            "invalid type: string \"my-private-value\", expected u32",
+            None,
+        );
+        assert!(!m.contains("my-private-value"), "{m}");
+        assert_eq!(m, "invalid type: <value>, expected u32");
+
+        // Truncation to 200 chars, newlines flattened.
+        let long = format!("line1\nline2 {}", "word ".repeat(100));
+        let m = sanitize_error_message(&long, None);
+        assert_eq!(m.chars().count(), MAX_ERROR_MESSAGE_CHARS);
+        assert!(m.ends_with("...") && !m.contains('\n'));
+
+        // A long hyphenated directory name is not a token.
+        let path =
+            "x/-Users-victoragahi-Developer-causalmesh/c758ea9a-eb19-4085-b418-b0d8bdef0e98/s";
+        assert_eq!(sanitize_error_message(path, None), path);
+
+        // Plain text is left alone.
+        assert_eq!(
+            sanitize_error_message("Scope escapes the workspace roots", None),
+            "Scope escapes the workspace roots"
         );
     }
 

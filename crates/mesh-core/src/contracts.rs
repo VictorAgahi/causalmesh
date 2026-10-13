@@ -1990,6 +1990,12 @@ impl ContractGraph {
         if refs.is_empty() {
             return out;
         }
+        // One pass over the proto methods, not one per handler reference: a
+        // reload re-runs this over every handler in the workspace.
+        let mut by_name: HashMap<&str, Vec<NodeId>> = HashMap::with_capacity(proto_methods.len());
+        for (pid, n) in proto_methods {
+            by_name.entry(n.as_str()).or_default().push(*pid);
+        }
         for (id, recorded) in refs {
             let (Some(node), Some(parsed)) =
                 (self.nodes.get(&id), Self::parse_handler_ref(recorded))
@@ -2014,15 +2020,15 @@ impl ContractGraph {
             // the name be unique. Counting before filtering left a fully-qualified
             // handler unresolved whenever two packages declare the same
             // `Service.Method`.
-            let declared_here = proto_methods
-                .iter()
-                .filter(|(pid, n)| {
-                    n.as_str() == name
-                        && qualifier.is_none_or(|q| {
+            let declared_here = by_name.get(name.as_str()).map_or(0, |ids| {
+                ids.iter()
+                    .filter(|pid| {
+                        qualifier.is_none_or(|q| {
                             self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
                         })
-                })
-                .count();
+                    })
+                    .count()
+            });
             if declared_here != 1 {
                 continue;
             }

@@ -3451,6 +3451,46 @@ mod handler_ref_tests {
     }
 
     #[test]
+    fn a_package_qualifier_picks_one_of_two_same_named_rpcs() {
+        let node = |name: &str, pkg: &str, kind: NodeKind| ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: FilePath::from(Path::new("f")),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new(pkg),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let mut graph = ContractGraph::new();
+        let proto_a = graph.add_node(node("UserService.Get", "a.v1", NodeKind::GrpcMethod));
+        let proto_b = graph.add_node(node("UserService.Get", "b.v1", NodeKind::GrpcMethod));
+        let qualified = graph.add_node(node("h1", "", NodeKind::ServiceClass));
+        let bare = graph.add_node(node("h2", "", NodeKind::ServiceClass));
+        graph.rpc_calls.push((
+            qualified,
+            format!("{HANDLER_REF_PREFIX}'a.v1.UserService'|'Get'").into(),
+        ));
+        graph.rpc_calls.push((
+            bare,
+            format!("{HANDLER_REF_PREFIX}'UserService'|'Get'").into(),
+        ));
+        let methods = vec![
+            (proto_a, CompactStr::new("UserService.Get")),
+            (proto_b, CompactStr::new("UserService.Get")),
+        ];
+        let resolved = graph.resolve_handler_rpc_names(&methods);
+        assert_eq!(
+            resolved.get(&qualified).map(CompactStr::as_str),
+            Some("UserService.Get")
+        );
+        // Without a qualifier the name is declared twice: ambiguous, left out.
+        assert!(!resolved.contains_key(&bare));
+    }
+
+    #[test]
     fn the_marker_is_never_part_of_the_method() {
         let parsed = ContractGraph::parse_handler_ref("UNKNOWN|'AddBadge'|~").expect("parse");
         assert_eq!(parsed.service, "UNKNOWN");

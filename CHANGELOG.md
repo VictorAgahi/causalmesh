@@ -5,6 +5,18 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.11] — 2026-10-13
+
+Performance fix found by the nightly 50k contract-mix bench (`reload_ms` over budget). Bisecting
+the tags on the same machine and corpus: median reload 7.1.7 ~660 ms, 7.1.8 ~1070 ms, 7.1.9
+~1500 ms, 7.1.10 1000 to 3400 ms.
+
+### Fixed
+- `resolve_handler_rpc_names` rescanned every proto method for each handler reference (7.1.8
+  made the package-qualified check a filter over the whole list), so every reconcile cost
+  handlers x proto methods. It now indexes the proto methods by name once. Same corpus, same
+  machine: median reload 660 ms (three runs 659 / 661 / 661).
+
 ## [7.1.10] — 2026-10-13
 
 Generic fix from a field report: an agent asked what happens when a user is deleted on a NestJS

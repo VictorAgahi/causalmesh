@@ -512,7 +512,9 @@ impl MarkdownFormatter {
         }
 
         if trace.client_stubs.is_empty() && trace.service_level_clients.is_empty() {
-            out.push_str("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)\n");
+            out.push_str(
+                "### 2. Client Stubs: 0 (no literal call sites found in the indexed roots)\n",
+            );
             let files_note = if trace.files_scanned > 0 {
                 format!(
                     "({} contract-bearing files scanned across all workspace roots)",
@@ -522,7 +524,7 @@ impl MarkdownFormatter {
                 "across all workspace roots".to_string()
             };
             out.push_str(&format!(
-                "*Exhaustive AST scan {files_note} confirmed NO client stubs or invocation sites exist. Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic.*\n\n"
+                "*AST scan {files_note} found no client stubs or invocation sites at literal call sites. A call whose method or service is built at runtime, or that lives in a root that is not indexed, is not seen.*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -567,7 +569,7 @@ impl MarkdownFormatter {
 
         if trace.server_handlers.is_empty() {
             out.push_str(
-                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)\n",
+                "### 3. Server Handlers / Controllers: 0 (no literal registrations found in the indexed roots)\n",
             );
             let files_note = if trace.files_scanned > 0 {
                 format!("({} contract-bearing files checked)", trace.files_scanned)
@@ -575,7 +577,7 @@ impl MarkdownFormatter {
                 "in any indexed workspace root".to_string()
             };
             out.push_str(&format!(
-                "*Exhaustive AST scan confirmed NO server handlers implement this method {files_note}.*\n\n"
+                "*AST scan found no server handler registered for this method {files_note}. A handler registered at runtime, or in a root that is not indexed, is not seen.*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -626,7 +628,7 @@ impl MarkdownFormatter {
                 "across indexed workspace roots".to_string()
             };
             out.push_str(&format!(
-                "### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)\n*No upstream producers resolved {files_note}.*\n\n"
+                "### 1. Upstream Event Producers: 0 found (literal call sites only)\n*No upstream producers statically resolved {files_note}; not proof of absence (runtime-resolved names and unindexed roots are invisible).*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -672,7 +674,7 @@ impl MarkdownFormatter {
                 "across indexed workspace roots".to_string()
             };
             out.push_str(&format!(
-                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)\n*No downstream consumers resolved {files_note}.*\n\n"
+                "### 3. Downstream Consumers / Handlers: 0 found (literal registrations only)\n*No downstream consumers statically resolved {files_note}; not proof of absence (dynamic registration and unindexed roots are invisible).*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -775,21 +777,67 @@ impl MarkdownFormatter {
                 "*Past the first hop, the walk follows producers declared in the same file as a consumer (a handler that re-emits): those rows are `heuristic`.*\n",
             );
         }
+        let indexed = |other_missing: bool, other: &str| -> String {
+            if matrix.event_only_in_tests {
+                "the event is indexed only in test files (`include_tests: true` lists them)"
+                    .to_string()
+            } else if other_missing {
+                "the topic is indexed".to_string()
+            } else {
+                format!("{other} is indexed")
+            }
+        };
         if matrix.no_producer_resolved {
             header.push_str(&format!(
-                "\n**No producer resolved** for this event outside tests (0 AST producers found across {} workspace roots). If not emitted via an unindexed runtime-dynamic topic string or raw SQL trigger, this negative result is authoritative: nothing in static application code emits it.\n",
+                "\n**No producer statically resolved** for this event outside tests: {}, but no literal producer call site was found across {} workspace roots. This is not proof that nothing emits it: the producer may publish under a name resolved at runtime (registry, config, template string) or live in a root that is not indexed.\n",
+                indexed(matrix.no_consumer_resolved, "a consumer"),
                 roots.len()
             ));
         }
         if matrix.no_consumer_resolved {
             header.push_str(&format!(
-                "\n**No consumer resolved** for this event outside tests (0 AST consumers found across {} workspace roots). This negative result is authoritative for static code.\n",
+                "\n**No consumer statically resolved** for this event outside tests: {}, but no literal consumer registration was found across {} workspace roots. This is not proof that nobody consumes it: a consumer may be registered dynamically, through a pattern that is not in the config, or live in a root that is not indexed.\n",
+                indexed(matrix.no_producer_resolved, "a producer"),
                 roots.len()
+            ));
+        }
+        if matrix.no_producer_resolved || matrix.no_consumer_resolved {
+            let kind = match (matrix.no_producer_resolved, matrix.no_consumer_resolved) {
+                (true, true) => "`topic_producer` or `topic_consumer`",
+                (true, false) => "`topic_producer`",
+                _ => "`topic_consumer`",
+            };
+            header.push_str(&format!(
+                "*A `[[engines.contracts.patterns]]` of kind {kind} can close this gap for a project-specific registry (see SETUP.md).*\n"
+            ));
+        }
+        if !matrix.unexpanded.is_empty() {
+            let tail = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
+                "Their downstream is not shown.".to_string()
+            } else {
+                format!("Repeat with `depth: {}` to follow them.", matrix.depth + 1)
+            };
+            let level = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
+                format!("maximum depth {}", matrix.depth)
+            } else {
+                format!("depth {}", matrix.depth)
+            };
+            header.push_str(&format!(
+                "\n**Depth limit reached** ({level}): {} consumer(s) were not expanded: {}. {tail}\n",
+                matrix.unexpanded.len(),
+                Self::node_labels(&matrix.unexpanded, roots)
+            ));
+        }
+        if !matrix.chain_end.is_empty() {
+            header.push_str(&format!(
+                "\n**Chain ends** at {} consumer(s) with no statically resolved onward publish: {}. A terminal consumer is normal; if one of them publishes under a name resolved at runtime, the chain continues there.\n",
+                matrix.chain_end.len(),
+                Self::node_labels(&matrix.chain_end, roots)
             ));
         }
         if total == 0 {
             header.push_str(&format!(
-                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across {} indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name.*\n",
+                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across {} indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name. A name that only a runtime registry, config or template string produces is not indexed under that name: try the literal stream or topic of a neighbouring hop.*\n",
                 roots.len()
             ));
             return header;
@@ -954,6 +1002,46 @@ impl MarkdownFormatter {
         out
     }
 
+    /// Most node labels a header note lists; the rest is a "+K more" marker.
+    const NOTE_LABELS: usize = 5;
+    /// Longest name and location shown in a header note label, in characters.
+    const NOTE_NAME_CHARS: usize = 80;
+    const NOTE_LOC_CHARS: usize = 100;
+
+    fn clamp_chars(text: &str, max: usize) -> String {
+        if text.chars().count() <= max {
+            return text.to_string();
+        }
+        let cut: String = text.chars().take(max.saturating_sub(3)).collect();
+        format!("{cut}...")
+    }
+
+    /// Up to [`Self::NOTE_LABELS`] `name (location)` labels with bounded length,
+    /// then `+K more`: the notes sit outside paging and repeat on every page.
+    fn node_labels(nodes: &[&ContractNode], roots: &[PathBuf]) -> String {
+        let mut out: Vec<String> = nodes
+            .iter()
+            .take(Self::NOTE_LABELS)
+            .map(|n| {
+                format!(
+                    "`{}` (`{}`)",
+                    Self::clamp_chars(
+                        &n.name.replace(['`', '\n', '\r'], "'"),
+                        Self::NOTE_NAME_CHARS
+                    ),
+                    Self::clamp_chars(
+                        &Self::location(n, roots).replace(['`', '\n', '\r'], "'"),
+                        Self::NOTE_LOC_CHARS
+                    )
+                )
+            })
+            .collect();
+        if nodes.len() > Self::NOTE_LABELS {
+            out.push(format!("+{} more", nodes.len() - Self::NOTE_LABELS));
+        }
+        out.join(", ")
+    }
+
     /// Display label of each root, indexed like `roots`: its path relative to
     /// the roots' common parent (the root's own name when that is empty).
     fn root_labels(roots: &[PathBuf]) -> Vec<String> {
@@ -1097,6 +1185,11 @@ mod tests {
             no_producer_resolved: false,
             no_consumer_resolved: false,
             file_linked_hops: false,
+            depth: 1,
+            unexpanded: Vec::new(),
+            chain_end: Vec::new(),
+            event_only_in_tests: false,
+            hidden_rows: 0,
             rows: nodes
                 .iter()
                 .map(|n| mesh_core::ImpactRow {
@@ -1303,17 +1396,22 @@ mod tests {
         };
         let out = MarkdownFormatter::format_grpc_trace(&empty_trace);
         assert!(
-            out.contains("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)"),
+            out.contains(
+                "### 2. Client Stubs: 0 (no literal call sites found in the indexed roots)"
+            ),
             "{out}"
         );
         assert!(
             out.contains("1248 contract-bearing files scanned across all workspace roots"),
             "{out}"
         );
-        assert!(out.contains("Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic."), "{out}");
+        assert!(
+            out.contains("found no client stubs or invocation sites at literal call sites"),
+            "{out}"
+        );
         assert!(
             out.contains(
-                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)"
+                "### 3. Server Handlers / Controllers: 0 (no literal registrations found in the indexed roots)"
             ),
             "{out}"
         );
@@ -1419,11 +1517,13 @@ mod tests {
             downstream_consumers: Vec::new(),
             related_sagas: Vec::new(),
             downstream_producers: Vec::new(),
+            unexpanded: Vec::new(),
+            chain_end: Vec::new(),
             files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_impact_flow(&empty_flow);
         assert!(
-            out.contains("### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)"),
+            out.contains("### 1. Upstream Event Producers: 0 found (literal call sites only)"),
             "{out}"
         );
         assert!(
@@ -1432,7 +1532,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)"
+                "### 3. Downstream Consumers / Handlers: 0 found (literal registrations only)"
             ),
             "{out}"
         );

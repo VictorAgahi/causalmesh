@@ -55,7 +55,7 @@ pub struct AnalyzeImpactTool;
 
 impl McpTool for AnalyzeImpactTool {
     const NAME: &'static str = "analyze_impact";
-    const DESCRIPTION: &'static str = "Authoritative causal impact matrix: for an HTTP route (`VERB /path`), its handler (file:line, root) and the graph edges on it, covering the handler only (HTTP clients are not linked across repos); for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue, stream or saga, who publishes it (producers, outbox writes) and who consumes or subscribes to it (consumer handlers, message broker and event bus listeners) (direct by default, or through `depth` causal hops of real Produces/Consumes edges). A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace or the .proto wire-format check (use analyze_grpc). It does NOT report test coverage, and does NOT find the callers of an HTTP route.";
+    const DESCRIPTION: &'static str = "Authoritative causal impact matrix: for an HTTP route (`VERB /path`), its handler (file:line, root) and the graph edges on it, covering the handler only (HTTP clients are not linked across repos); for a proto/gRPC method or service, its server handlers and clients; for an event, topic, queue, stream or saga, who publishes it (producers, outbox writes) and who consumes or subscribes to it (consumer handlers, message broker and event bus listeners) (direct by default, or through `depth` causal hops of real Produces/Consumes edges). Every row gives a path:line to check; rows marked heuristic or ambiguous deserve a targeted read. Coverage is literal call sites in the indexed roots: 'No producer statically resolved' with a consumer present means NOT STATICALLY RESOLVED (the publisher may use a runtime-resolved name, a registry or config, or live in an unindexed root), never 'nobody produces it'; the same holds for consumers. A 'Depth limit reached' note is a depth stop; a 'Chain ends' note is the end of the statically resolved chain only. Each row is EXTERNAL (another workspace root than the contract owner's) or INTERNAL (same root) and carries the edge confidence (exact / heuristic / ambiguous). Paged with `limit`/`offset`. DO NOT USE for the generated-stub trace, the .proto wire-format check or 'who calls this gRPC method' (use analyze_grpc). It does NOT report test coverage, and does NOT find the callers of an HTTP route.";
     type Args = AnalyzeImpactArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -89,16 +89,15 @@ impl McpTool for AnalyzeImpactTool {
                 &snapshot.contract_graph,
             )));
         }
-        let mut matrix = snapshot
-            .contract_graph
-            .impact_matrix(args.target.as_str(), depth);
-        let before = matrix.rows.len();
-        if !args.include_tests.unwrap_or(false) {
-            matrix
-                .rows
-                .retain(|r| !mesh_core::is_test_node(r.node, &state.allowed_roots));
-        }
-        let hidden_tests = before - matrix.rows.len();
+        let include_tests = args.include_tests.unwrap_or(false);
+        // Rows and notes share one visibility rule, judged on root-relative paths.
+        let matrix =
+            snapshot
+                .contract_graph
+                .impact_matrix_visible(args.target.as_str(), depth, &|n| {
+                    !include_tests && mesh_core::is_test_node(n, &state.allowed_roots)
+                });
+        let hidden_tests = matrix.hidden_rows;
         let mut text =
             MarkdownFormatter::format_impact_matrix(&matrix, &state.allowed_roots, offset, limit);
         if hidden_tests > 0 {

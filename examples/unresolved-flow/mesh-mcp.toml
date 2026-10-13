@@ -1,0 +1,12 @@
+# Fixture: an event chain whose middle hop publishes to a stream resolved at runtime.
+[workspace]
+name = "unresolved-flow"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

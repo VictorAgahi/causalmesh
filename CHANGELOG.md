@@ -5,6 +5,64 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.10] — 2026-10-13
+
+Generic fix from a field report: an agent asked what happens when a user is deleted on a NestJS
+and Redis Streams workspace. `analyze_impact` listed the first hops, then said nothing about the
+last stream. The producer of that stream publishes to `config.stream`, read from a
+`getGatherCompletionConfig(...)`-style registry at runtime, so no literal `publish(...)` exists
+for the indexer to see. Querying that stream returned "No producer resolved ... this negative
+result is authoritative" next to an indexed consumer, and `depth: 2` ended at that consumer
+without a word, so the agent concluded a method was never called.
+
+Reproduced first on `examples/unresolved-flow` (entry stream, a post-processor publishing to
+`cfg.stream`, a final consumer with its own effect): at `depth: 2` and `3` the answer was the
+depth-1 answer with no note, and the final stream got the "authoritative" sentence above. The
+old wording came from `format_impact_matrix`; the "Authoritative AST Scan" label is only in
+`analyze_grpc` output (and the unused `format_impact_flow`), not in the impact matrix.
+
+### Changed (behaviour)
+- `analyze_impact`, event targets. A zero is worded as "not statically resolved", never as
+  absence. "No producer statically resolved" says that a consumer (or the topic) is indexed, that
+  no literal producer call site was found, and that the producer may publish under a name
+  resolved at runtime (registry, config, template string) or live in a root that is not indexed.
+  "No consumer statically resolved" is the mirror case. Those two notes end with one sentence
+  pointing to a `[[engines.contracts.patterns]]` of kind `topic_producer` (or `topic_consumer`)
+  for a project-specific registry (see SETUP.md).
+- `analyze_impact` traversal boundary. "Depth limit reached (depth N)" counts and lists (up to 5,
+  names and locations clamped, then "+K more") the consumers the walk reached but did not expand
+  because of `depth`, with the `depth` to repeat the call with. It makes no claim about what lies
+  past them (the first version relied on a file-level "has a publish" test, which was silent for a
+  non-literal publish and could claim a continuation that did not exist). At the maximum depth it
+  says so and that their downstream is not shown. "Chain ends" lists the consumers the walk did
+  expand and found no statically resolved onward publish for, and says a terminal consumer is
+  normal while a handler publishing under a runtime-resolved name continues the chain there; it
+  carries no pattern pointer. Order is file, line, name, node id.
+- Every note (no producer, no consumer, depth limit, chain end) and the rows now share one
+  visibility set, with test files judged on root-relative paths (`is_test_node`); a workspace
+  root under a directory named `tests` is no longer all test code. An event indexed only in test
+  files is said to be. `ContractGraph::impact_matrix_visible` takes the hide rule; `impact_matrix`
+  keeps its signature.
+- `analyze_grpc` output no longer prints `EXACTLY 0 (Authoritative AST Scan)` or "confirmed NO".
+  It prints `0 (no literal call sites found in the indexed roots)` / `0 (no literal registrations
+  found in the indexed roots)` and says a method built at runtime or a root that is not indexed
+  is not seen. Tests updated: the two `format_grpc_trace` assertions in `mesh-parsers`.
+  `.agents/rules/mesh-authority.md` no longer tells agents to treat a 0 as authoritative.
+- A target that matches nothing now says that a name produced only by a runtime registry is not
+  indexed under that name, and suggests the literal stream of a neighbouring hop.
+- Server instructions and the tool descriptions: a 0 is scoped to literal call sites in the
+  indexed roots; "who calls this gRPC method / RPC client call sites" is routed to `analyze_grpc`
+  and `find_dependents` is said to answer import and symbol-usage questions; a claim of absence
+  needs a query across all roots with the tool that matches the question. `format_impact_flow`
+  no longer labels its 0 as authoritative.
+
+### Not done
+- Candidate dynamic emitters (file:line and the unresolved expression of non-literal
+  `publish` / `emit` / `xadd` calls) are not listed. The indexer records no non-literal call
+  site, and recording one needs a new node or field through every extractor and the index cache,
+  which is not cheap. The publisher in the field case was also a project helper, not a library
+  call a rule recognises. The notes name the limit instead.
+
 ## [7.1.9] — 2026-10-12
 
 Generic fixes from a QA run of 7.1.8 on a 16-root workspace (3565 files). The headline is the

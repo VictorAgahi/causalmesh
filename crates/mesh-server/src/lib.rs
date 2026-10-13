@@ -145,14 +145,14 @@ MeshMCP indexes this polyglot workspace (14 languages) into a graph of packages,
 WHEN TO USE IT: for a question that spans several repositories, start from the graph, then verify what matters with your usual tools.
 1. Who imports or uses a package, module or symbol (\"who imports X\", package usages, reverse dependencies, blast radius of a change): `find_dependents`.
 2. Events and messaging (who publishes an event, outbox writes, topics, queues, streams, consumers): `analyze_impact`.
-3. gRPC (server handlers, client call sites, .proto wire-format checks): `analyze_grpc`.
+3. gRPC (server handlers, \"who calls this RPC\" client call sites, .proto wire-format checks): `analyze_grpc`; `find_dependents` is for imports and symbol usage, not RPC callers.
 4. Symbol declarations across roots: `smart_search`.
 For an exact identifier (an enum value, a class name), plain grep is fine.
 
 LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:
   ToolSearch select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc
 
-READING RESULTS: every row carries a path:line you can open to check it. A 0 labeled 'Authoritative AST Scan' covers every indexed root, so a broad grep re-scan rarely adds anything; rows marked 'heuristic' or 'ambiguous', and notes about unindexed dynamic strings or SQL, are worth a targeted check.";
+READING RESULTS: every row carries a path:line you can open to check it. A 0 means no literal call site in any indexed root. 'Not statically resolved' (no producer or consumer found) is not absence: the name may be built at runtime (registry, config, template string) or live in an unindexed root. A claim of absence (\"never called\", \"no producer\") needs a query across ALL roots with the tool that matches the question. Rows marked 'heuristic' or 'ambiguous', and notes about unresolved, dynamic or depth-limited hops, are worth a targeted check.";
 
 /// Answers one JSON-RPC request (never a notification — see [`protocol::classify`]).
 /// Shared by the stdio server and `meshd`'s IPC dispatcher so both speak exactly

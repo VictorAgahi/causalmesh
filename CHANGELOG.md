@@ -26,15 +26,28 @@ old wording came from `format_impact_matrix`; the "Authoritative AST Scan" label
   absence. "No producer statically resolved" says that a consumer (or the topic) is indexed, that
   no literal producer call site was found, and that the producer may publish under a name
   resolved at runtime (registry, config, template string) or live in a root that is not indexed.
-  "No consumer statically resolved" is the mirror case. Both notes, and the two new ones below,
-  end with one sentence pointing to a `[[engines.contracts.patterns]]` of kind `topic_producer`
-  (or `topic_consumer`) for a project-specific registry (see SETUP.md).
+  "No consumer statically resolved" is the mirror case. Those two notes end with one sentence
+  pointing to a `[[engines.contracts.patterns]]` of kind `topic_producer` (or `topic_consumer`)
+  for a project-specific registry (see SETUP.md).
 - `analyze_impact` traversal boundary. "Depth limit reached (depth N)" counts and lists (up to 5,
-  with location) the consumers the walk reached but did not expand although their file has a
-  resolved onward publish, with the `depth` to repeat the call with. "Chain end within depth N"
-  lists the consumers the walk did expand and found no resolved onward publish for, and says that
-  a handler re-emitting under a runtime-resolved name continues the chain there. A depth stop is
-  now distinguishable from the end of the chain. The order is by file, line and name.
+  names and locations clamped, then "+K more") the consumers the walk reached but did not expand
+  because of `depth`, with the `depth` to repeat the call with. It makes no claim about what lies
+  past them (the first version relied on a file-level "has a publish" test, which was silent for a
+  non-literal publish and could claim a continuation that did not exist). At the maximum depth it
+  says so and that their downstream is not shown. "Chain ends" lists the consumers the walk did
+  expand and found no statically resolved onward publish for, and says a terminal consumer is
+  normal while a handler publishing under a runtime-resolved name continues the chain there; it
+  carries no pattern pointer. Order is file, line, name, node id.
+- Every note (no producer, no consumer, depth limit, chain end) and the rows now share one
+  visibility set, with test files judged on root-relative paths (`is_test_node`); a workspace
+  root under a directory named `tests` is no longer all test code. An event indexed only in test
+  files is said to be. `ContractGraph::impact_matrix_visible` takes the hide rule; `impact_matrix`
+  keeps its signature.
+- `analyze_grpc` output no longer prints `EXACTLY 0 (Authoritative AST Scan)` or "confirmed NO".
+  It prints `0 (no literal call sites found in the indexed roots)` / `0 (no literal registrations
+  found in the indexed roots)` and says a method built at runtime or a root that is not indexed
+  is not seen. Tests updated: the two `format_grpc_trace` assertions in `mesh-parsers`.
+  `.agents/rules/mesh-authority.md` no longer tells agents to treat a 0 as authoritative.
 - A target that matches nothing now says that a name produced only by a runtime registry is not
   indexed under that name, and suggests the literal stream of a neighbouring hop.
 - Server instructions and the tool descriptions: a 0 is scoped to literal call sites in the

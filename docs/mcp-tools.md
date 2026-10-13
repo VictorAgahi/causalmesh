@@ -322,7 +322,7 @@ for the method's service in a file where no call to this method was resolved —
 client is not held in a typed field, whose calls are all recorded — are listed as "may call", even
 when other clients were found: the client list is never presented as complete when it may not be.
 
-**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' covers literal call sites in every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. This is the tool for 'who calls this gRPC method / RPC client call sites'. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
+**Negative Constraints**: A 0 means no literal call site or registration in any indexed workspace root (a method built at runtime, or a root that is not indexed, is not seen); every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. This is the tool for 'who calls this gRPC method / RPC client call sites'. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema
 ```json
@@ -492,10 +492,14 @@ is not recorded under any name. So a 0 is never worded as proof of absence:
 
 - **No producer statically resolved** (a consumer or topic is indexed, no literal producer call site): the producer may publish under a runtime-resolved name or live in an unindexed root.
 - **No consumer statically resolved** (the mirror case): a consumer may be registered dynamically, through a pattern not in the config, or live in an unindexed root.
-- **Depth limit reached** (`depth` > 1 or default): consumers the walk reached but did not expand although their file has a resolved onward publish; counted and listed (up to 5), with the `depth` to repeat the call with. A depth stop is distinguishable from the end of the chain.
-- **Chain end within depth N**: consumers the walk did expand and found no resolved onward publish for. It is the end of the statically resolved chain; if the handler re-emits under a runtime-resolved name, the chain continues there.
+- **Depth limit reached (depth N)**: the walk reached K consumers it did not expand because of `depth`; listed (up to 5, names clamped, then "+K more") with the `depth` to repeat the call with. No claim is made about what lies past them. At the maximum depth the note says so and that their downstream is not shown. A depth stop is thus distinguishable from the end of the chain.
+- **Chain ends**: K consumers the walk did expand and found no statically resolved onward publish for. A terminal consumer is normal; if one publishes under a name resolved at runtime, the chain continues there.
 
-When one of these fires, the result points to a `[[engines.contracts.patterns]]` of kind
+The no-producer and no-consumer notes are computed from the same set of nodes as the rows shown
+(test files are judged on root-relative paths and hidden unless `include_tests: true`); when an
+event is indexed only in test files, they say so.
+
+When a no-producer or no-consumer note fires, the result points to a `[[engines.contracts.patterns]]` of kind
 `topic_producer` (or `topic_consumer`) to declare a project-specific registry (see `SETUP.md`).
 Non-literal publish call sites are not recorded by the indexer, so no candidate list of dynamic
 emitters is shown. A claim of absence ("never called", "no producer") needs a query across all

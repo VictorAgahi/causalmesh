@@ -219,8 +219,8 @@ pub struct ImpactFlow<'g> {
     /// the walk continued. Linked by file, not by a call edge.
     pub downstream_producers: Vec<&'g ContractNode>,
     /// Consumers (or sagas) the walk reached but did not expand because the
-    /// depth limit was hit, and that do have a resolved onward publish in their
-    /// file: a higher `depth` would follow them. Sorted by location.
+    /// depth limit was hit: a higher `depth` would follow them. Nothing is
+    /// claimed about what lies past them. Sorted by location, then id.
     pub unexpanded: Vec<&'g ContractNode>,
     /// Consumers (or sagas) the walk did expand (`depth >= 2`) and found no
     /// resolved onward publish for: a real end of the statically resolved
@@ -324,6 +324,11 @@ pub struct ImpactMatrix<'g> {
     pub unexpanded: Vec<&'g ContractNode>,
     /// See [`ImpactFlow::chain_end`], without nodes in test files.
     pub chain_end: Vec<&'g ContractNode>,
+    /// The event is indexed but every node of it is hidden (test files), so the
+    /// notes cannot say "indexed" about anything the rows show.
+    pub event_only_in_tests: bool,
+    /// Rows left out because `hide` judged their node a test file.
+    pub hidden_rows: usize,
 }
 
 /// In-memory graph of polyglot architecture contracts and dependencies.
@@ -2351,36 +2356,27 @@ impl ContractGraph {
         let mut flow = self.analyze_impact(target);
         let depth = depth.clamp(1, Self::MAX_IMPACT_DEPTH);
 
-        // Nodes with a resolved onward publish: a `Produces` edge of their own
-        // or of any node in their file (the file-linked rule the walk uses).
-        let mut producing_nodes: HashSet<NodeId> = HashSet::new();
-        let mut producing_files: HashSet<&FilePath> = HashSet::new();
-        for edge in &self.edges {
-            if edge.kind != EdgeKind::Produces {
-                continue;
-            }
-            producing_nodes.insert(edge.from);
-            if let Some(p) = self.nodes.get(&edge.from) {
-                producing_files.insert(&p.file_path);
-            }
-        }
-        let continues = |n: &ContractNode| {
-            producing_nodes.contains(&n.id) || producing_files.contains(&n.file_path)
-        };
+        // Total order over content with the node id as the last tiebreaker, so
+        // two nodes sharing file, line and name never swap between runs.
         let by_location = |nodes: &mut Vec<&'_ ContractNode>| {
             nodes.sort_by(|a, b| {
-                (&a.file_path, a.line_start, &a.name).cmp(&(&b.file_path, b.line_start, &b.name))
+                (&a.file_path, a.line_start, &a.name, a.id).cmp(&(
+                    &b.file_path,
+                    b.line_start,
+                    &b.name,
+                    b.id,
+                ))
             });
             nodes.dedup_by_key(|n| n.id);
         };
 
         if depth <= 1 {
+            // Reached, not expanded: no claim about what lies past them.
             let mut unexpanded: Vec<&ContractNode> = flow
                 .downstream_consumers
                 .iter()
                 .chain(flow.related_sagas.iter())
                 .copied()
-                .filter(|n| continues(n))
                 .collect();
             by_location(&mut unexpanded);
             flow.unexpanded = unexpanded;
@@ -2492,17 +2488,35 @@ impl ContractGraph {
         let mut unexpanded: Vec<&ContractNode> = frontier
             .iter()
             .filter_map(|id| self.nodes.get(id))
-            .filter(|n| continues(n))
             .collect();
         by_location(&mut unexpanded);
         flow.unexpanded = unexpanded;
-        let mut chain_end: Vec<&ContractNode> = expanded
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .filter(|n| !continues(n))
-            .collect();
-        by_location(&mut chain_end);
-        flow.chain_end = chain_end;
+
+        // Expanded consumers with no resolved onward publish (a `Produces` edge
+        // of their own or of any node in their file, the file-linked rule the
+        // walk uses). The edge scan runs only when there is something to judge.
+        if !expanded.is_empty() {
+            let mut producing_nodes: HashSet<NodeId> = HashSet::new();
+            let mut producing_files: HashSet<&FilePath> = HashSet::new();
+            for edge in &self.edges {
+                if edge.kind != EdgeKind::Produces {
+                    continue;
+                }
+                producing_nodes.insert(edge.from);
+                if let Some(p) = self.nodes.get(&edge.from) {
+                    producing_files.insert(&p.file_path);
+                }
+            }
+            let mut chain_end: Vec<&ContractNode> = expanded
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .filter(|n| {
+                    !producing_nodes.contains(&n.id) && !producing_files.contains(&n.file_path)
+                })
+                .collect();
+            by_location(&mut chain_end);
+            flow.chain_end = chain_end;
+        }
 
         flow
     }
@@ -2539,6 +2553,19 @@ impl ContractGraph {
     /// `via` (path, line, name), confidence — a total order over content, not
     /// over `NodeId`s or hash iteration.
     pub fn impact_matrix(&self, target: &str, depth: usize) -> ImpactMatrix<'_> {
+        self.impact_matrix_visible(target, depth, &|_| false)
+    }
+
+    /// [`Self::impact_matrix`] seen through `hide` (the caller's test-file rule,
+    /// judged on root-relative paths): hidden nodes are left out of the rows
+    /// (counted in `hidden_rows`) and every note (no producer / consumer, depth
+    /// limit, chain end) is computed from the same visible set as the rows.
+    pub fn impact_matrix_visible(
+        &self,
+        target: &str,
+        depth: usize,
+        hide: &dyn Fn(&ContractNode) -> bool,
+    ) -> ImpactMatrix<'_> {
         let norm_target = target.trim();
 
         // ── gRPC: anchors, then their handlers/clients through real edges ──
@@ -2698,15 +2725,20 @@ impl ContractGraph {
         let event_matched = !flow.topics.is_empty()
             || !flow.upstream_producers.is_empty()
             || !flow.downstream_consumers.is_empty();
+        let shown = |nodes: &[&ContractNode]| nodes.iter().any(|n| !hide(n));
+        // The synthetic cross-repo topic hub (no root) is not a site in any file.
+        let shown_in_a_root =
+            |nodes: &[&ContractNode]| nodes.iter().any(|n| n.repo_id != RepoId::MAX && !hide(n));
+        let event_only_in_tests = event_matched
+            && !shown_in_a_root(&flow.topics)
+            && !shown_in_a_root(&flow.upstream_producers)
+            && !shown_in_a_root(&flow.downstream_consumers);
         let no_producer_resolved = event_matched
-            && !flow
-                .upstream_producers
-                .iter()
-                .any(|n| !crate::is_test_path(&n.file_path))
+            && !shown(&flow.upstream_producers)
             && !flow
                 .topics
                 .iter()
-                .any(|n| n.name.starts_with("produce:") && !crate::is_test_path(&n.file_path));
+                .any(|n| n.name.starts_with("produce:") && !hide(n));
         let no_consumer_resolved = event_matched
             && !flow
                 .downstream_consumers
@@ -2716,7 +2748,7 @@ impl ContractGraph {
                         .iter()
                         .filter(|n| n.name.starts_with("consume:")),
                 )
-                .any(|n| !crate::is_test_path(&n.file_path));
+                .any(|n| !hide(n));
         let mut async_owners: Vec<RepoId> = flow
             .upstream_producers
             .iter()
@@ -2780,6 +2812,10 @@ impl ContractGraph {
         });
         rows.sort_by(|a, b| Self::row_key(a).cmp(&Self::row_key(b)));
 
+        let before = rows.len();
+        rows.retain(|r| !hide(r.node));
+        let hidden_rows = before - rows.len();
+
         let mut owner_roots = grpc_owners;
         owner_roots.extend(async_owners);
         owner_roots.sort_unstable();
@@ -2806,14 +2842,16 @@ impl ContractGraph {
                 .unexpanded
                 .iter()
                 .copied()
-                .filter(|n| !crate::is_test_path(&n.file_path))
+                .filter(|n| !hide(n))
                 .collect(),
             chain_end: flow
                 .chain_end
                 .iter()
                 .copied()
-                .filter(|n| !crate::is_test_path(&n.file_path))
+                .filter(|n| !hide(n))
                 .collect(),
+            event_only_in_tests,
+            hidden_rows,
         }
     }
 
@@ -4591,6 +4629,38 @@ mod tests {
             vec!["aProducer", "mProducer", "zProducer"],
             "producers must be ordered by their matched topic name, not HashMap order"
         );
+    }
+
+    /// Two consumers sharing file, line and name are two nodes: both are listed
+    /// as not expanded, ordered by node id, identically on every call.
+    #[test]
+    fn unexpanded_consumers_are_ordered_by_id_when_location_ties() {
+        let mut graph = ContractGraph::new();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let c = graph.add_node(memo_node(
+                "consume:Streams.TIE",
+                "",
+                "pp/tie.ts",
+                1,
+                NodeKind::PostProcessor,
+            ));
+            graph.add_consumer(c, "Streams.TIE");
+            ids.push(c);
+        }
+        graph.reconcile_edges();
+        let first = graph.analyze_impact_with_depth("TIE", 1);
+        let got: Vec<NodeId> = first.unexpanded.iter().map(|n| n.id).collect();
+        let mut want = ids.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        for _ in 0..5 {
+            let again = graph.analyze_impact_with_depth("TIE", 1);
+            assert_eq!(
+                again.unexpanded.iter().map(|n| n.id).collect::<Vec<_>>(),
+                got
+            );
+        }
     }
 
     /// Volontariapp 7.0.6 report, defects 5, 6 and 13: the re-emission of a

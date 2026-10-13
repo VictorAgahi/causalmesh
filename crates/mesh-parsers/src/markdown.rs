@@ -512,7 +512,9 @@ impl MarkdownFormatter {
         }
 
         if trace.client_stubs.is_empty() && trace.service_level_clients.is_empty() {
-            out.push_str("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)\n");
+            out.push_str(
+                "### 2. Client Stubs: 0 (no literal call sites found in the indexed roots)\n",
+            );
             let files_note = if trace.files_scanned > 0 {
                 format!(
                     "({} contract-bearing files scanned across all workspace roots)",
@@ -522,7 +524,7 @@ impl MarkdownFormatter {
                 "across all workspace roots".to_string()
             };
             out.push_str(&format!(
-                "*Exhaustive AST scan {files_note} confirmed NO client stubs or invocation sites exist. Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic.*\n\n"
+                "*AST scan {files_note} found no client stubs or invocation sites at literal call sites. A call whose method or service is built at runtime, or that lives in a root that is not indexed, is not seen.*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -567,7 +569,7 @@ impl MarkdownFormatter {
 
         if trace.server_handlers.is_empty() {
             out.push_str(
-                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)\n",
+                "### 3. Server Handlers / Controllers: 0 (no literal registrations found in the indexed roots)\n",
             );
             let files_note = if trace.files_scanned > 0 {
                 format!("({} contract-bearing files checked)", trace.files_scanned)
@@ -575,7 +577,7 @@ impl MarkdownFormatter {
                 "in any indexed workspace root".to_string()
             };
             out.push_str(&format!(
-                "*Exhaustive AST scan confirmed NO server handlers implement this method {files_note}.*\n\n"
+                "*AST scan found no server handler registered for this method {files_note}. A handler registered at runtime, or in a root that is not indexed, is not seen.*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -775,75 +777,62 @@ impl MarkdownFormatter {
                 "*Past the first hop, the walk follows producers declared in the same file as a consumer (a handler that re-emits): those rows are `heuristic`.*\n",
             );
         }
-        let mut pointer = None;
-        if matrix.no_producer_resolved {
-            let seen = if matrix.no_consumer_resolved {
-                "the topic is indexed"
+        let indexed = |other_missing: bool, other: &str| -> String {
+            if matrix.event_only_in_tests {
+                "the event is indexed only in test files (`include_tests: true` lists them)"
+                    .to_string()
+            } else if other_missing {
+                "the topic is indexed".to_string()
             } else {
-                "a consumer is indexed"
-            };
+                format!("{other} is indexed")
+            }
+        };
+        if matrix.no_producer_resolved {
             header.push_str(&format!(
-                "\n**No producer statically resolved** for this event outside tests: {seen}, but no literal producer call site was found across {} workspace roots. This is not proof that nothing emits it: the producer may publish under a name resolved at runtime (registry, config, template string) or live in a root that is not indexed.\n",
+                "\n**No producer statically resolved** for this event outside tests: {}, but no literal producer call site was found across {} workspace roots. This is not proof that nothing emits it: the producer may publish under a name resolved at runtime (registry, config, template string) or live in a root that is not indexed.\n",
+                indexed(matrix.no_consumer_resolved, "a consumer"),
                 roots.len()
             ));
-            pointer = Some("topic_producer");
         }
         if matrix.no_consumer_resolved {
-            let seen = if matrix.no_producer_resolved {
-                "the topic is indexed"
-            } else {
-                "a producer is indexed"
-            };
             header.push_str(&format!(
-                "\n**No consumer statically resolved** for this event outside tests: {seen}, but no literal consumer registration was found across {} workspace roots. This is not proof that nobody consumes it: a consumer may be registered dynamically, through a pattern that is not in the config, or live in a root that is not indexed.\n",
+                "\n**No consumer statically resolved** for this event outside tests: {}, but no literal consumer registration was found across {} workspace roots. This is not proof that nobody consumes it: a consumer may be registered dynamically, through a pattern that is not in the config, or live in a root that is not indexed.\n",
+                indexed(matrix.no_producer_resolved, "a producer"),
                 roots.len()
             ));
-            pointer = pointer.or(Some("topic_consumer"));
         }
-        let label_of_node = |n: &ContractNode| -> String {
-            format!(
-                "`{}` (`{}`)",
-                n.name.replace('`', "'"),
-                Self::location(n, roots)
-            )
-        };
-        const SHOWN_NODES: usize = 5;
-        let list_nodes = |nodes: &[&ContractNode]| -> String {
-            let mut shown: Vec<String> = nodes
-                .iter()
-                .take(SHOWN_NODES)
-                .map(|n| label_of_node(n))
-                .collect();
-            if nodes.len() > SHOWN_NODES {
-                shown.push(format!("... {} more", nodes.len() - SHOWN_NODES));
-            }
-            shown.join(", ")
-        };
-        if !matrix.unexpanded.is_empty() {
-            let hint = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
-                "`depth` is already at its maximum, so query one of them directly".to_string()
-            } else {
-                format!("repeat the call with `depth: {}`", matrix.depth + 1)
+        if matrix.no_producer_resolved || matrix.no_consumer_resolved {
+            let kind = match (matrix.no_producer_resolved, matrix.no_consumer_resolved) {
+                (true, true) => "`topic_producer` or `topic_consumer`",
+                (true, false) => "`topic_producer`",
+                _ => "`topic_consumer`",
             };
             header.push_str(&format!(
-                "\n**Depth limit reached** (depth {}): {} consumer(s) were not expanded although each has a resolved onward publish in its file, so the chain continues past this answer: {}. This is a depth stop, not the end of the chain; {hint}.\n",
-                matrix.depth,
+                "*A `[[engines.contracts.patterns]]` of kind {kind} can close this gap for a project-specific registry (see SETUP.md).*\n"
+            ));
+        }
+        if !matrix.unexpanded.is_empty() {
+            let tail = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
+                "Their downstream is not shown.".to_string()
+            } else {
+                format!("Repeat with `depth: {}` to follow them.", matrix.depth + 1)
+            };
+            let level = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
+                format!("maximum depth {}", matrix.depth)
+            } else {
+                format!("depth {}", matrix.depth)
+            };
+            header.push_str(&format!(
+                "\n**Depth limit reached** ({level}): {} consumer(s) were not expanded: {}. {tail}\n",
                 matrix.unexpanded.len(),
-                list_nodes(&matrix.unexpanded)
+                Self::node_labels(&matrix.unexpanded, roots)
             ));
         }
         if !matrix.chain_end.is_empty() {
             header.push_str(&format!(
-                "\n**Chain end within depth {}** at {} consumer(s): {}. No onward publish was statically resolved from their files. If they re-emit under a stream or event name resolved at runtime (registry, config, template string), the chain continues there; read these handlers before concluding that the flow stops.\n",
-                matrix.depth,
+                "\n**Chain ends** at {} consumer(s) with no statically resolved onward publish: {}. A terminal consumer is normal; if one of them publishes under a name resolved at runtime, the chain continues there.\n",
                 matrix.chain_end.len(),
-                list_nodes(&matrix.chain_end)
-            ));
-            pointer = pointer.or(Some("topic_producer"));
-        }
-        if let Some(kind) = pointer {
-            header.push_str(&format!(
-                "*A `[[engines.contracts.patterns]]` of kind `{kind}` can close this gap for a project-specific registry (see SETUP.md).*\n"
+                Self::node_labels(&matrix.chain_end, roots)
             ));
         }
         if total == 0 {
@@ -1013,6 +1002,46 @@ impl MarkdownFormatter {
         out
     }
 
+    /// Most node labels a header note lists; the rest is a "+K more" marker.
+    const NOTE_LABELS: usize = 5;
+    /// Longest name and location shown in a header note label, in characters.
+    const NOTE_NAME_CHARS: usize = 80;
+    const NOTE_LOC_CHARS: usize = 100;
+
+    fn clamp_chars(text: &str, max: usize) -> String {
+        if text.chars().count() <= max {
+            return text.to_string();
+        }
+        let cut: String = text.chars().take(max.saturating_sub(3)).collect();
+        format!("{cut}...")
+    }
+
+    /// Up to [`Self::NOTE_LABELS`] `name (location)` labels with bounded length,
+    /// then `+K more`: the notes sit outside paging and repeat on every page.
+    fn node_labels(nodes: &[&ContractNode], roots: &[PathBuf]) -> String {
+        let mut out: Vec<String> = nodes
+            .iter()
+            .take(Self::NOTE_LABELS)
+            .map(|n| {
+                format!(
+                    "`{}` (`{}`)",
+                    Self::clamp_chars(
+                        &n.name.replace(['`', '\n', '\r'], "'"),
+                        Self::NOTE_NAME_CHARS
+                    ),
+                    Self::clamp_chars(
+                        &Self::location(n, roots).replace(['`', '\n', '\r'], "'"),
+                        Self::NOTE_LOC_CHARS
+                    )
+                )
+            })
+            .collect();
+        if nodes.len() > Self::NOTE_LABELS {
+            out.push(format!("+{} more", nodes.len() - Self::NOTE_LABELS));
+        }
+        out.join(", ")
+    }
+
     /// Display label of each root, indexed like `roots`: its path relative to
     /// the roots' common parent (the root's own name when that is empty).
     fn root_labels(roots: &[PathBuf]) -> Vec<String> {
@@ -1159,6 +1188,8 @@ mod tests {
             depth: 1,
             unexpanded: Vec::new(),
             chain_end: Vec::new(),
+            event_only_in_tests: false,
+            hidden_rows: 0,
             rows: nodes
                 .iter()
                 .map(|n| mesh_core::ImpactRow {
@@ -1365,17 +1396,22 @@ mod tests {
         };
         let out = MarkdownFormatter::format_grpc_trace(&empty_trace);
         assert!(
-            out.contains("### 2. Client Stubs: EXACTLY 0 (Authoritative AST Scan)"),
+            out.contains(
+                "### 2. Client Stubs: 0 (no literal call sites found in the indexed roots)"
+            ),
             "{out}"
         );
         assert!(
             out.contains("1248 contract-bearing files scanned across all workspace roots"),
             "{out}"
         );
-        assert!(out.contains("Do NOT perform redundant fallback ripgrep/grep searches; this negative result is deterministic."), "{out}");
+        assert!(
+            out.contains("found no client stubs or invocation sites at literal call sites"),
+            "{out}"
+        );
         assert!(
             out.contains(
-                "### 3. Server Handlers / Controllers: EXACTLY 0 (Authoritative AST Scan)"
+                "### 3. Server Handlers / Controllers: 0 (no literal registrations found in the indexed roots)"
             ),
             "{out}"
         );

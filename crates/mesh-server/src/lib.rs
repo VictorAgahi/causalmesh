@@ -152,7 +152,7 @@ For an exact identifier (an enum value, a class name), plain grep is fine.
 LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:
   ToolSearch select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc
 
-READING RESULTS: every row carries a path:line you can open to check it. A 0 labeled 'Authoritative AST Scan' covers literal call sites in every indexed root. 'Not statically resolved' (no producer or consumer found) is not absence: the name may be built at runtime (registry, config, template string) or live in an unindexed root. A claim of absence (\"never called\", \"no producer\") needs a query across ALL roots with the tool that matches the question. Rows marked 'heuristic' or 'ambiguous', and notes about unresolved, dynamic or depth-limited hops, are worth a targeted check.";
+READING RESULTS: every row carries a path:line you can open to check it. A 0 means no literal call site in any indexed root. 'Not statically resolved' (no producer or consumer found) is not absence: the name may be built at runtime (registry, config, template string) or live in an unindexed root. A claim of absence (\"never called\", \"no producer\") needs a query across ALL roots with the tool that matches the question. Rows marked 'heuristic' or 'ambiguous', and notes about unresolved, dynamic or depth-limited hops, are worth a targeted check.";
 
 /// Answers one JSON-RPC request (never a notification — see [`protocol::classify`]).
 /// Shared by the stdio server and `meshd`'s IPC dispatcher so both speak exactly

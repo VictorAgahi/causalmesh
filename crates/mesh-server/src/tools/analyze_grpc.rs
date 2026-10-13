@@ -140,6 +140,15 @@ fn run_with_git(
                 );
                 resolved = resolve(&found.to_string_lossy());
             }
+            ProtoSuffixMatch::Canonical { chosen, others } => {
+                let shown = display_proto_path(&chosen, &state.allowed_roots);
+                resolution_note = format!(
+                    "### Resolved path\n`{target}` matches {} `.proto` files; `{shown}` is the only one under a configured `proto_dirs` entry, so it is the canonical one and the wire-format check targets it.\nAlso found, not used:\n{}\n\n",
+                    others.len() + 1,
+                    list_paths(&others, &state.allowed_roots)
+                );
+                resolved = resolve(&chosen.to_string_lossy());
+            }
             ProtoSuffixMatch::Bare(found) => {
                 let list = if found.is_empty() {
                     "no `.proto` file with that name exists under the workspace roots".to_string()
@@ -253,6 +262,12 @@ fn is_proto_path(path: &str) -> bool {
 
 enum ProtoSuffixMatch {
     Unique(PathBuf),
+    /// Several files end with the target and exactly one is under a configured
+    /// `proto_dirs` entry: that one is canonical, the others are copies.
+    Canonical {
+        chosen: PathBuf,
+        others: Vec<PathBuf>,
+    },
     /// The target is a bare file name: candidates are listed, none is chosen.
     Bare(Vec<PathBuf>),
     Several(Vec<PathBuf>),
@@ -353,6 +368,37 @@ fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
         .filter(|f| ends_with_target(f))
         .cloned()
         .collect();
+    // Candidates under a configured `proto_dirs` entry are the canonical ones (a
+    // generated package copy elsewhere is not). Without `proto_dirs`, or with no
+    // candidate under it, nothing is preferred.
+    if found.len() > 1 {
+        let dirs: Vec<String> = state
+            .config
+            .engines
+            .contracts
+            .as_ref()
+            .and_then(|c| c.grpc.as_ref())
+            .map(|g| g.proto_dirs.clone())
+            .unwrap_or_default();
+        if !dirs.is_empty() {
+            let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
+            let (canonical, copies): (Vec<PathBuf>, Vec<PathBuf>) = found
+                .iter()
+                .cloned()
+                .partition(|f| under_proto_dirs(f, &dirs, &state.allowed_roots, workspace_root));
+            match canonical.len() {
+                0 => {}
+                1 => {
+                    let mut canonical = canonical;
+                    return ProtoSuffixMatch::Canonical {
+                        chosen: canonical.remove(0),
+                        others: copies,
+                    };
+                }
+                _ => found = canonical,
+            }
+        }
+    }
     match found.len() {
         1 => ProtoSuffixMatch::Unique(found.remove(0)),
         0 => {
@@ -364,6 +410,58 @@ fn resolve_proto_suffix(target: &str, state: &AppState) -> ProtoSuffixMatch {
         }
         _ => ProtoSuffixMatch::Several(found),
     }
+}
+
+/// Whether `file` lies under one of the configured `proto_dirs`, compared by
+/// path components and never as text: each dir (written relative to the root or
+/// to the workspace root, optionally behind `${workspace_root}/`) must appear as
+/// a contiguous run of components of the file's path relative to its root or to
+/// the workspace root, or, when it is absolute, be a path prefix of the file.
+/// The part of the path above the roots is never searched, so a checkout living
+/// in `/home/me/proto-work` does not make every file canonical, and `registry-proto`
+/// is not `registry`.
+fn under_proto_dirs(
+    file: &Path,
+    dirs: &[String],
+    roots: &[PathBuf],
+    workspace_root: Option<&Path>,
+) -> bool {
+    let components = |p: &Path| -> Vec<String> {
+        p.components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    };
+    let root = roots
+        .iter()
+        .filter(|r| file.starts_with(r))
+        .max_by_key(|r| r.components().count());
+    let mut relatives: Vec<Vec<String>> = Vec::new();
+    if let Some(rel) = root.and_then(|r| file.strip_prefix(r).ok()) {
+        relatives.push(components(rel));
+    }
+    if let Some(rel) = workspace_root.and_then(|w| file.strip_prefix(w).ok()) {
+        relatives.push(components(rel));
+    }
+    dirs.iter().any(|dir| {
+        let clean = mesh_core::strip_workspace_root_prefix(dir).replace('\\', "/");
+        if Path::new(&clean).is_absolute() && file.starts_with(&clean) {
+            return true;
+        }
+        let wanted: Vec<&str> = clean
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        !wanted.is_empty()
+            && relatives.iter().any(|rel| {
+                rel.len() >= wanted.len()
+                    && rel
+                        .windows(wanted.len())
+                        .any(|w| w.iter().zip(&wanted).all(|(a, b)| a.as_str() == *b))
+            })
+    })
 }
 
 /// `<root dir name>/<path under the root>`, forward slashes: the spelling a user
@@ -1272,6 +1370,202 @@ message User {
         let audit = std::sync::Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
         let rescan = std::sync::Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
         AppState::new(config, vec![root.to_path_buf()], audit, rescan)
+    }
+
+    fn state_with_proto_dirs(root: &Path, dirs: &[&str]) -> AppState {
+        let list: Vec<String> = dirs.iter().map(|d| format!("\"{d}\"")).collect();
+        let config = mesh_core::Config::load_from_str(&format!(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n[engines.contracts.grpc]\nproto_dirs = [{}]\n",
+            list.join(", ")
+        ))
+        .expect("config");
+        let audit = std::sync::Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
+        let rescan = std::sync::Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+        AppState::new(config, vec![root.to_path_buf()], audit, rescan)
+    }
+
+    /// A relative target matching a canonical file under `proto_dirs` and a
+    /// generated copy elsewhere resolves to the canonical one and says so.
+    #[test]
+    fn the_copy_under_proto_dirs_is_canonical_and_the_other_is_listed_unused() {
+        let repo = TempRepo::new();
+        repo.write("registry/proto/user.proto", BASE_PROTO);
+        repo.write("packages/gen/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_with_proto_dirs(&repo.root, &["registry/proto"]);
+
+        let out = run_with_git(
+            &proto_args("proto/user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .expect("canonical copy resolves");
+        assert!(
+            out.text
+                .starts_with("### Resolved path\n`proto/user.proto` matches 2"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains(
+                "`repo/registry/proto/user.proto` is the only one under a configured `proto_dirs`"
+            ),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("Also found, not used:\n- `repo/packages/gen/proto/user.proto`"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.files_accessed.len(), 1);
+        assert!(
+            out.files_accessed[0].contains("registry"),
+            "{:?}",
+            out.files_accessed
+        );
+
+        // Without `proto_dirs` the same target stays ambiguous (today's behaviour).
+        let plain = state_for(&repo.root);
+        let err = run_with_git(
+            &proto_args("proto/user.proto", Some("main")),
+            &plain,
+            &repo.runner(),
+        )
+        .err()
+        .expect("ambiguous without proto_dirs");
+        assert!(err.1.contains("matches 2 `.proto` files"), "{}", err.1);
+
+        // `proto_dirs` that none of the candidates is under: unchanged too.
+        let elsewhere = state_with_proto_dirs(&repo.root, &["nowhere"]);
+        let err = run_with_git(
+            &proto_args("proto/user.proto", Some("main")),
+            &elsewhere,
+            &repo.runner(),
+        )
+        .err()
+        .expect("ambiguous when no candidate is canonical");
+        assert!(err.1.contains("matches 2 `.proto` files"), "{}", err.1);
+    }
+
+    /// Several canonical candidates: only those are listed, the copy is not.
+    #[test]
+    fn several_candidates_under_proto_dirs_list_only_those() {
+        let repo = TempRepo::new();
+        repo.write("registry/proto/user.proto", BASE_PROTO);
+        repo.write("other/proto/user.proto", BASE_PROTO);
+        repo.write("packages/gen/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_with_proto_dirs(&repo.root, &["registry/proto", "other/proto"]);
+
+        let err = run_with_git(
+            &proto_args("proto/user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("still ambiguous between the canonical ones");
+        assert!(err.1.contains("matches 2 `.proto` files"), "{}", err.1);
+        assert!(
+            err.1.contains("repo/registry/proto/user.proto"),
+            "{}",
+            err.1
+        );
+        assert!(err.1.contains("repo/other/proto/user.proto"), "{}", err.1);
+        assert!(!err.1.contains("packages/gen"), "{}", err.1);
+    }
+
+    /// The bare-name safeguard is untouched by `proto_dirs`.
+    #[test]
+    fn a_bare_name_is_never_resolved_even_with_a_canonical_copy() {
+        let repo = TempRepo::new();
+        repo.write("registry/proto/user.proto", BASE_PROTO);
+        repo.write("packages/gen/proto/user.proto", BASE_PROTO);
+        repo.commit("base");
+        let state = state_with_proto_dirs(&repo.root, &["registry/proto"]);
+        let err = run_with_git(
+            &proto_args("user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("bare name refused");
+        assert!(err.1.contains("bare file name"), "{}", err.1);
+    }
+
+    #[test]
+    fn proto_dirs_are_compared_by_components_below_the_root_never_as_text() {
+        let roots = vec![PathBuf::from("/home/me/proto-work/repo")];
+        let dirs = |d: &[&str]| d.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let under = |file: &str, d: &[&str]| {
+            under_proto_dirs(
+                Path::new(file),
+                &dirs(d),
+                &roots,
+                Some(Path::new("/home/me/proto-work")),
+            )
+        };
+        // The checkout's own directory name does not make everything canonical.
+        assert!(!under(
+            "/home/me/proto-work/repo/gen/pkg/user.proto",
+            &["proto"]
+        ));
+        // A directory whose name merely contains the configured one is not it.
+        assert!(!under(
+            "/home/me/proto-work/repo/gen/registry-proto/user.proto",
+            &["registry"]
+        ));
+        assert!(!under(
+            "/home/me/proto-work/repo/gen/registry-proto/user.proto",
+            &["registry-pro"]
+        ));
+        // The real thing, relative to the root or to the workspace root.
+        assert!(under(
+            "/home/me/proto-work/repo/registry/proto/user.proto",
+            &["registry/proto"]
+        ));
+        assert!(under(
+            "/home/me/proto-work/repo/registry/proto/user.proto",
+            &["${workspace_root}/repo/registry"]
+        ));
+        assert!(under(
+            "/home/me/proto-work/repo/svc/proto/user.proto",
+            &["proto"]
+        ));
+        assert!(under(
+            "/home/me/proto-work/repo/gen/registry-proto/user.proto",
+            &["registry-proto"]
+        ));
+        // An absolute dir is a path prefix (the sample paths are POSIX).
+        if cfg!(unix) {
+            assert!(under(
+                "/home/me/proto-work/repo/registry/user.proto",
+                &["/home/me/proto-work/repo/registry"]
+            ));
+            assert!(!under(
+                "/home/me/proto-work/repo/registry-x/user.proto",
+                &["/home/me/proto-work/repo/registry"]
+            ));
+        }
+    }
+
+    #[test]
+    fn a_lookalike_directory_is_not_canonical_in_a_resolved_target() {
+        let repo = TempRepo::new();
+        repo.write("gen/registry-proto/api/user.proto", BASE_PROTO);
+        repo.write("x/api/user.proto", BASE_PROTO);
+        repo.commit("base");
+        // `registry` is a prefix of `registry-proto` as text only: nothing is canonical.
+        let state = state_with_proto_dirs(&repo.root, &["registry"]);
+        let err = run_with_git(
+            &proto_args("api/user.proto", Some("main")),
+            &state,
+            &repo.runner(),
+        )
+        .err()
+        .expect("still ambiguous");
+        assert!(err.1.contains("matches 2 `.proto` files"), "{}", err.1);
     }
 
     fn proto_args(target: &str, base: Option<&str>) -> AnalyzeGrpcArgs {

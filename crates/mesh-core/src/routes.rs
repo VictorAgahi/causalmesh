@@ -8,9 +8,10 @@
 //! HTTP verb is case-insensitive. An optional global prefix (`http_prefix`) is
 //! accepted with or without.
 
+use crate::config::WorkspaceConfig;
 use crate::contracts::ContractGraph;
 use crate::test_paths::is_test_node;
-use crate::types::{ContractNode, NodeKind};
+use crate::types::{ContractNode, NodeKind, RepoId};
 use std::path::{Path, PathBuf};
 
 /// HTTP verbs a route query or an impact target may start with.
@@ -153,6 +154,150 @@ pub fn path_segments(path: &str) -> Vec<Seg> {
 /// The configured `http_prefix` as segments (empty when unset).
 pub fn prefix_segments(prefix: Option<&str>) -> Vec<Seg> {
     prefix.map(path_segments).unwrap_or_default()
+}
+
+/// One resolved prefix: the text to display and its segments to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Prefix {
+    text: String,
+    segs: Vec<Seg>,
+}
+
+impl Prefix {
+    /// An empty text is a valid prefix: for a root it means "no prefix here",
+    /// overriding the workspace-wide one.
+    fn new(text: &str) -> Self {
+        let text = text.trim();
+        Self {
+            text: text.to_string(),
+            segs: path_segments(text),
+        }
+    }
+
+    /// `None` for an empty text (the workspace-wide `http_prefix = ""` is unset).
+    fn non_empty(text: &str) -> Option<Self> {
+        let prefix = Self::new(text);
+        (!prefix.text.is_empty()).then_some(prefix)
+    }
+}
+
+/// The HTTP prefix of every root: the workspace-wide `http_prefix`, overridden
+/// per root by `[workspace.http_prefixes]`. Indexed by `RepoId`, so a route is
+/// shown (and matched) with the prefix of the root its file lives under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpPrefixes {
+    workspace: Option<Prefix>,
+    per_root: Vec<Option<Prefix>>,
+}
+
+/// How tightly a `[workspace.http_prefixes]` key names a root (higher wins).
+/// An exact name or path beats a glob; among globs the longer key (more
+/// literal text) wins, and equal keys are broken by key order so the choice
+/// never depends on hash order.
+fn key_specificity(key: &str, root: &Path, rel: &str) -> Option<(u8, usize)> {
+    let key = key.trim().trim_start_matches("./").trim_end_matches('/');
+    if key.is_empty() {
+        return None;
+    }
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let abs = root.to_string_lossy().replace('\\', "/");
+    if key == name || key == rel || key == abs {
+        return Some((2, key.len()));
+    }
+    let glob = globset::Glob::new(key).ok()?.compile_matcher();
+    (glob.is_match(rel) || glob.is_match(&name) || glob.is_match(&abs)).then_some((1, key.len()))
+}
+
+/// `root` relative to the workspace root, `/`-separated (`.` for the root itself);
+/// the absolute path when the workspace root is unknown or does not contain it.
+fn relative_to_workspace(root: &Path, workspace_root: Option<&Path>) -> String {
+    let rel = workspace_root
+        .and_then(|w| root.strip_prefix(w).ok())
+        .unwrap_or(root);
+    let joined = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+impl HttpPrefixes {
+    /// One prefix for every root (the historical `http_prefix`).
+    pub fn uniform(prefix: Option<&str>) -> Self {
+        Self {
+            workspace: prefix.and_then(Prefix::non_empty),
+            per_root: Vec::new(),
+        }
+    }
+
+    /// Resolves the prefix of each of `roots` (in `RepoId` order) from `ws`.
+    pub fn resolve(ws: &WorkspaceConfig, roots: &[PathBuf]) -> Self {
+        let workspace = ws.http_prefix.as_deref().and_then(Prefix::non_empty);
+        let mut keys: Vec<(&String, &String)> = ws.http_prefixes.iter().collect();
+        keys.sort();
+        let per_root = roots
+            .iter()
+            .map(|root| {
+                let rel = relative_to_workspace(root, ws.resolved_workspace_root.as_deref());
+                keys.iter()
+                    .filter_map(|(k, v)| key_specificity(k, root, &rel).map(|s| (s, k, v)))
+                    .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+                    .map(|(_, _, v)| Prefix::new(v))
+            })
+            .collect();
+        Self {
+            workspace,
+            per_root,
+        }
+    }
+
+    /// Keys of `[workspace.http_prefixes]` that name none of `roots`, sorted.
+    pub fn unmatched_keys(ws: &WorkspaceConfig, roots: &[PathBuf]) -> Vec<String> {
+        let rels: Vec<String> = roots
+            .iter()
+            .map(|r| relative_to_workspace(r, ws.resolved_workspace_root.as_deref()))
+            .collect();
+        let mut out: Vec<String> = ws
+            .http_prefixes
+            .keys()
+            .filter(|k| {
+                !roots
+                    .iter()
+                    .zip(&rels)
+                    .any(|(root, rel)| key_specificity(k, root, rel).is_some())
+            })
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn for_repo(&self, repo: RepoId) -> Option<&Prefix> {
+        match self.per_root.get(repo as usize) {
+            Some(Some(own)) => Some(own),
+            _ => self.workspace.as_ref(),
+        }
+    }
+
+    /// The prefix text to display on a route of root `repo`, if any.
+    pub fn text(&self, repo: RepoId) -> Option<&str> {
+        self.for_repo(repo)
+            .map(|p| p.text.as_str())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The prefix segments a query is matched against for a route of root `repo`.
+    pub fn segs(&self, repo: RepoId) -> &[Seg] {
+        self.for_repo(repo).map_or(&[], |p| p.segs.as_slice())
+    }
 }
 
 /// `(verb, rest)` when `s` starts with an HTTP verb (any case) and a space.
@@ -329,7 +474,7 @@ pub fn display_label(label: &str, prefix: Option<&str>) -> Option<String> {
 pub fn find_routes<'g>(
     graph: &'g ContractGraph,
     query: &RouteQuery,
-    prefix: &[Seg],
+    prefixes: &HttpPrefixes,
     scope: Option<&Path>,
     include_tests: bool,
     roots: &[PathBuf],
@@ -344,7 +489,9 @@ pub fn find_routes<'g>(
         let Some(route) = node_route(node) else {
             continue;
         };
-        let Some(rank) = match_route(query, &route, prefix).filter(|r| *r <= worst_rank) else {
+        let Some(rank) =
+            match_route(query, &route, prefixes.segs(node.repo_id)).filter(|r| *r <= worst_rank)
+        else {
             continue;
         };
         if !include_tests && is_test_node(node, roots) {
@@ -368,7 +515,7 @@ pub fn find_routes<'g>(
 pub fn nearest_routes<'g>(
     graph: &'g ContractGraph,
     query: &RouteQuery,
-    prefix: &[Seg],
+    prefixes: &HttpPrefixes,
     include_tests: bool,
     roots: &[PathBuf],
     max: usize,
@@ -383,7 +530,7 @@ pub fn nearest_routes<'g>(
         }
         let same_verb = query.verb.is_none_or(|v| v == route.verb);
         let shared = [route.segs.clone(), {
-            let mut full = prefix.to_vec();
+            let mut full = prefixes.segs(node.repo_id).to_vec();
             full.extend(route.segs.iter().cloned());
             full
         }]
@@ -626,5 +773,108 @@ mod tests {
             Some(RouteRank::Exact)
         );
         assert_eq!(match_route(&q("GET /"), &r("GET /events"), &[]), None);
+    }
+
+    fn workspace(extra: &str, workspace_root: &str) -> WorkspaceConfig {
+        let text = format!("[workspace]\nname = \"w\"\nroots = [\".\"]\n{extra}");
+        let mut cfg = crate::config::Config::load_from_str(&text).expect("config");
+        cfg.workspace.resolved_workspace_root = Some(PathBuf::from(workspace_root));
+        cfg.workspace
+    }
+
+    fn roots() -> Vec<PathBuf> {
+        [
+            "/w/api-gateway",
+            "/w/services/billing",
+            "/w/services/users",
+            "/w/npm-packages",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    #[test]
+    fn per_root_prefixes_resolve_by_name_relative_path_and_glob() {
+        let ws = workspace(
+            "http_prefix = \"/pkg\"\n[workspace.http_prefixes]\n\
+             \"api-gateway\" = \"/api/v1\"\n\"services/billing\" = \"/billing\"\n\"services/*\" = \"/svc\"\n",
+            "/w",
+        );
+        let p = HttpPrefixes::resolve(&ws, &roots());
+        assert_eq!(p.text(0), Some("/api/v1"), "by directory name");
+        assert_eq!(p.text(1), Some("/billing"), "an exact path beats a glob");
+        assert_eq!(p.text(2), Some("/svc"), "by glob");
+        assert_eq!(
+            p.text(3),
+            Some("/pkg"),
+            "unlisted keeps the workspace prefix"
+        );
+        assert_eq!(p.segs(0), &[Seg::Lit("api".into()), Seg::Lit("v1".into())]);
+        assert_eq!(
+            p.text(40),
+            Some("/pkg"),
+            "an unknown root id falls back too"
+        );
+    }
+
+    #[test]
+    fn no_prefix_anywhere_shows_none_and_keeps_http_prefix_alone_working() {
+        let none = HttpPrefixes::resolve(&workspace("", "/w"), &roots());
+        assert!((0..4).all(|i| none.text(i).is_none() && none.segs(i).is_empty()));
+        let only = HttpPrefixes::resolve(&workspace("http_prefix = \"/api\"\n", "/w"), &roots());
+        assert!((0..4).all(|i| only.text(i) == Some("/api")));
+        // Only per-root: unlisted roots show nothing.
+        let per = HttpPrefixes::resolve(
+            &workspace("[workspace.http_prefixes]\n\"users\" = \"/u\"\n", "/w"),
+            &roots(),
+        );
+        assert_eq!(per.text(2), Some("/u"));
+        assert_eq!(per.text(0), None);
+        assert_eq!(HttpPrefixes::uniform(Some("/x")).text(7), Some("/x"));
+    }
+
+    #[test]
+    fn an_empty_per_root_prefix_removes_the_workspace_one_for_that_root() {
+        let ws = workspace(
+            "http_prefix = \"/api\"\n[workspace.http_prefixes]\n\"npm-packages\" = \"\"\n",
+            "/w",
+        );
+        let p = HttpPrefixes::resolve(&ws, &roots());
+        assert_eq!(p.text(3), None);
+        assert!(p.segs(3).is_empty());
+        assert_eq!(p.text(0), Some("/api"));
+    }
+
+    #[test]
+    fn keys_matching_no_root_are_reported() {
+        let ws = workspace(
+            "[workspace.http_prefixes]\n\"api-gateway\" = \"/a\"\n\"gateway\" = \"/b\"\n\"svc/*\" = \"/c\"\n\"**/users\" = \"/d\"\n",
+            "/w",
+        );
+        assert_eq!(
+            HttpPrefixes::unmatched_keys(&ws, &roots()),
+            vec!["gateway".to_string(), "svc/*".to_string()]
+        );
+    }
+
+    #[test]
+    fn routes_are_matched_with_the_prefix_of_their_own_root() {
+        let ws = workspace(
+            "[workspace.http_prefixes]\n\"api-gateway\" = \"/api\"\n",
+            "/w",
+        );
+        let p = HttpPrefixes::resolve(&ws, &roots());
+        let route = r("GET /users/:id");
+        let query = q("GET /api/users/:id");
+        assert_eq!(
+            match_route(&query, &route, p.segs(0)),
+            Some(RouteRank::Exact)
+        );
+        assert_eq!(match_route(&query, &route, p.segs(3)), None);
+        assert_eq!(
+            match_route(&q("GET /users/:id"), &route, p.segs(3)),
+            Some(RouteRank::Exact)
+        );
     }
 }

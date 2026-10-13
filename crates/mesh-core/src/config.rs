@@ -98,6 +98,15 @@ pub struct WorkspaceConfig {
     /// matching. Never detected from source.
     #[serde(default)]
     pub http_prefix: Option<String>,
+    /// Per-root override of [`Self::http_prefix`], for a workspace whose roots
+    /// do not share one gateway prefix (a shared npm-packages root next to the
+    /// API gateway). Keyed by root directory name (`"api-gateway"`), by the
+    /// root's path relative to the workspace root, or by a glob on either
+    /// (`"services/*"`). A route whose file lives under a listed root is shown
+    /// with that root's prefix; roots not listed keep `http_prefix`. Never
+    /// detected from source.
+    #[serde(default)]
+    pub http_prefixes: HashMap<String, String>,
     /// `workspace_root` expanded and canonicalized against the config file's
     /// directory by [`Config::resolve_workspace_root`]. Relative tool scopes are
     /// anchored here instead of on the process CWD, which an IDE-spawned server
@@ -209,7 +218,7 @@ fn default_group_1() -> usize {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomPatternConfig {
     pub name: String,
@@ -236,6 +245,25 @@ pub enum PatternConfidence {
 }
 
 impl CustomPatternConfig {
+    /// The `file_pattern` as the matcher reads it: leading `*` and `.` stripped,
+    /// compared by suffix or substring. `None` means every file.
+    pub fn file_needle(&self) -> Option<String> {
+        self.file_pattern.as_deref().map(|fp| {
+            fp.trim_start_matches('*')
+                .trim_start_matches('.')
+                .to_string()
+        })
+    }
+
+    /// Whether this pattern is evaluated on `path` (a `file_pattern` match on the
+    /// whole path string, exactly as `CompiledPattern` does).
+    pub fn applies_to(&self, path: &str) -> bool {
+        match self.file_needle() {
+            Some(needle) => path.ends_with(needle.as_str()) || path.contains(needle.as_str()),
+            None => true,
+        }
+    }
+
     /// Whether the topic edges of this pattern are reported as `exact`.
     pub fn is_exact(&self) -> bool {
         self.confidence == Some(PatternConfidence::Exact)

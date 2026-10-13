@@ -11,6 +11,7 @@ pub mod health;
 pub mod index_cache;
 pub mod paths;
 pub mod properties;
+pub mod reload_kind;
 pub mod rescan;
 pub mod root_guard;
 pub mod routes;

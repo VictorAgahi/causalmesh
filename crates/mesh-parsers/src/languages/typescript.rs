@@ -1653,7 +1653,8 @@ impl TypeScriptExtractor {
     }
 
     /// `service|method` of a handler decorated with `args`; a missing service
-    /// is empty and a missing method is the name of the method it decorates.
+    /// is empty and a missing method is the name of the method it decorates, in
+    /// which case the record ends in `|~` (the method was not written).
     fn handler_reference(args: &[String], method_name: &str) -> String {
         let service = args
             .first()
@@ -1673,7 +1674,11 @@ impl TypeScriptExtractor {
                 format!("'{}'", chars.into_iter().collect::<String>())
             }
         };
-        format!("{service}|{method}")
+        if args.get(1).is_some() {
+            format!("{service}|{method}")
+        } else {
+            format!("{service}|{method}|~")
+        }
     }
 
     /// One [`CONST_VALUE_PREFIX`] record per top-level string constant, `as const`
@@ -3830,6 +3835,62 @@ export class UserController {
         assert_eq!(
             trace.handler_rpc_names.get(&handler.id).map(|n| n.as_str()),
             Some("UserService.AddBadgeToUser")
+        );
+        // The decorator arguments as written, not the recombined handler name.
+        assert_eq!(
+            trace
+                .handler_declared_as
+                .get(&handler.id)
+                .map(String::as_str),
+            Some("USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER")
+        );
+        let rendered = crate::markdown::MarkdownFormatter::format_grpc_trace(&trace);
+        assert!(
+            rendered.contains(
+                "`UserService.AddBadgeToUser` (declared as `USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER`)"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("declared as `USER_SERVICE_NAME.ADD_BADGE_TO_USER`"));
+    }
+
+    /// An unresolved (non-constant) service and no written method: nothing is
+    /// shown as "declared as" for what was never written.
+    #[test]
+    fn an_unresolved_service_without_a_written_method_shows_no_declared_as() {
+        let code = r#"
+export class C {
+  @GrpcMethod(UNKNOWN_SERVICE)
+  addBadgeToUser() {}
+  @GrpcMethod()
+  removeBadge() {}
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/c.ts", code)]);
+        let trace = graph.analyze_grpc("UserService.AddBadgeToUser");
+        assert!(trace.handler_declared_as.is_empty());
+        let rendered = crate::markdown::MarkdownFormatter::format_grpc_trace(&trace);
+        assert!(!rendered.contains("|~"), "{rendered}");
+        assert!(!rendered.contains("declared as"), "{rendered}");
+    }
+
+    #[test]
+    fn a_handler_with_no_written_method_argument_is_declared_as_its_service_alone() {
+        let code = r#"
+export class C {
+  @GrpcMethod(USER_SERVICE_NAME)
+  addBadgeToUser() {}
+}
+"#;
+        let graph = grpc_graph(&[], &[("src/names.ts", NAMES_TS), ("src/c.ts", code)]);
+        let trace = graph.analyze_grpc("UserService.AddBadgeToUser");
+        let (handler, _) = trace.server_handlers[0];
+        assert_eq!(
+            trace
+                .handler_declared_as
+                .get(&handler.id)
+                .map(String::as_str),
+            Some("USER_SERVICE_NAME")
         );
     }
 

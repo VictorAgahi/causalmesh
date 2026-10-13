@@ -14,6 +14,11 @@ pub struct FileSignature {
 #[derive(Debug, Clone, Default)]
 pub struct DifferentialVfs {
     signatures: HashMap<PathBuf, FileSignature>,
+    /// `(mtime_nanos, size)` of files the guards refused for a reason that only
+    /// their bytes decide (too big, binary, long line, nesting). A file never
+    /// enters `signatures` then, so without this every differential reload read
+    /// it again just to refuse it again.
+    rejected: HashMap<PathBuf, (u128, u64)>,
 }
 
 impl DifferentialVfs {
@@ -46,6 +51,40 @@ impl DifferentialVfs {
             .is_some_and(|s| s.mtime_nanos == mtime_nanos && s.file_size == file_size)
     }
 
+    /// Remembers that the guards refused `path` when it had the stat `stat`
+    /// ([`Self::stat_of`], taken before the file was read, so a file changed
+    /// during the scan never looks like the one that was refused).
+    pub fn note_rejected(&mut self, path: &Path, stat: (u128, u64)) {
+        self.rejected.insert(path.to_path_buf(), stat);
+    }
+
+    /// Forgets every remembered refusal for which `keep` is false: the reload
+    /// passes the set of paths the crawl found, so a deleted file (or one that
+    /// fell out of the capped rejected list) leaves no entry behind and a path
+    /// recreated with the same mtime and size is looked at again.
+    pub fn retain_rejected(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.rejected.retain(|path, _| keep(path));
+    }
+
+    /// Number of remembered refusals.
+    pub fn rejected_len(&self) -> usize {
+        self.rejected.len()
+    }
+
+    /// `(mtime_nanos, size)` of `metadata`, the stat a refusal is remembered by.
+    pub fn stat_of(metadata: &std::fs::Metadata) -> (u128, u64) {
+        Self::stat_parts(metadata)
+    }
+
+    /// `true` when `path` was refused by the guards and neither its mtime nor its
+    /// size moved since, so refusing it again would read it for nothing.
+    #[inline]
+    pub fn is_rejection_unchanged(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
+        self.rejected
+            .get(path)
+            .is_some_and(|stat| *stat == Self::stat_parts(metadata))
+    }
+
     /// Builds the full signature (stat + SHA-256). Pure — safe on any thread.
     pub fn compute_signature(metadata: &std::fs::Metadata, content: &[u8]) -> FileSignature {
         let (mtime_nanos, file_size) = Self::stat_parts(metadata);
@@ -62,6 +101,7 @@ impl DifferentialVfs {
     /// Records `sig` for `path`. Returns `true` if the content hash is new or differs
     /// from the cached one (i.e. the file must be re-indexed); a bare `touch` returns `false`.
     pub fn upsert(&mut self, path: &Path, sig: FileSignature) -> bool {
+        self.rejected.remove(path);
         let changed = self
             .signatures
             .get(path)
@@ -88,6 +128,7 @@ impl DifferentialVfs {
 
     /// Removes a file from the VFS cache (e.g. when deleted from disk).
     pub fn remove(&mut self, path: &Path) -> bool {
+        self.rejected.remove(path);
         self.signatures.remove(path).is_some()
     }
 
@@ -102,6 +143,7 @@ impl DifferentialVfs {
     }
 
     pub fn clear(&mut self) {
+        self.rejected.clear();
         self.signatures.clear();
     }
 }
@@ -158,5 +200,62 @@ mod tests {
         // Remove
         assert!(vfs.remove(&path));
         assert_eq!(vfs.len(), 0);
+    }
+
+    #[test]
+    fn a_guard_rejection_is_remembered_until_the_file_moves() {
+        let mut vfs = DifferentialVfs::new();
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "x").unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_path_buf();
+        let meta = std::fs::metadata(&path).unwrap();
+
+        assert!(!vfs.is_rejection_unchanged(&path, &meta));
+        vfs.note_rejected(&path, DifferentialVfs::stat_of(&meta));
+        assert!(vfs.is_rejection_unchanged(&path, &meta));
+        // A clone (the state handed to a reloaded config) keeps it.
+        assert!(vfs.clone().is_rejection_unchanged(&path, &meta));
+
+        // The file grows: the refusal no longer holds.
+        write!(file, "more bytes").unwrap();
+        file.flush().unwrap();
+        let grown = std::fs::metadata(&path).unwrap();
+        assert!(!vfs.is_rejection_unchanged(&path, &grown));
+
+        // Being indexed or removed clears it.
+        vfs.note_rejected(&path, DifferentialVfs::stat_of(&grown));
+        let sig = DifferentialVfs::compute_signature(&grown, b"x");
+        vfs.upsert(&path, sig);
+        assert!(!vfs.is_rejection_unchanged(&path, &grown));
+        vfs.note_rejected(&path, DifferentialVfs::stat_of(&grown));
+        vfs.remove(&path);
+        assert!(!vfs.is_rejection_unchanged(&path, &grown));
+    }
+
+    #[test]
+    fn a_refusal_noted_with_the_pre_read_stat_does_not_hide_a_file_fixed_meanwhile() {
+        let mut vfs = DifferentialVfs::new();
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "too long").unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_path_buf();
+        let at_read = DifferentialVfs::stat_of(&std::fs::metadata(&path).unwrap());
+        // Fixed while the scan was still running, then the refusal is recorded.
+        write!(file, " fixed in the meantime").unwrap();
+        file.flush().unwrap();
+        vfs.note_rejected(&path, at_read);
+        let now = std::fs::metadata(&path).unwrap();
+        assert!(!vfs.is_rejection_unchanged(&path, &now));
+    }
+
+    #[test]
+    fn retain_rejected_drops_what_the_crawl_no_longer_finds() {
+        let mut vfs = DifferentialVfs::new();
+        let (a, b) = (PathBuf::from("/w/a.ts"), PathBuf::from("/w/b.ts"));
+        vfs.note_rejected(&a, (1, 2));
+        vfs.note_rejected(&b, (1, 2));
+        vfs.retain_rejected(|p| p == a.as_path());
+        assert_eq!(vfs.rejected_len(), 1);
     }
 }

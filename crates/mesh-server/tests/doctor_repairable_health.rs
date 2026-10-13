@@ -541,3 +541,115 @@ fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() 
         );
     }
 }
+
+/// A config that no longer parses: `doctor` reports the parse error and, for a
+/// live daemon, that it still serves its previous config (hash and load time).
+#[test]
+#[cfg(unix)]
+fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
+    let home = tempfile::tempdir().expect("home");
+    let project = tempfile::tempdir().expect("project");
+    let config = write_config(project.path());
+    let canonical_project = dunce::canonicalize(project.path()).expect("canon");
+    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let served_sha = mesh_core::config_watch::config_sha256(&std::fs::read(&config).unwrap());
+
+    let cache = home.path().join(".cache").join("mesh-mcp").join("meshd");
+    std::fs::create_dir_all(&cache).expect("mkdir");
+    let meta = mesh_core::socket::DaemonMeta {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    std::fs::write(
+        cache.join(format!("{workspace_id}.meta")),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .expect("meta");
+    let status = mesh_core::config_watch::DaemonConfigStatus {
+        started_ms: 1_000,
+        config_path: Some(config.clone()),
+        config_sha256: Some(served_sha.clone()),
+        last_error: None,
+        rejected_sha256: None,
+        loaded_ms: Some(1_000),
+        last_reload: None,
+    };
+    std::fs::write(
+        cache.join(format!("{workspace_id}.config.json")),
+        serde_json::to_string(&status).unwrap(),
+    )
+    .expect("status");
+    let sock_dir = home.path().join(".cache").join("mesh");
+    std::fs::create_dir_all(&sock_dir).expect("mkdir");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(sock_dir.join(format!("meshd-{workspace_id}.sock")))
+            .expect("bind stand-in socket");
+
+    // Break the file after the daemon loaded it.
+    std::fs::write(&config, "[workspace\nname = \"broken\"\n").expect("break config");
+
+    let checks = run_doctor(home.path(), &config, false);
+    let syntax = find(&checks, "Config syntax").expect("syntax check present");
+    assert_eq!(syntax["status"], "error", "{syntax:?}");
+    let check = find(&checks, "Daemon config").expect("daemon config check present");
+    assert_eq!(check["status"], "warn", "{check:?}");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("is invalid"), "{message}");
+    assert!(
+        message.contains("still serving its previous config"),
+        "{message}"
+    );
+    assert!(message.contains(&served_sha[..12]), "{message}");
+    assert!(message.contains("loaded"), "{message}");
+}
+
+/// The same invalid file with no daemon running says so, instead of nothing.
+#[test]
+fn invalid_config_without_a_daemon_says_none_is_running() {
+    let home = tempfile::tempdir().expect("home");
+    let project = tempfile::tempdir().expect("project");
+    let config = write_config(project.path());
+    std::fs::write(&config, "[workspace\nname = \"broken\"\n").expect("break config");
+
+    let checks = run_doctor(home.path(), &config, false);
+    let check = find(&checks, "Daemon config").expect("daemon config check present");
+    assert_eq!(check["status"], "info", "{check:?}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("no meshd is running"),
+        "{check:?}"
+    );
+}
+
+/// Unmatched `[workspace.http_prefixes]` keys are a warning, matched ones are not.
+#[test]
+fn http_prefixes_keys_matching_no_root_are_warned_about() {
+    let home = tempfile::tempdir().expect("home");
+    let project = tempfile::tempdir().expect("project");
+    std::fs::create_dir_all(project.path().join("gateway")).expect("root");
+    let config = project.path().join("mesh-mcp.toml");
+    std::fs::write(
+        &config,
+        "[workspace]\nname = \"p\"\nroots = [\"gateway\"]\n[workspace.http_prefixes]\n\"gateway\" = \"/api\"\n\"nope\" = \"/x\"\n",
+    )
+    .expect("write config");
+    let checks = run_doctor(home.path(), &config, false);
+    let check = find(&checks, "HTTP prefixes").expect("http prefixes check present");
+    assert_eq!(check["status"], "warn", "{check:?}");
+    let message = check["message"].as_str().unwrap();
+    assert!(
+        message.contains("nope") && !message.contains("gateway\","),
+        "{message}"
+    );
+
+    std::fs::write(
+        &config,
+        "[workspace]\nname = \"p\"\nroots = [\"gateway\"]\n[workspace.http_prefixes]\n\"gateway\" = \"/api\"\n",
+    )
+    .expect("write config");
+    let checks = run_doctor(home.path(), &config, false);
+    let check = find(&checks, "HTTP prefixes").expect("http prefixes check present");
+    assert_eq!(check["status"], "ok", "{check:?}");
+}

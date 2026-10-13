@@ -207,8 +207,27 @@ http_prefix = "/api/v1"
 ```
 
 `smart_search`, `analyze_impact` and `visualize_mesh` then display `PATCH /api/v1/events/:id/state`
-and accept the route with or without the prefix. It is workspace-wide and optional; MeshMCP does
-not try to detect `setGlobalPrefix`.
+and accept the route with or without the prefix. It is optional; MeshMCP does not try to detect
+`setGlobalPrefix`.
+
+When roots do not share one prefix (a shared npm-packages root next to the API gateway), give
+each root its own, keyed by the root's directory name, by its path relative to the workspace root,
+or by a glob on either:
+
+```toml
+[workspace]
+http_prefix = "/api/v1"            # roots not listed below
+
+[workspace.http_prefixes]
+"api-gateway" = "/api/v1"
+"services/*"  = "/svc"             # a glob on the path relative to the workspace root
+"npm-packages" = ""                # an empty value: no prefix for this root
+```
+
+A route is shown with the prefix of the root its file lives under; an exact name or path beats a
+glob, and a root that matches no key keeps `http_prefix` (none if that is unset too). A route is
+still accepted with or without its prefix. `mesh-mcp doctor` warns about a key that matches no
+root.
 
 ---
 
@@ -321,6 +340,21 @@ second, checked at most every 250 ms) rebuild the workspace state in the backgro
 one keeps serving; no restart is needed. A file that does not parse, or whose roots do not
 resolve, is refused: the old state keeps serving, a warning goes to the daemon log
 (`~/.cache/mesh-mcp/logs/meshd-<id>.log`) and `mesh-mcp doctor` shows it under "Daemon config".
+With the file invalid, `doctor` also says that the daemon is still serving its previous config
+(its hash and how long ago it was loaded), or that no daemon is running.
+
+What a reload costs depends on what changed (the daemon log says `display-only`, `partial` or
+`full` with the duration, and `doctor` shows the last one under "Daemon config"):
+
+| Edit | Reload | Work done |
+| :--- | :--- | :--- |
+| `http_prefix`, `[workspace.http_prefixes]`, `name`, `version`, `[engines.policy]` (skills, stop rules, governance), `[engines.docs]` `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback` | display-only | the config is swapped over the running index; no file is read |
+| `[[engines.contracts.patterns]]` added, removed or edited | partial | only the files a changed pattern's `file_pattern` applies to are extracted again (the parse cache answers the tree-sitter part) |
+| anything else (`roots`, `exclude_patterns`, `[engines.contracts.*]` other than patterns, docs `enabled` / `paths` / `sanitize_prompt_injections`, `[cache]`, ...) | full | the workspace is indexed again, reusing the per-file parse cache for every file whose parse inputs did not change |
+
+The check runs when a request arrives, not on a timer: an edit made while no client is talking to
+the daemon is applied by the next request. A reload never serves a half-built index; the old
+state keeps serving until the new one is ready, and a reload that fails keeps the old state.
 
 **Root guard.** With no config file found, the workspace is the current directory. If that is
 `/`, a drive root or your home directory (a client launched with the wrong cwd), `mesh-mcp run`
@@ -563,6 +597,7 @@ Every key below changes behaviour.
 | :--- | :--- |
 | `[workspace]` `name`, `version`, `workspace_root`, `roots`, `exclude_patterns` | **wired** |
 | `[workspace]` `http_prefix` | **wired** — global HTTP route prefix (`"/api/v1"`) shown on routes and accepted optionally when matching |
+| `[workspace.http_prefixes]` | **wired** — per-root override of `http_prefix`, keyed by root directory name, path relative to the workspace root, or a glob on either (7.1.9) |
 | `[workspace.mount_aliases]` | **wired** — translates container bind-mount paths (e.g. `/workspace`) to local host roots |
 | `[engines.docs]` `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` | **wired** — `enabled` toggles doc indexing, `paths` restricts doc scope (`"docs/**"` or `"${workspace_root}/docs/**"`), `fuzzy_fallback` controls full-text fallback |
 | `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` | **wired** |

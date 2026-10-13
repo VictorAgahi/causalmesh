@@ -126,6 +126,14 @@ pub const CONST_VALUE_PREFIX: char = '$';
 /// records when the graph is reconciled. Never becomes an edge by itself.
 pub const HANDLER_REF_PREFIX: char = '@';
 
+/// A parsed [`HANDLER_REF_PREFIX`] record.
+struct HandlerRef<'a> {
+    service: &'a str,
+    method: &'a str,
+    /// `false` when the decorator had no method argument.
+    method_written: bool,
+}
+
 /// `userService` / `userClient` -> `UserService`; anything else -> `None`.
 /// The service a client field is assumed to talk to when nothing binds it.
 pub fn service_from_client_field_name(field: &str) -> Option<String> {
@@ -178,6 +186,10 @@ pub struct GrpcTrace<'g> {
     /// literals resolved to exactly one RPC: the proto RPC name to show in
     /// place of the raw decorator expression.
     pub handler_rpc_names: HashMap<NodeId, CompactStr>,
+    /// The decorator arguments of those handlers as written
+    /// (`USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER`), for the
+    /// "declared as" text. Absent for a handler without a recorded decorator.
+    pub handler_declared_as: HashMap<NodeId, String>,
     /// When the target is a method: callers linked to the method's *service*
     /// (a client constructed for it, `getService<UserServiceClient>(…)`)
     /// without the called method being resolved, in files with no resolved
@@ -1830,12 +1842,23 @@ impl ContractGraph {
                     .map(|name| (h.id, name.clone()))
             })
             .collect();
+        let handler_declared_as = self
+            .rpc_calls
+            .iter()
+            .filter(|(id, _)| self.handler_rpc_names.contains_key(id))
+            .filter(|(id, _)| server_handlers.iter().any(|(h, _)| h.id == *id))
+            .filter_map(|(id, recorded)| {
+                let reference = recorded.strip_prefix(HANDLER_REF_PREFIX)?;
+                Some((*id, Self::declared_as(reference)?))
+            })
+            .collect();
         GrpcTrace {
             target: CompactStr::new(norm_target),
             proto_definition,
             client_stubs,
             server_handlers,
             handler_rpc_names,
+            handler_declared_as,
             service_level_clients,
             related_rpcs,
             files_scanned: self.file_to_nodes.len(),
@@ -1861,7 +1884,8 @@ impl ContractGraph {
                 Some(rpc) => rpc
                     .rsplit_once('.')
                     .map(|(service, method)| (Some(service.to_string()), method.to_string())),
-                None => reference.split_once('|').map(|(service, method)| {
+                None => Self::parse_handler_ref(reference).map(|parsed| {
+                    let (service, method) = (parsed.service, parsed.method);
                     let literal_service = service
                         .starts_with(['\'', '"', '`'])
                         .then(|| unquote(service))
@@ -1877,6 +1901,48 @@ impl ContractGraph {
             }
         }
         out
+    }
+
+    /// The one parser of a [`HANDLER_REF_PREFIX`] record (the text after the
+    /// prefix): `service|method`, with a trailing `|~` when the method argument
+    /// was not written and `method` is the one NestJS derives from the decorated
+    /// method's name.
+    fn parse_handler_ref(reference: &str) -> Option<HandlerRef<'_>> {
+        let (service, rest) = reference.split_once('|')?;
+        let mut parts = rest.split('|');
+        let method = parts.next()?;
+        let method_written = parts.next() != Some("~");
+        Some(HandlerRef {
+            service,
+            method,
+            method_written,
+        })
+    }
+
+    /// The decorator arguments of a [`HANDLER_REF_PREFIX`] record as they were
+    /// written: `service, method`, or the service alone when the method was
+    /// not written. Truncated to 120 characters. `None` when nothing was written.
+    fn declared_as(reference: &str) -> Option<String> {
+        const MAX: usize = 120;
+        let HandlerRef {
+            service,
+            method,
+            method_written,
+        } = Self::parse_handler_ref(reference)?;
+        let text = match (service.is_empty(), method_written) {
+            (true, true) => method.to_string(),
+            (true, false) => return None,
+            (false, true) => format!("{service}, {method}"),
+            (false, false) => service.to_string(),
+        };
+        if text.is_empty() {
+            return None;
+        }
+        if text.chars().count() > MAX {
+            let cut: String = text.chars().take(MAX).collect();
+            return Some(format!("{cut}..."));
+        }
+        Some(text)
     }
 
     /// Resolves every [`HANDLER_REF_PREFIX`] record to `Service.Method` when
@@ -1905,11 +1971,12 @@ impl ContractGraph {
             return out;
         }
         for (id, recorded) in refs {
-            let (Some(node), Some((service_expr, method_expr))) =
-                (self.nodes.get(&id), recorded.split_once('|'))
+            let (Some(node), Some(parsed)) =
+                (self.nodes.get(&id), Self::parse_handler_ref(recorded))
             else {
                 continue;
             };
+            let (service_expr, method_expr) = (parsed.service, parsed.method);
             let (Some(service), Some(method)) = (
                 Self::resolve_literal_expr(service_expr, node.repo_id, &consts),
                 Self::resolve_literal_expr(method_expr, node.repo_id, &consts),
@@ -3212,6 +3279,60 @@ impl ContractGraph {
             node.docstring
         ])
         .to_string()
+    }
+}
+
+#[cfg(test)]
+mod handler_ref_tests {
+    use super::*;
+
+    #[test]
+    fn declared_as_shows_only_what_was_written() {
+        assert_eq!(ContractGraph::declared_as("S|M").as_deref(), Some("S, M"));
+        assert_eq!(
+            ContractGraph::declared_as("S|'Derived'|~").as_deref(),
+            Some("S")
+        );
+        assert_eq!(ContractGraph::declared_as("|M").as_deref(), Some("M"));
+        // `@GrpcMethod()`: nothing was written, so nothing is shown.
+        assert_eq!(ContractGraph::declared_as("|'Derived'|~"), None);
+    }
+
+    #[test]
+    fn served_methods_of_unresolved_handlers_ignore_the_marker() {
+        let mut graph = ContractGraph::new();
+        graph.rpc_calls.push((
+            1,
+            format!("{HANDLER_REF_PREFIX}'UserService'|'AddBadge'|~").into(),
+        ));
+        graph.rpc_calls.push((
+            2,
+            format!("{HANDLER_REF_PREFIX}UNKNOWN_SERVICE|'AddBadge'|~").into(),
+        ));
+        graph
+            .rpc_calls
+            .push((3, format!("{HANDLER_REF_PREFIX}'S'|'Other'").into()));
+        let served = graph.handler_served_methods();
+        let method = fold_rpc_name("AddBadge");
+        assert_eq!(
+            served.get(&1),
+            Some(&(Some("UserService".to_string()), method.clone()))
+        );
+        assert_eq!(served.get(&2), Some(&(None, method)));
+        assert_eq!(
+            served.get(&3),
+            Some(&(Some("S".to_string()), fold_rpc_name("Other")))
+        );
+    }
+
+    #[test]
+    fn the_marker_is_never_part_of_the_method() {
+        let parsed = ContractGraph::parse_handler_ref("UNKNOWN|'AddBadge'|~").expect("parse");
+        assert_eq!(parsed.service, "UNKNOWN");
+        assert_eq!(parsed.method, "'AddBadge'");
+        assert!(!parsed.method_written);
+        let written = ContractGraph::parse_handler_ref("'S'|'M'").expect("parse");
+        assert!(written.method_written);
     }
 }
 

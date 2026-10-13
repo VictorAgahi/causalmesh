@@ -255,11 +255,7 @@ impl CompiledPattern {
     pub fn compile(cfg: &CustomPatternConfig) -> Result<Self, regex::Error> {
         Ok(Self {
             kind: cfg.kind,
-            file_needle: cfg.file_pattern.as_deref().map(|fp| {
-                fp.trim_start_matches('*')
-                    .trim_start_matches('.')
-                    .to_string()
-            }),
+            file_needle: cfg.file_needle(),
             regex: regex::Regex::new(&cfg.regex)?,
             target_group: cfg.target_group,
             consumer_group: cfg.consumer_group,

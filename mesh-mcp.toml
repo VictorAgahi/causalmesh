@@ -24,6 +24,15 @@ roots = [
 # `analyze_impact` and `visualize_mesh` display routes with it prepended and accept a route
 # query with or without it (`GET /events/:id` and `GET /api/v1/events/:id` both match).
 # http_prefix = "/api/v1"
+#
+# Per-root prefixes, for roots that do not share one (a shared npm-packages root next to the API
+# gateway). Keys are a root directory name, a path relative to the workspace root, or a glob on
+# either. A root matching no key keeps `http_prefix`; an empty value means no prefix for that
+# root. `mesh-mcp doctor` warns about a key that matches no root. It is a table of its own, so
+# it goes after every plain `[workspace]` key:
+# [workspace.http_prefixes]
+# "api-gateway" = "/api/v1"
+# "services/*"  = "/svc"
 
 exclude_patterns = [
   "**/.env*",

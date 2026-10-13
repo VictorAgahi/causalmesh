@@ -108,7 +108,10 @@ fragment-only route hit (`/state`) never replaces the symbol results of the same
 only when no symbol matches. Test code is judged on the path relative to its workspace root, so a
 checkout living under a directory named `testing` or `e2e` keeps its routes visible. The
 workspace key `http_prefix` (see below) is accepted with or without in the query and prepended
-when displayed. Routes built at runtime (a path assembled from variables, `setGlobalPrefix`
+when displayed; `[workspace.http_prefixes]` overrides it per root (keyed by root directory name,
+path relative to the workspace root, or a glob on either), so a route is shown, and matched with
+or without, the prefix of the root its file lives under, and a root listed nowhere keeps
+`http_prefix`. Routes built at runtime (a path assembled from variables, `setGlobalPrefix`
 read from an environment variable) are not in the graph.
 
 Line numbers (`L<start>-L<end>`) are original-file coordinates: an indexed hit is anchored on
@@ -378,6 +381,17 @@ the top of the result names the file. Several matches are listed: with an explic
 call fails with `-32602` and the list, without one the trace is kept and the check is skipped with
 the list. No match lists the closest files by name. A path with `..`, an absolute path and anything
 outside the roots never reaches this search: the jail and its `-32602` are unchanged.
+
+**Canonical copies (7.1.9).** When several files match and `[engines.contracts.grpc] proto_dirs`
+is configured, the candidates under a `proto_dirs` entry are the canonical ones. Exactly one: it
+is used, the `### Resolved path` heading says so and lists the other copies as "Also found, not
+used" (a generated package copy tracked in Git, for example). Several: only those are listed.
+None, or no `proto_dirs`: unchanged. A bare file name is still never auto-resolved.
+
+**Server handlers.** A handler whose `@GrpcMethod(SERVICE, ENUM.MEMBER)` arguments resolved to
+a proto RPC is shown as `Service.Method` followed by the decorator arguments as written
+(for example `UserService.AddBadgeToUser (declared as USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`),
+cut at 120 characters.
 
 **Base.** An explicit `base` is resolved with `git rev-parse --verify --end-of-options <base>^{commit}`.
 Without `base`, the first existing ref of `origin/HEAD` → `origin/main` → `main` is taken and the

@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 /// Crawl depth used for every full workspace scan.
 pub const SCAN_DEPTH: usize = 10;
 
+/// A file the guards refused for a reason only its bytes decide, with the
+/// `(mtime_nanos, size)` it had before it was read.
+type StableReject = (PathBuf, (u128, u64));
+
 /// Why `process_file` never produced a fragment for a file — a deliberate,
 /// counted policy rejection (see `IndexHealth`), distinct from
 /// `FileIndex::parse_failed`, which means the file passed every one of these
@@ -363,7 +367,8 @@ impl WorkspaceIndexer {
             config_fingerprint,
         };
 
-        let (fragments, health) = Self::run_scan_pass(files, roots, &scan_cfg, pool);
+        let (fragments, health, stable_rejects) =
+            Self::run_scan_pass(files, roots, &scan_cfg, pool);
 
         let mut snapshot = MeshSnapshot {
             doc_index: Self::doc_index_for(config),
@@ -372,6 +377,9 @@ impl WorkspaceIndexer {
             ..MeshSnapshot::default()
         };
         let mut vfs = vfs;
+        if let Some(vfs) = vfs.as_deref_mut() {
+            Self::note_stable_rejects(vfs, &stable_rejects);
+        }
         for frag in fragments {
             if let Some(vfs) = vfs.as_deref_mut() {
                 vfs.upsert(&frag.path, frag.signature.clone());
@@ -441,7 +449,7 @@ impl WorkspaceIndexer {
         roots: &[PathBuf],
         scan_cfg: &ScanConfig,
         pool: Option<&BackgroundRescanEngine>,
-    ) -> (Vec<FileFragment>, IndexHealth) {
+    ) -> (Vec<FileFragment>, IndexHealth, Vec<StableReject>) {
         let work = || {
             files
                 .par_iter()
@@ -449,10 +457,16 @@ impl WorkspaceIndexer {
                     let root = roots
                         .get(*repo_id as usize)
                         .map_or(path.as_path(), |r| r.as_path());
+                    // The stat a refusal is remembered by is the one from before the
+                    // file is read: a file fixed during the pass then differs from it.
+                    let stat = std::fs::metadata(path)
+                        .ok()
+                        .map(|m| DifferentialVfs::stat_of(&m));
                     (
                         *repo_id,
                         path.clone(),
                         Self::process_file(path, *repo_id, root, scan_cfg),
+                        stat,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -466,14 +480,22 @@ impl WorkspaceIndexer {
         health.record_scanned(results.len());
         let mut fragments = Vec::with_capacity(results.len());
         let mut needs_retry: Vec<(RepoId, PathBuf)> = Vec::new();
-        for (repo_id, path, outcome) in results {
+        let mut stable_rejects: Vec<StableReject> = Vec::new();
+        for (repo_id, path, outcome, stat) in results {
             match outcome {
                 Ok(frag) if frag.code.parse_failed => needs_retry.push((repo_id, path)),
                 Ok(frag) => {
                     health.record_indexed();
                     fragments.push(frag);
                 }
-                Err(reason) => Self::record_rejection(&mut health, reason, path),
+                Err(reason) => {
+                    // A read error may be transient; the other refusals are a
+                    // function of the file's bytes alone.
+                    if let (false, Some(stat)) = (matches!(reason, RejectKind::ReadError), stat) {
+                        stable_rejects.push((path.clone(), stat));
+                    }
+                    Self::record_rejection(&mut health, reason, path);
+                }
             }
         }
 
@@ -517,7 +539,7 @@ impl WorkspaceIndexer {
         }
 
         health.normalize_rejected();
-        (fragments, health)
+        (fragments, health, stable_rejects)
     }
 
     /// Counts a rejection and remembers the file by path (plan 4 step 4.1), so a
@@ -558,6 +580,14 @@ impl WorkspaceIndexer {
         health.record_rejected_file_detail(path, reason, size, detail);
     }
 
+    /// Remembers the stat of every file the guards refused for a reason that only
+    /// its bytes decide, so a later differential reload does not read it again.
+    fn note_stable_rejects(vfs: &mut DifferentialVfs, rejects: &[StableReject]) {
+        for (path, stat) in rejects {
+            vfs.note_rejected(path, *stat);
+        }
+    }
+
     /// Size on disk for a rejection record; 0 when the file can no longer be stat'ed.
     fn file_size(path: &Path) -> u64 {
         std::fs::metadata(path).map_or(0, |m| m.len())
@@ -581,6 +611,22 @@ impl WorkspaceIndexer {
     /// state, which already reflects whatever the first pass just did (idempotence
     /// invariant I2).
     pub fn reload(state: &AppState) {
+        Self::reload_with(state, Some(&state.rescan), None);
+    }
+
+    /// [`Self::reload`] with the pool choice and a forced set made explicit.
+    ///
+    /// `pool` is the Rayon pool the re-extraction runs on: the QoS-background one
+    /// (`Some(&state.rescan)`) for a reload nobody waits on, `None` (the global
+    /// pool, normal priority) when a caller is waiting for the result. On a busy
+    /// machine background QoS threads are starved, so a reload on the config-swap
+    /// path must not use them. `force` names files to re-extract and re-fold even
+    /// though their bytes are unchanged (a changed custom pattern governs them).
+    pub fn reload_with(
+        state: &AppState,
+        pool: Option<&BackgroundRescanEngine>,
+        force: Option<&(dyn Fn(&Path) -> bool + Sync)>,
+    ) {
         let _guard = state
             .reload_lock
             .lock()
@@ -589,7 +635,7 @@ impl WorkspaceIndexer {
         let roots = &state.allowed_roots;
         let files = Self::crawl_all(config, roots);
 
-        let vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
         // Deleted: tracked by the VFS but no longer on disk. Only a full crawl's
         // complete file surface can answer this by set difference — a targeted,
         // path-driven reload (`reload_paths`) instead knows about a deletion
@@ -600,6 +646,10 @@ impl WorkspaceIndexer {
             .filter(|p| !present.contains(p))
             .map(Path::to_path_buf)
             .collect();
+        // The refusal memo follows the crawl too: a deleted file (or one that fell
+        // out of the capped rejected list) must not stay in it, or a path recreated
+        // with the same mtime and size would be taken for the file that was refused.
+        vfs.retain_rejected(|p| present.contains(p));
         drop(vfs);
         // A rejected file never enters the VFS, so the sweep above cannot see it
         // vanish; its entry in the rejected list must still go (plan 4 step 4.1).
@@ -614,7 +664,7 @@ impl WorkspaceIndexer {
                 .map(|r| r.path.clone()),
         );
 
-        Self::apply_incremental(state, "VFS differential", files, deleted);
+        Self::apply_incremental(state, "VFS differential", files, deleted, pool, force);
     }
 
     /// Targeted reload driven directly by the file watcher's own reported paths —
@@ -747,7 +797,14 @@ impl WorkspaceIndexer {
             .reload_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::apply_incremental(state, "Targeted", candidates, deleted);
+        Self::apply_incremental(
+            state,
+            "Targeted",
+            candidates,
+            deleted,
+            Some(&state.rescan),
+            None,
+        );
     }
 
     /// The `root` in `roots` that most specifically contains `path` (the longest
@@ -790,6 +847,8 @@ impl WorkspaceIndexer {
         label: &str,
         files: Vec<(RepoId, PathBuf)>,
         deleted: Vec<PathBuf>,
+        pool: Option<&BackgroundRescanEngine>,
+        force: Option<&(dyn Fn(&Path) -> bool + Sync)>,
     ) {
         let config = &state.config;
         let roots = &state.allowed_roots;
@@ -805,7 +864,7 @@ impl WorkspaceIndexer {
         let mut candidates: Vec<(RepoId, PathBuf)> = files
             .par_iter()
             .filter(|(_, p)| match std::fs::metadata(p) {
-                Ok(m) => !vfs.is_unchanged_fast(p, &m),
+                Ok(m) => !vfs.is_unchanged_fast(p, &m) && !vfs.is_rejection_unchanged(p, &m),
                 Err(_) => false,
             })
             .map(|(r, p)| (*r, p.clone()))
@@ -833,7 +892,17 @@ impl WorkspaceIndexer {
         // An alias config edit changes what the scripts it governs import without
         // touching those files: they are re-extracted, and folded in even though their
         // own bytes are unchanged.
-        let forced = Self::alias_governed_scripts(state, &vfs, roots, &candidates, &deleted);
+        let mut forced = Self::alias_governed_scripts(state, &vfs, roots, &candidates, &deleted);
+        if let Some(force) = force {
+            let known: HashSet<&Path> = forced.iter().map(|(_, p)| p.as_path()).collect();
+            let extra: Vec<(RepoId, PathBuf)> = files
+                .iter()
+                .filter(|(_, p)| force(p) && !known.contains(p.as_path()))
+                .cloned()
+                .collect();
+            drop(known);
+            forced.extend(extra);
+        }
         let forced_paths: HashSet<PathBuf> = forced.iter().map(|(_, p)| p.clone()).collect();
         let already: HashSet<PathBuf> = candidates.iter().map(|(_, p)| p.clone()).collect();
         for (repo_id, path) in forced {
@@ -847,6 +916,14 @@ impl WorkspaceIndexer {
             return;
         }
 
+        tracing::debug!(
+            target: "mesh::indexer",
+            "{label}: re-extracting {} candidate file(s) ({} forced), {} deleted, on the {} pool.",
+            candidates.len(),
+            forced_paths.len(),
+            deleted.len(),
+            if pool.is_some() { "background" } else { "global" }
+        );
         let doc_template = state.snapshot().doc_index.clone_settings();
         // The workspace's persistent cache, when attached (plan 4 step 4.4): a branch
         // switch back to already-seen content is a lookup instead of a re-parse, and
@@ -860,8 +937,9 @@ impl WorkspaceIndexer {
             cache: state.index_cache.get(),
             config_fingerprint: Self::config_fingerprint(&extract_cfg),
         };
-        let (fragments, pass_health) =
-            Self::run_scan_pass(&candidates, roots, &scan_cfg, Some(&state.rescan));
+        let (fragments, pass_health, stable_rejects) =
+            Self::run_scan_pass(&candidates, roots, &scan_cfg, pool);
+        Self::note_stable_rejects(&mut vfs, &stable_rejects);
 
         // A file whose parse still fails after `run_scan_pass`'s retry keeps its last
         // known-good facts: it is excluded here, *before* the VFS is touched, so its
@@ -1046,7 +1124,7 @@ impl WorkspaceIndexer {
     /// Builds the doc index from `[engines.docs]` so aliases, stop words and the
     /// phrase boost configured by the user actually apply. A default-constructed
     /// `DocIndex` silently ignores all of them.
-    fn doc_index_for(config: &Config) -> DocIndex {
+    pub fn doc_index_for(config: &Config) -> DocIndex {
         match config.engines.docs.as_ref() {
             Some(docs) => DocIndex::new(
                 docs.aliases.clone(),
@@ -1662,7 +1740,14 @@ mod tests {
         // already-deleted (as `reload_paths` would if its earlier stat had
         // raced a delete), but the file is actually back on disk by the time
         // this runs — exactly as it would be after a real resurrection.
-        WorkspaceIndexer::apply_incremental(&state, "Test", Vec::new(), vec![a_path]);
+        WorkspaceIndexer::apply_incremental(
+            &state,
+            "Test",
+            Vec::new(),
+            vec![a_path],
+            Some(&state.rescan),
+            None,
+        );
 
         let view = state.snapshot();
         assert_eq!(
@@ -1844,6 +1929,121 @@ mod tests {
         assert_eq!(view.generation, 2);
         assert_eq!(view.property_registry.get("app.a.name"), Some("a-value"));
         assert_eq!(view.property_registry.get("app.b.name"), None);
+    }
+
+    /// A file the guards refuse (here a 3 KB line) is not read again by a
+    /// differential reload while its stat is unchanged, and is again once it moves.
+    /// Reading it again on every reload is what made a config reload on a
+    /// workspace with many such files crawl behind the QoS-background pool.
+    #[test]
+    fn a_guard_rejected_file_is_not_reprocessed_until_it_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let long = root.join("bundle.ts");
+        std::fs::write(&long, format!("export const a = '{}';\n", "x".repeat(3000)))
+            .expect("write");
+        std::fs::write(root.join("ok.ts"), "export class Fine {}\n").expect("write ok");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.snapshot().health.rejected.len(), 1);
+        {
+            let vfs = state.vfs.lock().expect("vfs");
+            let meta = std::fs::metadata(&long).expect("meta");
+            assert!(vfs.is_rejection_unchanged(&long, &meta));
+        }
+
+        // Nothing moved: the reload finds no candidate, the snapshot is untouched.
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert_eq!(view.generation, 1);
+        assert_eq!(view.health.rejected.len(), 1);
+        drop(view);
+
+        // Fixed on disk: it is picked up and indexed, no longer rejected.
+        std::fs::write(&long, "export class Bundle {}\n").expect("fix");
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert!(
+            view.health.rejected.is_empty(),
+            "{:?}",
+            view.health.rejected
+        );
+        assert!(view
+            .contract_graph
+            .all_nodes()
+            .any(|n| n.name.as_str() == "Bundle"));
+    }
+
+    /// A refused file that is deleted leaves nothing in the refusal memo, so the
+    /// same path recreated with the same size and mtime but fixed content is
+    /// indexed instead of being taken for the file that was refused.
+    #[test]
+    fn a_recreated_path_with_the_same_stat_is_not_hidden_by_a_stale_refusal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let path = root.join("bundle.ts");
+        let long = format!("export const a = '{}';\n", "x".repeat(3000));
+        std::fs::write(&path, &long).expect("write");
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        assert_eq!(state.vfs.lock().expect("vfs").rejected_len(), 1);
+
+        std::fs::remove_file(&path).expect("rm");
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            state.vfs.lock().expect("vfs").rejected_len(),
+            0,
+            "memo pruned"
+        );
+
+        // Same size, same mtime, but lines short enough to pass the guards.
+        let mut fixed = String::from("export class Recreated {}\n");
+        while fixed.len() < long.len() {
+            fixed.push('\n');
+        }
+        fixed.truncate(long.len());
+        std::fs::write(&path, &fixed).expect("recreate");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("restore mtime");
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert!(
+            view.health.rejected.is_empty(),
+            "{:?}",
+            view.health.rejected
+        );
+        assert!(view
+            .contract_graph
+            .all_nodes()
+            .any(|n| n.name.as_str() == "Recreated"));
     }
 
     /// `[engines.contracts.spring]` `property_files` / `auto_redact_secrets` /

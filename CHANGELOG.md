@@ -5,6 +5,81 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.9] — 2026-10-12
+
+Generic fixes from a QA run of 7.1.8 on a 16-root workspace (3565 files). The headline is the
+daemon's config reload latency, whose cause was measured before it was changed.
+
+### Fixed
+- A config edit took tens of seconds to minutes to be served by `meshd` on a busy machine
+  (12 to 34 s for a declarative pattern, about 3.5 minutes for the display-only `http_prefix`),
+  against 0.5 s on a quiet one. Measured on a synthetic 4000-file, 8-root corpus with 320 files
+  the guards refuse: a reload took 0.8 s idle and 65 to 68 s with the CPUs saturated, the whole
+  difference being the closing differential reload of the new state. That reload ran on the
+  QoS-background pool (`QOS_CLASS_BACKGROUND`, starved on a busy machine), and it re-read every
+  file the guards had refused (too big, binary, a line over 1024 bytes, nesting) on every
+  reload, because a refused file never entered the VFS and so always looked changed. Both are
+  fixed: a refused file is remembered with the stat it had before it was read (so a file fixed
+  during a scan is not hidden) and is read again only once its mtime or size moves, the memo is
+  pruned against every crawl, and the closing reload of a replacing state, which a request is
+  waiting for, runs on a dedicated pool at an intermediate priority (`QOS_CLASS_UTILITY` on macOS,
+  `nice(5)` on Linux, below-normal on Windows) instead of the watcher's background pool
+  (`QOS_CLASS_BACKGROUND` / `nice(10)`, unchanged for watcher-triggered rescans). Same corpus, same
+  saturation: a display-only edit is served in about 135-195 ms and a new root in about 0.6 s.
+  A pattern edit whose `file_pattern` selects every one of the 3680 files re-extracts them all:
+  0.7 s on the normal pool, 2.6-5.2 s on the utility pool, and more than 3 minutes on the
+  background pool (not finished when the run ended). The check itself still runs only when a
+  request arrives (there is no timer), so an edit made while no client talks to the daemon is
+  applied by the next request; SETUP.md says so.
+- `doctor` with a config that does not parse reported the parse error and nothing about the
+  running daemon. It now also says the daemon is still serving its previous config (that
+  config's hash and how long ago it was loaded), or that no daemon is running.
+- `analyze_grpc` with a relative `.proto` target matching several files (the canonical file
+  under `[engines.contracts.grpc] proto_dirs` and a generated package copy tracked in Git) is no
+  longer ambiguous when exactly one candidate is under a `proto_dirs` entry: it resolves to that
+  one, says so, and lists the other copies as "also found, not used". When several are under
+  `proto_dirs` only those are listed. With no `proto_dirs`, or none of the candidates under it,
+  nothing changes. The bare-name, jail and case-insensitive-extension safeguards are untouched.
+- The gRPC handler line showed `declared as USER_SERVICE_NAME.ADD_BADGE_TO_USER` for
+  `@GrpcMethod(USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER)`: the service
+  expression and the method member were recombined. It now prints the decorator arguments as
+  written (`USER_SERVICE_NAME, USER_COMMAND_METHODS.ADD_BADGE_TO_USER`), cut at 120 characters.
+
+- A `partial` or `display-only` reload no longer skips its catch-up (and so serves stale pattern
+  facts) when the file watcher cannot be started; a watcher failure only loses live watching.
+- Classifying a config edit now fails closed: every config struct is destructured field by field,
+  so a new key is a compile error until it is classified, and a test changes each
+  serialised key in turn and checks the resulting kind. `[engines.policy]` (including
+  `read_governance_mode` and `enabled`) is display-only because `AppState::new` rebuilds the
+  governance engine from the new config and nothing in it reaches the index.
+- `analyze_grpc` decides "under `proto_dirs`" by path components relative to the candidate's root
+  (or the workspace root), never as text on the absolute path: a checkout in `/home/me/proto-work`
+  no longer makes every candidate canonical, and `registry-proto` is not `registry`.
+- "declared as" for `@GrpcMethod()` with no written argument shows nothing instead of the method
+  name NestJS derives; the handler record parser is shared by all three users and understands the
+  `|~` marker everywhere (the unresolved-handler fallback used to keep it in the method name). The
+  index cache schema version is bumped (11) so no record of the older shape is reused.
+
+### Added
+- A config edit is classified by what it costs. Display-only keys (`http_prefix`,
+  `[workspace.http_prefixes]`, `name`, `version`, `[engines.policy]`, and the query-time docs keys
+  `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`) swap the config over the running
+  index with no file read. A changed `[[engines.contracts.patterns]]` re-extracts only the files
+  the changed pattern's `file_pattern` applies to (the per-file parse cache never held pattern
+  results, so it was already valid). Everything else rebuilds the index, reusing the parse cache
+  for every file whose parse inputs did not change. In every case the old state serves until the
+  new one is ready and a failing reload keeps the old state. The daemon logs the reload start,
+  kind (`display-only` / `partial` / `full`) and duration to stderr, and `doctor` shows
+  "last reload: kind, duration, age" under "Daemon config". Tests compare the incremental
+  and partial results with a full rebuild by snapshot fingerprint.
+- `[workspace.http_prefixes]`, an optional per-root override of `http_prefix`, keyed by root
+  directory name, by path relative to the workspace root, or by a glob on either. A route is shown
+  with the prefix of the root its file lives under and is still accepted with or without it;
+  roots not listed keep `http_prefix`, an empty value removes the prefix for that root, and
+  with neither set no prefix is shown. The table is strict (string values only). `doctor` warns
+  about a key that matches no root. Documented in SETUP.md, the annotated `mesh-mcp.toml` and
+  `docs/mcp-tools.md`.
+
 ## [7.1.8] — 2026-10-12
 
 Generic fixes from a field report. One behaviour change (declarative pattern confidence) is

@@ -1990,6 +1990,12 @@ impl ContractGraph {
         if refs.is_empty() {
             return out;
         }
+        // One pass over the proto methods, not one per handler reference: a
+        // reload re-runs this over every handler in the workspace.
+        let mut by_name: HashMap<&str, Vec<NodeId>> = HashMap::with_capacity(proto_methods.len());
+        for (pid, n) in proto_methods {
+            by_name.entry(n.as_str()).or_default().push(*pid);
+        }
         for (id, recorded) in refs {
             let (Some(node), Some(parsed)) =
                 (self.nodes.get(&id), Self::parse_handler_ref(recorded))
@@ -2014,15 +2020,15 @@ impl ContractGraph {
             // the name be unique. Counting before filtering left a fully-qualified
             // handler unresolved whenever two packages declare the same
             // `Service.Method`.
-            let declared_here = proto_methods
-                .iter()
-                .filter(|(pid, n)| {
-                    n.as_str() == name
-                        && qualifier.is_none_or(|q| {
+            let declared_here = by_name.get(name.as_str()).map_or(0, |ids| {
+                ids.iter()
+                    .filter(|pid| {
+                        qualifier.is_none_or(|q| {
                             self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
                         })
-                })
-                .count();
+                    })
+                    .count()
+            });
             if declared_here != 1 {
                 continue;
             }
@@ -3442,6 +3448,46 @@ mod handler_ref_tests {
             served.get(&3),
             Some(&(Some("S".to_string()), fold_rpc_name("Other")))
         );
+    }
+
+    #[test]
+    fn a_package_qualifier_picks_one_of_two_same_named_rpcs() {
+        let node = |name: &str, pkg: &str, kind: NodeKind| ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind,
+            file_path: FilePath::from(Path::new("f")),
+            line_start: 1,
+            line_end: 1,
+            package: CompactStr::new(pkg),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let mut graph = ContractGraph::new();
+        let proto_a = graph.add_node(node("UserService.Get", "a.v1", NodeKind::GrpcMethod));
+        let proto_b = graph.add_node(node("UserService.Get", "b.v1", NodeKind::GrpcMethod));
+        let qualified = graph.add_node(node("h1", "", NodeKind::ServiceClass));
+        let bare = graph.add_node(node("h2", "", NodeKind::ServiceClass));
+        graph.rpc_calls.push((
+            qualified,
+            format!("{HANDLER_REF_PREFIX}'a.v1.UserService'|'Get'").into(),
+        ));
+        graph.rpc_calls.push((
+            bare,
+            format!("{HANDLER_REF_PREFIX}'UserService'|'Get'").into(),
+        ));
+        let methods = vec![
+            (proto_a, CompactStr::new("UserService.Get")),
+            (proto_b, CompactStr::new("UserService.Get")),
+        ];
+        let resolved = graph.resolve_handler_rpc_names(&methods);
+        assert_eq!(
+            resolved.get(&qualified).map(CompactStr::as_str),
+            Some("UserService.Get")
+        );
+        // Without a qualifier the name is declared twice: ambiguous, left out.
+        assert!(!resolved.contains_key(&bare));
     }
 
     #[test]

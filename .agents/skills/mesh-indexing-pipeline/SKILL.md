@@ -67,7 +67,15 @@ the wrong place.
 - **Differential VFS**: [`crates/mesh-core/src/vfs.rs`](../../../crates/mesh-core/src/vfs.rs)
   - `DifferentialVfs::is_unchanged_fast(path, metadata)`, `compute_signature`, `upsert`, `tracked_paths`, `remove`
 - **Background pool**: [`crates/mesh-core/src/rescan.rs`](../../../crates/mesh-core/src/rescan.rs)
-  - `BackgroundRescanEngine::install(op)`, `::spawn(task)`, `::thread_count()`
+  - `BackgroundRescanEngine::new()` (`RescanPriority::Background`, watcher rescans),
+    `::with_priority(RescanPriority::Utility)` (config-driven reload a request waits for, built by
+    `WorkspaceHost` in `crates/mesh-daemon/src/host.rs`), `::install(op)`, `::spawn(task)`,
+    `::thread_count()`
+- **Config-driven reload**: [`crates/mesh-core/src/reload_kind.rs`](../../../crates/mesh-core/src/reload_kind.rs)
+  (`ReloadKind` = `DisplayOnly` / `Partial` / `Full`, `ReloadPlan::forces(path)`: what a config edit
+  costs) and [`crates/mesh-core/src/config_watch.rs`](../../../crates/mesh-core/src/config_watch.rs)
+  (hash of the config file the daemon follows). Guard-refused files are remembered with the stat
+  they had before the read and re-read only when mtime or size moves (`indexer.rs`).
 - **Watcher**: [`crates/mesh-core/src/watcher.rs`](../../../crates/mesh-core/src/watcher.rs) (debounce, coalescing, one recursive FSEvents stream per root on macOS, per-directory watches elsewhere, in-memory ignore filter), `crates/mesh-core/src/watcher/git.rs` (Git gate: holds reloads during checkout/rebase, plan 4 step 4.2) and [`crates/mesh-server/src/watcher.rs`](../../../crates/mesh-server/src/watcher.rs) (binds `WorkspaceIndexer::reload_paths` as the `ReloadFn`)
 
 ---
@@ -146,7 +154,9 @@ nothing else is running, so background-priority threads only make the wait longe
 doc comment on `build_snapshot` records this as the reason. `reload` runs behind a live
 IDE, where the cost that matters is keystroke latency, so it goes through
 `BackgroundRescanEngine::install`, whose `start_handler` sets `QOS_CLASS_BACKGROUND` on
-macOS and `setpriority(..., 10)` on Linux (Commandment 7). `install` is what makes the
+macOS and `setpriority(..., 10)` on Linux (Commandment 7). The one reload a request is blocked on,
+the closing reload after a config edit in `meshd`, runs on a pool at `RescanPriority::Utility`
+(`QOS_CLASS_UTILITY`, `setpriority(..., 5)`) so a busy machine cannot starve it. `install` is what makes the
 `par_iter` *inside* the closure run on those threads; `spawn` alone would only move the
 outer task.
 

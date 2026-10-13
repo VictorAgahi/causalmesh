@@ -20,7 +20,13 @@ newline corrupts the JSON-RPC stream for the whole session.
   - `MPSC_BUFFER_CAPACITY = 64`
 - **Event loop & method table**: [`crates/mesh-server/src/lib.rs`](../../../crates/mesh-server/src/lib.rs)
   (`run_server`, `respond`: `initialize`, `ping`, `tools/list`, `tools/call`; notifications are
-  classified by `protocol::classify` and never answered)
+  classified by `protocol::classify` and never answered). The `initialize` result carries
+  `instructions` (`MCP_SERVER_INSTRUCTIONS`): which tool answers which question, framed as a
+  verifiable starting point (imperative "MANDATORY / do NOT verify" wording was rejected by agents
+  in 7.0.18 and is banned by a test), a 0 scoped to literal call sites in the indexed roots, and
+  the `ToolSearch select:` line for deferred-loading clients. A refusing server
+  (`run_refusing_server`, degenerate workspace root) answers `initialize` with the reason and every
+  `tools/call` with a tool error.
 - **Wire types**: [`crates/mesh-server/src/protocol.rs`](../../../crates/mesh-server/src/protocol.rs)
   - `JsonRpcRequest`, `JsonRpcResponse::success/error`, `JsonRpcError`, `classify` → `Incoming`
   - `RequestMeta { traceparent, tracestate }`, `RequestMeta::extract_trace_id()`

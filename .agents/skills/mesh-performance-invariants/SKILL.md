@@ -167,8 +167,10 @@ The three indices live in one `MeshSnapshot` so a reader cannot observe a new
 Disk, tree-sitter and SQLite work runs either in `spawn_blocking` (`ToolRegistry::invoke`)
 or on the Rayon pools. `McpTool::run` is synchronous for that reason. Background rescans
 go through `BackgroundRescanEngine`, whose threads are `QOS_CLASS_BACKGROUND` on macOS,
-`nice 10` on Linux and below-normal priority on Windows (Commandment 7); use `install` when the closure itself contains a
-`par_iter`, `spawn` when it does not.
+`nice 10` on Linux and below-normal priority on Windows (Commandment 7). A reload that a request
+is waiting for (the daemon applying a config edit) uses `RescanPriority::Utility`
+(`QOS_CLASS_UTILITY` / `nice 5`), because the background class is starved on a busy machine.
+Use `install` when the closure itself contains a `par_iter`, `spawn` when it does not.
 
 ### 2.10 Parallel extraction, sequential fold
 

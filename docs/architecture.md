@@ -1,5 +1,10 @@
 # MeshMCP Architecture
 
+> **Two ways in.** This page is the single-file *reference*: every constant, timeout and edge case.
+> For a step-by-step explanation that does not assume Rust, start with the
+> [architecture guide](architecture/README.md) (eight short chapters from "what problem" to "reading
+> the code"). What each language contributes: [parser-support.md](parser-support.md).
+
 This document describes how MeshMCP is built: the crates, the snapshot model, the indexing
 pipeline and its guards, the path jail, the transport, the daemon, the parse cache, the Linux
 network sandbox and the audit trail. Statements here are checked against the code; measured
@@ -237,13 +242,18 @@ entirely on how much of it is function bodies; no general percentage is claimed.
 ### 8.0 Thread priority and file watching
 
 The boot scan runs on the global Rayon pool at normal priority (the user is waiting for it).
-Incremental reloads run on `BackgroundRescanEngine`, a dedicated Rayon pool whose threads lower
-their own priority:
+Incremental reloads run on `BackgroundRescanEngine` (`crates/mesh-core/src/rescan.rs`), a dedicated
+Rayon pool whose threads lower their own priority. It comes in two priorities
+(`RescanPriority`):
 
-- **macOS**: `pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)`.
-- **Linux**: `setpriority(PRIO_PROCESS, 0, 10)`.
-- **Windows**: `SetThreadPriority(.., THREAD_PRIORITY_BELOW_NORMAL)`, then
-  `THREAD_MODE_BACKGROUND_BEGIN` (the latter alone does not change the reported CPU priority).
+| | `Background` (watcher-triggered rescans, nobody waits) | `Utility` (config-driven reload of a replacing state, a request waits) |
+| :--- | :--- | :--- |
+| macOS | `pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)` | `QOS_CLASS_UTILITY` |
+| Linux | `setpriority(PRIO_PROCESS, 0, 10)` | `setpriority(PRIO_PROCESS, 0, 5)` |
+| Windows | `SetThreadPriority(.., THREAD_PRIORITY_BELOW_NORMAL)`, then `THREAD_MODE_BACKGROUND_BEGIN` (the latter alone does not change the reported CPU priority) | `THREAD_PRIORITY_BELOW_NORMAL` only |
+
+The background class is starved on a busy machine; a config edit that waited on it took minutes
+(7.1.9), which is why the second priority exists.
 
 The file watcher (`crates/mesh-core/src/watcher.rs`) debounces events for 150 ms, coalesces a
 burst into one queued reload, and hands the changed paths to `WorkspaceIndexer::reload_paths`,
@@ -262,6 +272,11 @@ only files whose size or mtime changed, confirmed by content hash).
   has settled. A hold lasts at most 60 s; an `index.lock` older than 30 s with no `git` process
   is treated as orphaned. While a hold is open, tool answers come immediately from the last
   complete snapshot and start with a note naming its generation.
+
+Files the guards refuse (oversized, binary, a line over 1,024 bytes, nesting) never enter the VFS,
+so they would look changed on every reload. The indexer remembers each refused file with the stat
+it had before it was read and reads it again only once its mtime or size moves; the memo is pruned
+against every crawl (7.1.9).
 
 The daemon transport is a Unix domain socket on macOS/Linux and a named pipe on Windows.
 
@@ -293,6 +308,26 @@ still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket 
 longer a race against a large repo's indexing time, since the socket now exists independently of
 how long that indexing takes.
 
+### 8.1a The daemon follows its config (7.1.7, 7.1.9)
+
+`meshd` does not hold a fixed `AppState`: it serves a `WorkspaceHost`
+(`crates/mesh-daemon/src/host.rs`). On a request, at most every 250 ms, it reads and hashes the
+config file it was started from (`mesh_core::config_watch`; mtime and length are not trusted). A
+different hash builds a new state on a blocking thread while the previous one keeps serving; an
+`ArcSwap` store swaps it in once the new state has its first snapshot, and the old watcher is
+cancelled. A config that fails to parse or whose roots do not resolve is refused and recorded for
+`doctor`; refused bytes are not retried until the file changes. There is no timer: an edit made
+while no client talks to the daemon is applied by the next request.
+
+How much work the swap does depends on the edit (`mesh_core::reload_kind`): display-only keys swap
+the config over the running index, a changed `[[engines.contracts.patterns]]` re-extracts only the
+files it applies to, anything else rebuilds the index through the parse cache. The detail, the
+test strategy and the key table are in [`development.md`](development.md#what-a-config-edit-costs-719).
+
+A workspace that resolves to `/`, a drive root or the user's home with no config file is refused
+before any daemon is spawned (`mesh_core::guard_workspace_root`, `crates/mesh-core/src/root_guard.rs`):
+the session stays up and answers every `tools/call` with an error naming the directory.
+
 ### 8.2 One parse cache per workspace, under a quota (plan 4 step 4.4)
 
 The persistent parse cache (`PersistentIndexCache`, `crates/mesh-core/src/index_cache.rs`) is
@@ -314,6 +349,13 @@ branch switch back to already-seen content is a lookup instead of a re-parse.
   evicted entries since open.
 
 The pre-4.4 machine-wide `~/.cache/mesh-mcp/index-cache.db` is no longer read.
+
+The cache key of a file folds in its content hash, its `RepoId`, the extraction-config fingerprint
+and, for a JavaScript / TypeScript file, the `tsconfig` / `jsconfig` `paths` and `package.json`
+`imports` aliases that govern it, so editing an alias config re-extracts exactly the files under it.
+The fingerprint does not depend on the workspace roots (adding a root does not invalidate the
+cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 11 at 7.1.11) and the
+workspace id folds in the binary version.
 
 ### 8.3 Kernel network sandbox of `meshd` (Linux, plan 4 step 4.10)
 

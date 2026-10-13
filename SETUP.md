@@ -3,19 +3,19 @@
 This guide takes you from nothing to an AI agent that understands your architecture. Budget
 about 20 minutes: five to install, fifteen to write a config that actually reflects your repo.
 
-If you only want to see it work, jump to [Step 1](#step-1-install) then
+If you only want to see it work, jump to [Step 1](#step-1--install) then
 [the demo](#try-it-on-the-bundled-demo).
 
 **Contents**
 
-1. [Install](#step-1-install)
-2. [Generate a starting config](#step-2-generate-a-starting-config)
-3. [Tell it where your code is](#step-3-tell-it-where-your-code-is)
-4. [Check it actually indexed something](#step-4-check-it-actually-indexed-something)
-5. [Connect your agent](#step-5-connect-your-agent)
-6. [Teach it your conventions](#step-6-teach-it-your-conventions)
-7. [Put your playbooks in front of the agent](#step-7-put-your-playbooks-in-front-of-the-agent)
-8. [Guard critical paths](#step-8-guard-critical-paths-optional)
+1. [Install](#step-1--install)
+2. [Generate a starting config](#step-2--generate-a-starting-config)
+3. [Tell it where your code is](#step-3--tell-it-where-your-code-is)
+4. [Check it actually indexed something](#step-4--check-it-actually-indexed-something)
+5. [Connect your agent](#step-5--connect-your-agent)
+6. [Teach it your conventions](#step-6--teach-it-your-conventions)
+7. [Put your playbooks in front of the agent](#step-7--put-your-playbooks-in-front-of-the-agent)
+8. [Guard critical paths](#step-8--guard-critical-paths-optional)
 9. [Config reference](#config-reference)
 10. [Troubleshooting](#troubleshooting)
 
@@ -40,6 +40,14 @@ mesh-mcp --version
 `install.sh` downloads the rolling `latest` release, rebuilt from `main` on every merge, for macOS
 (Apple Silicon and Intel), Linux x86-64 and Windows x86-64. On other platforms (Linux arm64, for
 example) it falls back to `cargo install` from the repository, which needs a Rust toolchain.
+
+### What the installer does not give you
+
+`install.sh` downloads the rolling `latest` build of `main` over HTTPS from GitHub. This repository
+documents no checksum or signature verification, no SBOM or provenance, no version pinning of that
+build and no offline or air-gapped install path (building from source needs crates.io). If you need
+those, build from a pinned commit yourself. The runtime binaries contain no network client code; the
+installer is the only step that downloads anything.
 
 ### From source
 
@@ -102,7 +110,7 @@ cd /path/to/your/monorepo
 mesh-mcp init --auto
 ```
 
-This writes `.agents/mesh-mcp.toml`, guessing your roots from directory names it recognises
+This writes `.agents/mesh-mcp.toml`, guessing your roots from directory names it recognises (a fixed layout heuristic: `api-gateway` or `gateway`, `services/*`, ...; a draft for that layout, not a detector)
 (`services/`, `packages/`, `crates/`, `proto*/`, `docs/`, `k8s*/`, …). An existing
 `.agents/mesh-mcp.toml` is kept as is; `--force` regenerates it.
 
@@ -242,7 +250,7 @@ mesh-mcp doctor
 Abridged output (the exact lines depend on the platform and configuration):
 
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (v7.0.0, commit: ...)...
+🔍 Running MeshMCP Diagnostic Healthcheck (v7.1.11, commit: ...)...
 
 ✔ Config syntax: valid (.agents/mesh-mcp.toml)
 ℹ Project skills: none configured ([engines.policy.skills])
@@ -250,7 +258,7 @@ Abridged output (the exact lines depend on the platform and configuration):
 ✔ Root overlap: 6 root(s), none overlapping
 ✔ Symlink invariants: follow_links=false verified (crawler rejects symlink traversal)
 ✔ Secret redaction engine: active (test secrets masked)
-✔ Tree-sitter parsers: initialized (Java, Go, Python, TypeScript, TSX, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
+✔ Tree-sitter parsers: initialized (Java, Go, Python, TypeScript, TSX, JavaScript, Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala, Protobuf)
 ✔ Toolchain utilities: git and ripgrep detected
 ⚠ Index health: ... file(s) scanned, ... indexed, ... not indexed, first 10 listed
     (... non-source file(s) skipped: images, fonts, archives, lockfiles, bundles)
@@ -309,6 +317,13 @@ claude mcp add mesh-mcp -- mesh-mcp run
 `mesh-mcp init --auto --write-ide-config` writes these files for you, plus Claude Code's
 project-scope `.mcp.json`. It only adds or replaces the
 `mesh-mcp` entry: other servers are kept, and a file that is not valid JSON is left untouched.
+
+It also writes a short routing section into `CLAUDE.md` and `AGENTS.md` at the workspace root
+(which tool answers which question, results as a verifiable `path:line` starting point, and a
+`ToolSearch select:` line in `CLAUDE.md` only), between `<!-- mesh-mcp:begin … -->` and
+`<!-- mesh-mcp:end -->`. Re-running replaces the section in place and leaves the rest of each file
+alone; a half-marked file is left untouched with a warning. In one small bench (`CHANGELOG.md` 7.0.19) a project file
+was followed where the server's own `initialize.instructions` were not; one data point, not a rule.
 
 ### Verify by hand
 
@@ -383,8 +398,11 @@ own.
 
 ## Step 6 — Teach it your conventions
 
-gRPC, Spring, OpenAPI and AsyncAPI are recognised out of the box. Your in-house event bus is
-not. If Step 4 showed services but no topics or events, this is the missing piece.
+gRPC, Spring, OpenAPI and AsyncAPI are recognised out of the box, and so are the common
+JavaScript / TypeScript brokers (Kafka, Redis, NATS, MQTT, RabbitMQ, BullMQ, SQS / SNS, ...) and
+HTTP route frameworks (NestJS, Express, Fastify, Next.js, ...), including `tsconfig` / `jsconfig`
+`paths` and `package.json` `imports` aliases, which are read without any setting. Your in-house
+event bus is not. If Step 4 showed services but no topics or events, this is the missing piece.
 
 ### Search vocabulary
 
@@ -405,7 +423,7 @@ Without `aliases`, an agent asking about "the DLQ" finds nothing in a document t
 
 ### Custom contract patterns
 
-Describe how your codebase declares producers, consumers, sagas and RPC calls:
+Describe how your codebase declares producers, consumers, sagas and RPC calls (the two patterns below are examples from one project's conventions; adapt the regexes, do not copy them):
 
 ```toml
 [[engines.contracts.patterns]]
@@ -436,6 +454,12 @@ explicit `confidence`. Before 7.1.8 every pattern edge was `exact`.
 
 Producers and consumers naming the same topic get linked automatically, which is what makes
 `analyze_impact` able to trace an event end to end.
+
+A publisher that takes its topic from a runtime registry or a config object
+(`publish(cfg.stream, cfg.type, ...)`) leaves no literal for the indexer to read, so
+`analyze_impact` says "No producer statically resolved" next to a consumer that is indexed. That
+is a gap in what can be seen, not proof that nobody produces the topic. Declare the registry with a
+`topic_producer` (or `topic_consumer`) pattern that captures the literal value.
 
 Use single-quoted TOML strings for regexes so you don't have to double every backslash. Check
 your work with `mesh-mcp graph --format mermaid`; an invalid regex is logged and skipped rather
@@ -600,7 +624,7 @@ Every key below changes behaviour.
 | `[workspace.http_prefixes]` | **wired** — per-root override of `http_prefix`, keyed by root directory name, path relative to the workspace root, or a glob on either (7.1.9) |
 | `[workspace.mount_aliases]` | **wired** — translates container bind-mount paths (e.g. `/workspace`) to local host roots |
 | `[engines.docs]` `enabled`, `paths`, `aliases`, `stop_words`, `exact_phrase_boost`, `fuzzy_fallback`, `sanitize_prompt_injections` | **wired** — `enabled` toggles doc indexing, `paths` restricts doc scope (`"docs/**"` or `"${workspace_root}/docs/**"`), `fuzzy_fallback` controls full-text fallback |
-| `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group` | **wired** |
+| `[[engines.contracts.patterns]]` `name`, `kind`, `file_pattern`, `regex`, `target_group`, `consumer_group`, `confidence` | **wired** — `confidence` (`exact` or `heuristic`, topic patterns only, default `heuristic` since 7.1.8) is the confidence of the edges the pattern creates; editing a pattern re-extracts only the files it applies to |
 | `[engines.contracts.grpc]` `proto_dirs`, `controller_annotations`, `canonical_fqcn_projection` | **wired** — scopes `.proto` dirs, configures controller annotations (e.g. `@GrpcMethod`), and controls canonical FQCN projection |
 | `[engines.contracts.spring]` `enabled`, `property_files`, `resolve_placeholders`, `auto_redact_secrets` | **wired** — scopes property files, resolves `${...}` placeholders, and masks sensitive secrets |
 | `[engines.contracts.openapi]` `enabled`, `spec_files` | **wired** — scopes OpenAPI spec detection |
@@ -612,6 +636,10 @@ Every key below changes behaviour.
 | `[cache]` `max_size_mb` | **wired** — quota (MiB, default `2048`) of this workspace's parse cache `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`, database + WAL. Checked on open and after every scan writing more than 100 entries; over quota, least recently used entries are evicted down to 80 % of it |
 
 Secret masking and prompt-injection sanitisation are on by default.
+
+Every key is classified by what changing it costs a running `meshd` (see
+[Daemon vs standalone](#daemon-vs-standalone)): the `display-only`, `partial` and `full` rows of
+that table are the authority for which keys need an index rebuild.
 
 There is no `[engines.watcher]` and no `[engines.audit]` section: the watcher is always on with
 a 150 ms debounce, and the audit log path is fixed at `~/.cache/mesh-mcp/audit.db`.
@@ -667,6 +695,12 @@ By design: it searches *declared symbols*, not raw text. For a full-text scan of
 **`Sandbox escape attempt detected`**
 The requested path is outside every configured root. That's the security jail working — add the
 directory to `roots` if it should be readable.
+
+**I edited `mesh-mcp.toml` and nothing changed**
+The daemon applies a config edit on the next request, at most every 250 ms, and keeps serving the
+old state until the new one is ready (seconds on a large workspace). If the file does not parse or
+its roots do not resolve, the old config stays active: run `mesh-mcp doctor`, which shows the
+refusal under "Daemon config". Only the main toml is followed, not files it refers to.
 
 **Changes aren't picked up**
 The watcher debounces 150 ms and rescans in the background. On Linux, a large workspace can

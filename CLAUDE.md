@@ -85,7 +85,9 @@ Claude Code must strictly enforce these invariants on every edit:
    - Modifications targeting `proto-registry` or guarded repos return an RSAH structured refusal.
    - Install OS pre-commit hook via `mesh-mcp install-hooks`.
 7. **OS Politeness & Cryptographic Audit**:
-   - Rayon rescan thread pool runs with `QOS_CLASS_BACKGROUND` (macOS) / `nice(10)` (Linux).
+   - Rayon rescan thread pool runs with `QOS_CLASS_BACKGROUND` (macOS) / `nice(10)` (Linux) for
+     watcher-triggered rescans; the config-driven reload a request waits for runs on a second pool
+     at `QOS_CLASS_UTILITY` / `nice(5)` (`RescanPriority`, `crates/mesh-core/src/rescan.rs`).
    - Propagate W3C `traceparent` headers.
    - Append-only SQLite audit DB (`~/.cache/mesh-mcp/audit.db`, mode `0600`) with chained SHA-256 signatures.
 

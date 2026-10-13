@@ -21,6 +21,7 @@ Rules followed by every measurement in `quality.md`:
 | gRPC edge precision/recall on real projects | `scripts/golden/fetch.sh` (pinned corpus in `scripts/golden/repos.txt`), `scripts/golden/score.py <repo>`, ground truth in `tests/golden/*.expected.yaml` | `.github/workflows/golden.yml`, every PR, `ubuntu-latest`, fails under 1.0/1.0 | `quality.md` baseline and step 4.5 |
 | Index determinism | `scripts/determinism.sh` (5 sequential + 8 concurrent runs per workspace, one fingerprint required) | `ci.yml` "Determinism Gate", `ubuntu-latest` and `macos-latest` | `quality.md` Plan 3 closeout |
 | Boot, peak RSS, `smart_search` p50/p95, reload latency | `scripts/bench/gen_synthetic.py <dir> <files> [--services N]` + `scripts/bench/scale_bench.py <dir> <config> --budget-json scripts/bench/budgets.json` | `nightly-bench.yml`, daily, `ubuntu-latest`, 5,000 files, 8 roots | `quality.md` step 3.0 and Plan 3 closeout |
+| Size tiers: boot, peak RSS, search p50/p95, reload at 50,000 and 200,000 files, plain and contract mix, median of 3 cold runs | `scripts/bench/tier_bench.py --files N [--contracts] --runs 3 --budget-json scripts/bench/budgets-50k.json` (budgets: `budgets-50k.json`, `budgets-200k.json`, one section per platform) | `nightly-bench.yml`, job `scale-bench-50k`, daily, `ubuntu-latest` (the 200k tier is manual) | `quality.md` step 4.3; the 50k contract-mix `reload_ms` check caught the 7.1.8-7.1.10 reconcile regression fixed in 7.1.11 |
 | Parse cache growth over a simulated work week | `scripts/bench/cache_growth.py` | none | `quality.md` step 4.4 |
 | Reload behaviour during a large `git checkout` | `scripts/test_git_storm.sh` | none (exits non-zero on a violation) | `quality.md` step 4.2 |
 | YAML / Markdown peak memory per file | `scripts/bench/gen_yaml_md_corpus.py` + `scripts/bench/yaml_md_peak.py` (macOS `/usr/bin/time -l`), probe `crates/mesh-server/examples/parse_peak.rs` | none | `quality.md` step 4.9 |
@@ -47,7 +48,7 @@ PATH="$PWD/target/release:$PATH" scripts/golden/score.py online-boutique
 # Determinism
 scripts/determinism.sh
 
-# 5k synthetic scale bench, same as the nightly job.
+# 5k synthetic scale bench, same as the nightly `scale-bench` job.
 # Generate the corpus outside this repository: a corpus under a git-ignored path
 # (such as target/) is never watched, and the reload probe then reports None.
 python3 scripts/bench/gen_synthetic.py /tmp/mesh-synth-5k 5000 --services 8
@@ -56,12 +57,17 @@ MESH_MCP_BIN=target/release/mesh-mcp python3 scripts/bench/scale_bench.py \
   /tmp/mesh-synth-5k /tmp/mesh-synth-5k/.agents/mesh-mcp.toml \
   --queries 30 --budget-json scripts/bench/budgets.json
 
+# Size tier (50k contract mix, 3 cold runs), same as the nightly `scale-bench-50k` job.
+# The contract-mix corpus is about 240 MB under /tmp.
+MESH_MCP_BIN=target/release/mesh-mcp python3 scripts/bench/tier_bench.py --files 50000 --contracts \
+  --runs 3 --propose --budget-json scripts/bench/budgets-50k.json
+
 # smart_search page payload on the golden corpora
 MESH_MCP_BIN=target/release/mesh-mcp python3 scripts/bench/search_payload.py --limit 20
 ```
 
 The Python harnesses document their options under `--help`. Wall-clock results on a shared or busy machine are noisy; the
-nightly budgets carry 4–5x headroom for that reason, and `quality.md` notes the machine load
+nightly budgets were set at 4–5x the CI-runner medians for that reason, and `quality.md` notes the machine load
 when it matters.
 
 ---

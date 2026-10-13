@@ -1,6 +1,7 @@
 # MeshMCP Developer Guide
 
-Building, testing and extending MeshMCP. The invariants every change must preserve are in
+Building, testing and extending MeshMCP. New to the project or to Rust? Read the
+[architecture guide](architecture/README.md) first. The invariants every change must preserve are in
 [`CLAUDE.md`](../CLAUDE.md); task-specific guides for coding agents are in
 [`.agents/skills/`](../.agents/skills/README.md).
 
@@ -8,8 +9,10 @@ Building, testing and extending MeshMCP. The invariants every change must preser
 
 ## 1. Prerequisites
 
-- **Rust**: a current stable toolchain. CI builds with the latest stable release
-  (`dtolnay/rust-toolchain@stable`); no minimum supported version is pinned or tested.
+- **Rust**: 1.90 or newer. The minimum is `rust-version` in the root `Cargo.toml`; it is set by the
+  dependencies (`tree-sitter-language` requires 1.90) and was verified with
+  `cargo +1.90 check --workspace --all-targets`. CI builds with the latest stable release
+  (`dtolnay/rust-toolchain@stable`) and does not run a job on 1.90 itself.
 - **C compiler** (`clang` or `gcc`, MSVC on Windows): the tree-sitter grammars are C code
   compiled by their build scripts.
 - **Platforms exercised by CI**: `ubuntu-latest`, `macos-latest`, `windows-latest` (test suite);
@@ -205,7 +208,11 @@ What it actually checks:
 - **Daemon config** (7.1.7): `meshd` records which config hash it serves
   (`<cache>/meshd/<workspace_id>.config.json`); doctor warns when the file on disk differs or the
   daemon refused it (only while the refused bytes are still on disk), or, for a pre-7.1.7 daemon
-  with no record, when the config is newer than the daemon's `.meta` file, with the remedy.
+  with no record, when the config is newer than the daemon's `.meta` file, with the remedy. It also
+  shows the last reload (kind, duration, age; 7.1.9). When the config does not parse, doctor says
+  so and adds that the daemon still serves its previous config (hash and age), or that no daemon
+  is running.
+- **`[workspace.http_prefixes]`** (7.1.9): a key that matches no root is a warning.
 - **Workspace root** (7.1.7): an error when the workspace resolves to `/`, a drive root or HOME
   with no config file (`mesh_core::guard_workspace_root`); the index-health scan is then skipped.
 
@@ -226,6 +233,24 @@ whatever happens. The host tests use a per-test cache directory (`WorkspaceHost:
 touch `~/.cache/mesh-mcp`. Only the main toml is followed. Tests:
 `host::tests` edit a config on disk and observe the state change, and an invalid edit keep the old
 state.
+
+### What a config edit costs (7.1.9)
+
+A reload is classified before it runs (`mesh_core::reload_kind`, `ReloadKind`):
+
+| Kind | Config keys | Work |
+| :--- | :--- | :--- |
+| `DisplayOnly` | `http_prefix`, `[workspace.http_prefixes]`, `name`, `version`, `[engines.policy]`, docs `aliases` / `stop_words` / `exact_phrase_boost` / `fuzzy_fallback` | the config is swapped over the running index; no file is read |
+| `Partial` | `[[engines.contracts.patterns]]` added, removed or edited | only files a changed pattern's `file_pattern` applies to are extracted again |
+| `Full` | everything else | the index is rebuilt, reusing the per-file parse cache for files whose parse inputs did not change |
+
+The classifier fails closed: every config struct is destructured field by field, so adding a key
+is a compile error until it is classified, and a test changes each serialised key in turn and
+checks the resulting kind. Tests compare the `DisplayOnly` and `Partial` results with a full
+rebuild by snapshot fingerprint (invariant I2: an incremental reload equals a full rebuild).
+The closing reload of a replacing state runs on a dedicated pool at `RescanPriority::Utility`
+(`crates/mesh-core/src/rescan.rs`), because a request is waiting for it; watcher-triggered rescans
+stay on the `Background` pool.
 
 The last line counts the `error` and `warn` checks above it (a check repaired by `--fix` is not
 counted).

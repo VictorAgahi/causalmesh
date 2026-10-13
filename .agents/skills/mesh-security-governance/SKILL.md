@@ -46,7 +46,8 @@ Six separate mechanisms, often confused with each other:
   - `AuditLogger::new(Option<PathBuf>)`, `::new_in_memory()`, `::default_db_path()`, `::log_path()`
   - `::record_entry()`, `::verify_db()`, `::verify_log_file()` (alias), `::export_to_jsonl()`,
     `::read_entries(path, since_epoch_secs)` (read-only, backs `mesh-mcp stats`)
-  - `::compute_sha256()`, `GENESIS_HASH`, `CHAIN_VERSION`, `AuditEntry { .., chain_version }`
+  - `::compute_sha256()`, `GENESIS_HASH`, `CHAIN_VERSION`, `AuditEntry { .., chain_version,
+    error_detail, error_detail_sig }`
 - **Governance gate in tool dispatch**: [`crates/mesh-server/src/tools/mod.rs`](../../../crates/mesh-server/src/tools/mod.rs)
   - `McpTool::mutates()`, `GOVERNANCE_BLOCKED_CODE = -32001`, the check inside `ToolRegistry::invoke`
 - **Git hook**: [`crates/mesh-server/src/cli/hooks.rs`](../../../crates/mesh-server/src/cli/hooks.rs) (`HooksCommand::run`, `build_hook_script`)
@@ -257,6 +258,16 @@ alias for `verify_db()`.
   existing version number means.
 - Calls refused before `run` (invalid arguments, RSAH refusals) are recorded too, with status
   `ERROR` (`ToolRegistry::record_refusal`).
+- Error detail (7.1.8). An `ERROR` row also stores a short sanitized `error_detail`
+  (`{"class","code","message"}`, message cut to 200 characters; a serde-echoed user value is
+  dropped wholesale, secrets are masked as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`, home
+  directories collapse to `~`; never the arguments). It is **not** part of the v2 hash input, so
+  an older binary still verifies the whole chain: it is bound by its own nullable column
+  `error_detail_sig = SHA-256(entry_hash || error_detail)` (`AuditLogger::error_detail_sig`).
+  `verify_db` rejects a detail with no valid signature (any row, v1 / v2 included), a signature
+  with no detail, and an edited detail or signature. Do not fold the detail into the chain
+  formula without bumping `CHAIN_VERSION`. Timestamps of new rows are ISO 8601; early rows hold
+  `<epoch-secs>.<millis>Z`, normalised on read, never rewritten.
 - Three metrics tables sit next to `audit_entries`, **outside** the hash chain:
   `tool_call_metrics` (latency per audited call, `record_tool_latency`),
   `index_cache_metrics` and `process_starts`. `mesh-mcp stats` reads them; `verify_db` ignores

@@ -87,7 +87,8 @@ Behaviours worth knowing:
     - Git pre-commit hook via `mesh-mcp install-hooks` (contract-first, from proto_dirs)
 
 [7] OS POLITENESS, TRACING & AUDIT
-    - reload pool at QOS_CLASS_BACKGROUND (macOS) / nice 10 (Linux) / below-normal (Windows)
+    - watcher reload pool at QOS_CLASS_BACKGROUND (macOS) / nice 10 (Linux) / below-normal
+      (Windows); config-driven reload at QOS_CLASS_UTILITY / nice 5 (RescanPriority)
     - W3C traceparent trace id recorded in the audit row
     - append-only SQLite audit DB (~/.cache/mesh-mcp/audit.db, 0600), chained SHA-256
 ```
@@ -109,13 +110,17 @@ causalmesh/
 └── crates/
     ├── mesh-core/src/         # types, contracts (graph), state (snapshot), security (jail),
     │                          # crawler, vfs, watcher (+ watcher/git.rs), index_cache, audit,
-    │                          # governance, properties, docs, yaml_stream, health, socket, rescan
-    ├── mesh-parsers/src/      # guard (AstGuard), decapitate (LanguageKind), languages/*,
-    │                          # markdown (formatter, 48 KB), graph + topology (rendering)
+    │                          # governance, properties, docs, yaml_stream, health, socket, rescan,
+    │                          # config_watch + reload_kind (daemon config reload), root_guard,
+    │                          # routes + test_paths (HTTP route matching, test-file rule), search_cache
+    ├── mesh-parsers/src/      # guard (AstGuard), decapitate (LanguageKind), languages/* (incl.
+    │                          # js_frameworks/, sfc, ts_config), markdown (formatter, 48 KB),
+    │                          # graph + topology (rendering)
     ├── mesh-server/src/       # main (CLI, proxy), lib (JSON-RPC loop), framing, protocol,
     │                          # indexer (WorkspaceIndexer), watcher, tools/ (6 MCP tools),
     │                          # cli/ (doctor, init, graph, hooks, stats)
-    └── mesh-daemon/src/       # main, server (socket / named pipe), idle, sandbox (Linux seccomp)
+    └── mesh-daemon/src/       # main, server (socket / named pipe), host (WorkspaceHost: follows the
+                               # config file), idle, sandbox (Linux seccomp)
 ```
 
 Task-specific guides: [`.agents/skills/README.md`](.agents/skills/README.md).
@@ -142,9 +147,9 @@ checked by `.github/workflows/golden.yml`; a change to indexing order or concurr
 
 | Need | Tool | Do not |
 | :--- | :--- | :--- |
-| Find a function, class or method declaration | `smart_search` | use it for docs or whole files; pass generic keywords expecting a text match (use the symbol name, or `fuzzy: true`) |
-| Find who imports or depends on a type, package or contract | `find_dependents` | pass very short generic names (`id`, `err`) |
-| Trace a gRPC method from `.proto` to handlers and clients; check wire-format breaks | `analyze_grpc` | use it for Kafka or other async messaging |
-| Impact of changing an RPC, service, topic or event | `analyze_impact` | expect test coverage (the graph does not link tests) |
+| Find a function, class, method or HTTP route (`PATCH /events/:id/state`) | `smart_search` | use it for docs or whole files; pass generic keywords expecting a text match (use the symbol name, or `fuzzy: true`) |
+| Find who imports or depends on a type, package or contract | `find_dependents` | pass very short generic names (`id`, `err`); use it for RPC callers (use `analyze_grpc`) |
+| Trace a gRPC method from `.proto` to handlers and clients (who calls this RPC); check wire-format breaks | `analyze_grpc` | use it for Kafka or other async messaging |
+| Impact of changing an RPC, service, topic, event or route handler | `analyze_impact` | expect test coverage (the graph does not link tests); read a zero as "nobody does it" (it means not statically resolved in the indexed roots) |
 | Read architecture docs and ADRs | `search_docs` | search source code with it |
 | See the service topology | `visualize_mesh` | raise `max_services` to see everything; zoom with `service` |

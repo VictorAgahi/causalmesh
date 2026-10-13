@@ -9,9 +9,13 @@ description: >-
 # MeshMCP Parser Engineering Skill
 
 Everything syntax-related lives in `crates/mesh-parsers`. Supported languages today, all
-through tree-sitter: Java, Go, Python, TypeScript (also `.tsx`, `.js`), Rust, C++, Kotlin, C#,
-Ruby, PHP, Swift, Scala and Protobuf (`tree-sitter-proto`); JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) has its own grammar. YAML (OpenAPI / AsyncAPI specs,
-Spring properties) is handled without tree-sitter (`spec_shape.rs`, `mesh_core::yaml_stream`).
+through tree-sitter: Java, Go, Python, TypeScript (`.ts`, `.mts`, `.cts`; `.tsx` on the TSX grammar),
+Rust, C++, Kotlin, C#, Ruby, PHP, Swift, Scala and Protobuf (`tree-sitter-proto`); JavaScript
+(`.js`, `.jsx`, `.mjs`, `.cjs`) has its own grammar (`tree-sitter-javascript`), with a TSX re-parse
+when annotated code does not parse cleanly as JavaScript. The `<script>` blocks of `.vue`,
+`.svelte` and `.astro` files are read with the JS / TS grammars (`sfc.rs`). YAML (OpenAPI /
+AsyncAPI specs, Spring properties) is handled without tree-sitter (`spec_shape.rs`,
+`mesh_core::yaml_stream`).
 
 ---
 
@@ -44,7 +48,13 @@ Spring properties) is handled without tree-sitter (`spec_shape.rs`, `mesh_core::
   [`java.rs`](../../../crates/mesh-parsers/src/languages/java.rs),
   [`go.rs`](../../../crates/mesh-parsers/src/languages/go.rs),
   [`python.rs`](../../../crates/mesh-parsers/src/languages/python.rs),
-  [`typescript.rs`](../../../crates/mesh-parsers/src/languages/typescript.rs),
+  [`typescript.rs`](../../../crates/mesh-parsers/src/languages/typescript.rs) (file extractor:
+  imports incl. CommonJS and `import()`, declarations, gRPC clients; also serves JavaScript),
+  [`js_frameworks/`](../../../crates/mesh-parsers/src/languages/js_frameworks/mod.rs) (rule tables for
+  brokers `messaging.rs`, HTTP routes `http.rs`, file-system routers `file_routes.rs`, tRPC and
+  GraphQL `api.rs`; per-file facts in `scope.rs`),
+  [`sfc.rs`](../../../crates/mesh-parsers/src/languages/sfc.rs) (`.vue` / `.svelte` / `.astro` script blocks, blanked in place so lines stay the file's),
+  [`ts_config.rs`](../../../crates/mesh-parsers/src/languages/ts_config.rs) (`tsconfig` / `jsconfig` `paths`, `package.json` `imports`, jailed to the workspace root),
   [`rust_lang.rs`](../../../crates/mesh-parsers/src/languages/rust_lang.rs),
   [`cpp.rs`](../../../crates/mesh-parsers/src/languages/cpp.rs),
   [`kotlin.rs`](../../../crates/mesh-parsers/src/languages/kotlin.rs),
@@ -160,8 +170,9 @@ arrays in `guard.rs` (`PARSERS`, `INDEX_PARSERS`) are sized by `TREE_SITTER_COUN
 initialised with one `None` per slot — all must grow together or you will index out of bounds.
 
 **Step 3.** Register the extensions in `LanguageKind::from_path`, which matches on
-suffixes. For reference, `Cpp` claims `.cpp .cc .cxx .hpp .hh .hxx .h`, and `TypeScript`
-claims `.ts .tsx .js`. Order matters where suffixes overlap.
+suffixes. For reference, `Cpp` claims `.cpp .cc .cxx .hpp .hh .hxx .h`, `TypeScript` claims
+`.ts .mts .cts`, `Tsx` claims `.tsx` and `JavaScript` claims `.js .jsx .mjs .cjs`. Order matters
+where suffixes overlap.
 
 **Step 4.** Write `crates/mesh-parsers/src/languages/<lang>.rs` with an `extract`
 following the contract in section 2, and add `pub mod <lang>;` at the top of

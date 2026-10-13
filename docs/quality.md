@@ -23,7 +23,7 @@ regression gate live.
 | :--- | :---: | :---: | :---: | :--- |
 | `online-boutique` | 14 | **100%** | **92.9%** | Original P0 baseline; superseded by step 2.1 below. |
 | `otel-demo` | 13 | 87.5% | 53.8% | Golden file written 2026-09-25 (see below); real gap found in the same run. |
-| `bank-of-anthos` | 0 (gRPC) | 100% | 100% | Golden file written 2026-09-25 — this repo is genuinely gRPC-free; its `http_routes` ground truth (18 Flask routes) has no `score.py` mode yet (see below). |
+| `bank-of-anthos` | 0 (gRPC) | 100% | 100% | Golden file written 2026-09-25 — this repo is genuinely gRPC-free; its `http_routes` ground truth (22 Flask routes) has no `score.py` mode yet (see below). |
 
 **How to reproduce:**
 ```bash
@@ -254,7 +254,7 @@ mesh-mcp's own output.
     match that real spelling, not the `.proto` service name, for the comparison to line up.
 - **`bank-of-anthos`**: genuinely gRPC-free (`score.py bank-of-anthos` correctly reports a
   vacuous 100%/100% on 0 golden edges — no gRPC edge is fabricated by the extractor either). Its
-  real ground truth is 18 Flask HTTP routes across its three Python services (`userservice`,
+  real ground truth is 22 Flask HTTP routes across its three Python services (`userservice`,
   `contacts`, `frontend`), written by hand from `@app.route(...)` decorators the same way step
   2.6's `extract_flask_route` reads them — including `/` and `/home`, which declare no
   `methods=` kwarg (Flask's own default of GET-only). The repo's other three services
@@ -1268,6 +1268,18 @@ Reading these honestly:
 - **Boot per file is ~5x the synthetic rate** (kubernetes 12.6 s / 30.5k files vs 4.1 s / 50k):
   real files are larger. Synthetic tiers are regression gates, not predictions of real repos.
 
+## Update (2026-10-11 to 2026-10-13, 7.1.x — figures recorded in CHANGELOG.md, not re-run for this page)
+
+These numbers come from the `CHANGELOG.md` entries named below, each measured by the author of
+that change on the platform and corpus it states there. They are copied, not re-measured.
+
+| Change | Measurement | Source |
+| :--- | :--- | :--- |
+| 7.1.0, path-aware JS / TS relative imports | `Imports` edges, release builds, vs 7.0.19: otel-demo 2,008 -> 1,509 (562 removed, 63 added); react 194,325 -> 137,558 (56,767 removed, 0 added); vscode/src 5,796,592 -> 1,170,703 (measured before the component-folder fix, which restores a few thousand real edges). Removed edges were classified by resolving each specifier on disk: false positives except the component-folder case. | `CHANGELOG.md` 7.1.0, "Measured" |
+| 7.1.0, pathological inputs | Linear on: a router mounted 3,000 times, 16,000-link `await` chains, a 380 KB component of unclosed tags, a 300 KB factory called 3,000 times, a 20,000-field resolver map. | `CHANGELOG.md` 7.1.0, "Measured" |
+| 7.1.9, config reload latency (synthetic 4,000-file, 8-root corpus, 320 files refused by the guards) | Reload 0.8 s idle and 65 to 68 s with the CPUs saturated, before. After, same saturation: a display-only edit served in about 135-195 ms, a new root in about 0.6 s. A pattern edit selecting all 3,680 files: 0.7 s on the normal pool, 2.6-5.2 s on the utility pool, more than 3 minutes on the background pool (not finished when the run ended). | `CHANGELOG.md` 7.1.9, "Fixed" |
+| 7.1.11, `reload_ms` regression found by the nightly 50k contract-mix bench | Median reload by tag, same machine and corpus: 7.1.7 ~660 ms, 7.1.8 ~1070 ms, 7.1.9 ~1500 ms, 7.1.10 1000 to 3400 ms. After the fix, median 660 ms (three runs 659 / 661 / 661). | `CHANGELOG.md` 7.1.11 |
+
 ## What's NOT measured yet
 
 - The 30,000-file `smart_search` budget violation above is not yet re-measured against a *real*
@@ -1281,7 +1293,7 @@ Reading these honestly:
   above; ongoing performance tracking and regression budgets for external repos remain manual.
 - Kafka/Pub-Sub topic resolution has real ground truth (`otel-demo`'s `orders` topic, above)
   but no `score.py` mode reads it yet.
-- HTTP route extraction has real ground truth (`bank-of-anthos`'s 18 Flask routes, above) but
+- HTTP route extraction has real ground truth (`bank-of-anthos`'s 22 Flask routes, above) but
   no comparable `score.py` mode exists yet; nor is there ground truth for its three Java/Spring
   services.
 - `analyze_impact_with_depth`'s `depth > 1` traversal against a real multi-hop async chain (e.g.

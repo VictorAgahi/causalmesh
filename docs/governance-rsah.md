@@ -8,7 +8,9 @@ MeshMCP has three governance mechanisms, configured under `[engines.policy]`:
 | **Stop rules** (`[engines.policy.stop_rules]`) + RSAH | MCP tool calls, depending on `read_governance_mode` | a structured refusal, or a logged warning | rules apply only to mutating tools, and no shipped tool mutates |
 | **Pre-commit hook** (`mesh-mcp install-hooks`) | `git commit` | rejects commits that mix contract and implementation changes | not installed until you run the command |
 
-`[engines.policy] enabled = false` turns off stop rules and skills.
+`[engines.policy] enabled = false` turns off stop rules and skills. Editing `[engines.policy]` in a
+running daemon is a display-only reload: the governance engine is rebuilt from the new config and
+no file is re-read.
 
 ---
 
@@ -163,6 +165,13 @@ A mistyped path would never fire, so `mesh-mcp doctor` checks every configured s
 ---
 
 ## 5. What this does and does not provide
+
+- The audit chain is a plain SHA-256 with no secret key. It exposes an accidental or partial edit; a
+  local user who rewrites the file and recomputes every hash is not detected. There is no remote
+  export and no retention or rotation policy: copy `audit.db` to storage you control if you need
+  durable evidence.
+- What an agent does with the text MeshMCP returns (snippets, paths) is outside MeshMCP: any data
+  egress to a model provider is the agent client's behaviour, not this tool's.
 
 - It gives the agent the team's process at the right moment (skills), an explicit stop signal it
   can relay to a human (RSAH, when enabled), and a last check at commit time (hook).

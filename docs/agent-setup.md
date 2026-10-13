@@ -110,6 +110,7 @@ Checklist, in this order:
   - producers and consumers must yield the **same key**, or they are never linked;
   - test each regex against real lines (`grep -rnE '<regex>' <repo> --include='*.ts' | head`)
     before adding it.
+  Example only (one project's convention; adapt the regex):
   ```toml
   [[engines.contracts.patterns]]
   name = "outbox-producer"
@@ -121,6 +122,10 @@ Checklist, in this order:
   # confidence = "exact"           # exact | heuristic (default heuristic): "exact" only if the
   #                                # regex captures a literal topic, not a mapping-table lookup
   ```
+- **HTTP routes behind a global prefix** (`app.setGlobalPrefix('api/v1')`, a gateway prefix): the
+  source never states it, so set `http_prefix = "/api/v1"` under `[workspace]`, or one prefix per
+  root under `[workspace.http_prefixes]` (key = root directory name, path relative to the
+  workspace root, or a glob). Routes are shown with it and accepted with or without it.
 - **Governance** (optional): `[engines.policy.stop_rules]` maps a path fragment to a message
   returned instead of letting an agent modify it, e.g. a contract registry that generates code
   for other repos. Propose it; do not invent rules the user did not ask for.
@@ -154,11 +159,14 @@ finds `.agents/mesh-mcp.toml` in its working directory and starts or reuses a ba
   `<!-- mesh-mcp:begin … -->` and `<!-- mesh-mcp:end -->`; re-running `init` replaces it in place and
   never touches the rest of either file. If `.agents/skills/mesh-mcp/SKILL.md` exists, the section
   points to it: the team skill stays where every agent can read it, no copy under `.claude/`.
-  Agents weigh a project file like this far more than the MCP server's own instructions: in the
-  Volontariapp bench, the same routing was ignored when it only came from the server and followed
-  on every run once it was in `CLAUDE.md`.
+  In one small bench (Volontariapp, one model, 3 runs; `CHANGELOG.md` 7.0.19) the routing was
+  loaded in 0 of 3 runs when it only came from the server and in 3 of 3 once it was in `CLAUDE.md`.
+  Treat that as one data point, not a general finding.
 
-The client must be **restarted** (a new Claude Code session) before the tools appear. Tools:
+The client must be **restarted** (a new Claude Code session) before the tools appear. Run it
+from the project: with no config file found, a workspace that resolves to `/`, a drive root or the
+user's home directory is refused (no daemon, no scan; every tool call answers with an error naming
+the directory). Pass `-c <path-to-mesh-mcp.toml>` if the client cannot start in the workspace. Tools:
 `smart_search`, `find_dependents`, `analyze_grpc`, `analyze_impact`, `search_docs`,
 `visualize_mesh`.
 
@@ -212,7 +220,16 @@ did not, and anything you left for them to decide (stop rules, git hook, global 
   results only contain the query. `find_dependents` warns when its answer is a substring fallback.
   Treat anything `heuristic`, `ambiguous` or merely name-matched as a lead to confirm by reading
   the code, not as a fact.
+- A zero is not proof of absence. "0 (no literal call sites found in the indexed roots)" and "No
+  producer statically resolved" mean no literal match: a topic name taken from a registry or a
+  config, or a producer in a root that is not indexed, is not seen. Before telling the user
+  something is "never called" or "has no producer", query all roots with the tool that matches the
+  question (`analyze_grpc` for RPC callers, `find_dependents` for imports, `analyze_impact` for
+  events) and state the coverage.
 - A tool answer that says a file is not indexed means: read that file directly.
+- Editing the config needs no restart: the daemon applies it on the next request and keeps serving
+  the old state until the new one is ready. `mesh-mcp doctor` shows a refused config under
+  "Daemon config".
 
 ---
 

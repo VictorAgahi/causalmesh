@@ -5,6 +5,51 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [7.1.10] — 2026-10-13
+
+Generic fix from a field report: an agent asked what happens when a user is deleted on a NestJS
+and Redis Streams workspace. `analyze_impact` listed the first hops, then said nothing about the
+last stream. The producer of that stream publishes to `config.stream`, read from a
+`getGatherCompletionConfig(...)`-style registry at runtime, so no literal `publish(...)` exists
+for the indexer to see. Querying that stream returned "No producer resolved ... this negative
+result is authoritative" next to an indexed consumer, and `depth: 2` ended at that consumer
+without a word, so the agent concluded a method was never called.
+
+Reproduced first on `examples/unresolved-flow` (entry stream, a post-processor publishing to
+`cfg.stream`, a final consumer with its own effect): at `depth: 2` and `3` the answer was the
+depth-1 answer with no note, and the final stream got the "authoritative" sentence above. The
+old wording came from `format_impact_matrix`; the "Authoritative AST Scan" label is only in
+`analyze_grpc` output (and the unused `format_impact_flow`), not in the impact matrix.
+
+### Changed (behaviour)
+- `analyze_impact`, event targets. A zero is worded as "not statically resolved", never as
+  absence. "No producer statically resolved" says that a consumer (or the topic) is indexed, that
+  no literal producer call site was found, and that the producer may publish under a name
+  resolved at runtime (registry, config, template string) or live in a root that is not indexed.
+  "No consumer statically resolved" is the mirror case. Both notes, and the two new ones below,
+  end with one sentence pointing to a `[[engines.contracts.patterns]]` of kind `topic_producer`
+  (or `topic_consumer`) for a project-specific registry (see SETUP.md).
+- `analyze_impact` traversal boundary. "Depth limit reached (depth N)" counts and lists (up to 5,
+  with location) the consumers the walk reached but did not expand although their file has a
+  resolved onward publish, with the `depth` to repeat the call with. "Chain end within depth N"
+  lists the consumers the walk did expand and found no resolved onward publish for, and says that
+  a handler re-emitting under a runtime-resolved name continues the chain there. A depth stop is
+  now distinguishable from the end of the chain. The order is by file, line and name.
+- A target that matches nothing now says that a name produced only by a runtime registry is not
+  indexed under that name, and suggests the literal stream of a neighbouring hop.
+- Server instructions and the tool descriptions: a 0 is scoped to literal call sites in the
+  indexed roots; "who calls this gRPC method / RPC client call sites" is routed to `analyze_grpc`
+  and `find_dependents` is said to answer import and symbol-usage questions; a claim of absence
+  needs a query across all roots with the tool that matches the question. `format_impact_flow`
+  no longer labels its 0 as authoritative.
+
+### Not done
+- Candidate dynamic emitters (file:line and the unresolved expression of non-literal
+  `publish` / `emit` / `xadd` calls) are not listed. The indexer records no non-literal call
+  site, and recording one needs a new node or field through every extractor and the index cache,
+  which is not cheap. The publisher in the field case was also a project helper, not a library
+  call a rule recognises. The notes name the limit instead.
+
 ## [7.1.9] — 2026-10-12
 
 Generic fixes from a QA run of 7.1.8 on a 16-root workspace (3565 files). The headline is the

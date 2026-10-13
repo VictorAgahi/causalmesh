@@ -626,7 +626,7 @@ impl MarkdownFormatter {
                 "across indexed workspace roots".to_string()
             };
             out.push_str(&format!(
-                "### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)\n*No upstream producers resolved {files_note}.*\n\n"
+                "### 1. Upstream Event Producers: 0 found (literal call sites only)\n*No upstream producers statically resolved {files_note}; not proof of absence (runtime-resolved names and unindexed roots are invisible).*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -672,7 +672,7 @@ impl MarkdownFormatter {
                 "across indexed workspace roots".to_string()
             };
             out.push_str(&format!(
-                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)\n*No downstream consumers resolved {files_note}.*\n\n"
+                "### 3. Downstream Consumers / Handlers: 0 found (literal registrations only)\n*No downstream consumers statically resolved {files_note}; not proof of absence (dynamic registration and unindexed roots are invisible).*\n\n"
             ));
         } else {
             out.push_str(&format!(
@@ -775,21 +775,80 @@ impl MarkdownFormatter {
                 "*Past the first hop, the walk follows producers declared in the same file as a consumer (a handler that re-emits): those rows are `heuristic`.*\n",
             );
         }
+        let mut pointer = None;
         if matrix.no_producer_resolved {
+            let seen = if matrix.no_consumer_resolved {
+                "the topic is indexed"
+            } else {
+                "a consumer is indexed"
+            };
             header.push_str(&format!(
-                "\n**No producer resolved** for this event outside tests (0 AST producers found across {} workspace roots). If not emitted via an unindexed runtime-dynamic topic string or raw SQL trigger, this negative result is authoritative: nothing in static application code emits it.\n",
+                "\n**No producer statically resolved** for this event outside tests: {seen}, but no literal producer call site was found across {} workspace roots. This is not proof that nothing emits it: the producer may publish under a name resolved at runtime (registry, config, template string) or live in a root that is not indexed.\n",
                 roots.len()
             ));
+            pointer = Some("topic_producer");
         }
         if matrix.no_consumer_resolved {
+            let seen = if matrix.no_producer_resolved {
+                "the topic is indexed"
+            } else {
+                "a producer is indexed"
+            };
             header.push_str(&format!(
-                "\n**No consumer resolved** for this event outside tests (0 AST consumers found across {} workspace roots). This negative result is authoritative for static code.\n",
+                "\n**No consumer statically resolved** for this event outside tests: {seen}, but no literal consumer registration was found across {} workspace roots. This is not proof that nobody consumes it: a consumer may be registered dynamically, through a pattern that is not in the config, or live in a root that is not indexed.\n",
                 roots.len()
+            ));
+            pointer = pointer.or(Some("topic_consumer"));
+        }
+        let label_of_node = |n: &ContractNode| -> String {
+            format!(
+                "`{}` (`{}`)",
+                n.name.replace('`', "'"),
+                Self::location(n, roots)
+            )
+        };
+        const SHOWN_NODES: usize = 5;
+        let list_nodes = |nodes: &[&ContractNode]| -> String {
+            let mut shown: Vec<String> = nodes
+                .iter()
+                .take(SHOWN_NODES)
+                .map(|n| label_of_node(n))
+                .collect();
+            if nodes.len() > SHOWN_NODES {
+                shown.push(format!("... {} more", nodes.len() - SHOWN_NODES));
+            }
+            shown.join(", ")
+        };
+        if !matrix.unexpanded.is_empty() {
+            let hint = if matrix.depth >= mesh_core::ContractGraph::MAX_IMPACT_DEPTH {
+                "`depth` is already at its maximum, so query one of them directly".to_string()
+            } else {
+                format!("repeat the call with `depth: {}`", matrix.depth + 1)
+            };
+            header.push_str(&format!(
+                "\n**Depth limit reached** (depth {}): {} consumer(s) were not expanded although each has a resolved onward publish in its file, so the chain continues past this answer: {}. This is a depth stop, not the end of the chain; {hint}.\n",
+                matrix.depth,
+                matrix.unexpanded.len(),
+                list_nodes(&matrix.unexpanded)
+            ));
+        }
+        if !matrix.chain_end.is_empty() {
+            header.push_str(&format!(
+                "\n**Chain end within depth {}** at {} consumer(s): {}. No onward publish was statically resolved from their files. If they re-emit under a stream or event name resolved at runtime (registry, config, template string), the chain continues there; read these handlers before concluding that the flow stops.\n",
+                matrix.depth,
+                matrix.chain_end.len(),
+                list_nodes(&matrix.chain_end)
+            ));
+            pointer = pointer.or(Some("topic_producer"));
+        }
+        if let Some(kind) = pointer {
+            header.push_str(&format!(
+                "*A `[[engines.contracts.patterns]]` of kind `{kind}` can close this gap for a project-specific registry (see SETUP.md).*\n"
             ));
         }
         if total == 0 {
             header.push_str(&format!(
-                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across {} indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name.*\n",
+                "\n*No gRPC handler/client or async producer/topic/consumer matched this target across {} indexed workspace roots (0 matches). Pass an exact proto method, service, or event/topic name. A name that only a runtime registry, config or template string produces is not indexed under that name: try the literal stream or topic of a neighbouring hop.*\n",
                 roots.len()
             ));
             return header;
@@ -1097,6 +1156,9 @@ mod tests {
             no_producer_resolved: false,
             no_consumer_resolved: false,
             file_linked_hops: false,
+            depth: 1,
+            unexpanded: Vec::new(),
+            chain_end: Vec::new(),
             rows: nodes
                 .iter()
                 .map(|n| mesh_core::ImpactRow {
@@ -1419,11 +1481,13 @@ mod tests {
             downstream_consumers: Vec::new(),
             related_sagas: Vec::new(),
             downstream_producers: Vec::new(),
+            unexpanded: Vec::new(),
+            chain_end: Vec::new(),
             files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_impact_flow(&empty_flow);
         assert!(
-            out.contains("### 1. Upstream Event Producers: 0 found (Authoritative AST Scan)"),
+            out.contains("### 1. Upstream Event Producers: 0 found (literal call sites only)"),
             "{out}"
         );
         assert!(
@@ -1432,7 +1496,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "### 3. Downstream Consumers / Handlers: 0 found (Authoritative AST Scan)"
+                "### 3. Downstream Consumers / Handlers: 0 found (literal registrations only)"
             ),
             "{out}"
         );

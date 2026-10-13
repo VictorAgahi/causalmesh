@@ -212,7 +212,7 @@ are left out and counted unless `include_tests: true`. Results are paged (`limit
 `offset` from the footer). When nothing matches exactly, the last-resort fallback lists import
 strings that merely contain `target` (3 characters at least), under an explicit heuristic warning.
 
-**Negative Constraints**: If 0 dependents are reported, no indexed import or call resolves to it; only dynamic or string-built references can be missing, so a targeted check of those beats a broad grep. DO NOT USE to search freeform text or method signatures (use smart_search).
+**Negative Constraints**: If 0 dependents are reported, no indexed import or call resolves to it; only dynamic or string-built references can be missing, so a targeted check of those beats a broad grep. DO NOT USE to search freeform text or method signatures (use smart_search). It answers import and symbol-usage questions; "who calls this gRPC method" and RPC client call sites go to `analyze_grpc`.
 
 #### JSON Schema
 ```json
@@ -322,7 +322,7 @@ for the method's service in a file where no call to this method was resolved —
 client is not held in a typed field, whose calls are all recorded — are listed as "may call", even
 when other clients were found: the client list is never presented as complete when it may not be.
 
-**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
+**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' covers literal call sites in every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. This is the tool for 'who calls this gRPC method / RPC client call sites'. DO NOT USE for message brokers or asynchronous event streams (use analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema
 ```json
@@ -483,7 +483,24 @@ the trace is still valid there, only the comparison is impossible.
 #### Description
 Impact matrix of a change. For an HTTP route written `VERB /path` (verb in GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS, any case): the handler(s) it resolves to, with file:line and root, plus the graph edges that touch the handler node (events it produces or consumes, RPCs it calls). For a proto/gRPC method or service: its server handlers and clients, resolved like `analyze_grpc` (`Implements` / `CallsRpc` edges). For an event, topic, queue or saga: its producers, topics, consumers and sagas — direct hits by default, or transitively through `depth` causal hops of real Produces/Consumes edges. Each row is classified `EXTERNAL` or `INTERNAL` and carries the confidence of its edge (`exact` / `heuristic` / `ambiguous`).
 
-**Negative Constraints**: A 0 labeled 'Authoritative AST Scan' covers every indexed workspace root, so a broad grep re-scan rarely adds anything; every row gives a path:line to check, and rows marked heuristic or ambiguous deserve a targeted read. DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
+**Negative Constraints**: Every row gives a path:line to check; rows marked heuristic or ambiguous deserve a targeted read. Coverage is literal call sites in the indexed roots: 'No producer statically resolved' with a consumer present means NOT STATICALLY RESOLVED (the publisher may use a runtime-resolved name, a registry or config, or live in an unindexed root), never 'nobody produces it'; the same holds for consumers. A 'Depth limit reached' note is a depth stop, a 'Chain end' note may hide a runtime-resolved hop. DO NOT USE for the generated-stub trace or the `.proto` wire-format check (use analyze_grpc). It does NOT report test coverage: the graph does not link tests to the code they cover.
+
+#### Unresolved flow notes
+The index records literal call sites only. A stream, topic or event type that a publisher takes
+from a runtime registry, a config object or a template string (`publish(cfg.stream, cfg.type, …)`)
+is not recorded under any name. So a 0 is never worded as proof of absence:
+
+- **No producer statically resolved** (a consumer or topic is indexed, no literal producer call site): the producer may publish under a runtime-resolved name or live in an unindexed root.
+- **No consumer statically resolved** (the mirror case): a consumer may be registered dynamically, through a pattern not in the config, or live in an unindexed root.
+- **Depth limit reached** (`depth` > 1 or default): consumers the walk reached but did not expand although their file has a resolved onward publish; counted and listed (up to 5), with the `depth` to repeat the call with. A depth stop is distinguishable from the end of the chain.
+- **Chain end within depth N**: consumers the walk did expand and found no resolved onward publish for. It is the end of the statically resolved chain; if the handler re-emits under a runtime-resolved name, the chain continues there.
+
+When one of these fires, the result points to a `[[engines.contracts.patterns]]` of kind
+`topic_producer` (or `topic_consumer`) to declare a project-specific registry (see `SETUP.md`).
+Non-literal publish call sites are not recorded by the indexer, so no candidate list of dynamic
+emitters is shown. A claim of absence ("never called", "no producer") needs a query across all
+indexed roots with the tool whose coverage matches the question: `analyze_grpc` for RPC call sites,
+`find_dependents` for imports and symbol usage, `analyze_impact` for events.
 
 #### HTTP route targets
 `analyze_impact(target: "PATCH /events/:id/state")` resolves the target against the `HttpEndpoint`
